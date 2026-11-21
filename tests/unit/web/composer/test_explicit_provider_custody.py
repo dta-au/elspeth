@@ -23,6 +23,7 @@ from elspeth.web.required_work import (
     RequiredWorkRole,
     RequiredWorkSource,
 )
+from tests.helpers.prompt_guard_audit import assert_prompt_guard_wire_payload
 from tests.unit.web.composer.test_llm_sampling_config import _settings
 from tests.unit.web.composer.test_prompt_guard_admission import _checks
 from tests.unit.web.sessions.test_token_usage_adapters import _ledger, _quota_service
@@ -68,7 +69,10 @@ def _assert_required_guard_admitted(engine, context, requests, *, role, user_pro
     assert check["mode"] == "required"
     assert (check["disposition"], check["reason"]) == ("allow", "clean")
     assert requests
-    assert all(json.loads(request.content)["userPrompt"] == user_prompt for request in requests)
+    for request in requests:
+        assert_prompt_guard_wire_payload(json.loads(request.content), user_prompt=user_prompt)
+    if user_prompt:
+        assert [json.loads(request.content)["userPrompt"] for request in requests].count(user_prompt) == 1
 
 
 @pytest.mark.asyncio

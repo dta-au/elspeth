@@ -23,6 +23,7 @@ from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.protocol import CompositionStateData
 from tests.helpers.advisor_review import parse_advisor_publication_review
 from tests.helpers.composer_operations import submit_and_settle
+from tests.helpers.prompt_guard_audit import assert_prompt_guard_wire_payloads
 from tests.unit.web.sessions.test_completion_gate_roundtrip import _green_result
 from tests.unit.web.sessions.test_routes import (
     _assert_required_route_guard_checks,
@@ -289,7 +290,7 @@ async def test_advisor_recovery_is_durable_only_with_explicit_clean_decision(tmp
     else:
         assert guard_envelopes == []
     assert bool(guard_requests) is adjudicates
-    assert all(request["userPrompt"] == "Please retry the review" for request in guard_requests)
+    assert_prompt_guard_wire_payloads(guard_requests, user_prompt="Please retry the review")
     pass_records = [
         row.tool_calls[0]["pass"]
         for row in stored
@@ -472,8 +473,12 @@ async def test_unchanged_graph_first_block_and_changed_failure_cause_are_saved(t
             _assert_required_route_guard_checks(guard_envelopes[guard_count:], guard_mount, roles=["advisor"] * expected_attempts)
             guard_count += expected_attempts
             assert len(guard_envelopes) == guard_count
-            assert len(guard_requests) >= guard_count
-            assert all(request["userPrompt"] == "Retry review" for request in guard_requests)
+            # A check whose units were all allowed earlier in this session
+            # under the same policy makes no service call.
+            checks = [envelope["check"] for envelope in guard_envelopes]
+            assert all(check["units_scanned"] or check["units_reused"] for check in checks)
+            assert len(guard_requests) >= sum(1 for check in checks if check["units_scanned"])
+            assert_prompt_guard_wire_payloads(guard_requests, user_prompt="Retry review")
             reviews = [
                 row.tool_calls[0]["review"]
                 for row in rows

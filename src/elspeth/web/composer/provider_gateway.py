@@ -48,7 +48,7 @@ from elspeth.web.composer.private_diagnostic_facts import bind_received_response
 from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused, build_prompt_guard_mount, enforce_prompt_guard
 from elspeth.web.composer.protocol import ComposerServiceError, ComposerSettings
 from elspeth.web.composer.provider_context import capture_provider_context
-from elspeth.web.composer.provider_errors import classify_provider_failure
+from elspeth.web.composer.provider_errors import classify_provider_failure, is_context_length_rejection
 from elspeth.web.composer.provider_quota import (
     ProviderCallCustody,
     provider_call_scope,
@@ -298,10 +298,16 @@ class _BadRequestLLMError(ComposerServiceError):
         *,
         provider_detail: str | None = None,
         provider_status_code: int | None = None,
+        sent_over_estimate: bool = False,
     ) -> None:
         super().__init__(message)
         self.provider_detail = provider_detail
         self.provider_status_code = provider_status_code
+        # Whether the rejected request was sent above the context budget's own
+        # token estimate. Set by the compose loop, which holds the decision; a
+        # rejection of such a request is likely about size even when the
+        # provider's reason is not one this code recognises.
+        self.sent_over_estimate = sent_over_estimate
 
 
 def _apply_openrouter_app_identity(kwargs: dict[str, Any]) -> None:
@@ -885,7 +891,8 @@ class ProviderGateway:
             cause = exc.__cause__
             status = ComposerLLMCallStatus.BAD_REQUEST_ERROR
             error_class = type(cause).__name__ if cause is not None else type(exc).__name__
-            error_message = error_class
+            # A recognised context-limit rejection is recorded by its closed reason, never by provider text.
+            error_message = "context_length_exceeded" if is_context_length_rejection(cause) else error_class
             attach_llm_calls(exc, recorder)
             raise
         except CredentialMaterialRefused as exc:
@@ -1071,7 +1078,8 @@ class ProviderGateway:
             cause = exc.__cause__
             status = ComposerLLMCallStatus.BAD_REQUEST_ERROR
             error_class = type(cause).__name__ if cause is not None else type(exc).__name__
-            error_message = error_class
+            # A recognised context-limit rejection is recorded by its closed reason, never by provider text.
+            error_message = "context_length_exceeded" if is_context_length_rejection(cause) else error_class
             attach_llm_calls(exc, recorder)
             raise
         except CredentialMaterialRefused as exc:

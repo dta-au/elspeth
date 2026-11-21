@@ -170,10 +170,11 @@ from elspeth.web.composer.provider_config import (
     infer_provider_from_model_name,
     infer_provider_from_unprefixed_model_name,
 )
-from elspeth.web.composer.provider_errors import classify_provider_failure
+from elspeth.web.composer.provider_errors import classify_provider_failure, is_context_length_rejection
 from elspeth.web.composer.provider_gateway import (
     ProviderGateway,
     _BadRequestLLMError,
+    _MalformedLLMResponseError,
     advisor_provider_failure_types,
     composer_loop_tool_definitions,
 )
@@ -194,7 +195,7 @@ from elspeth.web.composer.strict_transport import (
     StrictTransportDiagnostic,
     resolve_composer_tool_contract,
 )
-from elspeth.web.composer.tools import ToolResult
+from elspeth.web.composer.tools import ToolResult, is_blob_store_only_mutation_tool
 from elspeth.web.composer.tools.generation import MalformedSourceProofClaim, ProofUnavailable
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.credential_guard import require_no_credential_material, require_no_credential_material_in_state
@@ -552,6 +553,30 @@ def _record_advisor_repair_mutations(
     )
 
 
+def _drop_admitted_fallback_after_file_change(
+    review_state: _AdvisorReviewState,
+    tool_outcomes: tuple[_ToolOutcome, ...],
+) -> _AdvisorReviewState:
+    """Forget the kept admitted reply once the round creates, updates or deletes a session file.
+
+    The kept reply was admitted against the session as it stood. The graph
+    fingerprint covers what the graph references, but blob-store-only tools
+    (``create_blob``/``update_blob``/``delete_blob``) change session files
+    without changing the graph, so a reply about those files could otherwise
+    be published after they changed. Any such call that did not plainly fail
+    drops the fallback; the turn then ends as it would without one.
+    """
+    if review_state.admitted_fallback is None:
+        return review_state
+    for outcome in tool_outcomes:
+        if not is_blob_store_only_mutation_tool(outcome.call.function.name) or outcome.error_class is not None:
+            continue
+        if isinstance(outcome.response, ToolResult) and not outcome.response.success:
+            continue
+        return replace(review_state, admitted_fallback=None)
+    return review_state
+
+
 # The per-dispatch audit envelope (DispatchAudit, begin_dispatch, finish_*)
 # and the structural enforcement helper (dispatch_with_audit) live in
 # web/composer/audit.py next to the BufferingRecorder. Hoisting them out of
@@ -723,11 +748,15 @@ class ComposerServiceImpl:
         if operator_profile_registry is None and not trained_operator_mode:
             raise TypeError("operator_profile_registry must be provided")
         self._sessions_service = sessions_service
+        # Read once here: the switch is a constructor value of the preflight
+        # owner and of the policy-view factory, never a per-call env read.
+        validation_reuse_enabled = settings.composer_validation_reuse_enabled
         self._policy_context = PluginPolicyContextFactory(
             catalog,
             plugin_snapshot_factory,
             operator_profile_registry,
             trained_operator_mode=trained_operator_mode,
+            validation_reuse_enabled=validation_reuse_enabled,
         )
         self._chargeable_admission = ComposerChargeableAdmission(sessions_service)
         self._model = settings.composer_model
@@ -825,6 +854,7 @@ class ComposerServiceImpl:
             secret_wiring_policy=self._secret_wiring_policy,
             operator_profile_registry=operator_profile_registry,
             coordinator=runtime_preflight_coordinator or RuntimePreflightCoordinator(),
+            validation_reuse_enabled=validation_reuse_enabled,
         )
         self._availability = compute_availability(
             model=self._model,
@@ -910,6 +940,7 @@ class ComposerServiceImpl:
             sessions_service=sessions_service,
             chargeable_admission=self._chargeable_admission,
             prompt_guard_mount=self._advisor_prompt_guard_mount,
+            blob_service=blob_service,
         )
         self._composer_skill_name: str = PIPELINE_COMPOSER_SKILL_NAME
         self._interpretation_surfacing = InterpretationSurfacing(
@@ -1783,6 +1814,9 @@ class ComposerServiceImpl:
                 previously_shed=previously_shed_keys(frame.history, recorder.llm_calls),
                 held=held_tool_keys(recorder.llm_calls)
                 | (frame.history.shed_history_after(recorder.llm_calls) if reply_stage else frozenset()),
+                # A message under the byte maximum always goes: the estimate
+                # decides what is left out, the provider judges its own limit.
+                on_over_estimate="send",
             )
         except ContextBudgetRefusal as refusal:
             raise self._context_budget_refusal(
@@ -1799,7 +1833,7 @@ class ComposerServiceImpl:
             ) from refusal
         record = ComposerContextBudgetRecord.from_shed_keys(
             policy_hash=decision.policy_hash,
-            bytes_per_token=(self._context_budget_policy.fallback_bytes_per_token if decision.pricing.mode == "authored_prefix" else 1.0),
+            bytes_per_token=decision.bytes_per_token_used,
             estimated_tokens_before=decision.estimated_tokens_before,
             estimated_tokens_after=decision.estimated_tokens_after,
             # The decision's bound; the caller records the exact size of the request it sends.
@@ -1813,6 +1847,8 @@ class ComposerServiceImpl:
             pricing_mode=decision.pricing.mode,
             authored_bytes=decision.pricing.authored_bytes,
             authored_refuted=decision.pricing.authored_refuted,
+            over_estimate=decision.over_estimate,
+            max_prompt_tokens=self._context_budget_policy.max_prompt_tokens,
             anchor_status=anchor.reason,
             anchor_prompt_tokens=anchor.tokens,
             anchor_wire_bytes=anchor.wire_bytes,
@@ -1821,7 +1857,7 @@ class ComposerServiceImpl:
             decision_wire_bytes_after=decision.request_bytes_after,
         )
         if not shed:
-            return messages, record, 1.0
+            return messages, record, decision.bytes_per_token_used
 
         shed_history_positions = {
             _CONTEXT_BUDGET_HISTORY_START + position
@@ -1851,7 +1887,7 @@ class ComposerServiceImpl:
                 applied.append(stubbed_tool_message(message))
             else:
                 applied.append(message)
-        return applied, record, 1.0
+        return applied, record, decision.bytes_per_token_used
 
     def _context_budget_refusal(
         self,
@@ -1873,6 +1909,38 @@ class ComposerServiceImpl:
                 "estimated_tokens": refusal.estimated_tokens,
                 # Wire bytes: the measure both ceilings are judged on.
                 "request_bytes": refusal.request_bytes,
+                "max_prompt_tokens": self._context_budget_policy.max_prompt_tokens,
+                "max_request_bytes": self._context_budget_policy.max_request_bytes,
+                "largest_component": largest_component(component_bytes),
+            },
+            failed_turn=scope.failed_turn,
+        )
+
+    def _provider_capacity_refusal(
+        self,
+        budget_record: ComposerContextBudgetRecord,
+        component_bytes: Mapping[str, int],
+        scope: _ContextBudgetRefusalScope,
+    ) -> ComposerConvergenceError:
+        """Build the refusal for a sent request the provider rejected as over the model's context limit.
+
+        The same refusal shape as the pre-dispatch one, with ``provider`` as
+        the ceiling: the request was under ELSPETH's own maximum and was sent;
+        the limit that refused it is the gateway's or the model's. The sizes
+        are those of the request that was sent, from its own budget record.
+        """
+        return ComposerConvergenceError.capture(
+            max_turns=scope.composition_turns_used + scope.discovery_turns_used,
+            budget_exhausted="composition",
+            state=scope.state,
+            initial_version=scope.initial_version,
+            tool_invocations=scope.recorder.invocations,
+            llm_calls=scope.recorder.llm_calls,
+            reason="context_budget_exceeded",
+            evidence={
+                "ceiling": "provider",
+                "estimated_tokens": budget_record.estimated_tokens_after,
+                "request_bytes": budget_record.request_wire_bytes,
                 "max_prompt_tokens": self._context_budget_policy.max_prompt_tokens,
                 "max_request_bytes": self._context_budget_policy.max_request_bytes,
                 "largest_component": largest_component(component_bytes),
@@ -1928,19 +1996,49 @@ class ComposerServiceImpl:
             failed_turn=failed_turn,
             progress=progress,
         )
-        completion = await self._call_llm_before_deadline(
-            selected_messages,
-            selected_tools,
-            state,
-            initial_version,
-            deadline,
-            recorder=recorder,
-            composition_turns_used=composition_turns_used,
-            discovery_turns_used=discovery_turns_used,
-            failed_turn=failed_turn,
-            provider_owner=provider_owner,
-            context_budget=budget_record,
-        )
+        try:
+            completion = await self._call_llm_before_deadline(
+                selected_messages,
+                selected_tools,
+                state,
+                initial_version,
+                deadline,
+                recorder=recorder,
+                composition_turns_used=composition_turns_used,
+                discovery_turns_used=discovery_turns_used,
+                failed_turn=failed_turn,
+                provider_owner=provider_owner,
+                context_budget=budget_record,
+            )
+        except _BadRequestLLMError as rejection:
+            if not is_context_length_rejection(rejection.__cause__):
+                # Not recognised as a size rejection, so not called one. That the
+                # request went out above the estimate is carried for the user.
+                rejection.sent_over_estimate = budget_record.over_estimate is True
+                raise
+            # The gateway or the model refused the request as over its context
+            # limit. That is reported to the user as the size refusal it is,
+            # naming the provider as the ceiling, never as a provider outage.
+            kept_history = sum(chat_index not in budget_record.shed_history_indices for chat_index, _kind in budget_frame.history_entries)
+            raise self._provider_capacity_refusal(
+                budget_record,
+                # Sized on the request that was sent.
+                _context_budget_component_bytes(
+                    message_wire_split(selected_messages, selected_tools or None),
+                    state_index=_CONTEXT_BUDGET_HISTORY_START + kept_history,
+                    latest_start=latest_round_trip_start(selected_messages),
+                    latest_stop=len(selected_messages),
+                    sheddable_bytes=0,
+                ),
+                _ContextBudgetRefusalScope(
+                    state=state,
+                    initial_version=initial_version,
+                    composition_turns_used=composition_turns_used,
+                    discovery_turns_used=discovery_turns_used,
+                    failed_turn=failed_turn,
+                    recorder=recorder,
+                ),
+            ) from rejection
         assistant_tool_calls = completion.tool_batch.calls
         self._enforce_tool_call_cap(
             assistant_tool_calls=assistant_tool_calls,
@@ -3013,7 +3111,9 @@ class ComposerServiceImpl:
         # so subsequent preview_pipeline calls don't re-fire an already-failed
         # worker. Content identity prevents concurrent unsaved requests from
         # sharing a result solely because they both start at version zero.
-        runtime_preflight_cache = self._preflight.new_cache()
+        # The cache shares the round view's mutation epoch, so a verdict for
+        # a blob-bearing state is not reused across a mutation-kind tool call.
+        runtime_preflight_cache = self._preflight.new_cache(mutation_epoch=policy_catalog.mutation_epoch)
         last_runtime_preflight: ValidationResult | None = None
         session_scope = f"session:{session_id}" if session_id is not None else "session:unsaved"
 
@@ -3075,22 +3175,72 @@ class ComposerServiceImpl:
             # The compose-loop audit path captures the state id observed
             # before the provider call and passes this exact value to
             # persist_compose_turn_async as expected_current_state_id.
-            call_model = await self._call_model_turn(
-                llm_messages=llm_messages,
-                tools=tools,
-                state=state,
-                initial_version=initial_version,
-                deadline=deadline,
-                recorder=recorder,
-                progress=progress,
-                message=message,
-                composition_turns_used=composition_turns_used,
-                discovery_turns_used=discovery_turns_used,
-                failed_turn=failed_turn,
-                budget_frame=budget_frame,
-                provider_owner=provider_owner,
-                turn_evidence=turn_evidence,
-            )
+            try:
+                call_model = await self._call_model_turn(
+                    llm_messages=llm_messages,
+                    tools=tools,
+                    state=state,
+                    initial_version=initial_version,
+                    deadline=deadline,
+                    recorder=recorder,
+                    progress=progress,
+                    message=message,
+                    composition_turns_used=composition_turns_used,
+                    discovery_turns_used=discovery_turns_used,
+                    failed_turn=failed_turn,
+                    budget_frame=budget_frame,
+                    provider_owner=provider_owner,
+                    turn_evidence=turn_evidence,
+                )
+            except (ComposerConvergenceError, OpenAIError, _MalformedLLMResponseError, _BadRequestLLMError) as round_failure:
+                # The composer call of an extra review round (a newly flagged
+                # graph after this turn changed it) timed out, failed or was
+                # refused with a 400: fall back to the reply the earlier pass
+                # admitted, block standing. The failed call is already in the
+                # turn's LLM-call audit. Without a kept reply for this
+                # unchanged graph and these session files, the failure stands
+                # exactly as before; the kept reply is checked before any
+                # preflight runs, and a preflight failure never replaces it.
+                async def fallback_preflight(
+                    _state: CompositionState = state,
+                    _last_runtime_preflight: ValidationResult | None = last_runtime_preflight,
+                ) -> ValidationResult | None:
+                    return await self._preflight.turn_runtime_preflight(
+                        state=_state,
+                        user_id=user_id,
+                        session_id=session_id,
+                        last_runtime_preflight=_last_runtime_preflight,
+                        runtime_preflight_cache=runtime_preflight_cache,
+                        initial_version=initial_version,
+                        session_scope=session_scope,
+                        recorder=recorder,
+                        plugin_snapshot=plugin_snapshot,
+                        session_operation_context=session_operation_context,
+                    )
+
+                try:
+                    fallback_result = await self._completion._admitted_fallback_result(
+                        advisor_review_state=advisor_review_state,
+                        state=state,
+                        runtime_preflight=fallback_preflight,
+                        session_id=session_id,
+                        session_operation_context=session_operation_context,
+                        recorder=recorder,
+                        repair_turns_used=repair_turns_used,
+                        persisted_assistant_message_id=persisted_assistant_message_id,
+                        persisted_assistant_content=persisted_assistant_content,
+                        persisted_tool_call_turn=persisted_tool_call_turn,
+                    )
+                except ComposerRuntimePreflightError:
+                    # The round's own failure is what the user is owed, re-raised
+                    # with its own ``__cause__`` unchanged; the preflight failure
+                    # stays attached as its ``__context__``.
+                    raise round_failure from round_failure.__cause__
+                if fallback_result is None:
+                    raise
+                # An END blocked terminal: the advisor-repair prose replacer
+                # passes it through untouched, so only the receipt is added.
+                return self._completion._append_checkpoint_receipt(fallback_result, turn_evidence=turn_evidence)
             recovery_result = self._terminal_recovery_result(
                 call_model.completion, state, recorder, prior_tools_persisted=persisted_tool_call_turn
             )
@@ -3388,6 +3538,7 @@ class ComposerServiceImpl:
                 advisor_review_state,
                 dispatch.tool_outcomes,
             )
+            advisor_review_state = _drop_admitted_fallback_after_file_change(advisor_review_state, dispatch.tool_outcomes)
             current_state_id = persist.current_state_id
             persisted_assistant_message_id = persist.persisted_assistant_message_id
             persisted_assistant_content = persist.persisted_assistant_content

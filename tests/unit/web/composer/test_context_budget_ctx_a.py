@@ -1,6 +1,7 @@
 """CTX-A: conservative admission and stable shedding regressions."""
 
 import inspect
+import math
 from copy import deepcopy
 from dataclasses import replace
 
@@ -95,7 +96,9 @@ async def test_live_compose_second_call_anchors_and_records_replay_figures(monke
 
 
 def policy(cap=1000, byte_cap=1000000, high=0.85):
-    return ContextBudgetPolicy(cap, byte_cap, high, 0.6)
+    # One token per byte, so the marks and sizes in these tests read directly; the shipped
+    # rate has its own tests (test_context_budget_repricing.py).
+    return ContextBudgetPolicy(cap, byte_cap, high, 0.6, 1.0)
 
 
 def test_provider_anchor_prices_growth_without_average_ratio_credit():
@@ -404,10 +407,13 @@ def test_newest_usable_anchor_survives_interleaved_model_and_failure():
         assert anchor.tokens == 600
 
 
-def test_static_authorship_prices_only_explicitly_labelled_bytes():
+def test_authorship_labels_are_recorded_and_do_not_change_the_price():
     assert "authored_bytes" in inspect.signature(decide_context_budget).parameters
-    result = decide_context_budget(policy=policy(), request_bytes=2000, segments=[], previously_shed=frozenset(), authored_bytes=1800)
-    assert result.estimated_tokens_after == 800
+    priced = replace(policy(), fallback_bytes_per_token=3.0)
+    labelled = decide_context_budget(policy=priced, request_bytes=2000, segments=[], previously_shed=frozenset(), authored_bytes=1800)
+    unlabelled = decide_context_budget(policy=priced, request_bytes=2000, segments=[], previously_shed=frozenset())
+    assert labelled.estimated_tokens_after == unlabelled.estimated_tokens_after == 667
+    assert (labelled.pricing.authored_bytes, unlabelled.pricing.authored_bytes) == (1800, 0)
     with pytest.raises(ContextBudgetRefusal):
         decide(2000)
 
@@ -455,6 +461,44 @@ def test_changed_tools_never_receive_anchor_credit():
     assert anchor.shared_bytes == len(canonical_json(messages[0]).encode())
 
 
+def _shipped_rate_decision(anchor_tokens, anchor_wire_bytes):
+    """A 600,000-byte request after a 300,000-byte one, at the SHIPPED DEFAULT rate (no rate passed to the policy)."""
+    shipped = ContextBudgetPolicy(10_000_000, 10_000_000, 0.85, 0.6)
+    assert shipped.fallback_bytes_per_token == 3.0
+    return decide_context_budget(
+        policy=shipped,
+        request_bytes=600_000,
+        segments=[],
+        previously_shed=frozenset(),
+        anchor_tokens=anchor_tokens,
+        anchor_wire_bytes=anchor_wire_bytes,
+        anchor_status="anchored",
+    )
+
+
+@pytest.mark.parametrize("anchor_tokens", [50_000, 75_000, 99_999, 100_000])
+def test_a_provider_count_sparser_than_the_policy_rate_never_raises_the_rate(anchor_tokens):
+    """The floor: one unusually sparse response (here 3.0 to 6.0 bytes per token) must not make later estimates optimistic."""
+    result = _shipped_rate_decision(anchor_tokens, 300_000)
+    assert result.bytes_per_token_used == 3.0
+    assert result.pricing.authored_refuted is False
+    assert result.estimated_tokens_after == math.ceil(600_000 / 3.0)
+
+
+@pytest.mark.parametrize("anchor_tokens", [100_001, 150_000, 300_000])
+def test_only_a_denser_provider_count_replaces_the_policy_rate(anchor_tokens):
+    result = _shipped_rate_decision(anchor_tokens, 300_000)
+    assert result.bytes_per_token_used == 300_000 / anchor_tokens < 3.0
+    assert result.pricing.authored_refuted is True
+    # Never below the provider's own count for the bytes it already counted.
+    assert result.estimated_tokens_after == math.ceil(600_000 / (300_000 / anchor_tokens)) >= anchor_tokens
+
+
+@given(st.integers(1, 2_000_000), st.integers(1, 2_000_000))
+def test_the_rate_used_is_never_above_the_policy_rate(anchor_tokens, anchor_wire_bytes):
+    assert _shipped_rate_decision(anchor_tokens, anchor_wire_bytes).bytes_per_token_used <= 3.0
+
+
 def test_refusal_has_replayable_pricing_and_byte_arm_is_named():
     with pytest.raises(ContextBudgetRefusal) as caught:
         decide_context_budget(
@@ -470,7 +514,8 @@ def test_refusal_has_replayable_pricing_and_byte_arm_is_named():
         )
     evidence = caught.value.pricing
     assert evidence is not None
-    assert evidence.mode == "conservative"
+    # "authored_prefix" is the byte arm's recorded name; "conservative" is no longer produced.
+    assert evidence.mode == "authored_prefix"
     assert (evidence.anchor_tokens, evidence.anchor_wire_bytes, evidence.shared_bytes, evidence.request_bytes) == (400, 2000, 200, 500)
 
 
@@ -789,13 +834,11 @@ def test_planner_rejects_a_sheddable_position_missing_from_mutable_set(monkeypat
         )
 
 
-def test_omitted_anchor_authored_evidence_fails_closed_like_unknown():
-    """F9-1: omitting the anchor's authored bytes must not mean a measured zero.
+def test_omitted_anchor_authored_evidence_prices_like_unknown_and_never_discards_the_providers_count():
+    """F9-1, restated for byte-rate pricing: a dense provider count is never discarded.
 
-    Zero authored bytes price the anchor's own request at its full wire size,
-    which no plausible count can exceed, so a contradictory provider count
-    would be discarded. Omission must behave exactly as explicit unknown
-    evidence: the anchored arm alone.
+    Omitted and explicitly unknown authored evidence price alike, and the
+    provider's measured density is applied whichever was passed.
     """
     arguments = {
         "policy": ContextBudgetPolicy(90_000, 1_000_000, 0.85, 0.6),
@@ -812,4 +855,8 @@ def test_omitted_anchor_authored_evidence_fails_closed_like_unknown():
         decide_context_budget(**arguments)
     with pytest.raises(ContextBudgetRefusal) as unknown:
         decide_context_budget(**arguments, anchor_authored_bytes=None)
-    assert omitted.value.estimated_tokens == unknown.value.estimated_tokens == 117_407
+    # Authored evidence, present or not, no longer selects the arm. The provider counted this
+    # conversation at 1.42 bytes per token; that density replaces the policy rate, and the
+    # smaller of the two arms is used (the anchored arm would be 117,407).
+    assert omitted.value.estimated_tokens == unknown.value.estimated_tokens == math.ceil(159_396 / (142_015 / 100_000)) == 112_239
+    assert omitted.value.pricing is not None and omitted.value.pricing.authored_refuted is True

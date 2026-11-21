@@ -22,7 +22,7 @@ from elspeth.web.composer.tools.strict_profile import (
 
 K = StrictViolationKind
 
-# The 34 loop tools with no free-form object anywhere in their flat schema S.
+# The 35 loop tools with no free-form object anywhere in their flat schema S.
 _STRICT_CANDIDATES: frozenset[str] = frozenset(
     {
         "list_blobs",
@@ -34,6 +34,7 @@ _STRICT_CANDIDATES: frozenset[str] = frozenset(
         "update_blob",
         "delete_blob",
         "wire_blob_inline_ref",
+        "report_composer_bug",
         "list_sources",
         "clear_source",
         "inspect_source",
@@ -79,12 +80,13 @@ _OPTION_TOOLS: frozenset[str] = frozenset(
     }
 )
 
-# The 14 strict candidates that are NOT strict-clean as sent (optional
-# properties, or keywords outside the wire allowlist). The other 19 are.
+# The 15 strict candidates that are NOT strict-clean as sent (optional
+# properties, or keywords outside the wire allowlist). The other 20 are.
 _NOT_CLEAN_AS_SENT: frozenset[str] = frozenset(
     {
         "create_blob",
         "wire_blob_inline_ref",
+        "report_composer_bug",
         "clear_source",
         "get_pipeline_state",
         "get_blob_content",
@@ -353,7 +355,7 @@ def test_checker_does_not_mutate_its_input() -> None:
 def test_inventory_partition_over_flat_s_is_pinned_by_name() -> None:
     definitions = {definition["name"]: definition["parameters"] for definition in get_tool_definitions()}
     assert set(definitions) == _STRICT_CANDIDATES | _OPTION_TOOLS
-    assert len(_STRICT_CANDIDATES) == 34
+    assert len(_STRICT_CANDIDATES) == 35
     assert len(_OPTION_TOOLS) == 11
 
     clean = {name for name in _STRICT_CANDIDATES if check_openai_strict(definitions[name], tool=name) == ()}

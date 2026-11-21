@@ -53,6 +53,7 @@ from elspeth.web.required_work import (
     RequiredWorkRole,
 )
 from elspeth.web.sessions.models import chat_messages_table, quota_policies_table, quota_provider_attempts_table, token_usage_ledger_table
+from tests.helpers.prompt_guard_audit import assert_prompt_guard_wire_payload
 from tests.unit.web.composer._helpers import _empty_state
 from tests.unit.web.composer.test_prompt_guard_admission import authority as _authority
 from tests.unit.web.composer.test_provider_quota_end_to_end import _lease
@@ -145,7 +146,7 @@ async def test_bound_end_preserves_mandatory_evidence_beyond_hint_allowance(
     def inspect(sent: httpx.Request) -> httpx.Response:
         assert sent.url.host == "advisor-shield.example.test"
         body = json.loads(sent.content)
-        assert body["userPrompt"] == request
+        assert_prompt_guard_wire_payload(body, user_prompt=request)
         shield_bodies.append(body)
         return httpx.Response(
             200,
@@ -288,8 +289,14 @@ async def test_bound_end_preserves_mandatory_evidence_beyond_hint_allowance(
     assert request in "".join(inspection_values) and candidate in "".join(inspection_values)
     # Complete producer units retain their order and bytes at the detector.
     # Framing between units can split a request across document boundaries.
+    # A unit whose exact inspected text already went earlier in the same
+    # check is inspected once, at its first position.
     cursor = 0
+    first_seen: set[str] = set()
     for index, value in enumerate(inspection_values):
+        if value in first_seen:
+            continue
+        first_seen.add(value)
         unit = f"Message 1, content part {index}:\n{value}"
         position = inspected.find(unit, cursor)
         assert position >= 0, f"Prompt guard omitted or reordered content part {index}"
@@ -362,7 +369,7 @@ async def test_sql_quota_refusal_keeps_retry_reservation_without_second_sdk_call
 
     def inspect(sent: httpx.Request) -> httpx.Response:
         body = json.loads(sent.content)
-        assert body["userPrompt"] == request
+        assert_prompt_guard_wire_payload(body, user_prompt=request)
         shield_bodies.append(body)
         return httpx.Response(
             200,
@@ -460,7 +467,10 @@ async def test_sql_quota_refusal_keeps_retry_reservation_without_second_sdk_call
             )
         assert caught.value.decision.refusal_reason is AdmissionRefusalReason.QUOTA_EXCEEDED
         assert budget.reserved_calls == 2 and budget.validated_cost == Decimal("0.01") and budget.cost_known
-        assert len(sdk_calls) == len(recorder.llm_calls) == 1 and len(shield_bodies) == 2
+        # First check: prompt call and document call; the retry's check sends
+        # only its new documents because the prompt was allowed in this session.
+        assert len(sdk_calls) == len(recorder.llm_calls) == 1 and len(shield_bodies) == 3
+        assert [body["userPrompt"] for body in shield_bodies] == [request, "", ""]
         assert recorder.llm_calls[0].provider_cost == 0.01
         assert len(refusals) == 1 and refusals[0].usage == 40 and refusals[0].cap == 1
         with engine.connect() as connection:

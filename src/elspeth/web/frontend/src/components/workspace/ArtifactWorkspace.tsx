@@ -27,6 +27,7 @@ import { useAuditReadinessStore } from "@/stores/auditReadinessStore";
 import { useExecutionStore } from "@/stores/executionStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import type { RunStatus } from "@/types/index";
+import { AuthoringPaneToggle } from "./AuthoringPaneToggle";
 import { useWorkspacePaneController } from "./WorkspacePaneContext";
 import { ApprovalsView } from "./ApprovalsView";
 import { ChecksView } from "./ChecksView";
@@ -518,7 +519,10 @@ export function ArtifactWorkspaceSurface({
       <div className="artifact-workspace-toolbar">
         {/* ARGOnite: the toolbar is the pipeline pane's title bar. The title
             is visually hidden when the pane is too narrow for title, track
-            and catalog together (workspace.css @container), never removed. */}
+            and catalog together (workspace.css @container), never removed.
+            While the conversation is hidden, its Show control opens the bar,
+            at the spot its Hide control held in the conversation's bar. */}
+        <AuthoringPaneToggle placement="artifact" />
         <h2 className="workspace-pane-title workspace-pane-title--collapsible">
           Pipeline
         </h2>

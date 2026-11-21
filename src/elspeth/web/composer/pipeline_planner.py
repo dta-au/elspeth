@@ -139,6 +139,7 @@ from elspeth.web.composer.planner_authoring_aids import (
     build_planner_authoring_aids,
     build_schema_contract_evidence,
     discovery_digest_detail_tools,
+    discovery_digest_schema_reads,
     planner_plugin_contract,
     planner_plugin_contract_from_snapshot,
 )
@@ -165,7 +166,7 @@ from elspeth.web.composer.provider_context import capture_provider_context
 from elspeth.web.composer.provider_discovery_response import (
     argument_error_response,
 )
-from elspeth.web.composer.provider_errors import classify_provider_failure
+from elspeth.web.composer.provider_errors import classify_provider_failure, is_context_length_rejection
 from elspeth.web.composer.provider_gateway import _litellm_acompletion
 from elspeth.web.composer.provider_quota import (
     ProviderCallCustody,
@@ -201,10 +202,11 @@ from elspeth.web.composer.tools._common import (
     RuntimePreflight,
     ToolContext,
     ToolResult,
+    _failure_result,
 )
 from elspeth.web.composer.tools._dispatch import _schema_violation_loc, execute_discovery_tool_with_context
 from elspeth.web.composer.tools._generation_schema_response import AdmittedPluginSchemaResponse
-from elspeth.web.composer.tools.blobs import BlobIdArgumentsModel
+from elspeth.web.composer.tools.blobs import BlobIdArgumentsModel, blob_list_is_incomplete
 from elspeth.web.composer.tools.generation import (
     _CLOSED_VALIDATION_ERROR_CODES,
     EXPLAIN_VALIDATION_ERROR_GUIDANCE,
@@ -228,6 +230,7 @@ from elspeth.web.credential_guard import (
     require_no_credential_material_for_tool,
     require_no_credential_material_in_tool_wire,
 )
+from elspeth.web.interpretation_state import server_staged_review_preservation_error
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.resource_identity import canonical_resource_uuid
 from elspeth.web.secrets.wiring_policy import SecretWiringPolicy
@@ -238,9 +241,11 @@ _TERMINAL_TOOL_NAME: Final[str] = PLANNER_TERMINAL_TOOL_NAME
 
 _PIPELINE_CURRENT_INFORMATION: Final[str] = "pipeline.current"
 _CATALOG_SELECTION_INFORMATION: Final[str] = "catalog.selection"
+# list_transforms is a selection index (no configuration), so its key is an
+# inventory key recorded as catalog.selection, never as catalog details.
 _CATALOG_DETAIL_INFORMATION_BY_TOOL: Final[Mapping[str, str]] = {
     "list_sources": "catalog.details.source",
-    "list_transforms": "catalog.details.transform",
+    "list_transforms": "catalog.inventory.transform",
     "list_sinks": "catalog.details.sink",
 }
 # The only manifest keys the authoring aids may close. Their palette tools
@@ -258,6 +263,7 @@ def _valid_information_key(key: str) -> bool:
         _CATALOG_SELECTION_INFORMATION,
         *_CATALOG_DETAIL_INFORMATION_BY_TOOL.values(),
         "pipeline.full",
+        "pipeline.structure",
         "pipeline.source",
         "model.catalog",
         "blob.index.session",
@@ -270,6 +276,7 @@ def _valid_information_key(key: str) -> bool:
     } or key.startswith(
         (
             "pipeline.component:",
+            "pipeline.field:",
             "plugin.schema:",
             "plugin.assistance:",
             "blob.metadata:",
@@ -392,15 +399,24 @@ class PlannerDiscoveryPolicy:
         cls,
         *,
         required_catalog_detail_tools: tuple[str, ...] = (),
+        required_transform_schema_reads: tuple[str, ...] = (),
         aid_supplied_information: frozenset[str] = frozenset(),
     ) -> PlannerDiscoveryPolicy:
         unknown_detail_tools = set(required_catalog_detail_tools) - set(_CATALOG_DETAIL_INFORMATION_BY_TOOL)
         if unknown_detail_tools:
             raise ValueError("planner discovery policy contains an unknown catalog detail tool")
+        if any(type(name) is not str or not name for name in required_transform_schema_reads):
+            raise ValueError("planner discovery policy contains an invalid transform schema read")
         if set(aid_supplied_information) - _AID_SUPPLIED_INFORMATION_KEYS:
             raise ValueError("planner discovery policy contains an unknown aid-supplied information key")
         unavailable: frozenset[str] = frozenset()
-        detail_gaps = frozenset(_CATALOG_DETAIL_INFORMATION_BY_TOOL[tool] for tool in required_catalog_detail_tools)
+        # An omitted transform prohibition is returned only by that plugin's
+        # get_plugin_schema read (the list_transforms index does not carry it),
+        # so the gap is the exact key that read produces.
+        detail_gaps = frozenset(_CATALOG_DETAIL_INFORMATION_BY_TOOL[tool] for tool in required_catalog_detail_tools) | frozenset(
+            _tool_information_keys("get_plugin_schema", {"plugin_type": "transform", "name": name})[0]
+            for name in required_transform_schema_reads
+        )
         manifest = PlannerInformationManifest(
             supplied=frozenset({_PIPELINE_CURRENT_INFORMATION, _CATALOG_SELECTION_INFORMATION}) | aid_supplied_information,
             unavailable=unavailable,
@@ -435,6 +451,10 @@ class PlannerDiscoveryPolicy:
 
 def _tool_information_keys(name: str, arguments: Mapping[str, Any]) -> tuple[str, ...]:
     if name == "get_pipeline_state":
+        if "field_path" in arguments and arguments["field_path"] is not None:
+            return ("pipeline.field:" + canonical_json(dict(arguments)),)
+        if "since_start" in arguments and arguments["since_start"] is True:
+            return ("pipeline.diff",)
         component = arguments["component"] if "component" in arguments else None
         normalized = component.strip().lower() if type(component) is str else ""
         if normalized in _FULL_STATE_ALIASES or component is None or normalized == "set_pipeline_arguments":
@@ -563,8 +583,24 @@ def _model_catalog_information_covered(key: str, supplied: frozenset[str]) -> bo
 
 
 def _resolved_discovery_information_keys(call: _ParsedToolCall, discovery: AdmittedDiscoveryResult) -> tuple[str, ...]:
-    """Add complete provider coverage only when the real listing is complete."""
+    """Claim coverage only for what the real listing covered.
+
+    Model listings add complete provider coverage when untruncated. A file
+    listing that says older files were left out supplies nothing: its
+    inventory key stays pending, so the gaps-closed notice cannot follow it.
+    """
     keys = planner_discovery_information_keys(call)
+    if call.name == "get_pipeline_state" and discovery.result.success:
+        assert discovery.response is not None
+        data = discovery.response.to_wire()
+        assert type(data) is dict
+        if "view" in data:
+            if data["offset_chars"] != 0 or data["next_offset_chars"] is not None:
+                return ()
+            if data["view"] == "structure":
+                return ("pipeline.structure",)
+    if call.name in {"list_blobs", "list_composer_blobs"} and discovery.result.success:
+        return () if blob_list_is_incomplete(discovery.result) else keys
     if call.name != "list_models" or not discovery.result.success:
         return keys
     provider = call.arguments["provider"] if "provider" in call.arguments else None
@@ -1280,10 +1316,14 @@ _PLANNER_INFORMATION_EXACT: Final[Mapping[str, ComposerPlannerInformationClass]]
         ComposerPlannerInformationClass.SECRET_REFERENCE,
         ComposerPlannerInformationClass.VALIDATION_CODE,
     }
+} | {
+    "catalog.inventory.transform": ComposerPlannerInformationClass.CATALOG_SELECTION,
+    "pipeline.structure": ComposerPlannerInformationClass.PIPELINE_COMPONENT,
 }
 _PLANNER_INFORMATION_PREFIXES: Final[tuple[tuple[str, ComposerPlannerInformationClass], ...]] = (
     ("model.catalog.", ComposerPlannerInformationClass.MODEL_CATALOG),
     ("pipeline.component:", ComposerPlannerInformationClass.PIPELINE_COMPONENT),
+    ("pipeline.field:", ComposerPlannerInformationClass.PIPELINE_COMPONENT),
     ("plugin.schema:", ComposerPlannerInformationClass.PLUGIN_SCHEMA),
     ("plugin.assistance:", ComposerPlannerInformationClass.PLUGIN_ASSISTANCE),
     ("blob.metadata:", ComposerPlannerInformationClass.BLOB_METADATA),
@@ -3244,6 +3284,9 @@ async def _build_valid_pipeline_plan(
     )
     if not candidate.acceptable:
         raise AuditIntegrityError("canonical interpretation requirements failed candidate revalidation")
+    review_error = server_staged_review_preservation_error(current_state, candidate.result.updated_state)
+    if review_error is not None:
+        raise _PipelineCandidateRejected(_failure_result(current_state, review_error, error_code="server_owned_review_protected"))
 
     safe_pipeline: Mapping[str, Any] = pipeline
     # The candidate state that corresponds to ``safe_pipeline``. Custody
@@ -3252,7 +3295,7 @@ async def _build_valid_pipeline_plan(
     # Stage-2 verdict for a pipeline that is not the one being proposed.
     candidate_state = candidate.result.updated_state
     custody_result: PipelineCustodyResult = "not_required"
-    if candidate.prepared_inline_blob is not None:
+    if candidate.prepared_inline_blob is not None or candidate.prepared_prompt_blobs:
         if custody_config.session_engine is None:
             raise AuditIntegrityError("inline pipeline custody requires session_engine")
         preparation = prepare_pipeline_custody(
@@ -3260,6 +3303,7 @@ async def _build_valid_pipeline_plan(
             candidate.prepared_inline_blob,
             session_id=originating_message.session_id,
             max_storage_per_session=custody_config.max_storage_per_session,
+            prompt_blobs=candidate.prepared_prompt_blobs,
         )
         await _await_custody_settlement(
             finalize_pipeline_custody(
@@ -3283,7 +3327,7 @@ async def _build_valid_pipeline_plan(
             current_state,
             safe_context,
         )
-        if not safe_candidate.acceptable or safe_candidate.prepared_inline_blob is not None:
+        if not safe_candidate.acceptable or safe_candidate.prepared_inline_blob is not None or safe_candidate.prepared_prompt_blobs:
             raise AuditIntegrityError("custody-safe pipeline failed canonical revalidation")
         candidate_state = safe_candidate.result.updated_state
         custody_result = "ready"
@@ -3413,7 +3457,9 @@ def _planner_context_budget_components(
     return named
 
 
-def _planner_context_budget_exhausted(ceiling: Literal["tokens", "bytes"], components: Mapping[str, int]) -> PipelinePlannerError:
+def _planner_context_budget_exhausted(
+    ceiling: Literal["tokens", "bytes", "provider"], components: Mapping[str, int]
+) -> PipelinePlannerError:
     return PipelinePlannerError(
         "planner context budget exhausted",
         code="CONTEXT_BUDGET_EXHAUSTED",
@@ -3458,7 +3504,9 @@ def _fit_planner_context_budget(
     trip are protected.
     ``messages`` and ``hatch_transcript`` are not changed. Raises the
     ``CONTEXT_BUDGET_EXHAUSTED`` planner error when protected content alone
-    exceeds a ceiling.
+    exceeds the byte maximum. A request estimated over ``max_prompt_tokens``
+    is sent with every segment shed, and its record says so
+    (``over_estimate``): the provider judges its own limit.
 
     ``model`` is the model this call requests (the planner's, or the escape
     hatch's on a hatch turn); only a same-model, same-dialect live call can
@@ -3572,6 +3620,10 @@ def _fit_planner_context_budget(
             + protected_reference_bytes(scratch_messages, excluded_positions=frozenset({0, *mutable_positions})),
             previously_shed=previously_shed_keys(history, earlier_calls),
             held=held_tool_keys(earlier_calls),
+            # A request under the byte maximum always goes, as on the compose
+            # loop: the estimate decides what is left out, the provider judges
+            # its own limit.
+            on_over_estimate="send",
         )
     except ContextBudgetRefusal as refusal:
         raise _planner_context_budget_exhausted(
@@ -3587,7 +3639,7 @@ def _fit_planner_context_budget(
         ) from refusal
     record = ComposerContextBudgetRecord.from_shed_keys(
         policy_hash=decision.policy_hash,
-        bytes_per_token=(policy.fallback_bytes_per_token if decision.pricing.mode == "authored_prefix" else 1.0),
+        bytes_per_token=decision.bytes_per_token_used,
         estimated_tokens_before=decision.estimated_tokens_before,
         estimated_tokens_after=decision.estimated_tokens_after,
         request_wire_bytes=decision.request_bytes_after,
@@ -3602,6 +3654,8 @@ def _fit_planner_context_budget(
         pricing_mode=decision.pricing.mode,
         authored_bytes=decision.pricing.authored_bytes,
         authored_refuted=decision.pricing.authored_refuted,
+        over_estimate=decision.over_estimate,
+        max_prompt_tokens=policy.max_prompt_tokens,
         anchor_status=anchor.reason,
         anchor_prompt_tokens=anchor.tokens,
         anchor_wire_bytes=anchor.wire_bytes,
@@ -3893,6 +3947,7 @@ async def _plan_pipeline_inner(
     )
     discovery_policy = PlannerDiscoveryPolicy.initial(
         required_catalog_detail_tools=discovery_digest_detail_tools(authoring_aids),
+        required_transform_schema_reads=discovery_digest_schema_reads(authoring_aids),
         aid_supplied_information=_aid_supplied_information(authoring_aids),
     )
     information_manifest = discovery_policy.manifest
@@ -4124,7 +4179,8 @@ async def _plan_pipeline_inner(
                 temperature=model_config.temperature,
                 seed=model_config.seed,
                 error_class=type(exc).__name__,
-                error_message=type(exc).__name__,
+                # A recognised context-limit rejection is recorded by its closed reason, never by provider text.
+                error_message="context_length_exceeded" if is_context_length_rejection(exc) else type(exc).__name__,
                 failure=exc,
                 private_request=private_request,
                 max_completion_tokens_requested=budget_policy.max_completion_tokens,
@@ -4346,6 +4402,22 @@ async def _plan_pipeline_inner(
                     # An admitted dispatch still needs terminal evidence, but
                     # a first-party fault must retain its original type.
                     raise
+                if is_context_length_rejection(exc):
+                    # The gateway or the model refused the request as over its
+                    # context limit. That is the size refusal it is, naming the
+                    # provider as the ceiling, never a provider outage; sized on
+                    # the request that was sent.
+                    raise _planner_context_budget_exhausted(
+                        "provider",
+                        _planner_context_budget_components(
+                            message_wire_split(budget_messages, active_tools),
+                            latest_start=latest_round_trip_start(budget_messages),
+                            hatch_transcript_index=hatch_transcript_index,
+                            history_sheddable=0,
+                            tool_sheddable=0,
+                            hatch_sheddable=0,
+                        ),
+                    ) from None
                 if provider_failure.kind == "timeout":
                     raise PipelinePlannerError("planner provider call timed out", code="TIMEOUT") from None
                 if provider_failure.retryable and attempt < model_config.max_api_attempts:
@@ -5353,6 +5425,13 @@ async def _plan_pipeline_inner(
                 if call_to_execute.wire_error is not None:
                     raise call_to_execute.wire_error
                 execution_arguments = cast(dict[str, Any], deep_thaw(call_to_execute.arguments))
+                discovery_context = (
+                    replace(request_context, baseline=turn_evidence.effects.initial_state if turn_evidence is not None else None)
+                    if call_to_execute.name == "get_pipeline_state"
+                    and "since_start" in execution_arguments
+                    and execution_arguments["since_start"] is True
+                    else request_context
+                )
                 result = cast(
                     ToolResult,
                     await run_planner_sync(
@@ -5360,7 +5439,7 @@ async def _plan_pipeline_inner(
                         call_to_execute.name,
                         execution_arguments,
                         current_state,
-                        request_context,
+                        discovery_context,
                     ),
                 )
                 if result.updated_state != current_state:
@@ -5510,7 +5589,6 @@ async def _plan_pipeline_inner(
                 }
             )
             information_available = result.success
-            newly_covered_keys = tuple(key for key in information_keys[call.call_id] if not information_manifest.supplies(key))
             if call.name == "get_plugin_schema" and result.success:
                 assert isinstance(discovery_result, AdmittedDiscoveryResult)
                 pending_schema_loaded.append((str(call.arguments["plugin_type"]), str(call.arguments["name"])))
@@ -5529,10 +5607,14 @@ async def _plan_pipeline_inner(
                 last_argument_failure = None
                 consecutive_argument_failures = 0
                 assert isinstance(discovery_result, AdmittedDiscoveryResult)
-                information_manifest = information_manifest.with_result(
-                    _resolved_discovery_information_keys(call, discovery_result),
-                    available=information_available,
+                # The attempt records the requested keys this result resolved,
+                # not every key the call asked for: a capped file listing
+                # resolves nothing.
+                resolved_keys = _resolved_discovery_information_keys(call, discovery_result)
+                newly_covered_keys = tuple(
+                    key for key in information_keys[call.call_id] if key in resolved_keys and not information_manifest.supplies(key)
                 )
+                information_manifest = information_manifest.with_result(resolved_keys, available=information_available)
                 if information_available:
                     new_information.extend(_planner_information_classes(newly_covered_keys))
             else:

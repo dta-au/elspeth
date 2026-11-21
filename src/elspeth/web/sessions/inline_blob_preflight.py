@@ -86,6 +86,30 @@ def _inline_discovery_config(state: InlinePreflightState) -> _DiscoveryConfig:
     }
 
 
+def malformed_inline_blob_marker_paths(config: InlinePreflightState) -> tuple[str, ...]:
+    """Field paths of ``blob_ref`` mappings in ``config`` that are not well-formed markers.
+
+    :func:`prepare_session_inline_blob_snapshot` answers ``None`` both for a
+    state with no inline files and for one whose markers cannot be read at
+    all. A caller that was then refused for lack of a snapshot uses this to
+    tell the two apart and to name the fields. Paths only: a reason can quote
+    a value from the options, and these reach an HTTP response.
+    """
+    try:
+        _discover_blob_content_refs(cast(dict[str, Any], _inline_discovery_config(config)))
+    except BlobContentResolutionError as exc:
+        return tuple(field_path for field_path, _reason in exc.malformed)
+    return ()
+
+
+def inline_blob_refs(config: InlinePreflightState) -> tuple[BlobInlineRef, ...]:
+    """Every inline-content binding in ``config``, one per place a file is bound; empty if a marker is malformed."""
+    try:
+        return tuple(_discover_blob_content_refs(cast(dict[str, Any], _inline_discovery_config(config))))
+    except BlobContentResolutionError:
+        return ()
+
+
 _REFUSAL_LIMIT_BYTES: Mapping[InlineBlobNotAdmittedReason, int | None] = MappingProxyType(
     {
         "unverified": None,
@@ -190,6 +214,19 @@ def prepare_session_inline_blob_snapshot(
     aggregate_exhausted = False
     for ref in refs:
         if ref.blob_id in records:
+            # Bytes are read once per file, but the total counts every
+            # binding, as validation and run admission count it: a file bound
+            # in two places is resolved twice. The binding that crosses the
+            # cap withdraws its file, so a reader of it is refused as the run
+            # would refuse it.
+            if not aggregate_exhausted:
+                repeated_bytes = len(records[ref.blob_id][1])
+                aggregate += repeated_bytes
+                declared_aggregate += repeated_bytes
+                if aggregate > BLOB_INLINE_AGGREGATE_BYTE_CAP:
+                    del records[ref.blob_id]
+                    refusals[ref.blob_id] = "aggregate_oversized"
+                    aggregate_exhausted = True
             continue
         if aggregate_exhausted:
             # Reads stop here, as before; keep any more specific reason

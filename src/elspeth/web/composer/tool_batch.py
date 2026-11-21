@@ -192,6 +192,7 @@ from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
     ServerStagedRequiredControlUserTerm,
     interpretation_sites,
+    server_staged_review_preservation_error,
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.sessions.converters import state_from_record
@@ -458,10 +459,12 @@ async def _approval_containment_refusal(
             # checks is included: the wording is true of every call whatever
             # each one's own result says.
             f"This session requires approval for pipeline changes and this response carried {staged} pipeline-change "
-            "calls. None of them was applied and no proposal was recorded. Separate proposals are each "
-            "drawn against the same saved pipeline, so the user could only ever accept one of them. Submit the whole "
-            "intended result as one change: a single set_pipeline call containing every edit, with no other pipeline "
-            "mutation in the same response.",
+            "calls. None of them was applied and no proposal was recorded: only one proposal can await the user at a "
+            "time. Send the first change alone, then tell the user what follows; send each next change after the one "
+            "before it is accepted. A pipeline between changes does not have to validate: a change that leaves "
+            "errors is still recorded as a proposal, and the errors clear with the last change. "
+            "create_blob is not a pipeline change: in an earlier response, create the file "
+            "for the prompt; then send the one call carrying its marker.",
         )
     if staged == 1:
         pending = [
@@ -1863,9 +1866,11 @@ async def run_tool_batch(
             and turn_preferences is not None
             and turn_preferences.trust_mode == "explicit_approve"
             and is_mutation_tool(tool_name)
-            # create_blob stays immediate because it allocates the blob id a
-            # later composition proposal may reference. Destructive blob-only
-            # writes such as update_blob/delete_blob still require approval.
+            # Additive blob creates (create_blob, report_composer_bug) stay
+            # immediate: create_blob allocates the blob id a later composition
+            # proposal may reference, and neither overwrites nor removes
+            # anything. Destructive blob-only writes such as
+            # update_blob/delete_blob still require approval.
             and (not is_blob_store_only_mutation_tool(tool_name) or is_approval_required_blob_store_only_mutation_tool(tool_name))
         )
 
@@ -1920,7 +1925,7 @@ async def run_tool_batch(
                     decoded_args_by_call_id[tool_call.id] = audit_arguments
                     transcript_arguments = (
                         redact_tool_call_arguments(tool_name, arguments, telemetry=ctx.redaction_telemetry)
-                        if candidate.prepared_inline_blob is not None
+                        if candidate.prepared_inline_blob is not None or candidate.prepared_prompt_blobs
                         else audit_arguments
                     )
                     _replace_llm_tool_call_arguments(
@@ -1934,6 +1939,7 @@ async def run_tool_batch(
                 if (
                     candidate.acceptable
                     and candidate.prepared_inline_blob is None
+                    and not candidate.prepared_prompt_blobs
                     and composition_content_hash(candidate.result.updated_state) == composition_content_hash(state)
                 ):
                     finalized_candidate_result = finalize_tool_result(
@@ -2047,22 +2053,35 @@ async def run_tool_batch(
                             _replace_llm_tool_call_arguments(
                                 llm_messages,
                                 tool_call_id=tool_call.id,
-                                arguments=redacted_arguments if candidate.prepared_inline_blob is not None else audit_arguments,
+                                arguments=redacted_arguments
+                                if candidate.prepared_inline_blob is not None or candidate.prepared_prompt_blobs
+                                else audit_arguments,
                                 dialect=ctx.tool_contract_dialect,
                                 semantic=True,
                             )
                             interpretation_requirements_are_internal = True
+                        candidate_result = candidate.result
+                        if candidate.acceptable:
+                            review_error = server_staged_review_preservation_error(state, candidate_result.updated_state)
+                            if review_error is not None:
+                                candidate_result = _candidate_rejection_result(
+                                    state,
+                                    review_error,
+                                    error_code="server_owned_review_protected",
+                                    rejected_component="pipeline",
+                                )
                         finalized_candidate_result = finalize_tool_result(
-                            candidate.result,
+                            candidate_result,
                             tool_name=tool_name,
                             catalog=ctx.policy_catalog,
                             context=candidate_context,
                             prior_validation=candidate_prior_validation,
                         )
-                        proposal_acceptable = candidate.acceptable
+                        proposal_acceptable = candidate.acceptable and candidate_result.success
                         if (
                             proposal_acceptable
                             and candidate.prepared_inline_blob is None
+                            and not candidate.prepared_prompt_blobs
                             and composition_content_hash(finalized_candidate_result.updated_state) == composition_content_hash(state)
                         ):
                             unapplied_admission = _unapplied_admission(
@@ -2073,7 +2092,7 @@ async def run_tool_batch(
                                 runtime_preflight=last_runtime_preflight,
                             )
                             redacted_arguments = None
-                        if proposal_acceptable and candidate.prepared_inline_blob is not None:
+                        if proposal_acceptable and (candidate.prepared_inline_blob is not None or candidate.prepared_prompt_blobs):
                             if proposals_this_turn >= _MAX_PENDING_PROPOSALS_PER_TURN:
                                 raise _pending_proposal_cap_error(
                                     proposals_this_turn + 1,
@@ -2088,6 +2107,7 @@ async def run_tool_batch(
                                 candidate.prepared_inline_blob,
                                 session_id=session_id,
                                 max_storage_per_session=ctx.custody.max_blob_storage_per_session_bytes,
+                                prompt_blobs=candidate.prepared_prompt_blobs,
                             )
 
                             # From this point forward every authority-bearing
@@ -2722,6 +2742,7 @@ async def run_tool_batch(
                         abandonment_context=abandonment_context,
                         advisor_transcript=ctx.turn_evidence.transcript.snapshot() if ctx.turn_evidence is not None else None,
                         current_state=state,
+                        session_operation_context=ctx.session_operation_context,
                     ),
                     audit=audit,
                     recorder=recorder,
@@ -3081,8 +3102,12 @@ async def run_tool_batch(
             else:
                 turn_has_mutation = True
             if session_aware_outcome.result is not None:
+                # Same delta-base rule as the ordinary dispatch below.
+                if session_aware_outcome.result.success:
+                    last_validation = session_aware_outcome.result.validation
+                elif session_aware_outcome.result.updated_state is not state:
+                    last_validation = None
                 state = session_aware_outcome.result.updated_state
-                last_validation = session_aware_outcome.result.validation
             continue
 
         # Precompute runtime preflight for preview_pipeline outside
@@ -3334,6 +3359,9 @@ async def run_tool_batch(
                 if ctx.turn_evidence is not None:
                     ctx.turn_evidence.diff_baseline = (diff_baseline, diff_baseline_kind)
             call_baseline, call_baseline_kind = diff_baseline, diff_baseline_kind
+            if _tool_name == "get_pipeline_state" and ctx.turn_evidence is not None:
+                call_baseline = ctx.turn_evidence.effects.initial_state
+                call_baseline_kind = "request_start"
             if (
                 _tool_name == "diff_pipeline"
                 and ctx.turn_evidence is not None
@@ -3645,8 +3673,16 @@ async def run_tool_batch(
             if findings is not None:
                 result = replace(result, runtime_preflight=findings)
         if unapplied_admission is None:
+            # Only a success becomes the next delta base: a refused result's
+            # validation describes the refused call (its rejection entries,
+            # and for a refused full replacement nothing else), not the graph.
+            # A refusal that replaced the state object drops the base so the
+            # dispatcher revalidates the current state.
+            if result.success:
+                last_validation = result.validation
+            elif result.updated_state is not state:
+                last_validation = None
             state = result.updated_state
-            last_validation = result.validation
             last_runtime_preflight = result.runtime_preflight or last_runtime_preflight
         # Mark the (plugin_type, plugin_name) pair as
         # schema-loaded for this session when a get_plugin_schema

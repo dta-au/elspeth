@@ -84,7 +84,7 @@ from elspeth.core.dag.coalesce_merge import merge_coalesce_schema, merge_guarant
 from elspeth.core.dag.guarantees import ResolutionMode
 from elspeth.core.dag.models import GraphValidationError
 from elspeth.core.expression_types import UNRESOLVED, ResultKinds, SchemaFieldType, expression_kinds, input_kinds
-from elspeth.core.templates import extract_jinja2_field_usage
+from elspeth.core.templates import PromptTemplateRefusal, extract_jinja2_field_usage
 from elspeth.plugins.infrastructure.base import aggregation_trigger_count_cap_error
 from elspeth.plugins.infrastructure.templates import TemplateError, create_sandboxed_environment, find_runtime_unbound_variables
 from elspeth.plugins.sources.field_normalization import (
@@ -114,11 +114,14 @@ from elspeth.plugins.transforms.llm.multi_query import (
 )
 from elspeth.web.composer._validation_probe import (
     DeferredBlobContractProbe,
-    is_deferred_blob_error,
+    deferred_created_fields,
+    holds_inline_content_reference,
     is_inline_content_reference,
+    only_marker_errors,
     prepare_query_definition_probe,
     prepare_validation_probe_options,
 )
+from elspeth.web.paths import NESTED_LOCAL_PATH_OPTION_KEYS, SINK_LOCAL_PATH_OPTION_KEYS, SOURCE_LOCAL_PATH_OPTION_KEYS
 from elspeth.web.validation import INTERPRETATION_PLACEHOLDER_RE
 
 if TYPE_CHECKING:
@@ -920,6 +923,35 @@ def _coalesce_mapped_branch_connections(branches: CoalesceBranches | None) -> tu
         )
         if branch_name != input_connection
     )
+
+
+def _connection_consumer_claims(nodes: Sequence[NodeSpec]) -> list[tuple[str, str, str]]:
+    """Return ``(connection, node id, description)`` for every binding that consumes a connection.
+
+    Queue and row_union ``NodeSpec.input`` fields are structural placeholders,
+    not consuming bindings. Coalesce/row_union identity branches are direct
+    COPY edges; only mapped branches claim their input connection. One node
+    can claim one connection twice (two mapped branches of one barrier).
+
+    The one authority for who consumes what: the duplicate-consumer error and
+    the duplicate-consumer facts in ``graph_repair_suggestions`` both read it,
+    so the two never name different consumers.
+    """
+    claims: list[tuple[str, str, str]] = [
+        (node.input, node.id, f"node '{node.id}'") for node in nodes if node.node_type not in ("coalesce", "queue", "row_union")
+    ]
+    for node in nodes:
+        if node.node_type == "coalesce":
+            claims.extend(
+                (connection_name, node.id, f"coalesce '{node.id}' mapped branch")
+                for connection_name in _coalesce_mapped_branch_connections(node.branches)
+            )
+        elif node.node_type == "row_union":
+            claims.extend(
+                (connection_name, node.id, f"row_union '{node.id}' mapped branch")
+                for connection_name in _coalesce_mapped_branch_connections(node.branches)
+            )
+    return claims
 
 
 def _serialize_branches(branches: CoalesceBranches) -> list[str] | dict[str, str]:
@@ -2238,6 +2270,22 @@ class ValidationProbeCache:
         from elspeth.plugins.infrastructure.validation import get_transform_config_model
 
         try:
+            # A batch-aware transform refuses ADR-013 declared input fields in its
+            # constructor with FrameworkBugError, which no probe site tolerates, so
+            # an authored option would crash validate(). The node rules report it
+            # typed (``batch_required_fields_invalid``); to the probe it is a
+            # config failure. Only whether the helper refuses is read here, and
+            # the registry is consulted only when the option is present.
+            if (
+                _declared_input_fields_option(holder.options) is not _MISSING_DECLARED_INPUT_FIELDS
+                and _batch_aware_required_input_fields_error(plugin, plugin, holder.options) is not None
+            ):
+                raise PluginConfigError(
+                    f"Invalid configuration for transform '{plugin}': required_input_fields on a batch-aware transform",
+                    cause="batch_aware_declared_input_fields",
+                    plugin_name=plugin,
+                    component_type="transform",
+                )
             probe_options = prepare_validation_probe_options(holder.options, plugin=plugin)
             with plugin_preflight_mode(True):
                 try:
@@ -2247,9 +2295,11 @@ class ValidationProbeCache:
                         raise
                     # A marker can live in an unused option while construction
                     # still computes a valid contract. Defer only after failure,
-                    # and only when every typed error rejects an unresolved
-                    # marker in a string field. Unknown fields and mixed config
-                    # errors remain failures, even if their values are markers.
+                    # and only when every typed error is explained by a valid
+                    # marker (``only_marker_errors``: at or under its path, the
+                    # other branch of its union, or a min_length container
+                    # holding it). Unknown fields and mixed config errors
+                    # remain failures, even if their values are markers.
                     try:
                         config_model = get_transform_config_model(plugin, probe_options)
                     except ValueError:
@@ -2262,8 +2312,8 @@ class ValidationProbeCache:
                         except (PluginConfigError, PydanticValidationError) as config_error:
                             cause = config_error if isinstance(config_error, PydanticValidationError) else config_error.__cause__
                             if isinstance(cause, PydanticValidationError):
-                                details = cause.errors(include_url=False, include_context=False)
-                                if details and all(is_deferred_blob_error(detail, details) for detail in details):
+                                details = cause.errors(include_url=False)
+                                if only_marker_errors(details, probe_options):
                                     raise DeferredBlobContractProbe from exc
                     raise
         except Exception as exc:
@@ -2366,6 +2416,84 @@ def _probe_sink_declarations(plugin: str, options: Mapping[str, Any]) -> _SinkDe
     # Abstain rather than invent: the raw-config union at the call site keeps
     # whatever the schema block declared.
     return _SinkDeclarations(declared if declared is not None else frozenset(), reads)
+
+
+def _sink_probe_defers(output: OutputSpec) -> bool:
+    """Whether ``output``'s config fails only where a valid file reference stands.
+
+    ``_probe_sink_declarations`` abstains to the empty requirement on any
+    construction failure, so a ``text`` or ``document`` sink whose ``path`` or
+    ``field`` holds a file reference loses the ``field`` it requires. The
+    runtime preflight decides that requirement on the real bytes; this is the
+    test for saying so. The rule is the transform probe's (``only_marker_errors``):
+    unknown fields and mixed config errors are config failures, not deferrals.
+    """
+    if _sink_path_file_reference_errors(output) or not holds_inline_content_reference(deep_thaw(output.options)):
+        return False
+    from elspeth.plugins.infrastructure.config_base import PluginConfigError
+    from elspeth.plugins.infrastructure.validation import get_sink_config_model
+
+    probe_options = prepare_validation_probe_options(output.options, plugin=output.plugin)
+    try:
+        config_model = get_sink_config_model(output.plugin)
+        if config_model is not None:
+            config_model.from_dict(probe_options, plugin_name=output.plugin)
+    except PluginConfigError as config_error:
+        # ``from_dict`` chains the error ``model_validate`` raised, always pydantic's own
+        # class; a pre-check refusal has no cause. Anything else is a config failure.
+        cause = config_error.__cause__
+        return type(cause) is PydanticValidationError and only_marker_errors(cause.errors(include_url=False), probe_options)
+    except Exception as exc:
+        if not _is_sink_config_probe_exception(exc):
+            raise
+    return False
+
+
+# A file reference where a local path stands can never run. The save path
+# (``web/execution/_validation_authoring.py``) and run admission
+# (``web/execution/service.py``) confine the keys in ``web/paths.py`` and admit
+# only a non-empty string there (or Chroma's explicit ``None``); a reference
+# is neither, so the reference alone decides it here, over the same keys.
+def _local_path_file_reference_entry(component: str, subject: str, key: str) -> ValidationEntry:
+    return ValidationEntry(
+        component,
+        f"{subject} {key} must be a string path; an attached file cannot stand there.",
+        "high",
+        "plugin_options_invalid",
+    )
+
+
+def _source_path_file_reference_errors(source_name: str, source: SourceSpec) -> tuple[ValidationEntry, ...]:
+    """A file reference at a ``SOURCE_LOCAL_PATH_OPTION_KEYS`` key of a source."""
+    component = "source" if source_name == "source" else f"source:{source_name}"
+    return tuple(
+        _local_path_file_reference_entry(component, f"Source '{source_name}'", key)
+        for key in SOURCE_LOCAL_PATH_OPTION_KEYS
+        if key in source.options and is_inline_content_reference(deep_thaw(source.options[key]))
+    )
+
+
+def _sink_path_file_reference_errors(output: OutputSpec) -> tuple[ValidationEntry, ...]:
+    """A file reference at a ``SINK_LOCAL_PATH_OPTION_KEYS`` key of an output."""
+    return tuple(
+        _local_path_file_reference_entry(f"output:{output.name}", f"Sink '{output.name}'", key)
+        for key in SINK_LOCAL_PATH_OPTION_KEYS
+        if key in output.options and is_inline_content_reference(deep_thaw(output.options[key]))
+    )
+
+
+def _nested_path_file_reference_errors(node: NodeSpec) -> tuple[ValidationEntry, ...]:
+    """A file reference at a ``NESTED_LOCAL_PATH_OPTION_KEYS`` key of a node's ``provider_config``."""
+    if node.plugin is None or "provider_config" not in node.options:
+        return ()
+    provider_config = deep_thaw(node.options["provider_config"])
+    if type(provider_config) is not dict:
+        return ()
+    return tuple(
+        _local_path_file_reference_entry(f"node:{node.id}", f"{node.node_type.capitalize()} '{node.id}'", f"provider_config.{key}")
+        for key in NESTED_LOCAL_PATH_OPTION_KEYS
+        if key in provider_config and is_inline_content_reference(provider_config[key])
+    )
 
 
 def _batch_distribution_profile_value_field_entries(
@@ -4472,6 +4600,39 @@ def _validate_multi_query_required_input_columns(node: NodeSpec) -> tuple[Valida
     return tuple(errors)
 
 
+def _prompt_template_refusal(exc: Exception) -> str | None:
+    """The first template size or nesting refusal inside a pydantic error, or ``None``.
+
+    Those sentences name the template's position and quote none of its text,
+    so they are shown as written; other option errors keep the generic text.
+    """
+    if type(exc) is not PydanticValidationError:
+        return None
+    for error in exc.errors():
+        if "ctx" in error and "error" in error["ctx"] and type(error["ctx"]["error"]) is PromptTemplateRefusal:
+            return str(error["ctx"]["error"])
+    return None
+
+
+def _inline_prompt_template_refusal(node: NodeSpec) -> str | None:
+    """The plugin's template refusal for an llm node's inline ``prompt_template``, or ``None``.
+
+    The plugin factory flattens its config errors to text, so the probe's
+    failure does not carry the typed refusal; this asks the plugin's own field
+    validator again. Any other rejection is ``None``: the caller keeps the
+    generic warning for it.
+    """
+    if node.plugin != "llm" or "prompt_template" not in node.options or type(node.options["prompt_template"]) is not str:
+        return None
+    try:
+        LLMConfig.validate_prompt_template(node.options["prompt_template"])
+    except PromptTemplateRefusal as exc:
+        return str(exc)
+    except ValueError:
+        return None
+    return None
+
+
 @observation_boundary(
     tier=3,
     source="NodeSpec carrying web-authored multi-query input and output declarations",
@@ -4544,12 +4705,15 @@ def _validate_multi_query_generated_input_requirements(node: NodeSpec) -> tuple[
             )
             return ()
     except (ValueError, TemplateSyntaxError) as exc:
+        template_refusal = _prompt_template_refusal(exc)
         return (
             ValidationEntry(
                 component=f"node:{node.id}",
                 message=(
                     str(exc)
                     if isinstance(exc, OrderedQueryPlanError)
+                    else template_refusal
+                    if template_refusal is not None
                     else "Invalid multi-query options. Check queries, input declarations, schema, image_inputs and prompt templates against the plugin schema."
                 ),
                 severity="high",
@@ -5002,35 +5166,18 @@ def _check_schema_contracts(
             )
         )
 
-    # Queue and row_union NodeSpec.input fields are structural placeholders,
-    # not consuming bindings. Coalesce/row_union identity branches are direct
-    # COPY edges; only mapped branches claim their input connection.
-    consumer_claims: list[tuple[str, str, str]] = [
-        (node.input, node.id, f"node '{node.id}'") for node in nodes if node.node_type not in ("coalesce", "queue", "row_union")
-    ]
-    for node in nodes:
-        if node.node_type == "coalesce":
-            consumer_claims.extend(
-                (connection_name, node.id, f"coalesce '{node.id}' mapped branch")
-                for connection_name in _coalesce_mapped_branch_connections(node.branches)
-            )
-        elif node.node_type == "row_union":
-            consumer_claims.extend(
-                (connection_name, node.id, f"row_union '{node.id}' mapped branch")
-                for connection_name in _coalesce_mapped_branch_connections(node.branches)
-            )
+    consumer_claims = _connection_consumer_claims(nodes)
     consumer_counts = Counter(connection_name for connection_name, _node_id, _desc in consumer_claims)
     duplicate_consumers = sorted(name for name, count in consumer_counts.items() if count > 1)
     for connection_name in duplicate_consumers:
-        dup_entries = [(node_id, desc) for name, node_id, desc in consumer_claims if name == connection_name]
-        first_node, first_desc = dup_entries[0]
-        second_node, second_desc = dup_entries[1]
+        named = [f"{desc} ({node_id})" for name, node_id, desc in consumer_claims if name == connection_name]
+        # Every consumer is named. At exactly two the message is the one
+        # shipped before every consumer was named, byte for byte.
+        listed = ", ".join(named[:-1]) + " and " + named[-1]
         errors.append(
             _err(
                 f"connection:{connection_name}",
-                f"Duplicate consumer for connection '{connection_name}': "
-                f"{first_desc} ({first_node}) and {second_desc} ({second_node}). "
-                "Use a gate for fan-out.",
+                f"Duplicate consumer for connection '{connection_name}': {listed}. Use a gate for fan-out.",
                 "high",
                 "duplicate_connection_consumer",
             )
@@ -5380,6 +5527,13 @@ def _check_schema_contracts(
             return declared_required
         try:
             transform = probe_cache.transform(node.plugin, node)
+        except DeferredBlobContractProbe:
+            # The constructed model would demote every declared field the node
+            # CREATES; without the file only the names its config shape fixes
+            # are known to be created, and only those are dropped. Everything
+            # else keeps the raw declaration.
+            created = deferred_created_fields(node.plugin, deep_thaw(node.options))
+            return declared_required if created is None else declared_required - created
         except Exception as exc:
             if not _is_config_probe_exception(exc):
                 raise
@@ -5514,21 +5668,22 @@ def _check_schema_contracts(
             if not _is_config_probe_exception(exc):
                 raise
             if isinstance(exc, DeferredBlobContractProbe):
-                if producer.producer_id not in contract_probe_failed_producers:
-                    contract_probe_failed_producers.add(producer.producer_id)
-                    contract_warnings.append(
-                        _warn(
-                            f"node:{producer.producer_id}",
-                            f"Contract preview for node '{producer.producer_id}' is deferred until authorized blob materialization. "
-                            "Inline-content bytes are not available to this authoring probe; execution validation must resolve "
-                            "them and validate the plugin contract before the pipeline can run.",
-                            "medium",
-                            "contract_probe_deferred",
-                        )
-                    )
-                # Unknown content proves no guarantees. In particular, never
-                # promote authored guaranteed_fields into a verified contract.
-                return True, frozenset()
+                # The node's contract is checked before the run starts, once
+                # its file is read; the notice is emitted once per node at the
+                # end of this walk (``_deferred_contract_notice``). Unknown
+                # content proves nothing the node ADDS: its own authored
+                # guaranteed_fields are never promoted to a verified contract.
+                # A known pass-through still forwards its input, so it votes
+                # with exactly the guarantees it inherits (and abstains when
+                # its upstream abstains). Any other plugin abstains wholly:
+                # its output is its own, and none of it is known.
+                if not is_known_pass_through:
+                    return False, frozenset()
+                inherited_participates, inherited_fields = _connection_propagation_vote(
+                    producer_node.input,
+                    visited_fan_in_ids=visited_fan_in_ids,
+                )
+                return inherited_participates, inherited_fields if inherited_participates else frozenset()
             # Keep Stage 1 tolerant of partially configured draft nodes for
             # non-pass-through transforms — constructor-time errors must not
             # crash preview/export endpoints. For known pass-through plugins
@@ -5548,7 +5703,16 @@ def _check_schema_contracts(
             # Class name only — the triage signal ("something about this
             # plugin's config is wrong") is preserved; detailed diagnosis
             # belongs in server logs, not the UI warning list.
-            if producer.producer_id not in contract_probe_failed_producers:
+            #
+            # The one exception: the plugin's template size, nesting or
+            # number-literal refusal. Its sentence names the template's
+            # position and quotes none of its text, and with many llm steps
+            # the user needs the step, so it is an error naming the step.
+            template_refusal = _inline_prompt_template_refusal(producer_node)
+            if producer.producer_id not in contract_probe_failed_producers and template_refusal is not None:
+                contract_probe_failed_producers.add(producer.producer_id)
+                errors.append(_err(f"node:{producer.producer_id}", template_refusal, "high", "plugin_options_invalid"))
+            elif producer.producer_id not in contract_probe_failed_producers:
                 contract_probe_failed_producers.add(producer.producer_id)
                 if is_known_pass_through:
                     contract_warnings.append(
@@ -6106,6 +6270,127 @@ def _check_schema_contracts(
             return True, frozenset(merged)
 
         return _effective_producer_vote(producer, visited_fan_in_ids=visited_fan_in_ids)
+
+    # The fields deferring nodes could add, resolved along exactly the paths
+    # the vote walks (pass-throughs, gates, fan-ins), memoized per producer
+    # for this walk like the structural vote. Kept beside the vote, never in
+    # it: a possible addition is not a guarantee and reaches no edge contract.
+    _possible_additions_memo: dict[str, _PossibleAdditions] = {}
+    # Only a marker can defer a probe, so a graph without one has nothing to
+    # walk, and the notice sweep below asks only these nodes.
+    marker_holding_node_ids = frozenset(
+        candidate.id
+        for candidate in nodes
+        if candidate.node_type in {"transform", "aggregation"}
+        and candidate.plugin is not None
+        and holds_inline_content_reference(deep_thaw(candidate.options))
+    )
+
+    def _possibly_added(producer: ProducerEntry, missing: frozenset[str]) -> frozenset[str]:
+        """The ``missing`` fields a deferring node on ``producer``'s path could add; walks only when there is a question."""
+        if not missing or not marker_holding_node_ids:
+            return frozenset()
+        return _producer_possible_additions(producer).among(missing)
+
+    def _path_names_its_additions(producer: ProducerEntry) -> bool:
+        """Every deferring node on ``producer``'s path names the fields it could add (``_PossibleAdditions.named``).
+
+        Its constructed twin would participate with those fields; with them
+        held as possible additions, what is still missing is what the twin
+        would refuse too, so the edge can be checked like the twin's.
+        """
+        if not marker_holding_node_ids:
+            return False
+        return _producer_possible_additions(producer).named
+
+    def _connection_possible_additions(connection_name: str, *, visited: frozenset[str]) -> _PossibleAdditions:
+        producer = resolver.find_producer_for(connection_name)
+        if producer is None:
+            return _NO_POSSIBLE_ADDITIONS
+        return _producer_possible_additions(producer, visited=visited)
+
+    def _producer_possible_additions(producer: ProducerEntry, *, visited: frozenset[str] = frozenset()) -> _PossibleAdditions:
+        """What deferring nodes on ``producer``'s vote path could add beyond its guarantees."""
+        if producer.producer_id in visited:
+            return _NO_POSSIBLE_ADDITIONS
+        if producer.producer_id in _possible_additions_memo:
+            return _possible_additions_memo[producer.producer_id]
+        additions = _producer_possible_additions_uncached(producer, visited=visited | {producer.producer_id})
+        _possible_additions_memo[producer.producer_id] = additions
+        return additions
+
+    def _fan_in_possible_additions(arms: list[tuple[tuple[bool, frozenset[str]], _PossibleAdditions]]) -> _PossibleAdditions:
+        """An intersecting fan-in: a field is possible where EVERY arm guarantees it or could add it.
+
+        Subtracting what every arm guarantees leaves only what the vote's
+        intersection does not already carry.
+        """
+        guaranteed = [fields if participates else frozenset() for (participates, fields), _additions in arms]
+        bounded = [
+            fields | additions.fields for fields, (_vote, additions) in zip(guaranteed, arms, strict=True) if not additions.unbounded
+        ]
+        certain = frozenset.intersection(*guaranteed) if guaranteed else frozenset()
+        if not bounded:
+            return _PossibleAdditions(unbounded=bool(arms))
+        partly = any(additions.has_unnamed for _vote, additions in arms)
+        return _PossibleAdditions(frozenset.intersection(*bounded) - certain, partly_unbounded=partly)
+
+    def _producer_possible_additions_uncached(producer: ProducerEntry, *, visited: frozenset[str]) -> _PossibleAdditions:
+        if is_source_producer_id(producer.producer_id):
+            return _NO_POSSIBLE_ADDITIONS
+        producer_node = node_by_id[producer.producer_id]
+        if producer_node.node_type == "gate":
+            return _connection_possible_additions(producer_node.input, visited=visited)
+        if producer_node.node_type == "queue":
+            return _fan_in_possible_additions(
+                [
+                    (
+                        _producer_entry_propagation_vote(arm, visited_fan_in_ids=visited),
+                        _producer_possible_additions(arm, visited=visited),
+                    )
+                    for arm in resolver.queue_predecessors(producer_node.id)
+                ]
+            )
+        if producer_node.node_type in {"row_union", "coalesce"}:
+            if producer_node.node_type == "coalesce" and producer_node.merge != "union":
+                # Nested merges guarantee branch NAMES; unmirrored merges abstain.
+                return _NO_POSSIBLE_ADDITIONS
+            branches = [
+                (
+                    _connection_propagation_vote(connection, visited_fan_in_ids=visited),
+                    _connection_possible_additions(connection, visited=visited),
+                )
+                for connection in _coalesce_branch_connections(producer_node.branches)
+            ]
+            if producer_node.node_type == "coalesce" and producer_node.policy == "require_all":
+                # Every branch arrives: the merged row carries any branch's additions.
+                combined = _NO_POSSIBLE_ADDITIONS
+                for _vote, additions in branches:
+                    combined = combined.union(additions)
+                return combined
+            return _fan_in_possible_additions(branches)
+        if producer_node.node_type not in {"transform", "aggregation"} or producer_node.plugin is None:
+            return _NO_POSSIBLE_ADDITIONS
+        try:
+            transform = probe_cache.transform(producer_node.plugin, producer_node)
+        except DeferredBlobContractProbe:
+            created = deferred_created_fields(producer_node.plugin, deep_thaw(producer_node.options))
+            own = _PossibleAdditions(unbounded=True) if created is None else _PossibleAdditions(created)
+            if producer_node.plugin not in _known_pass_through_plugins():
+                return own
+            return own.union(_connection_possible_additions(producer_node.input, visited=visited))
+        except Exception as exc:
+            if not _is_config_probe_exception(exc):
+                raise
+            return _NO_POSSIBLE_ADDITIONS
+        output_schema_config = transform._output_schema_config
+        open_contract = output_schema_config is None or output_schema_config.allows_extra_fields
+        if not (transform.passes_through_input or (transform.forwards_input_fields and open_contract)):
+            # Its output is its own and constructed: nothing upstream can add to it.
+            return _NO_POSSIBLE_ADDITIONS
+        inherited = _connection_possible_additions(producer_node.input, visited=visited)
+        closed_names = output_schema_config.closed_field_names() if output_schema_config is not None else None
+        return inherited if closed_names is None else inherited.within(closed_names)
 
     def _mirrored_coalesce_merged_guarantees(producer: ProducerEntry) -> frozenset[str] | None:
         """Return a coalesce's merged guarantee set, or None to abstain.
@@ -7256,21 +7541,34 @@ def _check_schema_contracts(
                 if string_type_error is not None:
                     errors.append(string_type_error)
 
+        # A field a node upstream could add once its file is read is neither
+        # guaranteed nor missing: the runtime preflight decides it on the
+        # bytes (``contract_probe_deferred`` names the node). Only the fields
+        # nothing on the path could supply are reported, in the error and in
+        # the edge contract.
         if contract_required:
             contract_missing_fields = contract_required - producer_guaranteed
-            edge_contracts.append(
-                EdgeContract(
-                    from_id=actual_producer.producer_id,
-                    to_id=node.id,
-                    producer_guarantees=tuple(sorted(producer_guaranteed)),
-                    consumer_requires=tuple(sorted(contract_required)),
-                    missing_fields=tuple(sorted(contract_missing_fields)),
-                    satisfied=not contract_missing_fields,
+            contract_possibly_added = _possibly_added(actual_producer, contract_missing_fields)
+            contract_missing_fields -= contract_possibly_added
+            # Only an edge whose every missing field could be added is left
+            # without a verdict. Fields nothing could add stay an unsatisfied
+            # entry: the source data-contract review reads it to offer the
+            # card that would let the source promise them.
+            if contract_missing_fields or not contract_possibly_added:
+                edge_contracts.append(
+                    EdgeContract(
+                        from_id=actual_producer.producer_id,
+                        to_id=node.id,
+                        producer_guarantees=tuple(sorted(producer_guaranteed)),
+                        consumer_requires=tuple(sorted(contract_required)),
+                        missing_fields=tuple(sorted(contract_missing_fields)),
+                        satisfied=not contract_missing_fields,
+                    )
                 )
-            )
 
         if consumer_required:
             missing_fields = consumer_required - producer_guaranteed
+            missing_fields -= _possibly_added(actual_producer, missing_fields)
             if missing_fields:
                 error_component = (
                     _producer_owner(actual_producer) if is_source_producer_id(actual_producer.producer_id) else f"node:{node.id}"
@@ -7380,6 +7678,10 @@ def _check_schema_contracts(
             producer_closed = producer_schema is not None and not producer_schema.allows_extra_fields
             if (producer_participates or producer_guaranteed) and producer_closed:
                 declared_missing = declared_input - consumer_required - producer_guaranteed
+                # A closed producer bounds what deferring nodes behind it could
+                # add to its own declared names (``_PossibleAdditions.within``);
+                # an optional one among them is decided before the run.
+                declared_missing -= _possibly_added(actual_producer, declared_missing)
                 if declared_missing:
                     errors.append(
                         _err(
@@ -7541,18 +7843,26 @@ def _check_schema_contracts(
             # sink's required fields per-row. Emitting no EdgeContract renders
             # the edge as "not yet checked" rather than asserting a
             # satisfaction verdict the composer cannot support.
-            if sink_required and (producer_guaranteed or producer_participates):
+            # A deferring step that names what it adds (``_path_names_its_additions``)
+            # is checked like its constructed twin, which participates: only a
+            # field neither forwarded nor nameable by the file is reported.
+            if sink_required and (producer_guaranteed or producer_participates or _path_names_its_additions(actual_producer)):
                 missing_fields = sink_required - producer_guaranteed
-                edge_contracts.append(
-                    EdgeContract(
-                        from_id=actual_producer.producer_id,
-                        to_id=f"output:{output.name}",
-                        producer_guarantees=tuple(sorted(producer_guaranteed)),
-                        consumer_requires=tuple(sorted(sink_required)),
-                        missing_fields=tuple(sorted(missing_fields)),
-                        satisfied=not missing_fields,
+                # As at the node consumers above: what a deferring node on the
+                # path could add is decided before the run, not refused here.
+                possibly_added = _possibly_added(actual_producer, missing_fields)
+                missing_fields -= possibly_added
+                if missing_fields or not possibly_added:
+                    edge_contracts.append(
+                        EdgeContract(
+                            from_id=actual_producer.producer_id,
+                            to_id=f"output:{output.name}",
+                            producer_guarantees=tuple(sorted(producer_guaranteed)),
+                            consumer_requires=tuple(sorted(sink_required)),
+                            missing_fields=tuple(sorted(missing_fields)),
+                            satisfied=not missing_fields,
+                        )
                     )
-                )
                 if missing_fields:
                     errors.append(
                         _err(
@@ -8176,7 +8486,135 @@ def _check_schema_contracts(
     for sweep_output in outputs:
         _sweep_schema_syntax(f"output:{sweep_output.name}", sweep_output.options)
 
+    # One notice per node whose contract this walk could not read because it
+    # sits in a file the authoring check does not open. Every check above that
+    # met such a node abstained on what the file decides (the vote, the edge
+    # type check, the coalesce and row_union comparisons, the value_transform
+    # binding); this is where that abstention is said, whichever check met it.
+    # Asked of every plugin node holding a valid marker, not only those a check
+    # happened to consult, so the notice does not depend on which checks a
+    # graph shape triggers. Only a marker can defer a probe, so a node without
+    # one is never constructed here (a construction no check asked for could
+    # raise what no check would have met). The cache makes this a lookup for
+    # every node already probed.
+    def _probe_defers(node: NodeSpec, plugin: str) -> bool:
+        """Whether ``node``'s probe deferred on a file; other config failures belong to the config rules."""
+        try:
+            probe_cache.transform(plugin, node)
+        except DeferredBlobContractProbe:
+            return True
+        except Exception as exc:
+            if not _is_config_probe_exception(exc):
+                raise
+        return False
+
+    for deferred_node in nodes:
+        if deferred_node.id not in marker_holding_node_ids or deferred_node.plugin is None:
+            continue
+        if _nested_path_file_reference_errors(deferred_node):
+            continue
+        if _probe_defers(deferred_node, deferred_node.plugin):
+            contract_warnings.append(_deferred_contract_notice(deferred_node))
+    # The same notice for a sink: its required fields were not read either.
+    contract_warnings.extend(_deferred_sink_notice(output) for output in outputs if _sink_probe_defers(output))
+
     return tuple(errors), tuple(contract_warnings), tuple(edge_contracts)
+
+
+@dataclass(frozen=True, slots=True)
+class _PossibleAdditions:
+    """Fields a node whose contract waits on a file could add on a producer's path: never a guarantee.
+
+    A missing-field check subtracts these from what it reports, because the
+    runtime preflight decides them on the file's bytes. ``fields`` are the
+    names the deferring nodes' config shapes fix (``deferred_created_fields``);
+    ``unbounded`` means a deferring node on the path adds fields its config
+    cannot name, so any missing field could be one of them. ``partly_unbounded``
+    means such a node sits on the path but the result is bounded anyway (a
+    closed schema after it, or an intersecting fan-in where another arm
+    bounds it): the fields are still right to subtract, but what that node's
+    constructed twin would vote is unknown, so the path does not NAME all it
+    adds.
+    """
+
+    fields: frozenset[str] = frozenset()
+    unbounded: bool = False
+    partly_unbounded: bool = False
+
+    def union(self, other: _PossibleAdditions) -> _PossibleAdditions:
+        return _PossibleAdditions(
+            self.fields | other.fields, self.unbounded or other.unbounded, self.partly_unbounded or other.partly_unbounded
+        )
+
+    def within(self, declared: frozenset[str]) -> _PossibleAdditions:
+        """What survives a closed schema declaring ``declared``: nothing else passes it."""
+        return _PossibleAdditions(declared if self.unbounded else self.fields & declared, partly_unbounded=self.has_unnamed)
+
+    @property
+    def has_unnamed(self) -> bool:
+        """A deferring node on the path adds fields no config names."""
+        return self.unbounded or self.partly_unbounded
+
+    @property
+    def named(self) -> bool:
+        """Every deferring node on the path names what it adds, and at least one adds something."""
+        return bool(self.fields) and not self.has_unnamed
+
+    def among(self, missing: frozenset[str]) -> frozenset[str]:
+        """The missing fields one of these could supply."""
+        return missing if self.unbounded else missing & self.fields
+
+
+_NO_POSSIBLE_ADDITIONS: Final = _PossibleAdditions()
+
+
+def _key_field_held_in_file(options: object) -> bool:
+    """``key_field`` (or a ``lookups[].key_field``) of a named-additions plugin is an attached file: the step READS that field."""
+    if type(options) is not dict:
+        return False
+    if "key_field" in options and is_inline_content_reference(options["key_field"]):
+        return True
+    lookups = options["lookups"] if "lookups" in options else None
+    return type(lookups) is list and any(
+        type(lookup) is dict and "key_field" in lookup and is_inline_content_reference(lookup["key_field"]) for lookup in lookups
+    )
+
+
+def _deferred_contract_notice(node: NodeSpec) -> ValidationEntry:
+    """The ``contract_probe_deferred`` notice: node, fields and fact, in two sentences, no content.
+
+    Names come from the node's config shape (``deferred_created_fields``)
+    only where they are certain; otherwise the notice says "the fields this
+    step reads and adds" without naming any: the file may hold a field the
+    step reads (``blob_text_expand.blob_ref_field``) as well as one it adds. It carries no repair hint: nothing on the
+    node is wrong, and the runtime preflight decides the question.
+    """
+    plugin = node.plugin if node.plugin is not None else node.node_type
+    created = deferred_created_fields(plugin, deep_thaw(node.options))
+    if not created:
+        fields = "the fields this step reads and adds"
+    elif _key_field_held_in_file(deep_thaw(node.options)):
+        fields = f"the key field it reads and the fields it adds ({', '.join(sorted(created))})"
+    else:
+        fields = f"the fields it adds ({', '.join(sorted(created))})"
+    return ValidationEntry(
+        f"node:{node.id}",
+        f"Node '{node.id}' ({plugin}) reads an attached file that this check does not open, so {fields}, "
+        "their types and whether they can be empty are checked before the run starts. No change is needed.",
+        "medium",
+        "contract_probe_deferred",
+    )
+
+
+def _deferred_sink_notice(output: OutputSpec) -> ValidationEntry:
+    """``contract_probe_deferred`` for an output: the fields it requires are decided on the file's bytes."""
+    return ValidationEntry(
+        f"output:{output.name}",
+        f"Output '{output.name}' ({output.plugin}) reads an attached file that this check does not open, so the fields "
+        "it requires are checked before the run starts. No change is needed.",
+        "medium",
+        "contract_probe_deferred",
+    )
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -8505,6 +8943,7 @@ class CompositionState:
             if source_name_error is not None:
                 component = "source" if source_name == "source" else f"source:{source_name}"
                 errors.append(_err(component, source_name_error, "high", "source_name_invalid"))
+            errors.extend(_source_path_file_reference_errors(source_name, self.sources[source_name]))
 
         # 1b. Every routing label the runtime settings model validates
         # (elspeth-2ed41f0a4a): connection/route/branch labels and sink names.
@@ -8577,6 +9016,7 @@ class CompositionState:
                     )
                 )
             seen_node_ids.add(node.id)
+            errors.extend(_nested_path_file_reference_errors(node))
 
         # 5. Output names unique
         seen_output_names: set[str] = set()
@@ -8584,6 +9024,7 @@ class CompositionState:
             if output.name in seen_output_names:
                 errors.append(_err(f"output:{output.name}", f"Duplicate output name: '{output.name}'.", "high", "duplicate_output_name"))
             seen_output_names.add(output.name)
+            errors.extend(_sink_path_file_reference_errors(output))
 
         # 6. Edge IDs unique
         seen_edge_ids: set[str] = set()

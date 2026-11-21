@@ -11,13 +11,13 @@ import os
 import re
 import stat
 import threading
-from collections.abc import Awaitable, Callable, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
-from typing import Any, Never, TypedDict, TypeVar, cast
+from typing import Any, Final, Never, TypedDict, TypeVar, cast
 from uuid import UUID, uuid4, uuid5
 
 from opentelemetry import metrics
@@ -110,6 +110,14 @@ _INLINE_CUSTODY_SCHEMA = "elspeth.inline-custody.v1"
 _LOWERCASE_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _LOWERCASE_UUID_HEX = re.compile(r"[0-9a-f]{32}\Z")
 _INLINE_CUSTODY_STAGE_SUFFIX = ".inline-custody-staged"
+
+SESSION_FORK_COPY_DESCRIPTION_PREFIX: Final = "copied from session fork (original: "
+"""Start of every session-fork copy's ``source_description``; the original's description is not kept."""
+
+
+def session_fork_copy_description(source_blob_id: UUID) -> str:
+    """The ``source_description`` a session-fork copy records (readers match :data:`SESSION_FORK_COPY_DESCRIPTION_PREFIX`)."""
+    return f"{SESSION_FORK_COPY_DESCRIPTION_PREFIX}{source_blob_id})"
 
 
 def _blob_operation_path_token(
@@ -432,6 +440,8 @@ def inline_custody_blob_id(request: InlineCustodyRequest) -> UUID:
             "composer_skill_hash": fields["creating_composer_skill_hash"],
         },
     }
+    if request.identity_arguments_hash is not None:
+        identity["safe_arguments_hash"] = request.identity_arguments_hash
     return uuid5(_INLINE_CUSTODY_NAMESPACE, canonical_json(identity))
 
 
@@ -2881,6 +2891,38 @@ class BlobServiceImpl:
         _require_blob_operation_context(context, allowed_kinds=_READ_BLOB_OPERATION_KINDS)
         return self._fenced_blob_record(blob_id, context)
 
+    def get_blobs_sync(self, blob_ids: Iterable[UUID], context: SessionOperationContext) -> tuple[BlobRecord, ...]:
+        """Get several blobs' metadata in ONE authority mutation, in ascending id order.
+
+        ``_fenced_blob_record`` for a set: the exact context is checked once
+        and every row is read under the session's fence lock in that one
+        transaction, so the records are one snapshot. Rows are read (and so
+        locked) in ascending UUID order. Every transaction that locks a blob
+        row first holds that row's session lock (``locked_session_transaction``),
+        so no other transaction can hold one of these rows meanwhile, and the
+        order cannot form a cycle with the single-record readers or writers.
+        The first missing or out-of-custody id fails the whole read with
+        ``BlobNotFoundError`` and nothing is returned. No ids: no transaction.
+        """
+        _require_blob_operation_context(context, allowed_kinds=_READ_BLOB_OPERATION_KINDS)
+        ordered = tuple(sorted(set(blob_ids)))
+        if not ordered:
+            return ()
+        # Local import: see _fenced_blob_record.
+        from elspeth.web.coordination.repository import SessionDerivedCustodyError
+
+        def _read_all(transaction: SessionOperationMutationTransaction) -> tuple[BlobRecord, ...]:
+            records: list[BlobRecord] = []
+            for blob_id in ordered:
+                try:
+                    records.append(transaction.blobs.read_blob(blob_id=blob_id))
+                except SessionDerivedCustodyError:
+                    # As one read: outside the fence's custody reads exactly like missing.
+                    raise BlobNotFoundError(str(blob_id)) from None
+            return tuple(records)
+
+        return self._session_operation_authority.mutate(context, _read_all)
+
     async def list_blobs(
         self,
         session_id: UUID,
@@ -4231,7 +4273,7 @@ class BlobServiceImpl:
                     content=content,
                     mime_type=source_blob.mime_type,
                     created_by=source_blob.created_by,
-                    source_description=f"copied from session fork (original: {source_blob.id})",
+                    source_description=session_fork_copy_description(source_blob.id),
                     # A copy is as LLM-authored as its source: relabelling it
                     # VERBATIM would let a fork launder model-written content
                     # past every modality guard (dta-au/elspeth#365). The

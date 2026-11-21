@@ -220,6 +220,30 @@ class ToolRejectionResponse(_StrictResponse):
     created_at: datetime
 
 
+class AdvisorEndReviewPassResponse(_StrictResponse):
+    """One stored END advisor-checkpoint pass, as the LLM audit view shows it.
+
+    Returned under GET /api/sessions/{id}/messages?include_llm_audit=true as
+    the ``pass`` member of a ``role="audit"`` row's only ``tool_calls``
+    entry, whose ``_kind`` is ``advisor_checkpoint_pass_audit``.
+
+    - ``phase``: always ``"end"``.
+    - ``pass_index``: the pass number within the request (integer, 0 or more).
+    - ``verdict``: ``clean``, ``flagged``, ``unavailable``,
+      ``request_rejected`` or ``malformed``.
+    - ``source``: ``prescan`` or ``model``.
+    - ``provider_attempts``: provider calls made for the pass (0, 1 or 2).
+    - ``publication_verdict``: ``ADMIT``, ``WITHHOLD`` or null.
+    """
+
+    phase: Literal["end"]
+    pass_index: int = Field(ge=0)
+    verdict: Literal["clean", "flagged", "unavailable", "request_rejected", "malformed"]
+    source: Literal["prescan", "model"]
+    provider_attempts: int = Field(ge=0, le=2)
+    publication_verdict: Literal["ADMIT", "WITHHOLD"] | None
+
+
 class ChatMessageResponse(_StrictResponse):
     """Response for a single chat message.
 

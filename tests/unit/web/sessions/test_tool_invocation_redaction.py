@@ -442,7 +442,7 @@ async def test_legacy_persistence_bounds_deep_response_before_recursive_projecti
         ),
     ],
 )
-async def test_legacy_persistence_scrubs_repair_argument_key_canaries(
+async def test_legacy_persistence_summarizes_duplicate_consumer_facts(
     tool_name: str,
     arguments: dict[str, object],
 ) -> None:
@@ -457,17 +457,10 @@ async def test_legacy_persistence_scrubs_repair_argument_key_canaries(
             "semantic_contracts": [],
             "graph_repair_suggestions": [
                 {
-                    "code": "repair_required",
+                    "code": "duplicate_connection_consumer",
                     "connection": "source_to_transform",
-                    "strategy": "repair",
-                    "reason": "A repair is required.",
-                    "affected_consumers": [],
-                    "tool_sequence": [
-                        {
-                            "tool": "upsert_node",
-                            "arguments": {key_canary: "secret value"},
-                        }
-                    ],
+                    "reason": "One connection can feed one processing node; every node listed reads this one. Change only the input bindings; preserve existing node options.",
+                    "affected_consumers": [{"id": key_canary}, {"id": "t2"}],
                 }
             ],
         },
@@ -517,7 +510,15 @@ async def test_legacy_persistence_scrubs_repair_argument_key_canaries(
         },
         sort_keys=True,
     )
-    assert "<redacted-repair-arguments>" in persisted_blob
+    persisted_facts = json.loads(public.content)["validation"]["graph_repair_suggestions"]
+    assert persisted_facts == [
+        {
+            "code": "<redacted-response-text>",
+            "connection": "<redacted-response-text>",
+            "reason": "<redacted-response-text>",
+            "affected_consumers": [{"id": "<redacted-response-text>"}, {"id": "<redacted-response-text>"}],
+        }
+    ]
     assert key_canary not in persisted_blob
 
 

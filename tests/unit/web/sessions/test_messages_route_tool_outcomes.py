@@ -43,8 +43,22 @@ async def _get(test_client: TestClient, url: str) -> Response:
         return response
 
 
-def _seed_compose_turn_with_outcomes(test_client: TestClient) -> dict[str, Any]:
-    """One assistant round-trip: an applied mutation, a lookup, a rejection."""
+def _seed_compose_turn_with_outcomes(
+    test_client: TestClient, *, stored_contents: dict[str, dict[str, Any]] | None = None
+) -> dict[str, Any]:
+    """One assistant round-trip: an applied mutation, a lookup, a rejection.
+
+    ``stored_contents`` replaces the stored text of the named tool rows
+    (``chat_messages.content`` is append-only, so it is chosen at insert).
+    """
+    contents: dict[str, dict[str, Any]] = {
+        "call_mutate": {"success": True},
+        "call_reject": {
+            "success": False,
+            "validation": {"errors": [{"error_code": "plugin_options_invalid", "message": "<redacted-response-text>"}]},
+        },
+        **(stored_contents or {}),
+    }
     session_id = str(uuid4())
     assistant_id = str(uuid4())
     state_id = str(uuid4())
@@ -100,7 +114,7 @@ def _seed_compose_turn_with_outcomes(test_client: TestClient) -> dict[str, Any]:
                     "id": str(uuid4()),
                     "session_id": session_id,
                     "role": "tool",
-                    "content": json.dumps({"success": True}),
+                    "content": json.dumps(contents["call_mutate"]),
                     "raw_content": None,
                     "tool_calls": None,
                     "tool_call_id": "call_mutate",
@@ -129,12 +143,7 @@ def _seed_compose_turn_with_outcomes(test_client: TestClient) -> dict[str, Any]:
                     "id": str(uuid4()),
                     "session_id": session_id,
                     "role": "tool",
-                    "content": json.dumps(
-                        {
-                            "success": False,
-                            "validation": {"errors": [{"error_code": "plugin_options_invalid", "message": "<redacted-response-text>"}]},
-                        }
-                    ),
+                    "content": json.dumps(contents["call_reject"]),
                     "raw_content": None,
                     "tool_calls": None,
                     "tool_call_id": "call_reject",
@@ -312,3 +321,65 @@ async def test_envelopes_without_tool_rows_are_left_unstamped(
     (assistant,) = [row for row in rows if row["role"] == "assistant"]
     (entry,) = assistant["tool_calls"]
     assert "outcome" not in entry
+
+
+def _stored_old_shape_repair_suggestion() -> list[dict[str, Any]]:
+    """``graph_repair_suggestions`` as rows stored before it became facts-only (redacted at write time)."""
+    return [
+        {
+            "code": "<redacted-response-text>",
+            "connection": "<redacted-response-text>",
+            "strategy": "<redacted-response-text>",
+            "reason": "<redacted-response-text>",
+            "affected_consumers": [
+                {"id": "<redacted-response-text>", "current_input": "<redacted-response-text>", "new_input": "<redacted-response-text>"}
+            ],
+            "tool_sequence": [
+                {"tool": "<redacted-response-text>", "arguments": "<redacted-repair-arguments>"},
+                {"tool": "<redacted-response-text>", "arguments": "<redacted-repair-arguments>"},
+            ],
+        }
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_tool_rows", [False, True], ids=["conversation", "tool-opt-in"])
+async def test_stored_rows_in_the_old_repair_suggestion_shape_still_read(test_client: TestClient, include_tool_rows: bool) -> None:
+    """A stored tool row whose validation carries the pre-facts-only suggestion still reads, unchanged.
+
+    No read path re-validates a stored result against the narrowed shadow
+    model: the outcome projection decodes the JSON generically and the
+    conversation view returns the row's text as stored.
+    """
+    old_contents: dict[str, dict[str, Any]] = {
+        "call_mutate": {
+            "success": True,
+            "validation": {"is_valid": False, "errors": [], "graph_repair_suggestions": _stored_old_shape_repair_suggestion()},
+        },
+        "call_reject": {
+            "success": False,
+            "validation": {
+                "is_valid": False,
+                "errors": [{"error_code": "plugin_options_invalid", "message": "<redacted-response-text>"}],
+                "graph_repair_suggestions": _stored_old_shape_repair_suggestion(),
+            },
+        },
+    }
+    seeded = _seed_compose_turn_with_outcomes(test_client, stored_contents=old_contents)
+    session_id = seeded["session_id"]
+
+    response = await _get(test_client, f"/api/sessions/{session_id}/messages?include_tool_rows={str(include_tool_rows).lower()}")
+
+    assert response.status_code == 200
+    rows = response.json()
+    assistant = next(row for row in rows if row["role"] == "assistant")
+    assert [call["outcome"] for call in assistant["tool_calls"]] == ["applied", "completed", "rejected"]
+    assert assistant["tool_calls"][2]["rejection"] == {
+        "error_code": "plugin_options_invalid",
+        "guidance": list(explain_validation_code("plugin_options_invalid")),
+    }
+    tools = {row["tool_call_id"]: row for row in rows if row["role"] == "tool"}
+    if include_tool_rows:
+        assert {call_id: json.loads(tools[call_id]["content"]) for call_id in old_contents} == old_contents
+    else:
+        assert tools == {}

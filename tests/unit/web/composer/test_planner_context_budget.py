@@ -644,8 +644,29 @@ async def _discovery_run(
     return completion, recorder
 
 
+def _repriced_estimate(budget: ComposerContextBudgetRecord) -> int:
+    """The estimate the shared decision makes, recomputed from the record's own fields.
+
+    Every byte costs 3.0 bytes per token, or the previous call's measured density when a
+    plausible provider count (between 1 and 8 bytes per token) is denser. The anchored arm is
+    that count plus one token per byte not shared with it. The smaller arm is the estimate.
+    """
+    assert budget.anchor_prompt_tokens is not None
+    rate = 3.0
+    if budget.anchor_prompt_tokens <= budget.anchor_wire_bytes <= 8 * budget.anchor_prompt_tokens:
+        rate = min(rate, budget.anchor_wire_bytes / budget.anchor_prompt_tokens)
+    byte_arm = math.ceil(budget.decision_wire_bytes_after / rate)
+    anchored_arm = budget.anchor_prompt_tokens + budget.decision_wire_bytes_after - budget.anchor_shared_bytes
+    # The record names the rate the estimate applied: 1.0 for the anchored arm, the byte arm's rate otherwise.
+    assert budget.bytes_per_token == repr(1.0 if anchored_arm < byte_arm else rate)
+    assert budget.pricing_mode == ("anchored" if anchored_arm < byte_arm else "authored_prefix")
+    return min(byte_arm, anchored_arm)
+
+
 @pytest.mark.asyncio
-async def test_six_producer_schema_results_fit_authored_budget_with_foreign_control(tmp_path: Path, tool_context: ToolContext) -> None:
+async def test_six_producer_schema_results_fit_the_budget_and_labels_do_not_change_the_price(
+    tmp_path: Path, tool_context: ToolContext
+) -> None:
     schemas = (
         ("transform", "llm"),
         ("source", "llm"),
@@ -688,27 +709,32 @@ async def test_six_producer_schema_results_fit_authored_budget_with_foreign_cont
     assert len(recorder.llm_calls) == 2
     budget = recorder.llm_calls[1].context_budget
     assert budget is not None
+    # "authored_prefix" is the recorded name of the byte arm, which now prices every byte.
     assert budget.pricing_mode == "authored_prefix"
-    assert budget.bytes_per_token == "3.0"
-    assert budget.estimated_tokens_after == budget.decision_wire_bytes_after - budget.authored_bytes + math.ceil(budget.authored_bytes / 3)
-    assert budget.estimated_tokens_after < budget.anchor_prompt_tokens + budget.decision_wire_bytes_after - budget.anchor_shared_bytes
+    # Was: unlabelled bytes at one token each and labelled bytes at 3.0 (the authored formula).
+    assert budget.estimated_tokens_after == _repriced_estimate(budget)
+    assert budget.estimated_tokens_after <= budget.anchor_prompt_tokens + budget.decision_wire_bytes_after - budget.anchor_shared_bytes
     assert budget.estimated_tokens_after <= policy.max_prompt_tokens
 
-    # Removing provenance from the same protected results must cost more.
+    # Was: removing provenance from the same protected results cost more and was refused.
+    # Now the labels do not enter the price: the same estimate, and no refusal.
     assert len(captured) == 2
     foreign = deepcopy(captured[1])
     for message in foreign["messages"]:
         if message["role"] == "tool":
             message.pop(PROMPT_GUARD_CONTENT_PARTS_KEY, None)
-    with pytest.raises(PipelinePlannerError, match="context budget exhausted"):
-        original_fit(**foreign)
+    _messages, foreign_budget = original_fit(**foreign)
+    assert foreign_budget.estimated_tokens_after == budget.estimated_tokens_after
 
 
 @pytest.mark.asyncio
-async def test_six_schema_batch_costs_more_without_producer_labels(tmp_path: Path, tool_context: ToolContext) -> None:
-    """Base-collectable control: producer-labelled schema text is priced below foreign text.
+async def test_six_schema_batch_costs_the_same_with_and_without_producer_labels(tmp_path: Path, tool_context: ToolContext) -> None:
+    """Producer labels do not change the price: this is the test that catches label-dependent pricing coming back.
 
-    Reads only the planner fit's inputs and its refusal, never lane-only record fields.
+    Was ``…costs_more_without_producer_labels``: the unlabelled batch was priced at one token
+    per byte and refused. That was a size rule only (commit 5cf449179: text ELSPETH did not
+    author might be denser than 3.0 bytes per token); the budget never made a trust decision.
+    What replaces it: a provider count denser than 3.0 sets the rate for the next call.
     """
     schemas = (
         ("transform", "llm"),
@@ -754,13 +780,24 @@ async def test_six_schema_batch_costs_more_without_producer_labels(tmp_path: Pat
     for message in foreign["messages"]:
         if message["role"] == "tool":
             message.pop(PROMPT_GUARD_CONTENT_PARTS_KEY, None)
-    with pytest.raises(PipelinePlannerError, match="context budget exhausted"):
-        original_fit(**foreign)
+    _labelled_messages, labelled_budget = original_fit(**deepcopy(captured[1]))
+    _foreign_messages, foreign_budget = original_fit(**foreign)
+    assert foreign_budget.estimated_tokens_after == labelled_budget.estimated_tokens_after
+    assert foreign_budget.estimated_tokens_after <= policy.max_prompt_tokens
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("anchor_tokens", "minimum"), [(100_000, 100_000), (40_000, 57_407)])
-async def test_planner_anchor_refutes_authored_pricing(tmp_path: Path, tool_context: ToolContext, anchor_tokens: int, minimum: int) -> None:
+# 40,000: the byte arm at 3.0 is below the anchored arm (57,407 measured 2026-11-20: the 40,000 anchor tokens
+# plus 17,407 unshared bytes, a difference that request growth leaves unchanged), so it is the estimate.
+# P3 (2026-11-20): +23 tokens = the +69 B list_transforms/get_plugin_assistance description change / 3.0;
+# +37 tokens = the +111 B get_plugin_schema description (usage_when_not_to_use) / 3.0.
+# Candidate 4 stack (2026-11-20): 54,107 measured on the stacked tree (the P1 and P2/P3 lanes together), not summed.
+# Re-measured on the candidate 4 stack with the inline prompt limit: 54,186 (+79 = +237 B set_pipeline description / 3.0).
+# get_pipeline_state description names the wrapped document: 54,195 measured (+9 = +29 B / 3.0, rounded down).
+@pytest.mark.parametrize(("anchor_tokens", "minimum"), [(100_000, 100_000), (40_000, 54_195)])
+async def test_planner_estimate_is_never_below_the_providers_count_and_uses_the_cheaper_arm(
+    tmp_path: Path, tool_context: ToolContext, anchor_tokens: int, minimum: int
+) -> None:
     lookup = _response_with_call_id("schema", "get_plugin_schema", {"plugin_type": "transform", "name": "web_scrape"})
     lookup.usage = {"prompt_tokens": anchor_tokens, "completion_tokens": 5, "total_tokens": anchor_tokens + 5, "cost": 0.01}
     completion = _ScriptedCompletion(lookup, _text_response("Which output format do you want?"))
@@ -780,12 +817,13 @@ async def test_planner_anchor_refutes_authored_pricing(tmp_path: Path, tool_cont
     if anchor_tokens == 100_000:
         assert budget.estimated_tokens_after >= minimum
     else:
-        assert budget.estimated_tokens_after == minimum
+        assert budget.estimated_tokens_after == minimum == _repriced_estimate(budget)
+        assert budget.pricing_mode == "authored_prefix"
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("metadata", ["missing", "legacy", "oversize"])
-async def test_planner_anchor_authored_metadata_fails_closed(
+async def test_planner_anchor_metadata_missing_is_priced_at_provider_density_and_inconsistent_is_refused(
     tmp_path: Path, tool_context: ToolContext, monkeypatch: pytest.MonkeyPatch, metadata: str
 ) -> None:
     def anchor_with_metadata(**kwargs: Any) -> Any:
@@ -829,15 +867,20 @@ async def test_planner_anchor_authored_metadata_fails_closed(
     budget = recorder.llm_calls[1].context_budget
     assert budget is not None
     assert budget.estimated_tokens_after >= 100_000
-    assert budget.pricing_mode == "anchored"
     assert budget.anchor_status == "authored_evidence_unavailable"
+    # Was: missing authored evidence forced the anchored arm. Now the evidence does not select
+    # the arm; what protects the estimate is the provider's own count, whose density (denser
+    # than 3.0 here) replaces the rate. ``authored_refuted`` records that it did.
     assert budget.authored_refuted is True
+    assert budget.pricing_mode == "authored_prefix"
+    assert budget.estimated_tokens_after == _repriced_estimate(budget)
 
 
 @pytest.mark.asyncio
 async def test_planner_anchored_arm_records_one_byte_growth_rate(tmp_path: Path, tool_context: ToolContext) -> None:
     lookup = _response_with_call_id("schema", "get_plugin_schema", {"plugin_type": "transform", "name": "web_scrape"})
-    lookup.usage = {"prompt_tokens": 40_000, "completion_tokens": 5, "total_tokens": 40_005, "cost": 0.01}
+    # 30,000 (was 40,000): low enough that the count plus the growth is below every byte at 3.0, so the anchored arm is used.
+    lookup.usage = {"prompt_tokens": 30_000, "completion_tokens": 5, "total_tokens": 30_005, "cost": 0.01}
     completion = _ScriptedCompletion(lookup, _text_response("Which output format do you want?"))
     recorder = BufferingRecorder()
     with pytest.raises(PlannerDeclined):
@@ -853,8 +896,9 @@ async def test_planner_anchored_arm_records_one_byte_growth_rate(tmp_path: Path,
     budget = recorder.llm_calls[1].context_budget
     assert budget is not None
     assert budget.pricing_mode == "anchored"
-    assert budget.bytes_per_token == "1.0"
+    assert budget.bytes_per_token == repr(1.0)
     assert budget.estimated_tokens_after == budget.anchor_prompt_tokens + budget.decision_wire_bytes_after - budget.anchor_shared_bytes
+    assert budget.estimated_tokens_after == _repriced_estimate(budget)
 
 
 @pytest.mark.asyncio
@@ -925,16 +969,14 @@ async def test_earlier_tool_results_are_stubbed_and_the_latest_round_is_intact(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("ceiling", ["tokens", "bytes"])
-async def test_an_oversized_intent_is_refused_before_any_provider_call(tmp_path: Path, tool_context: ToolContext, ceiling: str) -> None:
+async def test_an_oversized_intent_is_refused_before_any_provider_call(tmp_path: Path, tool_context: ToolContext) -> None:
+    # Was: parametrised over the token setting and the byte maximum, both refused. Now only the byte
+    # maximum refuses: an intent over the token setting is sent with everything shed and recorded as
+    # over (test_planner_fitting_request_goes.py).
     small_request, _ = await _decline(tmp_path, tool_context, _context(users={0: "Build CSV to JSON."}))
     base_bytes = _sent_bytes(small_request)
     cap_bytes = base_bytes + 10_000
-    policy = (
-        _context_policy(max_prompt_tokens=math.ceil(cap_bytes / _FALLBACK_RATIO), max_request_bytes=1_000_000)
-        if ceiling == "tokens"
-        else _context_policy(max_request_bytes=cap_bytes)
-    )
+    policy = _context_policy(max_request_bytes=cap_bytes)
     completion = _ScriptedCompletion(_text_response("Must not dispatch."))
     recorder = BufferingRecorder()
 
@@ -950,7 +992,7 @@ async def test_an_oversized_intent_is_refused_before_any_provider_call(tmp_path:
         )
 
     assert caught.value.code == ComposerPlannerCode.CONTEXT_BUDGET_EXHAUSTED.value
-    assert caught.value.detail_codes == (f"context_ceiling_{ceiling}", "largest_component_request")
+    assert caught.value.detail_codes == ("context_ceiling_bytes", "largest_component_request")
     assert completion.requests == []
     assert len(completion._responses) == 1  # no scripted response consumed
     assert recorder.llm_calls == ()
@@ -1018,7 +1060,8 @@ async def test_a_request_within_the_re_render_margin_of_the_ceiling_sheds_one_mo
 @pytest.mark.asyncio
 @pytest.mark.parametrize("model", [_ANTHROPIC, _UNMARKED], ids=["anthropic-marked", "unmarked"])
 async def test_a_dispatched_request_never_exceeds_either_ceiling(tmp_path: Path, tool_context: ToolContext, model: str) -> None:
-    """Over ceilings straddling the size after one shed, every request is sent within both ceilings or refused unsent."""
+    """Over ceilings straddling the size after one shed: the byte maximum is never exceeded by a sent request,
+    and a request over the token setting is sent only with everything shed and recorded as over."""
     assistants = {1: "a" * 20_000, 2: "b" * 5_000}
     context = _context(users={0: "Build CSV to JSON."}, assistants=assistants)
     full_request, _ = await _decline(tmp_path, tool_context, context, model=model)
@@ -1028,7 +1071,7 @@ async def test_a_dispatched_request_never_exceeds_either_ceiling(tmp_path: Path,
         _context_policy(max_prompt_tokens=math.ceil((one_shed + delta) / _FALLBACK_RATIO), max_request_bytes=1_000_000)
         for delta in (-6_000, -400, -10, 0, 10, 100, 400)
     ]
-    sent_count = 0
+    sent_count = overs = 0
     for policy in policies:
         completion, recorder, outcome = await _decline_or_refusal(tmp_path, tool_context, context, policy=policy, model=model)
         if type(outcome) is PlannerDeclined:
@@ -1038,12 +1081,21 @@ async def test_a_dispatched_request_never_exceeds_either_ceiling(tmp_path: Path,
             assert _sent_bytes(request) <= policy.max_request_bytes, policy
             assert call.request_byte_split.total_bytes <= policy.max_request_bytes, policy
             assert call.context_budget is not None
-            assert call.context_budget.estimated_tokens_after <= policy.max_prompt_tokens, policy
+            # Was: estimated_tokens_after <= max_prompt_tokens for every sent request. Now a request over the
+            # token setting is sent, recorded as over, with the whole earlier conversation left out.
+            over = call.context_budget.estimated_tokens_after > policy.max_prompt_tokens
+            assert call.context_budget.over_estimate is over, policy
+            assert call.context_budget.max_prompt_tokens == policy.max_prompt_tokens
+            if over:
+                overs += 1
+                assert call.context_budget.shed_history_indices == (0, 1, 2), policy
         else:
-            # Only the budget may refuse, and only before dispatch.
+            # Only the byte maximum may refuse, and only before dispatch.
             assert outcome.code == "CONTEXT_BUDGET_EXHAUSTED", (policy, outcome.code)
+            assert outcome.detail_codes[0] == "context_ceiling_bytes", (policy, outcome.detail_codes)
             assert completion.requests == [] and recorder.llm_calls == ()
-    assert sent_count >= len(policies) - 2  # the two tightest ceilings may refuse; the rest are sent
+    assert sent_count >= len(policies) - 2  # the two tightest byte ceilings may refuse; the rest are sent
+    assert overs >= 1  # the tightest token setting is exceeded with everything shed, and still sent
 
 
 @pytest.mark.asyncio
@@ -1469,7 +1521,8 @@ async def _hatch_run_or_refusal(
 
 @pytest.mark.asyncio
 async def test_a_dispatched_hatch_request_never_exceeds_either_ceiling(tmp_path: Path, tool_context: ToolContext) -> None:
-    """Over ceilings straddling the hatch request after one event is shed, every request is sent within both ceilings or refused unsent."""
+    """Over ceilings straddling the hatch request after one event is shed: no sent request exceeds the byte maximum,
+    and a request over the token setting is sent only recorded as over."""
     measured_completion, _ = await _hatch_run(tmp_path, tool_context, None, None)
     measured_hatch = measured_completion.requests[2]
     transcript = _transcript_of(measured_hatch["messages"][3]["content"])
@@ -1483,13 +1536,17 @@ async def test_a_dispatched_hatch_request_never_exceeds_either_ceiling(tmp_path:
     hatch_shed = 0
     for policy in policies:
         completion, recorder, outcome = await _hatch_run_or_refusal(tmp_path, tool_context, policy)
-        # Every dispatched request is the recorded one and fits both ceilings.
+        # Every dispatched request is the recorded one and fits the byte maximum.
         assert len(completion.requests) == len(recorder.llm_calls)
         for request, call in zip(completion.requests, recorder.llm_calls, strict=True):
             _sent_matches_record(request, call)
             assert _sent_bytes(request) <= policy.max_request_bytes, policy
             assert call.context_budget is not None
-            assert call.context_budget.estimated_tokens_after <= policy.max_prompt_tokens, policy
+            # Was: estimated_tokens_after <= max_prompt_tokens for every sent request. Now a request over
+            # the token setting is sent and its record says so.
+            over = call.context_budget.estimated_tokens_after > policy.max_prompt_tokens
+            assert call.context_budget.over_estimate is over, policy
+            assert call.context_budget.max_prompt_tokens == policy.max_prompt_tokens
         if type(outcome) is PlannerDeclined:
             hatch_sent += 1
             assert completion.requests[2]["model"] == "test/advisor"

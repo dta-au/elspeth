@@ -38,7 +38,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from elspeth.contracts.composer_audit import ComposerToolInvocation, PrivateToolAuthoring, ToolArgumentErrorCategory
 from elspeth.contracts.composer_llm_audit import ComposerLLMProviderCostSource, ReasoningWithhold
@@ -51,6 +51,9 @@ from elspeth.web.composer.provider_errors import ProviderRequestFailure
 from elspeth.web.composer.state import CompositionState, ValidationSummary
 from elspeth.web.composer.tools._common import ToolResult
 from elspeth.web.sessions._persist_payload import AuditOutcome, RedactedToolRow
+
+if TYPE_CHECKING:
+    from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointVerdict
 
 _ToolOutcomeResponse = ToolResult | Mapping[str, Any] | None
 
@@ -120,6 +123,22 @@ class _AdmittedLLMCompletion:
 
 
 @dataclass(frozen=True, slots=True)
+class _AdmittedReplyFallback:
+    """The first admitted reply of a turn whose newly flagged graph got an extra review round.
+
+    If that round times out, errors, or ends with its own reply withheld, the
+    turn publishes this reply beside the standing block, exactly as it would
+    have without the extra round. Valid only while the graph is the one this
+    reply was admitted against (``for_graph``).
+    """
+
+    reply: str
+    publication_binding: str
+    verdict: AdvisorCheckpointVerdict
+    for_graph: str
+
+
+@dataclass(frozen=True, slots=True)
 class _AdvisorReviewState:
     """Bounded END-checkpoint context carried across compose-loop iterations."""
 
@@ -127,6 +146,7 @@ class _AdvisorReviewState:
     previous_findings: tuple[str, ...] = ()
     previous_evidence_hash: str | None = None
     successful_mutating_actions: tuple[str, ...] = ()
+    admitted_fallback: _AdmittedReplyFallback | None = None
 
     def __post_init__(self) -> None:
         freeze_fields(self, "previous_findings", "successful_mutating_actions")

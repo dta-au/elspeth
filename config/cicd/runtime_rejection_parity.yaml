@@ -1950,6 +1950,17 @@ sites:
     is unset and ELSPETH_ALLOW_RAW_SECRETS is not "true". No authoring-side check can observe the server's
     env; deployment invariant, not a validate-green/runtime-red authoring gap. The sibling collision raise
     in _recurse (a5bbc45cf2c87a19) stays unmirrored precisely because it is OUTSIDE this guard.
+- key: 608ae6f70f18b1eb
+  path: src/elspeth/core/config.py
+  qualname: _load_within_structure_limits
+  exception: ValueError
+  message: 'YAML parse failed: {}'
+  ordinal: 0
+  disposition: structural
+  note: The same parse-failure check that load_bounded_pipeline_yaml held, now in the helper it shares
+    with load_rendered_pipeline_yaml. The composer's Stage-2 input is yaml.dump output (generate_yaml
+    in yaml_generator.py, or render_pipeline_yaml), which is by construction alias-free, shallow, and
+    parseable by _BoundedInMemoryYamlLoader; this is a defensive re-check.
 - key: e307756431afce42
   path: src/elspeth/core/config.py
   qualname: _lower_llm_component
@@ -2157,16 +2168,6 @@ sites:
     but nothing bounds the aggregate size of accumulated composer state, so ~3 maximally-sized upsert_node
     option payloads generate YAML over the 2 MiB limit at config.py:170-171 with no Stage-1 rule to catch
     it. elspeth-2ed41f0a4a census 2026-08-17.
-- key: 04d73f291757d487
-  path: src/elspeth/core/config.py
-  qualname: load_bounded_pipeline_yaml
-  exception: ValueError
-  message: 'YAML parse failed: {}'
-  ordinal: 0
-  disposition: structural
-  note: The composer's Stage-2 input is yaml.dump output from generate_yaml (yaml_generator.py:612-616),
-    which is by construction alias-free, shallow, and parseable by _BoundedInMemoryYamlLoader; config.py:176-177
-    is a defensive re-check.
 - key: 31fb18aa23e4a028
   path: src/elspeth/core/config.py
   qualname: sanitize_node_config_for_audit

@@ -176,7 +176,7 @@ async function workspaceBottomRow(page: ComposerPage["page"]): Promise<{
   artifactBottom: number;
   row: { top: number; bottom: number; left: number; right: number; borderTop: number };
   bar: { top: number; bottom: number; height: number };
-  collapse: { top: number; bottom: number } | null;
+  rowPaneToggles: number;
   authoringBandContent: string;
 } | null> {
   return page.evaluate(() => {
@@ -186,16 +186,12 @@ async function workspaceBottomRow(page: ComposerPage["page"]): Promise<{
     const pane = document.querySelector(".workspace-authoring-pane");
     const artifact = document.querySelector(".workspace-artifact-pane");
     const separator = document.querySelector('[data-workspace-part="separator"]');
-    const collapse = document.querySelector(
-      'button[aria-label="Collapse authoring pane"]',
-    );
     if (workspace === null || row === null || bar === null || pane === null || artifact === null || separator === null) {
       return null;
     }
     const workspaceBox = workspace.getBoundingClientRect();
     const rowBox = row.getBoundingClientRect();
     const barBox = bar.getBoundingClientRect();
-    const collapseBox = collapse?.getBoundingClientRect() ?? null;
     return {
       workspace: {
         left: workspaceBox.left,
@@ -215,10 +211,7 @@ async function workspaceBottomRow(page: ComposerPage["page"]): Promise<{
         borderTop: Number.parseFloat(getComputedStyle(row).borderTopWidth),
       },
       bar: { top: barBox.top, bottom: barBox.bottom, height: barBox.height },
-      collapse:
-        collapseBox === null || collapseBox.height === 0
-          ? null
-          : { top: collapseBox.top, bottom: collapseBox.bottom },
+      rowPaneToggles: row.querySelectorAll("[data-authoring-toggle]").length,
       authoringBandContent: getComputedStyle(pane, "::before").content,
     };
   });
@@ -227,7 +220,8 @@ async function workspaceBottomRow(page: ComposerPage["page"]): Promise<{
 /**
  * The row starts at the fold and sizes to its bar plus the outer bottom
  * gutter. The authoring card extends through that row to the same gutter.
- * The toggle stays centred against the content even when a reason wraps.
+ * The row holds workflow actions only: the hide/show toggle lives in the
+ * title bars (2026-11-20).
  */
 function expectBottomRowContract(
   edges: NonNullable<Awaited<ReturnType<typeof workspaceBottomRow>>>,
@@ -246,16 +240,16 @@ function expectBottomRowContract(
   expect(edges.rowBottomInset).toBe(edges.gutter);
   expect(Math.abs(edges.authoringBottom - (edges.workspace.bottom - edges.gutter))).toBeLessThanOrEqual(1);
   expect(Math.abs(edges.authoringBottom - edges.artifactBottom - (edges.row.bottom - edges.row.top))).toBeLessThanOrEqual(1);
-  expect(edges.collapse).not.toBeNull();
-  const collapseCentre = (edges.collapse!.top + edges.collapse!.bottom) / 2;
-  const barCentre = (edges.bar.top + edges.bar.bottom) / 2;
-  expect(Math.abs(collapseCentre - barCentre)).toBeLessThanOrEqual(1);
+  expect(edges.rowPaneToggles).toBe(0);
   expect(edges.authoringBandContent).toBe("none");
 }
 
 test.describe("Composer deterministic workspace geometry", () => {
   for (const viewport of [{ width: 1280, height: 720 }, { width: 1440, height: 900 }]) {
-    test(`conversation reaches the bottom gutter and its toggle leads the pipeline bar at ${viewport.width}x${viewport.height}`, async ({ page }) => {
+    test(`conversation reaches the bottom gutter and its toggle keeps one spot across both title bars at ${viewport.width}x${viewport.height}`, async ({ page }) => {
+      // Maintainer ruling 2026-11-20 (home A): open, the Hide control is the
+      // first thing in the conversation's title bar; collapsed, the Show
+      // control is the first thing in the pipeline's. Same box both ways.
       await page.setViewportSize(viewport);
       const sessionId = await installWorkspaceScenario(page, "empty-freeform");
       const composer = new ComposerPage(page);
@@ -266,25 +260,67 @@ test.describe("Composer deterministic workspace geometry", () => {
         expect(edges).not.toBeNull();
         expectBottomRowContract(edges!);
         const toggle = composer.collapseAuthoring();
-        const share = page.getByRole("button", { name: "Share inspect link" });
-        const [toggleBox, shareBox] = await Promise.all([toggle.boundingBox(), share.boundingBox()]);
+        const authoringHeader = page.locator(".workspace-pane-header");
+        const [toggleBox, headerBox] = await Promise.all([
+          toggle.boundingBox(),
+          authoringHeader.boundingBox(),
+        ]);
         expect(toggleBox).not.toBeNull();
-        expect(shareBox).not.toBeNull();
-        expect(toggleBox!.x).toBeGreaterThanOrEqual(edges!.fold);
-        expect(toggleBox!.x + toggleBox!.width).toBeLessThanOrEqual(shareBox!.x);
-        expect(Math.abs(toggleBox!.y + toggleBox!.height / 2 - shareBox!.y - shareBox!.height / 2)).toBeLessThanOrEqual(1);
+        expect(headerBox).not.toBeNull();
+        expect(toggleBox!.width).toBe(36);
+        expect(toggleBox!.height).toBe(36);
+        // Centred in the 46px band (1px bottom rule included in the box).
+        const centre = (b: { y: number; height: number }) => b.y + b.height / 2;
+        expect(Math.abs(centre(toggleBox!) - centre(headerBox!))).toBeLessThanOrEqual(1);
+        expect(
+          await authoringHeader.evaluate(
+            (header) => header.firstElementChild?.getAttribute("data-authoring-toggle"),
+          ),
+        ).toBe("hide");
 
         await toggle.click();
-        const restoreBox = await composer.restoreAuthoring().boundingBox();
-        const collapsedRow = await page.locator('[data-workspace-part="action-bar"]').boundingBox();
+        const restore = composer.restoreAuthoring();
+        await expect(restore).toBeFocused();
+        const restoreBox = await restore.boundingBox();
         expect(restoreBox).not.toBeNull();
-        expect(collapsedRow).not.toBeNull();
+        expect(Math.abs(restoreBox!.x - toggleBox!.x)).toBeLessThanOrEqual(1);
+        expect(Math.abs(restoreBox!.y - toggleBox!.y)).toBeLessThanOrEqual(1);
         expect(restoreBox!.width).toBe(toggleBox!.width);
         expect(restoreBox!.height).toBe(toggleBox!.height);
-        expect(Math.abs(restoreBox!.x - collapsedRow!.x - (toggleBox!.x - edges!.row.left))).toBeLessThanOrEqual(1);
-        expect(Math.abs(restoreBox!.y - toggleBox!.y)).toBeLessThanOrEqual(1);
+        expect(
+          await page
+            .locator(".artifact-workspace-toolbar")
+            .evaluate((bar) => bar.firstElementChild?.getAttribute("data-authoring-toggle")),
+        ).toBe("show");
         await expect(composer.authoringPane()).toBeHidden();
         await expect(composer.workspace()).toHaveCSS("grid-template-columns", `0px ${viewport.width}px`);
+
+        await restore.click();
+        await expect(composer.collapseAuthoring()).toBeFocused();
+        const reopenedBox = await composer.collapseAuthoring().boundingBox();
+        expect(Math.abs(reopenedBox!.x - toggleBox!.x)).toBeLessThanOrEqual(1);
+        expect(Math.abs(reopenedBox!.y - toggleBox!.y)).toBeLessThanOrEqual(1);
+      } finally {
+        await deleteWorkspaceScenario(page, sessionId);
+      }
+    });
+  }
+
+  for (const viewport of [{ width: 959, height: 800 }, { width: 720, height: 800 }]) {
+    test(`renders no hide/show toggle under 960px at ${viewport.width}px`, async ({ page }) => {
+      await page.setViewportSize(viewport);
+      const sessionId = await installWorkspaceScenario(page, "empty-freeform");
+      const composer = new ComposerPage(page);
+      try {
+        await composer.goto(sessionId);
+        await composer.waitForChatReady();
+        await expect(composer.composeViewTab()).toBeVisible();
+        await expect(page.locator("[data-authoring-toggle]")).toHaveCount(0);
+        // Compose has no action row; Pipeline has the workflow actions.
+        await expect(page.locator('[data-workspace-part="action-bar"]')).toBeHidden();
+        await composer.pipelineViewTab().click();
+        await expect(page.locator('[data-workspace-part="action-bar"]')).toBeVisible();
+        await expect(page.locator("[data-authoring-toggle]")).toHaveCount(0);
       } finally {
         await deleteWorkspaceScenario(page, sessionId);
       }
@@ -693,11 +729,11 @@ test.describe("Composer deterministic workspace geometry", () => {
     }
   });
 
-  test("collapsed restore control shares the action bar's line and stays clickable", async ({
+  test("collapsed Show control leads the pipeline title bar, badges unread items and stays clickable", async ({
     page,
   }) => {
-    // The same in-flow toggle leads the bar in both states. Keep the centre
-    // hit probe as well as geometry so an overlapping surface cannot hide it.
+    // Keep the centre hit probe as well as geometry so an overlapping
+    // surface cannot hide it.
     await page.setViewportSize({ width: 1280, height: 720 });
     const sessionId = await installWorkspaceScenario(page, "pending-acknowledgement");
     const composer = new ComposerPage(page);
@@ -706,23 +742,26 @@ test.describe("Composer deterministic workspace geometry", () => {
       await composer.waitForChatReady();
       await composer.collapseAuthoring().click();
       const restore = composer.restoreAuthoring();
-      const actionBar = page.locator(".workspace-action-bar");
       await expect(restore).toBeVisible();
       await expect(restore).toBeFocused();
-      const [restoreBox, barBox] = await Promise.all([
+      releasePendingAcknowledgement(page);
+      await expect(page.locator("#workspace-collapsed-status")).toContainText(
+        "1 decision to acknowledge",
+      );
+      await expect(restore.locator(".workspace-pane-toggle-badge--count")).toHaveText("1");
+      await expect(restore).toHaveAttribute(
+        "title",
+        "Show conversation (Ctrl+\\)\n1 decision to acknowledge",
+      );
+      const [restoreBox, toolbarBox] = await Promise.all([
         restore.boundingBox(),
-        actionBar.boundingBox(),
+        page.locator(".artifact-workspace-toolbar").boundingBox(),
       ]);
       expect(restoreBox).not.toBeNull();
-      expect(barBox).not.toBeNull();
-      // Same line: the button's vertical extent overlaps the action bar's.
-      expect(restoreBox!.y).toBeLessThan(barBox!.y + barBox!.height);
-      expect(restoreBox!.y + restoreBox!.height).toBeGreaterThan(barBox!.y);
-      // Share is the first workflow action, immediately beside the toggle.
-      const firstVerbBox = await page.getByRole("button", { name: "Share inspect link" }).boundingBox();
-      expect(firstVerbBox).not.toBeNull();
-      expect(firstVerbBox!.x).toBeGreaterThanOrEqual(
-        restoreBox!.x + restoreBox!.width,
+      expect(toolbarBox).not.toBeNull();
+      expect(restoreBox!.y).toBeGreaterThanOrEqual(toolbarBox!.y);
+      expect(restoreBox!.y + restoreBox!.height).toBeLessThanOrEqual(
+        toolbarBox!.y + toolbarBox!.height,
       );
       // No visible banner text: the status node stays in the tree for AT
       // (sr-only), so assert on rendered geometry, not DOM presence.
@@ -737,7 +776,7 @@ test.describe("Composer deterministic workspace geometry", () => {
         x: restoreBox!.x + restoreBox!.width / 2,
         y: restoreBox!.y + restoreBox!.height / 2,
       });
-      expect(hit).toContain("Restore authoring pane");
+      expect(hit).toContain("Show conversation");
     } finally {
       await deleteWorkspaceScenario(page, sessionId);
     }
@@ -808,7 +847,7 @@ test.describe("Composer deterministic workspace geometry", () => {
      unvalidated pipeline ("even blank ones"). This test exercises the gated
      state and pins the cross-element facts that remain: the reason line
      shares the verbs' line, and the pipeline's content-sized bottom row
-     keeps the collapse control registered against it. Still asserted as RENDERED
+     sizes to it. Still asserted as RENDERED
      geometry, not by snapshot — --update-snapshots rewrites only failing
      files, and a sub-threshold offset passes silently. */
   test("a gated Run keeps the reason line and the bottom rule registered with the completion buttons", async ({
@@ -874,14 +913,10 @@ test.describe("Composer deterministic workspace geometry", () => {
       expect(barBox).not.toBeNull();
       expect(barBox!.height).toBeLessThanOrEqual(64);
 
-      // One pipeline bottom row, the bar plus its bottom gutter, the collapse
-      // control centred on the bar — which on this one-line bar is the
-      // verbs' own top edge, asserted here as such so the registration is a
-      // rendered fact and not only a consequence of the centring.
+      // One pipeline bottom row, the bar plus its bottom gutter.
       const bottomRow = await workspaceBottomRow(page);
       expect(bottomRow).not.toBeNull();
       expectBottomRowContract(bottomRow!);
-      expect(Math.abs(bottomRow!.collapse!.top - save!.y)).toBeLessThanOrEqual(1);
     } finally {
       await setShowAdvanced(ctx, false);
       await deleteWorkspaceScenario(page, sessionId);
@@ -976,10 +1011,9 @@ test.describe("Composer deterministic workspace geometry", () => {
      alignment value the bar could carry resolves identically — they cannot
      tell align-items: center from flex-start. Only a reason taller than the
      buttons exercises the registration: the bar centres its group, the group
-     centres its members, and the bottom row centres the collapse control
-     against the bar — with flex-start anywhere in that chain the control (or
-     the verbs) would sit above the taller group's centre by half the
-     difference, the elspeth-15e8cff7a5 misregistration from the other side.
+     centres its members — with flex-start anywhere in that chain the verbs
+     would sit above the taller group's centre by half the difference, the
+     elspeth-15e8cff7a5 misregistration from the other side.
      Getting a tall reason takes a real squeeze now: with the chips gone the
      1fr reason column reaches its 44ch cap at the default 360px pane, where
      this scenario's validation copy balances onto two lines (36px) — so the
@@ -989,7 +1023,7 @@ test.describe("Composer deterministic workspace geometry", () => {
      group outgrows the buttons. 900 tall so the density regime is not also
      toggled; TECHNICAL-MODE so the bar carries its full three verbs and the
      column stays as narrow as the product allows. */
-  test("a three-line reason keeps the verbs and the collapse control on one centre", async ({
+  test("a three-line reason keeps the verbs on one centre", async ({
     page,
   }) => {
     await page.setViewportSize({ width: 1280, height: 900 });
@@ -1021,13 +1055,12 @@ test.describe("Composer deterministic workspace geometry", () => {
       await expect(composer.separator()).toHaveAttribute("aria-valuemax", "598");
       await expect(composer.separator()).toHaveAttribute("aria-valuenow", "598");
 
-      const [save, run, reasonBox, collapse] = await Promise.all([
+      const [save, run, reasonBox] = await Promise.all([
         composer.saveForReview().boundingBox(),
         composer.runPipeline().boundingBox(),
         reason.boundingBox(),
-        composer.collapseAuthoring().boundingBox(),
       ]);
-      for (const box of [save, run, reasonBox, collapse]) {
+      for (const box of [save, run, reasonBox]) {
         expect(box).not.toBeNull();
       }
       // Asserted, not assumed: the reason is taller than the buttons here, so
@@ -1036,7 +1069,6 @@ test.describe("Composer deterministic workspace geometry", () => {
       const centre = (b: { y: number; height: number }) => b.y + b.height / 2;
       expect(Math.abs(centre(save!) - centre(run!))).toBeLessThanOrEqual(1);
       expect(Math.abs(centre(reasonBox!) - centre(run!))).toBeLessThanOrEqual(1);
-      expect(Math.abs(centre(collapse!) - centre(run!))).toBeLessThanOrEqual(1);
       // Still one line — the reason grew downward within its column.
       expect(reasonBox!.x).toBeGreaterThan(save!.x);
       const bottomRow = await workspaceBottomRow(page);
@@ -1064,7 +1096,7 @@ test.describe("Composer deterministic workspace geometry", () => {
      by the three-line-reason row above, and this row keeps the relayout
      journey itself honest. 1024 is still desktop mode (narrow is 960) and
      the height stays 900 so the density regime is not also toggled. */
-  test("the pipeline bottom row sizes to its actions and gutter through a resize and back, with the collapse control centred on it", async ({
+  test("the pipeline bottom row sizes to its actions and gutter through a resize and back", async ({
     page,
   }) => {
     await page.setViewportSize({ width: 1600, height: 900 });
@@ -1136,6 +1168,8 @@ test.describe("Composer deterministic workspace geometry", () => {
           [composer.artifactTab("Run"), 36],
           [composer.catalogButton(), 36],
           [page.getByRole("button", { name: "Fullscreen" }), 36],
+          // The hide/show toggle joined the title bars' register 2026-11-20.
+          [composer.collapseAuthoring(), 36],
         ];
         const boxes = await Promise.all(
           controls.map(([control]) => control.boundingBox()),
@@ -1161,21 +1195,54 @@ test.describe("Composer deterministic workspace geometry", () => {
     });
   }
 
-  test("Ctrl+/ restores collapsed Compose before focusing the chat input", async ({ page }) => {
-    await page.setViewportSize({ width: 720, height: 720 });
+  test("Ctrl+/ shows Compose and focuses the chat input after a wide-layout collapse", async ({ page }) => {
+    // Under 960px the stored collapsed preference is ignored (no toggle
+    // renders there); Ctrl+/ still selects Compose, focuses the input and
+    // clears the preference for the next wide layout.
+    await page.setViewportSize({ width: 1280, height: 720 });
     const sessionId = await installWorkspaceScenario(page, "empty-freeform");
     const composer = new ComposerPage(page);
     try {
       await composer.goto(sessionId);
       await composer.waitForChatReady();
       await composer.collapseAuthoring().click();
+      await expect(composer.workspace()).toHaveAttribute("data-authoring-collapsed", "true");
+      await page.setViewportSize({ width: 720, height: 720 });
+      await expect(composer.composeViewTab()).toBeVisible();
+      await expect(composer.workspace()).not.toHaveAttribute("data-authoring-collapsed");
       await composer.pipelineViewTab().click();
       await page.keyboard.press("Control+/");
-      await expect(composer.workspace()).not.toHaveAttribute(
-        "data-authoring-collapsed",
-      );
       await expect(composer.composeViewTab()).toHaveAttribute("aria-selected", "true");
       await expect(composer.chatInput()).toBeFocused();
+      await page.setViewportSize({ width: 1280, height: 720 });
+      await expect(composer.collapseAuthoring()).toBeVisible();
+      await expect(composer.workspace()).not.toHaveAttribute("data-authoring-collapsed");
+    } finally {
+      await deleteWorkspaceScenario(page, sessionId);
+    }
+  });
+
+  test("Ctrl+Backslash toggles the conversation and keeps focus on a visible control", async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    const sessionId = await installWorkspaceScenario(page, "empty-freeform");
+    const composer = new ComposerPage(page);
+    try {
+      await composer.goto(sessionId);
+      await composer.waitForChatReady();
+      await composer.chatInput().focus();
+      await page.keyboard.press("Control+Backslash");
+      await expect(composer.workspace()).toHaveAttribute("data-authoring-collapsed", "true");
+      // Focus was inside the pane that went inert, so it moves to Show.
+      await expect(composer.restoreAuthoring()).toBeFocused();
+      await page.keyboard.press("Control+Backslash");
+      await expect(composer.workspace()).not.toHaveAttribute("data-authoring-collapsed");
+      await expect(composer.collapseAuthoring()).toBeFocused();
+      // From the canvas, focus stays put.
+      await composer.artifactTab("Workflow").focus();
+      await page.keyboard.press("Control+Backslash");
+      await expect(composer.workspace()).toHaveAttribute("data-authoring-collapsed", "true");
+      await expect(composer.artifactTab("Workflow")).toBeFocused();
+      await page.keyboard.press("Control+Backslash");
     } finally {
       await deleteWorkspaceScenario(page, sessionId);
     }

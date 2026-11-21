@@ -63,6 +63,7 @@ const AUDITED_COMPONENTS = [
   "WorkspaceSeparator",
   "GraphModal",
   "GraphView",
+  "OptionRows",
   "HelloWorldTutorial",
   "LoginPage",
   "ProgressView",
@@ -96,6 +97,7 @@ const EXPECTED_AUDITED_COMPONENTS_SORTED: readonly string[] = [
   "GraphMiniView",
   "GraphModal",
   "GraphView",
+  "OptionRows",
   "HeaderSessionSwitcher",
   "HeaderVersionSelector",
   "HelloWorldTutorial",
@@ -273,6 +275,7 @@ import { ShortcutsHelp } from "@/components/common/ShortcutsHelp";
 import { PipelineGloss } from "@/components/chat/PipelineGloss";
 import { PipelineValidationSummary } from "@/components/chat/PipelineValidationSummary";
 import { AcknowledgementCard } from "@/components/chat/AcknowledgementCard";
+import { OptionRows } from "@/components/inspector/OptionRows";
 import { AcknowledgementStack } from "@/components/chat/AcknowledgementStack";
 import { ChatInput } from "@/components/chat/ChatInput";
 import { ChatPanel } from "@/components/chat/ChatPanel";
@@ -1028,6 +1031,16 @@ describe("AcknowledgementCard", () => {
     // Guard against a vacuous pass: the loaded snapshot is in the audited DOM.
     await waitFor(() => expect(screen.getByRole("region", { name: /prompt template review/i }))
       .toHaveTextContent("Reply briefly."));
+    expect(screen.getByRole("button", { name: "Copy system prompt" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Copy user prompt template" })).toBeInTheDocument();
+    expect(await axe(container)).toHaveNoViolations();
+  });
+
+  it("has accessible copy controls on inspector prompt cells", async () => {
+    const { container } = render(<OptionRows options={{ system_prompt: "  system\n", prompt_template: " user 🐈 " }}
+      ariaLabel="Prompt options" plugin={{ kind: "transform", name: "llm" }} />);
+    expect(screen.getByRole("button", { name: "Copy system prompt" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Copy user prompt template" })).toBeInTheDocument();
     expect(await axe(container)).toHaveNoViolations();
   });
 

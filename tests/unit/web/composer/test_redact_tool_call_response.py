@@ -223,10 +223,9 @@ def test_type_driven_tool_result_accepts_and_scrubs_row_union_schema_facts() -> 
     assert _EXTERNAL_SCALAR_CANARY not in json.dumps(schema_facts, sort_keys=True)
 
 
-@pytest.mark.parametrize("tool_name", ["set_source", "upsert_node"])
-def test_repair_argument_summary_never_exposes_arbitrary_key_names(tool_name: str) -> None:
-    key_canary = "RAW_KEY_CANARY_/private/operator/path_sk-secret"
-    response = {
+def _old_shape_repair_response(key_canary: str) -> dict[str, Any]:
+    """A result carrying the repair suggestion shape that predates the facts-only form."""
+    return {
         "success": False,
         "validation": {
             "is_valid": False,
@@ -236,11 +235,11 @@ def test_repair_argument_summary_never_exposes_arbitrary_key_names(tool_name: st
             "semantic_contracts": [],
             "graph_repair_suggestions": [
                 {
-                    "code": "repair_required",
-                    "connection": "source_to_transform",
-                    "strategy": "repair",
+                    "code": "duplicate_consumer_connection",
+                    "connection": "shared",
+                    "strategy": "insert_fork_gate",
                     "reason": "A repair is required.",
-                    "affected_consumers": [],
+                    "affected_consumers": [{"id": "t1", "current_input": "shared", "new_input": "shared_to_t1"}],
                     "tool_sequence": [
                         {
                             "tool": "upsert_node",
@@ -255,14 +254,29 @@ def test_repair_argument_summary_never_exposes_arbitrary_key_names(tool_name: st
         "data": {"error": "repair required"},
     }
 
-    result = redact_tool_call_response(
-        tool_name,
-        response,
-        telemetry=NoopRedactionTelemetry(),
-    )
-    arguments_summary = result["validation"]["graph_repair_suggestions"][0]["tool_sequence"][0]["arguments"]
 
-    assert arguments_summary == "<redacted-repair-arguments>"
+def test_an_old_shape_repair_suggestion_is_refused_by_the_closed_response_model() -> None:
+    """The shadow model was narrowed, not widened: a live result in the old shape cannot be stored as one."""
+    key_canary = "RAW_KEY_CANARY_/private/operator/path_sk-secret"
+
+    with pytest.raises(ValidationError) as raised:
+        redact_tool_call_response("set_source", _old_shape_repair_response(key_canary), telemetry=NoopRedactionTelemetry())
+
+    rejected = {".".join(str(part) for part in error["loc"]) for error in raised.value.errors()}
+    assert rejected == {
+        "validation.graph_repair_suggestions.0.strategy",
+        "validation.graph_repair_suggestions.0.tool_sequence",
+        "validation.graph_repair_suggestions.0.affected_consumers.0.current_input",
+        "validation.graph_repair_suggestions.0.affected_consumers.0.new_input",
+    }
+
+
+def test_an_old_shape_repair_suggestion_under_a_declarative_policy_degrades_without_its_arguments() -> None:
+    key_canary = "RAW_KEY_CANARY_/private/operator/path_sk-secret"
+
+    result = redact_tool_call_response("upsert_node", _old_shape_repair_response(key_canary), telemetry=NoopRedactionTelemetry())
+
+    assert result["validation"] == "<redacted-response-mapping>"
     assert key_canary not in json.dumps(result, sort_keys=True)
 
 
@@ -763,9 +777,9 @@ def test_get_blob_content_populated_validation_envelope_redacts_external_scalars
     element, so a key-name drift between the builder and the shadow model would
     pass them silently; this test fails loudly on such drift.
 
-    It also confirms the heterogeneous repair-tool-call ``arguments`` mapping
-    keeps its dedicated structural sketch while surrounding externally derived
-    text is summarized. Closed booleans, severity, and counts remain useful.
+    It also pins the stored form of the duplicate-consumer facts: every string,
+    the consumer ids included, is summarized like other externally derived
+    text. Closed booleans, severity, and counts remain useful.
     """
     response = {
         "success": True,
@@ -804,17 +818,10 @@ def test_get_blob_content_populated_validation_envelope_redacts_external_scalars
             ],
             "graph_repair_suggestions": [
                 {
-                    "code": "duplicate_consumer_connection",
+                    "code": "duplicate_connection_consumer",
                     "connection": "shared",
-                    "strategy": "insert_fork_gate",
-                    "reason": "Give each consumer a unique branch input.",
-                    "affected_consumers": [
-                        {"id": "t1", "current_input": "shared", "new_input": "shared_to_t1"},
-                    ],
-                    "tool_sequence": [
-                        {"tool": "upsert_node", "arguments": {"id": "t1", "input": "shared_to_t1", "node_type": "transform"}},
-                        {"tool": "preview_pipeline", "arguments": {}},
-                    ],
+                    "reason": "One connection can feed one processing node; every node listed reads this one. Change only the input bindings; preserve existing node options.",
+                    "affected_consumers": [{"id": "t1"}, {"id": "t2"}],
                 },
             ],
         },
@@ -842,10 +849,15 @@ def test_get_blob_content_populated_validation_envelope_redacts_external_scalars
     # Blob bytes redacted (existing behaviour).
     assert result["data"]["content"] == "<redacted-blob-content>"
 
-    # The single Sensitive repair-arguments leaf is summarized to key count.
-    repair = result["validation"]["graph_repair_suggestions"][0]
-    assert repair["tool_sequence"][0]["arguments"] == "<redacted-repair-arguments>"
-    assert repair["tool_sequence"][1]["arguments"] == "<redacted-repair-arguments>"
+    # The duplicate-consumer facts keep their shape; every string is summarized.
+    assert result["validation"]["graph_repair_suggestions"] == [
+        {
+            "code": "<redacted-response-text>",
+            "connection": "<redacted-response-text>",
+            "reason": "<redacted-response-text>",
+            "affected_consumers": [{"id": "<redacted-response-text>"}, {"id": "<redacted-response-text>"}],
+        }
+    ]
 
     # Public status survives while free-form/provider/operator text is summarized.
     assert result["validation"]["is_valid"] is False
@@ -853,23 +865,44 @@ def test_get_blob_content_populated_validation_envelope_redacts_external_scalars
     assert result["validation"]["errors"][0]["message"] == "<redacted-response-text>"
     assert result["validation"]["semantic_contracts"][1]["producer_plugin"] is None
     assert result["validation"]["semantic_contracts"][0]["requirement_code"] == "<redacted-response-text>"
-    assert repair["affected_consumers"][0]["new_input"] == "<redacted-response-text>"
-    assert repair["code"] == "<redacted-response-text>"
 
-    # The repair-argument VALUES never reach the redacted output (only the
-    # affected_consumers descriptor — a non-sensitive structural field — may
-    # legitimately echo the new input name).
-    assert "'input': 'shared_to_t1'" not in str(result)
+
+def test_get_blob_content_refuses_an_old_shape_repair_suggestion() -> None:
+    """The narrowed shadow model admits only the facts; the removed keys are extra and refused."""
+    response = {
+        **_old_shape_repair_response("RAW_KEY_CANARY"),
+        "success": True,
+        "data": {
+            "blob_id": "blob-1",
+            "filename": "input.csv",
+            "mime_type": "text/csv",
+            "content": "secret,row\n1,2\n",
+            "truncated": False,
+            "size_bytes": 15,
+            "created_by": "user",
+            "creation_modality": "verbatim",
+            "content_hash": "a" * 64,
+            "total_chars": 15,
+            "start_char": 0,
+            "end_char": 15,
+            "next_offset_chars": None,
+        },
+    }
+
+    with pytest.raises(ValidationError) as raised:
+        redact_tool_call_response("get_blob_content", response, telemetry=NoopRedactionTelemetry())
+
+    assert {error["type"] for error in raised.value.errors()} == {"extra_forbidden"}
 
 
 def test_declarative_tool_result_redacts_nested_repair_arguments() -> None:
     """Declarative response policies must still descend into repair guidance.
 
     ``upsert_node`` keeps the ToolResult envelope declarative: top-level
-    ``validation`` and ``data`` are known response keys, but both can carry
-    nested credential-repair tool calls with open ``arguments`` mappings.
-    Those mappings must be structurally summarized before persistence, not
-    copied through with credential material intact.
+    ``validation`` and ``data`` are known response keys, and ``data`` can
+    carry nested credential-repair tool calls with open ``arguments``
+    mappings. Those mappings must be structurally summarized before
+    persistence, not copied through with credential material intact.
     """
     sentinel = "sk-test-declarative-nested-secret"
     response = {
@@ -880,26 +913,7 @@ def test_declarative_tool_result_redacts_nested_repair_arguments() -> None:
             "warnings": [],
             "suggestions": [],
             "semantic_contracts": [],
-            "graph_repair_suggestions": [
-                {
-                    "code": "credential_wiring_required",
-                    "connection": "source_to_enrich",
-                    "strategy": "wire_secret_ref",
-                    "reason": "Credential field must be wired by reference.",
-                    "affected_consumers": [
-                        {"id": "enrich", "current_input": "source", "new_input": "source_to_enrich"},
-                    ],
-                    "tool_sequence": [
-                        {
-                            "tool": "upsert_node",
-                            "arguments": {
-                                "id": "enrich",
-                                "options": {"api_key": sentinel},
-                            },
-                        },
-                    ],
-                },
-            ],
+            "graph_repair_suggestions": [],
         },
         "affected_nodes": ["enrich"],
         "version": 4,
@@ -925,7 +939,6 @@ def test_declarative_tool_result_redacts_nested_repair_arguments() -> None:
 
     result = redact_tool_call_response("upsert_node", response, telemetry=NoopRedactionTelemetry())
 
-    assert result["validation"]["graph_repair_suggestions"][0]["tool_sequence"][0]["arguments"] == "<redacted-repair-arguments>"
     repair = result["data"]["repair"]
     projected_arguments = repair["tool_sequence"][0]["arguments"]
     assert isinstance(projected_arguments, dict)

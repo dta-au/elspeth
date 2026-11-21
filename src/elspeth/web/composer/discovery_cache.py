@@ -8,9 +8,12 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from elspeth.contracts.blobs import BlobRecord
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.prompt_guard import PromptGuardContentPart
+from elspeth.contracts.secrets import SecretInventoryItem
 from elspeth.web.catalog.schemas import PluginSchemaInfo
+from elspeth.web.catalog.validation_reuse import MutationEpoch
 from elspeth.web.composer._attachment_response import AdmittedAttachmentResponse
 from elspeth.web.composer.discovery_response import AdmittedDiscoveryResult
 from elspeth.web.composer.prompt_guard_rendering import JsonPath, json_content_parts
@@ -20,6 +23,7 @@ from elspeth.web.composer.tools import ToolResult
 from elspeth.web.composer.tools._generation_schema_response import AdmittedPluginSchemaResponse
 from elspeth.web.composer.tools._registry import response_contract_for
 from elspeth.web.execution.runtime_preflight import RuntimePreflightEntry, RuntimePreflightKey
+from elspeth.web.execution.schemas import ValidationResult
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +37,83 @@ class CachedDiscoveryPayload:
 
 
 RuntimePreflightCache = dict[RuntimePreflightKey, RuntimePreflightEntry]
+
+
+@dataclass(frozen=True, slots=True)
+class BlobEvidence:
+    """One referenced blob as a runtime preflight would read it.
+
+    ``record`` is the whole metadata row (every field the materialiser
+    compares is in it). The stat fields catch stored bytes rewritten without
+    a record change, which the uncached path catches by re-hashing; the
+    change time is among them because a writer cannot set it back, so a
+    same-size rewrite with the modification time restored still shows.
+    """
+
+    record: BlobRecord
+    storage_size: int
+    storage_mtime_ns: int
+    storage_ctime_ns: int
+    storage_inode: int
+
+
+ResolvedLocalPath = tuple[str, str, str]
+
+
+@dataclass(frozen=True, slots=True)
+class PreflightEvidence:
+    """Every input a runtime preflight reads that can change between two calls.
+
+    ``blobs`` holds each referenced blob in id order. ``secret_inventory`` is
+    the user's inventory as ``secret_service.list_refs`` returns it (names and
+    availability, never values), which the preflight reads to judge
+    ``${NAME}`` credential values; a secret created or deleted over HTTP never
+    passes through a composer tool, so no mutation epoch sees it. A changed
+    value under an unchanged name is not in the inventory: a state whose
+    options wire a secret is therefore never reused at all. ``local_paths``
+    holds each source, sink and ``provider_config`` path as the path
+    allowlist resolves it (symbolic links followed), as
+    ``(component, option key, resolved path or error class)``.
+    """
+
+    blobs: tuple[BlobEvidence, ...]
+    secret_inventory: frozenset[SecretInventoryItem]
+    local_paths: tuple[ResolvedLocalPath, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class BlobBoundPreflightVerdict:
+    """A returned verdict for a blob-bearing state, with what it was judged on.
+
+    Reused only for the identical state object, in the same mutation epoch,
+    while a fresh read of the evidence still equals ``evidence``. ``result``
+    is a private deep copy; every reuse hands out another deep copy, so no
+    two callers share one mutable result. Failures are never stored here.
+    """
+
+    state: CompositionState
+    mutation_epoch: int
+    evidence: PreflightEvidence
+    result: ValidationResult
+
+
+class ComposeRoundPreflightCache(RuntimePreflightCache):
+    """One compose call's runtime-preflight cache.
+
+    The mapping itself is the existing cache for states without a blob
+    reference (returned verdicts and failures, keyed by
+    ``RuntimePreflightKey``). ``blob_verdicts`` is the separate store for
+    blob-bearing states, which the mapping never holds because blob status can
+    change without a state version change. ``mutation_epoch`` is the round
+    view's epoch, shared so a mutation-kind tool call ends every reuse.
+    """
+
+    __slots__ = ("blob_verdicts", "mutation_epoch")
+
+    def __init__(self, *, mutation_epoch: MutationEpoch) -> None:
+        super().__init__()
+        self.blob_verdicts: dict[RuntimePreflightKey, BlobBoundPreflightVerdict] = {}
+        self.mutation_epoch = mutation_epoch
 
 
 def tool_result_mutated_composition_state(

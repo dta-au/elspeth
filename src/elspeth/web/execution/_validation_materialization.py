@@ -13,15 +13,15 @@ from pathlib import Path
 from typing import Any, Final, Literal, cast
 from uuid import UUID
 
-import yaml
-
 from elspeth.contracts.blobs import AllowedMimeType, BlobCreator, BlobNotFoundError, BlobRecord, BlobStateError
 from elspeth.contracts.blobs_inline import (
+    BLOB_INLINE_AGGREGATE_FIELD_PATH,
     INLINE_BLOB_NOT_TEXT_CODE,
     INLINE_BLOB_NOT_TEXT_REPAIR,
     BlobContentResolutionError,
     BlobInlineRef,
     BlobInlineValidationViolation,
+    inline_blob_total_refusal,
     is_widened_blob_ref,
 )
 from elspeth.contracts.composer_paths import McpConfiguredRootAuthority
@@ -38,7 +38,9 @@ from elspeth.core.blobs_inline import (
     _substitute_blob_content_refs_for_validation,
     _validate_blob_content_refs_sync,
 )
+from elspeth.core.templates import MAX_JINJA_TEMPLATE_BYTES, template_size_refusal
 from elspeth.web.composer.state import CompositionState
+from elspeth.web.execution._rendered_pipeline_yaml import RenderedPipelineYaml, ResolvedPipelineTooLargeError
 from elspeth.web.execution._validation_model import (
     InterpretationValidatedState,
     MaterializedYaml,
@@ -147,7 +149,7 @@ def _llm_policy_components(state: CompositionState) -> tuple[_LLMPolicyComponent
 
 
 def _blob_inline_component_id(field_path: str) -> str | None:
-    if field_path == "(aggregate)":
+    if field_path == BLOB_INLINE_AGGREGATE_FIELD_PATH:
         return None
     if field_path.startswith("source."):
         return "source"
@@ -161,7 +163,7 @@ def _blob_inline_component_id(field_path: str) -> str | None:
 
 
 def _blob_inline_component_type(field_path: str) -> str | None:
-    if field_path == "(aggregate)":
+    if field_path == BLOB_INLINE_AGGREGATE_FIELD_PATH:
         return None
     if field_path.startswith("source."):
         return "source"
@@ -176,7 +178,24 @@ def _blob_inline_validation_detail(violations: list[BlobInlineValidationViolatio
     return "; ".join(f"{violation.field_path}: {violation.category}" for violation in violations)
 
 
+_INLINE_BLOB_TOTAL_REPAIR: Final = (
+    "Remove a file binding or shorten the largest files until the total is at or under the limit; "
+    "each file counts once for every place it is bound."
+)
+
+
 def _blob_inline_validation_error(violation: BlobInlineValidationViolation) -> ValidationError:
+    if violation.field_path == BLOB_INLINE_AGGREGATE_FIELD_PATH:
+        # The detail is the whole refusal sentence (total, cap, bindings);
+        # the code is the one every oversized refusal has always carried.
+        # A pipeline total can only be oversized, so the code is spelled out.
+        return ValidationError(
+            component_id=None,
+            component_type=None,
+            message=violation.detail,
+            suggestion=_INLINE_BLOB_TOTAL_REPAIR,
+            error_code="oversized_inline_blob_content",
+        )
     not_text = violation.category == "not_text"
     return ValidationError(
         component_id=_blob_inline_component_id(violation.field_path),
@@ -231,6 +250,37 @@ def llm_prompt_file_scalar_field(field_path: str) -> tuple[str, str] | None:
     if option_path in {"prompt_template", "system_prompt"} or (len(parts) == 3 and parts[0] == "queries" and parts[2] == "template"):
         return node_name, option_path
     return None
+
+
+def _oversized_llm_template_files(
+    fetched: Mapping[BlobInlineRef, bytes], *, node_plugins: Mapping[str, str]
+) -> tuple[ValidationError, ...]:
+    """One entry per llm template position whose file is over the template bound, naming the step.
+
+    Plugin construction refuses the same text later, but its entry names the
+    plugin ('llm'), not the step, so with two llm steps the reader cannot tell
+    which file to shorten. A UTF-8 file's bytes are the resolved template's
+    UTF-8 bytes, the measure the plugin applies; other encodings are left to
+    the plugin's own refusal.
+    """
+    errors: list[ValidationError] = []
+    for ref, content in fetched.items():
+        position = llm_prompt_file_scalar_field(ref.field_path)
+        if position is None or ref.encoding != "utf-8" or len(content) <= MAX_JINJA_TEMPLATE_BYTES:
+            continue
+        node_name, option_path = position
+        if option_path == "system_prompt" or node_name not in node_plugins or node_plugins[node_name] != "llm":
+            continue
+        errors.append(
+            ValidationError(
+                component_id=node_name,
+                component_type="transform",
+                message=template_size_refusal(f"{option_path} on step {node_name}", len(content), MAX_JINJA_TEMPLATE_BYTES),
+                suggestion=None,
+                error_code="plugin_options_invalid",
+            )
+        )
+    return tuple(errors)
 
 
 def unsupported_llm_prompt_file_refs(refs: list[BlobInlineRef], *, node_plugins: Mapping[str, str]) -> list[BlobInlineRef]:
@@ -753,7 +803,7 @@ def materialize_validation_yaml(
                 artifact=MaterializedYaml(
                     authored=interpretation.authored,
                     materialized_state=interpretation.materialized_state,
-                    pipeline_yaml=pipeline_yaml,
+                    pipeline=RenderedPipelineYaml.of_text(pipeline_yaml),
                 ),
                 checks=(
                     ValidationCheck(
@@ -869,6 +919,7 @@ def materialize_validation_yaml(
         content_failure_by_blob_id: dict[UUID, BlobInlineValidationViolation] = {}
         content_violations: list[BlobInlineValidationViolation] = []
         actual_total_bytes = 0
+        actual_binding_count = 0
         for ref in refs:
             if ref.blob_id in content_failure_by_blob_id:
                 previous_failure = content_failure_by_blob_id[ref.blob_id]
@@ -919,13 +970,14 @@ def materialize_validation_yaml(
                     )
                 )
             actual_total_bytes += len(content)
+            actual_binding_count += 1
             fetched[ref] = content
         if actual_total_bytes > BLOB_INLINE_AGGREGATE_BYTE_CAP:
             content_violations.append(
                 BlobInlineValidationViolation(
                     category="oversized",
-                    field_path="(aggregate)",
-                    detail=f"total resolved bytes {actual_total_bytes} exceeds aggregate cap {BLOB_INLINE_AGGREGATE_BYTE_CAP}",
+                    field_path=BLOB_INLINE_AGGREGATE_FIELD_PATH,
+                    detail=inline_blob_total_refusal(actual_total_bytes, BLOB_INLINE_AGGREGATE_BYTE_CAP, actual_binding_count),
                 )
             )
         if content_violations:
@@ -964,16 +1016,56 @@ def materialize_validation_yaml(
                 readiness=_blocked_readiness(code="blob_inline_refs", detail=detail),
                 semantic_contracts=interpretation.authored.semantic_contracts,
             )
+        oversized_templates = _oversized_llm_template_files(fetched, node_plugins=node_plugins)
+        if oversized_templates:
+            detail = "; ".join(error.message for error in oversized_templates)
+            return PhaseFailure(
+                passed_checks=(),
+                failed_check=ValidationCheck(
+                    name=CHECK_BLOB_INLINE_REFS,
+                    passed=False,
+                    detail=detail,
+                    affected_nodes=tuple(error.component_id for error in oversized_templates if error.component_id is not None),
+                    outcome_code=None,
+                ),
+                errors=oversized_templates,
+                readiness=_blocked_readiness(code="blob_inline_refs", detail=detail),
+                semantic_contracts=interpretation.authored.semantic_contracts,
+            )
+        # The resolved configuration's size is judged here, as text bytes of
+        # its data; the document stays in hand so the settings phase need not
+        # render it and parse it back.
+        try:
+            pipeline = RenderedPipelineYaml.of_resolved(resolved_config)
+        except ResolvedPipelineTooLargeError as exc:
+            detail = f"The resolved pipeline configuration holds {exc.total_bytes} bytes of text; the limit is {exc.limit_bytes} bytes."
+            return PhaseFailure(
+                passed_checks=(),
+                failed_check=ValidationCheck(
+                    name=CHECK_BLOB_INLINE_REFS, passed=False, detail=detail, affected_nodes=(), outcome_code=None
+                ),
+                errors=(
+                    ValidationError(
+                        component_id=None,
+                        component_type=None,
+                        message=detail,
+                        suggestion="Hold less text in prompt files and inline options, or split the pipeline.",
+                        error_code="resolved_pipeline_config_oversized",
+                    ),
+                ),
+                readiness=_blocked_readiness(code="blob_inline_refs", detail=detail),
+                semantic_contracts=interpretation.authored.semantic_contracts,
+            )
         check_detail = "All inline-content blob references and bytes are valid"
-        pipeline_yaml = yaml.dump(resolved_config, default_flow_style=False)
     else:
         check_detail = "No inline-content blob references found"
+        pipeline = RenderedPipelineYaml.of_text(pipeline_yaml)
 
     return PhaseReport(
         artifact=MaterializedYaml(
             authored=interpretation.authored,
             materialized_state=interpretation.materialized_state,
-            pipeline_yaml=pipeline_yaml,
+            pipeline=pipeline,
         ),
         checks=(
             ValidationCheck(

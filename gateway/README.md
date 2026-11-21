@@ -290,6 +290,26 @@ closed set of recognised variables — any other variable in the
 `ELSPETH_LLM_GATEWAY_` namespace fails startup. `_UPSTREAM_ORIGIN` must be
 `https://…` or exactly `http://127.0.0.1:<port>`.
 
+### Log events
+
+The container writes one JSON object per line to stderr for each event below.
+If the `elspeth_llm_gateway` logger already has a handler when the gateway
+starts (for example from `--log-config`), that configuration is used instead.
+
+| event | fields |
+| --- | --- |
+| `completion` | `request_id`, `request_hash`, `contract_major`, `adapter_name`, `adapter_version`, `adapter_api_major`, `model_alias`, `mapping_generation`, `status`, `latency_ms`; with `response_hash` and `response_bytes` on success, plus `prompt_tokens`, `completion_tokens` and `total_tokens` when the response reports usage; `error_code` on error |
+| `request_error` | `request_id`, `error_code`, `status` |
+| `upstream_result` | `request_id`, `upstream_status_class`, `upstream_status_code` |
+| `response_validation_rejected` | `request_id`, `validation_stage` (`adapter`, `canonical`), `exception_category` (`missing_field`, `invalid_type`, `invalid_value`, `other`, `contract_rejected`) |
+
+The token counts are a deliberate exception to ELSPETH's logging policy,
+which keeps call results out of logs because the audit trail holds them. The
+gateway has no audit store of its own, so it logs the counts, never content.
+Each count is logged exactly as the response reported it, and only when it is
+a non-negative integer; a missing or malformed count is left out and never
+fails the request.
+
 ### Derived images
 
 A real adapter ships as its own installable package, added on top of this

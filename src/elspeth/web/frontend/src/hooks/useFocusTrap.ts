@@ -68,11 +68,16 @@ export function useFocusTrap(
       const last = focusable[focusable.length - 1];
       const activeElement = document.activeElement;
       const escaped = !container.contains(activeElement);
+      // Focus on a focusable container itself (tabindex="-1", reached by a
+      // click on its text) sits before its first control in document order,
+      // so a native Shift+Tab from there would leave the trap. Treat it as
+      // the edge in both directions.
+      const onContainer = activeElement === container;
 
-      if (e.shiftKey && (activeElement === first || escaped)) {
+      if (e.shiftKey && (activeElement === first || escaped || onContainer)) {
         e.preventDefault();
         last.focus();
-      } else if (!e.shiftKey && (activeElement === last || escaped)) {
+      } else if (!e.shiftKey && (activeElement === last || escaped || onContainer)) {
         e.preventDefault();
         first.focus();
       }

@@ -29,25 +29,35 @@ def test_readme_operational_cutover_states_the_live_schema_epochs() -> None:
     readme = _readme_text()
     text = _section(readme, f"\n## What changed in {version}\n")
 
-    assert f"Session epoch {SESSION_SCHEMA_EPOCH} replaces session epoch 78" in text
-    assert f"Landscape epoch {SQLITE_SCHEMA_EPOCH} replaces epoch 50" in text
-    assert "`prompt_review_snapshots` and `prompt_file_approvals`" in text
-    assert "the Landscape store adds `run_prompt_inputs`" in text
-    assert "Preserve epoch 78 session stores and epoch 50 Landscape stores, which startup refuses" in text
+    assert f"Session epoch {SESSION_SCHEMA_EPOCH} and Landscape epoch {SQLITE_SCHEMA_EPOCH} are unchanged from 0.8.15" in text
+    assert "this release adds no schema-epoch cutover" in text
+    assert "existing 0.8.15 session and Landscape stores need no action" in text
+    assert "Upgrading from 0.8.14 or earlier means applying the 0.8.15 upgrade notes first" in text
+    assert "preserve epoch 78 session stores and epoch 50 Landscape stores, which startup refuses" in text
     assert (
         f"use a separately provisioned epoch {SESSION_SCHEMA_EPOCH} session store and epoch {SQLITE_SCHEMA_EPOCH} Landscape store" in text
     )
-    assert "this release adds no schema-epoch cutover" not in text
-    assert "need no action" not in text
     assert "Backwards compatibility is permitted and considered from 0.8.5 within explicitly supported boundaries" in text
     assert "authorizes no in-place migration, reset or downgrade" in text
     assert f"Package metadata is {version};" in text
     assert "the package version alone does not establish qualification or image publication" in text
     assert "Automatic image publication from main is held" in text
     assert "verify the release tag and image digest" in text
-    assert "It supersedes 0.8.14, which was tagged but never published" in text
+    assert "Long inline prompts belong in files" in text
+
+
+def test_readme_keeps_the_0_8_15_cutover_as_a_historical_pin() -> None:
+    """The 0.8.15 section keeps its own statements and no current-release claim."""
+    text = _section(_readme_text(), "\n## Previously in 0.8.15\n")
+
+    assert "It superseded 0.8.14, which was tagged but never published" in text
     assert "the 0.8.14 upgrade actions apply" in text
-    assert "A run interrupted before upgrading cannot be resumed after it" in text
+    assert "A run interrupted before upgrading to 0.8.15 cannot be resumed after it" in text
+    assert "Session epoch 79 replaced session epoch 78" in text
+    assert "Landscape epoch 51 replaced epoch 50" in text
+    assert "`prompt_review_snapshots` and `prompt_file_approvals`" in text
+    assert "the Landscape store added `run_prompt_inputs`" in text
+    assert "Package metadata is" not in text
 
 
 def test_readme_keeps_the_0_8_14_python_move_as_a_historical_pin() -> None:

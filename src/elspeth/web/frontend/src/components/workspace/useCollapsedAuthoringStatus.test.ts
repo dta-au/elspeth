@@ -105,7 +105,11 @@ describe("useCollapsedAuthoringStatus", () => {
         ],
       }),
     );
-    expect(result.current).toEqual({ text: "1 new message", tone: "busy" });
+    expect(result.current).toEqual({
+      text: "1 new message",
+      tone: "busy",
+      unreadCount: 1,
+    });
   });
 
   it("uses error, busy, unread, then neutral priority", () => {
@@ -125,7 +129,11 @@ describe("useCollapsedAuthoringStatus", () => {
     });
 
     act(() => useSessionStore.setState({ messages: [message("m1")] }));
-    expect(result.current).toEqual({ text: "1 new message", tone: "busy" });
+    expect(result.current).toEqual({
+      text: "1 new message",
+      tone: "busy",
+      unreadCount: 1,
+    });
 
     act(() => useSessionStore.setState({ isComposing: true }));
     expect(result.current).toEqual({
@@ -163,6 +171,7 @@ describe("useCollapsedAuthoringStatus", () => {
     expect(result.current).toEqual({
       text: "2 new messages, 1 decision to acknowledge",
       tone: "busy",
+      unreadCount: 3,
     });
   });
 

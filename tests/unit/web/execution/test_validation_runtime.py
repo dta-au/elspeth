@@ -10,7 +10,7 @@ import pytest
 from pydantic import BaseModel
 from pydantic import ValidationError as PydanticValidationError
 
-from elspeth.config_loading import load_settings_from_config_dict, load_settings_from_yaml_string
+from elspeth.config_loading import load_settings_from_config_dict
 from elspeth.contracts.data import CompatibilityResult
 from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.core.config import ElspethSettings, load_bounded_pipeline_yaml
@@ -23,6 +23,7 @@ from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.infrastructure.manager import PluginNotFoundError
 from elspeth.plugins.infrastructure.runtime_factory import PluginBundle
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
+from elspeth.web.execution._rendered_pipeline_yaml import RenderedPipelineYaml
 from elspeth.web.execution._validation_diagnostics import (
     _EdgePatchTarget,
     _GateFanOutFinding,
@@ -104,7 +105,7 @@ def _materialized(
             semantic_contracts=(_contract(),),
         ),
         materialized_state=materialized_state or policy_state,
-        pipeline_yaml=pipeline_yaml,
+        pipeline=RenderedPipelineYaml.of_text(pipeline_yaml),
     )
 
 
@@ -221,17 +222,13 @@ def _reframe_missing(exc: PydanticValidationError) -> list[ValidationError]:
 def test_settings_phase_loads_exact_yaml_without_host_expansion_and_detaches_evidence() -> None:
     materialized = _materialized(pipeline_yaml="sources: {}\nsinks: {}\n")
     parsed_settings = _settings()
-    load_yaml = _autospec_callable(load_bounded_pipeline_yaml, return_value={"sources": {}, "sinks": {}})
-    load_settings_yaml = _autospec_callable(load_settings_from_yaml_string, return_value=parsed_settings)
-    load_settings_dict = _autospec_callable(load_settings_from_config_dict)
+    load_settings_dict = _autospec_callable(load_settings_from_config_dict, return_value=parsed_settings)
 
     result = load_runtime_settings(
         materialized,
         operator_settings=None,
         secret_service=None,
         user_id=None,
-        load_yaml=load_yaml,
-        load_settings_yaml=load_settings_yaml,
         load_settings_dict=load_settings_dict,
         reframe_missing_parts=_reframe_missing,
     )
@@ -244,9 +241,9 @@ def test_settings_phase_loads_exact_yaml_without_host_expansion_and_detaches_evi
     assert result.artifact.materialized.materialized_state is materialized.materialized_state
     assert result.artifact.materialized.authored.semantic_contracts[0].outcome == "satisfied"
     assert [(check.name, check.detail) for check in result.checks] == [("settings_load", "Settings loaded successfully")]
-    load_settings_yaml.assert_called_once_with(materialized.pipeline_yaml, expand_env_vars=False)
-    load_yaml.assert_called_once_with(materialized.pipeline_yaml)
-    load_settings_dict.assert_not_called()
+    # The one bounded load of the exact text feeds the settings load; the
+    # text is not parsed a second time through a YAML-string settings loader.
+    load_settings_dict.assert_called_once_with({"sources": {}, "sinks": {}}, expand_env_vars=False)
 
 
 def test_settings_phase_reframes_missing_parts_but_retains_raw_check_detail() -> None:
@@ -262,9 +259,7 @@ def test_settings_phase_reframes_missing_parts_but_retains_raw_check_detail() ->
         operator_settings=None,
         secret_service=None,
         user_id=None,
-        load_yaml=load_bounded_pipeline_yaml,
-        load_settings_yaml=_autospec_callable(load_settings_from_yaml_string, side_effect=exc_info.value),
-        load_settings_dict=_autospec_callable(load_settings_from_config_dict),
+        load_settings_dict=_autospec_callable(load_settings_from_config_dict, side_effect=exc_info.value),
         reframe_missing_parts=_reframe_missing,
     )
 
@@ -283,9 +278,7 @@ def test_settings_phase_converts_only_expected_non_pydantic_errors(error: Except
         operator_settings=None,
         secret_service=None,
         user_id=None,
-        load_yaml=load_bounded_pipeline_yaml,
-        load_settings_yaml=_autospec_callable(load_settings_from_yaml_string, side_effect=error),
-        load_settings_dict=_autospec_callable(load_settings_from_config_dict),
+        load_settings_dict=_autospec_callable(load_settings_from_config_dict, side_effect=error),
         reframe_missing_parts=_reframe_missing,
     )
 
@@ -302,9 +295,7 @@ def test_settings_phase_propagates_unexpected_exceptions() -> None:
             operator_settings=None,
             secret_service=None,
             user_id=None,
-            load_yaml=load_bounded_pipeline_yaml,
-            load_settings_yaml=_autospec_callable(load_settings_from_yaml_string, side_effect=RuntimeError("loader invariant")),
-            load_settings_dict=_autospec_callable(load_settings_from_config_dict),
+            load_settings_dict=_autospec_callable(load_settings_from_config_dict, side_effect=RuntimeError("loader invariant")),
             reframe_missing_parts=_reframe_missing,
         )
 
@@ -336,7 +327,6 @@ def test_private_validation_refuses_nonlive_before_secret_access(
     monkeypatch.setattr(_validation_runtime, "redact_secret_refs_for_validation", forbid_secrets)
     materialized = _materialized(pipeline_yaml=f"{invocation}\nsources: {{}}\nsinks: {{}}\nprivate: {{secret_ref: FLOW_URL}}\n")
     materialized = replace(materialized, authored=replace(materialized.authored, all_secret_refs=(("FLOW_URL", None),)))
-    load_settings_yaml = _autospec_callable(load_settings_from_yaml_string)
     load_settings_dict = _autospec_callable(load_settings_from_config_dict)
     result = load_runtime_settings(
         materialized,
@@ -345,15 +335,12 @@ def test_private_validation_refuses_nonlive_before_secret_access(
         if secret_resolver_present
         else None,
         user_id="test",
-        load_yaml=load_bounded_pipeline_yaml,
-        load_settings_yaml=load_settings_yaml,
         load_settings_dict=load_settings_dict,
         reframe_missing_parts=_reframe_missing,
     )
     assert isinstance(result, PhaseFailure)
     assert result.failed_check.name == "settings_load"
     assert result.failed_check.detail == "Web execution does not support nonlive run invocation"
-    load_settings_yaml.assert_not_called()
     load_settings_dict.assert_not_called()
 
 
@@ -363,7 +350,7 @@ def test_private_validation_live_invocation_reaches_ordinary_secret_resolution(i
 
     materialized = _materialized(pipeline_yaml=f"{invocation}sources: {{}}\nsinks: {{}}\nprivate: {{secret_ref: FLOW_URL}}\n")
     materialized = replace(materialized, authored=replace(materialized.authored, all_secret_refs=(("FLOW_URL", None),)))
-    parsed_config = load_bounded_pipeline_yaml(materialized.pipeline_yaml)
+    parsed_config = load_bounded_pipeline_yaml(materialized.pipeline.text)
     resolve = _autospec_callable(_validation_runtime.resolve_secret_refs, spec_set=True, return_value=(parsed_config, ()))
     monkeypatch.setattr(_validation_runtime, "resolve_secret_refs", resolve)
     parsed_settings = _settings()
@@ -373,8 +360,6 @@ def test_private_validation_live_invocation_reaches_ordinary_secret_resolution(i
         operator_settings=None,
         secret_service=cast(WebSecretResolver, create_autospec(WebSecretResolver, instance=True, spec_set=True)),
         user_id="test",
-        load_yaml=load_bounded_pipeline_yaml,
-        load_settings_yaml=_autospec_callable(load_settings_from_yaml_string),
         load_settings_dict=loader,
         reframe_missing_parts=_reframe_missing,
     )

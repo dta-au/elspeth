@@ -90,12 +90,12 @@ GRAMMARS = {
     "_handle_convergence_error": "829a9f5cde2707ab04fb6a898a6a9e267246373a30f6f27a13974dda48f81058",
     "_handle_plugin_crash": "c0345259ed743d014249dfc660177a0f614e7d48572bd85107b2dbf1cc33aa25",
     "_handle_runtime_preflight_failure": "fd3578fce1748f626a5c0e09fab7f7f60f15c1e8ee0e8c950f580c378f553865",
-    "_run_composer_turn": "b369e747e2366dc835a4fd9cf662243cefbf3868b4a9ee1b1f72ccf6e3fbd757",
+    "_run_composer_turn": "cf624d7b64fa60d341d1d6f6bb0b57b05f0a6b644f43985e1a12e526393f0ba7",
 }
 IMPORT_GRAMMARS = {
     "src/elspeth/web/sessions/routes/_helpers.py|elspeth.web.required_work": "24c410aedf7d87072b30e0483a70191b9729d6d67166d1ef15b55ff0013b5199",
     "src/elspeth/web/sessions/composer_turn.py|elspeth.web.required_work": "4572b3179e9539f528774bd9f251888fa3c9f2531b5be474427d6339e9ecc32a",
-    "src/elspeth/web/sessions/composer_turn.py|elspeth.web.sessions.routes._helpers": "901b019d65c5e8523ee5ff9afdff54fe99f485ed5edc01283867fac310cf4ba6",
+    "src/elspeth/web/sessions/composer_turn.py|elspeth.web.sessions.routes._helpers": "a3e7eba36a7e36e4506dfabc6c30478e9d7bfd660e94f482a844d449a1d1c1dd",
 }
 
 

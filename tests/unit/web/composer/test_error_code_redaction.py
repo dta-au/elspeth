@@ -108,6 +108,8 @@ _REVIEWED_FORWARDERS: frozenset[tuple[str, str, str]] = frozenset(
         ("composer/tools/transforms.py", "_substring_refusal", "code"),
         ("composer/tools/transforms.py", "_prepare_transform_candidate", "error_code"),
         ("composer/turn_audit.py", "_state_payload_for_compose_turn", "error.error_code"),
+        # Re-emits the primary refusal entry's code, already censused at its producer.
+        ("composer/tools/state_inspection.py", "enforce_state_inspection_limit", "primary.error_code"),
         # The imported ``ADVISOR_SIGNOFF_BLOCKED_CODE`` (pinned below).
         ("composer/advisor_policy.py", "_advisor_signoff_fully_blocking_validation", "_ADVISOR_SIGNOFF_BLOCKED_CODE"),
         # Planner / discovery feedback that projects an already-produced code,
@@ -170,6 +172,8 @@ _REVIEWED_FORWARDERS: frozenset[tuple[str, str, str]] = frozenset(
         ("execution/http_errors.py", "pipeline_validation_http_exception", "err.error_code"),
         # RuntimeYamlImportError's only code is the literal censused at yaml_importer.py.
         ("sessions/routes/composer/state.py", "seed_state_from_runtime_yaml", "exc.error_code"),
+        # PromptFileTooLargeError's only code is a class constant (pinned below).
+        ("sessions/routes/composer/state.py", "_import_prompt_file_too_large_refusal", "exc.error_code"),
         ("coordination/repository.py", "record_composition_rejection", "error_code"),
         ("sessions/protocol.py", "decode_stored_composition_validation_errors", "error_code"),
         ("sessions/protocol.py", "serialize_composition_validation_error", "value.error_code"),
@@ -427,6 +431,9 @@ class TestRegistryCensus:
             f"{category}_inline_blob_content" for category in get_args(BlobInlineValidationCategory) if category != "not_text"
         } <= REGISTERED_ERROR_CODES
         assert "inline_blob_not_text" in REGISTERED_ERROR_CODES
+        from elspeth.web.sessions.protocol import PromptFileTooLargeError
+
+        assert PromptFileTooLargeError.error_code in REGISTERED_ERROR_CODES
         assert {"web_scrape_private_network_not_allowed", "web_fetch_private_network_not_allowed"} <= REGISTERED_ERROR_CODES
 
     def test_every_blocking_proof_diagnostic_code_is_registered(self) -> None:
@@ -539,7 +546,6 @@ def _persisted_first_error(tool_name: str, error_code: str) -> dict[str, object]
         ("patch_node_options", "plugin_options_invalid"),
         ("patch_node_options", "prompt_template_parts_required"),
         ("inspect_prompt_targets", "inspect_after_uncheckpointed_mutation"),
-        ("wire_blob_inline_ref", "prompt_template_parts_required"),
         ("wire_blob_inline_ref", "inline_blob_not_text"),
         ("wire_blob_inline_ref", "inline_blob_missing"),
         ("wire_blob_inline_ref", "inline_blob_not_ready"),

@@ -152,6 +152,11 @@ from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from elspeth.web.validation import _redact_sensitive_content
 from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
+from tests.helpers.prompt_guard_audit import (
+    PROMPT_GUARD_AUDIT_SCHEMA_VERSION,
+    assert_prompt_guard_check_shape,
+    unscanned_check_counts,
+)
 from tests.helpers.session_fences import fenced_operation_context
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
@@ -352,6 +357,44 @@ _BATCH_GA_CATALOG_CANONICAL_BYTES = 1335
 _CONTENT_UNDERSTANDING_CATALOG_CANONICAL_BYTES = 595
 # CDA-24 (2026-11-15): diff description measured by AST, 1377 -> 1358 UTF-8 bytes.
 _CDA24_MILESTONE_GUIDANCE_CANONICAL_BYTES = -19
+# Skill review A4 (2026-11-20): pipeline_capabilities.md scopes "one complete
+# document" to building or rebuilding (+233 B on disk). Measured with this
+# assertion's ceiling lowered to 1, live and small catalog alike: the scaffold
+# is 142,045 B before and 142,280 B after, +235 B. Price only that growth.
+_SKILL_REVIEW_A4_CAPABILITY_SCOPE_CANONICAL_BYTES = 235
+# Advisor scope carry (2026-11-20): the step-description field description
+# now says when to supply, preserve and refresh it, and pipeline_capabilities.md
+# teaches preserving description, options and unrelated routes in a
+# full-replacement edit. Measured with this assertion's ceiling lowered to 1 on
+# exported trees, live and small catalog alike: 142,832 B on the base, 143,247 B
+# with only the skill text (+415 B), 143,663 B with the description too
+# (+416 B: four 104 B copies in the canonical pipeline schema). Price only that
+# +831 B growth, preserving the prior 802 B headroom and the exact-boundary /
+# +1-byte overflow control.
+_ADVISOR_SCOPE_DESCRIPTION_GUIDANCE_CANONICAL_BYTES = 831
+# Review correction (2026-11-20): the same pipeline_capabilities.md paragraph
+# now says what a replacing upsert_node keeps (an omitted on_error keeps its
+# choice; an omitted description is dropped; supplied options replace the old
+# ones). Measured the same way: 143,663 B before, 143,749 B after, +86 B, all
+# of it that paragraph (the advisor text edits in the same round are not in
+# this request). Price only that growth; headroom and controls unchanged.
+_UPSERT_NODE_KEEPS_CORRECTION_CANONICAL_BYTES = 86
+_P2_READ_GUIDANCE_CANONICAL_BYTES = 237
+# P3 (2026-11-20): list_transforms becomes a selection index. Canonical JSON of
+# its description 629 -> 716 B (+87); get_plugin_assistance stops naming
+# list_transforms as a hints carrier, 905 -> 887 B (-18). Net +69 B, equal to
+# the measured scaffold overshoot (143,940 against a 143,871 ceiling).
+_P3_LISTING_INDEX_CANONICAL_BYTES = 69
+# P3 (2026-11-20, lead ruling option 1): get_plugin_schema returns and names
+# `usage_when_not_to_use`; its description's canonical JSON grows 420 -> 531 B
+# (+111), equal to the measured scaffold overshoot (144,051 against 143,940).
+# The pipeline_composer.md teaching line is not in the planner scaffold.
+_P3_SCHEMA_PROHIBITION_CANONICAL_BYTES = 111
+# Inline prompt limit: set_pipeline options description, 15,029 -> 15,266 B; measured on candidate 4 at 145,205 vs 144,968.
+_INLINE_PROMPT_LIMIT_CANONICAL_BYTES = 237
+# get_pipeline_state description names the document set_pipeline wraps ("that document" ->
+# "the flat `set_pipeline_arguments` document", +29 B); measured on candidate 4 at 145,234 vs 145,205.
+_GET_PIPELINE_STATE_WRAP_ANTECEDENT_CANONICAL_BYTES = 29
 _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
     int(_FIXED_SCAFFOLDING_BASELINE_BYTES * 1.10)
     + _POWER_AUTOMATE_CATALOG_CANONICAL_BYTES
@@ -371,6 +414,14 @@ _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
     + _BATCH_GA_CATALOG_CANONICAL_BYTES
     + _CONTENT_UNDERSTANDING_CATALOG_CANONICAL_BYTES
     + _CDA24_MILESTONE_GUIDANCE_CANONICAL_BYTES
+    + _SKILL_REVIEW_A4_CAPABILITY_SCOPE_CANONICAL_BYTES
+    + _ADVISOR_SCOPE_DESCRIPTION_GUIDANCE_CANONICAL_BYTES
+    + _UPSERT_NODE_KEEPS_CORRECTION_CANONICAL_BYTES
+    + _P2_READ_GUIDANCE_CANONICAL_BYTES
+    + _P3_LISTING_INDEX_CANONICAL_BYTES
+    + _P3_SCHEMA_PROHIBITION_CANONICAL_BYTES
+    + _INLINE_PROMPT_LIMIT_CANONICAL_BYTES
+    + _GET_PIPELINE_STATE_WRAP_ANTECEDENT_CANONICAL_BYTES
 )
 
 
@@ -928,6 +979,7 @@ async def _plan(
     policy_override: Any = None,
     retained_operation_context: pipeline_planner.RetainedOperationContext | None = None,
     turn_evidence: pipeline_planner.TurnEvidence | None = None,
+    turn_evidence_initial_state: CompositionState | None = None,
     context_policy: ContextBudgetPolicy | None = None,
     context_budget_history: ContextBudgetHistory | None = None,
 ) -> Any:
@@ -1015,7 +1067,18 @@ async def _plan(
                     mark_schema_loaded=mark_schema_loaded,
                     conversation_context=conversation_context,
                     retained_operation_context=retained_operation_context,
-                    turn_evidence=turn_evidence,
+                    turn_evidence=(
+                        pipeline_planner.TurnEvidence(
+                            session_id=origin.session_id,
+                            session_operation_context=operation_context,
+                            request_id=origin.message_id,
+                            request=origin.content,
+                            initial_state_id=None,
+                            initial_state=turn_evidence_initial_state,
+                        )
+                        if turn_evidence_initial_state is not None
+                        else turn_evidence
+                    ),
                     policy_catalog=policy_catalog,
                     plugin_snapshot=plugin_snapshot,
                     originating_message=origin,
@@ -1865,6 +1928,39 @@ async def test_digest_omission_keeps_inventory_available_after_details_close(
 
 
 @pytest.mark.asyncio
+async def test_omitted_transform_prohibition_gap_closes_only_on_that_plugins_schema_read(
+    tmp_path: Path, tool_context: ToolContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An oversized transform ``not_for`` is a per-plugin schema gap: list_transforms leaves it open."""
+    from elspeth.plugins.infrastructure.manager import PluginManager
+    from elspeth.web.catalog.service import CatalogServiceImpl
+
+    manager = PluginManager()
+    manager.register_builtin_plugins()
+    prohibition = "Do not use this plugin for synthetic oversized prohibition probes. " * 40
+    monkeypatch.setattr(manager.get_transform_by_name("passthrough"), "usage_when_not_to_use", prohibition)
+    catalog = CatalogServiceImpl(manager)
+    completion = _ScriptedCompletion(
+        _response_with_call_id("index", "list_transforms", {}),
+        _response_with_call_id("schema", "get_plugin_schema", {"plugin_type": "transform", "name": "passthrough"}),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, information_aware=True, catalog_service=catalog)
+
+    reference = json.loads(completion.requests[0]["messages"][1]["content"])
+    entry = next(item for item in reference["authoring_aids"]["discovery_digest"]["plugins"]["transforms"] if item["name"] == "passthrough")
+    assert "not_for_omitted" in entry and entry["not_for_omitted"]["details_via"] == "get_plugin_schema"
+    payload = json.loads(completion.requests[0]["messages"][-1]["content"])
+    assert payload["information_manifest"]["unresolved"] == ["plugin.schema:transform/passthrough"]
+    closure = "All declared information gaps are closed; emit the terminal proposal now."
+    assert len(completion.requests) == 3
+    # After the index read the gap is still open; after the plugin's schema read it closes.
+    assert not any(message.get("content") == closure for message in completion.requests[1]["messages"])
+    assert sum(message.get("content") == closure for message in completion.requests[2]["messages"]) == 1
+
+
+@pytest.mark.asyncio
 async def test_alias_metadata_success_resolves_the_canonical_fact_in_the_next_planner_request(tmp_path, tool_context):
     from elspeth.web.blobs.service import BlobServiceImpl
     from tests.fixtures.resource_identity import uuid_spelling
@@ -2570,8 +2666,12 @@ def restricted_discovery_producer(tmp_path: Path, tool_context: ToolContext) -> 
         return execute_discovery_tool_with_context(tool_name, dict(_DISCOVERY_TEST_ARGUMENTS[tool_name]), _empty_state(), context)
 
     with (
-        patch.object(blobs, "_sync_list_blobs", autospec=True, return_value=[]),
-        patch.object(blobs, "_sync_list_ready_blob_inline_descriptors", autospec=True, return_value=[]),
+        patch.object(
+            blobs,
+            "_sync_read_blob_list",
+            autospec=True,
+            return_value=blobs._BlobListRead(records=(), matching_total=0, ready_only=False),
+        ),
         patch.object(blobs, "_sync_get_blob", autospec=True, return_value=record),
         patch.object(blobs, "_locked_read_ready_blob", autospec=True, return_value=(record, content)),
         patch.object(sources, "_sync_get_blob", autospec=True, return_value=record),
@@ -5355,8 +5455,9 @@ def _assert_debug_guard_audit(row: dict[str, Any], context: SessionOperationCont
     assert type(check["duration_ms"]) is int and check["duration_ms"] >= 0
     assert len(check["request_hash"]) == 64
     assert int(check["request_hash"], 16) >= 0
+    assert_prompt_guard_check_shape(check)
     assert check == {
-        "schema_version": 1,
+        "schema_version": PROMPT_GUARD_AUDIT_SCHEMA_VERSION,
         "audit_id": check["audit_id"],
         "operation_id": context.fence.operation_id,
         "operation_epoch": context.fence.operation_epoch,
@@ -5380,6 +5481,7 @@ def _assert_debug_guard_audit(row: dict[str, Any], context: SessionOperationCont
         "reason": "guard_not_configured",
         "started_at": check["started_at"],
         "duration_ms": check["duration_ms"],
+        **unscanned_check_counts(),
     }
     assert row["content"] == json.dumps(envelope, sort_keys=True)
 
@@ -6920,7 +7022,8 @@ async def test_blob_content_discovery_buffers_admitted_result_and_redacts_persis
     assert invocation.tool_name == "get_blob_content"
     buffered = json.loads(invocation.result_canonical or "{}")
     assert buffered["data"]["content"] == "name,score\nada,42\n"
-    assert "affected_nodes" in buffered and "errors" in buffered["validation"]
+    # A successful file read carries no validation block, on the wire or in its buffered record.
+    assert "affected_nodes" in buffered and "validation" not in buffered
     from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
 
     summary, envelope = redacted_tool_invocation_content_and_envelope(invocation)

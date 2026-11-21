@@ -52,6 +52,8 @@ export interface PromptQueryEntry {
   selector: string;
   /** Reader-facing name: the entry's `name` (list form, `#<index>` if unnamed) or the mapping key. */
   name: string;
+  /** One-based list position; absent for mapping entries. */
+  position?: number;
   entry: Record<string, unknown>;
 }
 
@@ -65,13 +67,18 @@ export function promptQueryEntries(queries: unknown): PromptQueryEntry[] {
     typeof value === "object" && value !== null && !Array.isArray(value);
   if (Array.isArray(queries)) {
     return queries.flatMap((entry, index) => isEntry(entry)
-      ? [{ selector: String(index), name: typeof entry.name === "string" && entry.name !== "" ? entry.name : `#${index}`, entry }]
+      ? [{ selector: String(index), name: typeof entry.name === "string" && entry.name !== "" ? entry.name : `#${index}`, position: index + 1, entry }]
       : []);
   }
   if (isEntry(queries)) {
     return Object.entries(queries).flatMap(([key, entry]) => isEntry(entry) ? [{ selector: key, name: key, entry }] : []);
   }
   return [];
+}
+
+/** Every list label includes its position, including when its name is unique. */
+export function promptQueryCopyName(query: PromptQueryEntry): string {
+  return query.position === undefined ? query.name : `${query.name} (position ${query.position})`;
 }
 
 export function promptQueryTemplatePath(selector: string): string {
@@ -102,13 +109,32 @@ export function promptFileBindings(state: CompositionState | null): PromptFileBi
     }) : []);
 }
 
+/**
+ * `opens` says what Edit does for a refused save: `true` opens the editor
+ * read-only (Save disabled, `reason` shown), `false` is a file that cannot be
+ * shown as prompt text at all (missing, still processing, not text).
+ */
 export type PromptFileEditability =
   | { editable: true }
-  | { editable: false; code: string; reason: string };
+  | { editable: false; code: string; reason: string; opens: boolean };
+
+/** `prompt_file_unbound`: the slot no longer reads this file. */
+export const PROMPT_FILE_UNBOUND_REASON =
+  "This prompt no longer reads this file. Your text is kept. Refresh the pipeline to see where the prompt points now.";
 
 const EDITABLE_MIME_TYPES = new Set(["text/plain", "text/csv", "application/json", "application/x-jsonlines", "application/jsonl", "text/jsonl"]);
 
-/** Display mirror only. The server remains the save authority. */
+/** Whether a file's type can hold prompt text: the same set the prompt editor opens. */
+export function isPromptTextMimeType(mimeType: string): boolean {
+  return EDITABLE_MIME_TYPES.has(mimeType);
+}
+
+/**
+ * Display mirror of the save route's refusals (blobs/prompt_text_routes.py);
+ * the server remains the save authority. Not mirrored, because only the
+ * server can see it: whether the step's last approvals still cover its whole
+ * prompt surface (`prompt_file_stale` on save).
+ */
 export function promptFileEditability({ state, blobs, pendingEvents, nodeId, fieldPath, blobId }: {
   state: CompositionState | null;
   blobs: readonly BlobMetadata[];
@@ -117,12 +143,12 @@ export function promptFileEditability({ state, blobs, pendingEvents, nodeId, fie
   fieldPath: string;
   blobId: string;
 }): PromptFileEditability {
-  const refuse = (code: string, reason: string): PromptFileEditability => ({ editable: false, code, reason });
+  const refuse = (code: string, reason: string, opens = true): PromptFileEditability => ({ editable: false, code, reason, opens });
   const id = blobId.toLowerCase();
   const blob = blobs.find((item) => item.id.toLowerCase() === id);
-  if (!blob) return refuse("prompt_file_not_found", "This file is not in this session.");
-  if (blob.status !== "ready") return refuse("prompt_file_not_ready", "This file is still being processed.");
-  if (!EDITABLE_MIME_TYPES.has(blob.mime_type)) return refuse("prompt_file_not_text", "Only UTF-8 text files can be edited here.");
+  if (!blob) return refuse("prompt_file_not_found", "This file is not in this session.", false);
+  if (blob.status !== "ready") return refuse("prompt_file_not_ready", "This file is still being processed.", false);
+  if (!EDITABLE_MIME_TYPES.has(blob.mime_type)) return refuse("prompt_file_not_text", "Only UTF-8 text files can be edited here.", false);
   if (state === null) return { editable: true };
   const bindings = promptFileBindings(state);
   const promptReferences = new Set(bindings.map((binding) => `${binding.nodeId}:${binding.fieldPath}:${binding.blobId}`));
@@ -130,20 +156,28 @@ export function promptFileEditability({ state, blobs, pendingEvents, nodeId, fie
     || state.outputs.some((output) => optionBlobReferences(output.options).some((ref) => ref.blobId === id))
     || state.nodes.some((node) => optionBlobReferences(node.options).some((ref) =>
       ref.blobId === id && !promptReferences.has(`${node.id}:${ref.fieldPath}:${id}`)));
-  if (mixed) return refuse("prompt_file_mixed_use", "This file is also used outside a prompt. Ask the assistant to give this prompt its own file.");
+  if (mixed) return refuse("prompt_file_mixed_use", "This file is also used outside a prompt. Ask Composer to give this prompt its own file.");
   const matches = bindings.filter((binding) => binding.blobId === id);
   if (matches.length > 1) return refuse("prompt_file_shared_binding", "This file backs more than one prompt. Give each prompt its own file before editing it here.");
   const node = state.nodes.find((candidate) => candidate.id === nodeId);
   if (!node || !matches.some((binding) => binding.nodeId === nodeId && binding.fieldPath === fieldPath)) {
-    return refuse("prompt_file_unbound", "This prompt file is no longer bound here. Reload the session.");
-  }
-  if (bindings.filter((binding) => binding.nodeId === nodeId).length > 1) {
-    return refuse("prompt_file_node_multi_binding", "This node uses more than one prompt file. Re-point it through the agent and approve the review card.");
+    // Never "reload": unsaved prompt drafts live in memory only. The editor
+    // pairs this reason with "Refresh pipeline" (a graph read).
+    return refuse("prompt_file_unbound", PROMPT_FILE_UNBOUND_REASON);
   }
   if (matches[0]?.encoding !== "utf-8") return refuse("prompt_file_encoding_unsupported", "This prompt reads the file as non-UTF-8 text. Re-attach it as UTF-8 to edit it here.");
-  if (pendingEvents.some((event) => event.choice === "pending" && event.kind === "llm_prompt_template" && event.affected_node_id === nodeId)
-    && promptFileSlots(node.options).some((slot) => slot.fieldPath !== fieldPath && typeof slot.value === "string")) {
-    return refuse("prompt_file_review_pending_inline", "Approve the review card first, then edit the file.");
+  // A step may use several prompt files; each is edited on its own. While the
+  // step's review card is pending, though, the card covers every prompt slot
+  // and this editor shows one file, so any other slot keeps the save refused.
+  if (pendingEvents.some((event) => event.choice === "pending" && event.kind === "llm_prompt_template" && event.affected_node_id === nodeId)) {
+    const unseen = promptFileSlots(node.options).filter((slot) => slot.fieldPath !== fieldPath && slot.value !== null && slot.value !== undefined);
+    // Another prompt file is reported first, inline text only when no other file is involved.
+    if (unseen.some((slot) => typeof slot.value !== "string")) {
+      return refuse("prompt_file_review_pending", "Complete the existing node review before editing its files.");
+    }
+    if (unseen.length > 0) {
+      return refuse("prompt_file_review_pending_inline", "Approve the review card first, then edit the file.");
+    }
   }
   return { editable: true };
 }

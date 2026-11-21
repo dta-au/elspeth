@@ -5,7 +5,7 @@ From T8 the service resolves each route's dialect from ``composer_model`` /
 (``strict_transport.resolve_composer_tool_contract``). Under the default
 ``preferred``:
 
-- an OpenRouter planner with no custom base (row 4) sends the 36 mechanical
+- an OpenRouter planner with no custom base (row 4) sends the 37 mechanical
   tools with ``strict: true`` and the 10 option tools with ``strict: false``,
   and each LLM call records ``openai_strict`` with its strict-tool count;
 - ``composer_strict_tools="off"`` and the default ``gpt-5.5`` (row 7, ruling 7)
@@ -37,6 +37,7 @@ from elspeth.web.composer.service import ComposerAvailability, ComposerServiceIm
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.config import WebSettings
 from elspeth.web.prompt_guard_config import PromptGuardSettings
+from tests.helpers.prompt_guard_audit import assert_prompt_guard_wire_payload
 from tests.unit.web.composer._helpers import (
     FakeChoice,
     FakeFunction,
@@ -98,8 +99,8 @@ def _install_required_azure_guards(monkeypatch: pytest.MonkeyPatch, *, user_prom
         assert request.url.path == "/contentsafety/text:shieldPrompt"
         assert request.url.params["api-version"] == "2024-09-01"
         payload = json.loads(request.content)
-        assert type(payload) is dict and set(payload) == {"userPrompt", "documents"}
-        assert payload["userPrompt"] == user_prompt
+        assert type(payload) is dict
+        assert_prompt_guard_wire_payload(payload, user_prompt=user_prompt)
         assert type(payload["documents"]) is list
         assert all(type(document) is str for document in payload["documents"])
         requests.append(request)
@@ -166,10 +167,10 @@ def _strict_flags(tools: list[dict[str, Any]]) -> list[object]:
 @pytest.mark.parametrize(
     ("overrides", "dialect", "strict_count"),
     [
-        ({"composer_model": _OPENROUTER_PLANNER}, _STRICT, 36),
+        ({"composer_model": _OPENROUTER_PLANNER}, _STRICT, 37),
         ({"composer_model": _OPENROUTER_PLANNER, "composer_strict_tools": "off"}, _NONE, 0),
         ({}, _NONE, 0),
-        ({"composer_strict_tools": "forward_to_endpoint"}, _STRICT, 36),
+        ({"composer_strict_tools": "forward_to_endpoint"}, _STRICT, 37),
     ],
     ids=["openrouter_preferred", "openrouter_off", "default_gpt_5_5", "gpt_5_5_forward_to_endpoint"],
 )
@@ -190,9 +191,9 @@ async def test_compose_turn_sends_and_records_the_resolved_dialect(
     assert result.repair_turns_used == 0
     for request, call in zip(completion.call_args_list, result.llm_calls, strict=True):
         sent = request.kwargs["tools"]
-        assert len(sent) == 47
+        assert len(sent) == 48
         if dialect is _STRICT:
-            assert _strict_flags(sent).count(True) == 36
+            assert _strict_flags(sent).count(True) == 37
             assert _strict_flags(sent).count(False) == 11
         else:
             assert set(_strict_flags(sent)) == {"omitted"}

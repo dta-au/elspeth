@@ -40,8 +40,11 @@ def _predecessor(state, *, refused=True, output_name="refused_connection"):
     node = project_server_owned_option_metadata(state.to_dict())["nodes"][0]
     node["on_success"] = output_name
     if refused:
-        # Omit required wiring while retaining accepted vague-term identities.
+        # Change the text and omit the parts while retaining accepted vague-term
+        # identities. The stored prompt's own text without its parts is kept,
+        # not refused, so the text must change for the write to be refused.
         del node["options"]["prompt_template_parts"]
+        node["options"]["prompt_template"] += " Answer in one sentence."
     return node
 
 
@@ -81,7 +84,7 @@ async def test_refused_reviewed_route_does_not_admit_dependent_successor():
     )
     outcomes = result.tool_outcomes_for_assertion
     assert not outcomes[0].response.success
-    assert outcomes[0].response.validation.errors[0].error_code == "review_reconciliation_failed"
+    assert outcomes[0].response.validation.errors[0].error_code == "prompt_template_parts_required"
     assert not outcomes[1].response.success
     assert outcomes[1].response.validation.errors[0].error_code == "batch_dependency_refused"
     assert outcomes[1].pre_version == outcomes[1].post_version

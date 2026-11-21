@@ -78,12 +78,14 @@ _EMITTED_VALIDATION_ERROR_CODES: Final[frozenset[str]] = frozenset(
         "collector_scope_policy_invalid",
         "connection_sink_name_overlap",
         "contract_config_invalid",
+        "contract_probe_deferred",
         "credential_material_rejected",
         "credential_literal_forbidden",
         "deferred_intent_claim",
         "diff_baseline_unavailable",
         "duplicate_connection_consumer",
         "duplicate_connection_producer",
+        "duplicate_component_identity",
         "duplicate_edge_id",
         "duplicate_node_id",
         "duplicate_output_name",
@@ -126,6 +128,7 @@ _EMITTED_VALIDATION_ERROR_CODES: Final[frozenset[str]] = frozenset(
         "inline_source_content_conflict",
         "inline_source_csv_inspection_failed",
         "inline_source_comparison_incomplete",
+        "inspection_response_too_large",
         "invalid_arguments",
         "invalid_target_text",
         "invalid_utf8",
@@ -157,6 +160,7 @@ _EMITTED_VALIDATION_ERROR_CODES: Final[frozenset[str]] = frozenset(
         "part_not_found",
         "power_automate_origin_not_allowed",
         "prompt_template_parts_required",
+        "inline_prompt_too_long",
         "inline_blob_not_text",
         "inline_blob_missing",
         "inline_blob_not_ready",
@@ -172,6 +176,7 @@ _EMITTED_VALIDATION_ERROR_CODES: Final[frozenset[str]] = frozenset(
         "proof_repair_exhausted",
         "provider_config_path_policy_invalid",
         "quarantine_unknown_output",
+        "queries_patch_omits_existing",
         "query_input_columns_undeclared",
         "query_generated_fields_required",
         "query_template_unbound_row_fields",
@@ -199,6 +204,7 @@ _EMITTED_VALIDATION_ERROR_CODES: Final[frozenset[str]] = frozenset(
         "row_union_timeout_invalid",
         "runtime_preflight_not_run",
         "schema_contract_violation",
+        "server_owned_review_protected",
         "secret_context_unavailable",
         "secret_target_required",
         "secret_target_unsupported",
@@ -283,6 +289,9 @@ _EMITTED_POLICY_AND_EXECUTION_ERROR_CODES: Final[frozenset[str]] = frozenset(
         "missing_secret_ref",
         "missing_sink",
         "missing_source",
+        # Materialization's bound on the resolved configuration's text
+        # (web/execution/_rendered_pipeline_yaml.py).
+        "resolved_pipeline_config_oversized",
         "source_data_contract_analysis_limit_exceeded",
         "state_shape_materialization",
         "unauthorized_secret_ref",
@@ -304,10 +313,15 @@ _EMITTED_POLICY_AND_EXECUTION_ERROR_CODES: Final[frozenset[str]] = frozenset(
         "gate_expression_unbounded_string_amplification",
         "source_inspection_failed",
         "text_source_url_without_web_scrape",
-        # Session-route validation (persisted runtime-preflight failure).
+        # Session-route validation (persisted runtime-preflight failure, and
+        # the YAML import's refusal of a prompt file it cannot verify or that
+        # is over an inline size cap; the last is PromptFileTooLargeError's
+        # code, which the prompt-file save route reports too).
         # Not tool responses; registered so the census covers
         # the whole web tree without a special case.
         "runtime_preflight_failed",
+        "import_prompt_file_unverified",
+        "prompt_file_too_large",
     }
 )
 

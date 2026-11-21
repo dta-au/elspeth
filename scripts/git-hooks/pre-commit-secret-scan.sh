@@ -15,7 +15,8 @@
 # OR add a per-line comment marker `# secret-scan: allow-this-line` (the script ignores
 # lines containing that exact string).
 #
-# DO NOT bypass with --no-verify. The whole point is the safe path is the cheap path.
+# Bypass with --no-verify only with the maintainer's explicit permission for that
+# commit. The whole point is the safe path is the cheap path.
 
 set -euo pipefail
 
@@ -102,7 +103,8 @@ What to do:
     either reword the placeholder to look less credential-shaped
     (e.g., REDACTED-token-style-here), or append the marker
     "# secret-scan: allow-this-line" to the matched line and recommit.
-  - DO NOT use --no-verify. The hook exists so the safe path is the cheap path.
+  - Use --no-verify only with the maintainer's explicit permission for that
+    commit. The hook exists so the safe path is the cheap path.
 EOF
     exit 1
 fi

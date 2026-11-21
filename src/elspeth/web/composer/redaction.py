@@ -19,9 +19,10 @@ from collections.abc import Callable, Iterator, Mapping
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
 from types import MappingProxyType, UnionType
-from typing import Annotated, Any, Literal, TypeAliasType, Union, get_args, get_origin
+from typing import Annotated, Any, Final, Literal, TypeAliasType, Union, get_args, get_origin
 
 from pydantic import (
+    AfterValidator,
     BaseModel,
     BeforeValidator,
     ConfigDict,
@@ -1697,6 +1698,53 @@ class CreateBlobArgumentsModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+# Field bounds for ``report_composer_bug``. The tool's JSON schema
+# (``tools/reports.py``) reads the same constants, so the provider-facing
+# ``maxLength``/``pattern`` and the model that admits the call cannot disagree.
+REPORT_SUMMARY_MAX_CHARS: Final = 240
+REPORT_BEHAVIOR_MAX_CHARS: Final = 4000
+REPORT_GUIDANCE_REFERENCE_MAX_CHARS: Final = 1000
+REPORT_RELATED_TOOL_MAX_CHARS: Final = 100
+REPORT_RELATED_TOOL_PATTERN: Final = r"^[a-z][a-z0-9_]*$"
+
+
+def _require_visible_text(value: str) -> str:
+    """Refuse prose that is empty once whitespace is ignored."""
+    if not value.strip():
+        raise ValueError("expected text with at least one visible character")
+    return value
+
+
+_ReportProse = Annotated[str, AfterValidator(_require_visible_text), Sensitive()]
+
+
+class ReportComposerBugArgumentsModel(BaseModel):
+    """Redaction-bearing argument model for the ``report_composer_bug`` tool.
+
+    The report prose may quote tool errors or document text, so every prose
+    field is :class:`Sensitive`: the assistant row's ``chat_messages.tool_calls``
+    keeps a length-disclosing placeholder. The redaction does not reach the
+    other copies every tool's arguments have: the full text is also kept in
+    the session report file, in the tool row's visible tool event
+    (``received_arguments``) and in the audit row, and the visible event feeds
+    the advisor transcript. ``related_tool`` is limited to a tool-name
+    spelling and is kept in the clear so the call history shows which tool
+    was reported.
+    """
+
+    summary: _ReportProse = Field(min_length=1, max_length=REPORT_SUMMARY_MAX_CHARS)
+    expected_behavior: _ReportProse = Field(min_length=1, max_length=REPORT_BEHAVIOR_MAX_CHARS)
+    observed_behavior: _ReportProse = Field(min_length=1, max_length=REPORT_BEHAVIOR_MAX_CHARS)
+    guidance_reference: Annotated[
+        str | SkipJsonSchema[None],
+        BeforeValidator(_reject_supplied_null),
+        Sensitive(),
+    ] = Field(default=None, min_length=1, max_length=REPORT_GUIDANCE_REFERENCE_MAX_CHARS)
+    related_tool: _OmittableString = Field(default=None, max_length=REPORT_RELATED_TOOL_MAX_CHARS, pattern=REPORT_RELATED_TOOL_PATTERN)
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+
 # ---------------------------------------------------------------------------
 # set_pipeline argument model.
 #
@@ -2830,9 +2878,9 @@ _GET_AUDIT_INFO_REASON = HandlesNoSensitiveDataReason(
 _GET_PIPELINE_STATE_REASON = HandlesNoSensitiveDataReason(
     sensitive_data_locations=("in-memory composition state — structural metadata about the session pipeline",),
     why_arguments_safe=(
-        "get_pipeline_state accepts only an optional component selector string (a node id, "
-        "an output name, 'source', or a full-state alias); the handler indexes into the "
-        "composer state by this name and never echoes LLM-supplied payload into the result."
+        "get_pipeline_state accepts component and JSON-pointer selectors, a since_start boolean, "
+        "a non-negative page offset and a content hash. It reads existing composer state; "
+        "the only echoed selector is the bounded field_path, and no caller-supplied configuration is returned."
     ),
     why_responses_safe=(
         "Response mirrors the operator's own composition — plugin names, node ids, and "
@@ -3063,69 +3111,14 @@ def _summarize_blob_content(content: str) -> str:
     return "<redacted-blob-content>"
 
 
-def _restore_fixed_repair_arguments_for_validation(value: object) -> object:
-    """Admit only our exact fixed sentinel on an idempotent second projection."""
-    return {} if value == "<redacted-repair-arguments>" else value
-
-
-def _summarize_repair_arguments(arguments: Mapping[str, object]) -> str:
-    """Summarizer for ``get_blob_content`` repair-tool-call ``arguments``.
-
-    The validation envelope's ``graph_repair_suggestions[*].tool_sequence[*].
-    arguments`` slot is the one genuinely heterogeneous leaf in the
-    ``get_blob_content`` response surface. It holds the keyword arguments the
-    composer would pass to a repair tool (field paths, node ids, connection
-    selectors) and varies per repair tool, so it cannot be closed-typed the way
-    the surrounding structural fields can. It is NOT source-data lineage — it is
-    derived, advisory repair guidance — so summarizing it to a structural sketch
-    in ``chat_messages.tool_calls`` does not break attributability.
-
-    The mapping is an open carrier: both keys and values may be externally
-    derived. The summary therefore discloses neither names, values, nor count.
-
-    Contract (spec §4.2.6, §9 RSK-03):
-      * MUST NOT raise on any reachable input value.
-      * MUST return ``str``.
-
-    Pydantic validation guarantees a mapping or the stable fixed sentinel
-    before this runs.
-    """
-    del arguments
-    return "<redacted-repair-arguments>"
-
-
-class _RepairToolCallShadowModel(BaseModel):
-    """Redaction shadow for ``_RepairToolCall`` (tools/_common.py).
-
-    Mirrors the serialized ``tool_sequence[*]`` dict: a closed ``tool`` name
-    plus the heterogeneous ``arguments`` mapping. ``arguments`` is the only
-    leaf in the entire ``get_blob_content`` validation envelope that cannot be
-    closed-typed, so it carries a :class:`Sensitive` marker with a structural
-    summarizer (:func:`_summarize_repair_arguments`). It is advisory repair
-    guidance, not source-data lineage, so retaining only its key count is
-    sufficient for audit shape.
-    """
-
-    tool: str
-    arguments: Annotated[
-        Mapping[str, object],
-        BeforeValidator(_restore_fixed_repair_arguments_for_validation),
-        Sensitive(summarizer=_summarize_repair_arguments),
-    ]
-
-    model_config = ConfigDict(extra="forbid")
-
-
 class _AffectedConsumerShadowModel(BaseModel):
     """Redaction shadow for ``_AffectedConsumer`` (tools/_common.py).
 
-    All three fields are pipeline-structural scalar strings (node id and the
-    before/after input descriptors); none carries operator payload.
+    One pipeline-structural scalar string, the consumer's node id; it carries
+    no operator payload.
     """
 
     id: str
-    current_input: str
-    new_input: str
 
     model_config = ConfigDict(extra="forbid")
 
@@ -3133,18 +3126,15 @@ class _AffectedConsumerShadowModel(BaseModel):
 class _GraphRepairSuggestionShadowModel(BaseModel):
     """Redaction shadow for ``_GraphRepairSuggestion`` (tools/_common.py).
 
-    Mirrors a serialized ``graph_repair_suggestions[*]`` dict. Every scalar
-    field is a structural repair descriptor; the two nested lists descend into
-    :class:`_AffectedConsumerShadowModel` and :class:`_RepairToolCallShadowModel`
-    so the walker reaches the single Sensitive ``arguments`` leaf within.
+    Mirrors a serialized ``graph_repair_suggestions[*]`` dict: the facts of one
+    duplicate consumer. Every field is a structural scalar or a list of
+    :class:`_AffectedConsumerShadowModel`; there is no open-carrier leaf.
     """
 
     code: str
     connection: str
-    strategy: str
     reason: str
     affected_consumers: list[_AffectedConsumerShadowModel]
-    tool_sequence: list[_RepairToolCallShadowModel]
 
     model_config = ConfigDict(extra="forbid")
 
@@ -3283,10 +3273,7 @@ class GetBlobContentValidationModel(BaseModel):
     The validation envelope is structural pipeline-validation metadata, not
     blob bytes, so the field as a whole is intentionally NOT marked Sensitive.
     A post-validation scalar projection preserves closed public framing while
-    summarizing free-form text. The
-    ``graph_repair_suggestions[*].tool_sequence[*].arguments`` mapping also
-    carries its own Sensitive structural summarizer in
-    :class:`_RepairToolCallShadowModel`.
+    summarizing free-form text.
     """
 
     is_valid: bool
@@ -3490,7 +3477,7 @@ class ReadAttachmentResponseModel(BaseModel):
     """Sensitive full-file text and recoverable failures share a closed envelope."""
 
     success: bool
-    validation: GetBlobContentValidationModel
+    validation: GetBlobContentValidationModel | None = Field(default=None, exclude_if=lambda validation: validation is None)
     affected_nodes: list[str]
     version: int
     data: ReadAttachmentDataModel | None = Field(default=None, exclude_if=lambda data: data is None)
@@ -3501,6 +3488,10 @@ class ReadAttachmentResponseModel(BaseModel):
     def require_success_data(self) -> ReadAttachmentResponseModel:
         if self.success and self.data is None:
             raise ValueError("Successful read_attachment response requires complete data")
+        if not self.success and self.validation is None:
+            # A successful bounded read carries no validation block; a refusal's
+            # rejection lives only in ``validation.errors`` and must be present.
+            raise ValueError("Refused read_attachment response requires validation")
         return self
 
 
@@ -3514,7 +3505,7 @@ class GetBlobContentResponseModel(BaseModel):
     """
 
     success: bool
-    validation: GetBlobContentValidationModel
+    validation: GetBlobContentValidationModel | None = Field(default=None, exclude_if=lambda validation: validation is None)
     affected_nodes: list[str]
     version: int
     data: GetBlobContentDataModel | None = Field(default=None, exclude_if=lambda data: data is None)
@@ -3525,6 +3516,10 @@ class GetBlobContentResponseModel(BaseModel):
     def require_success_data(self) -> GetBlobContentResponseModel:
         if self.success and self.data is None:
             raise ValueError("Successful get_blob_content response requires data")
+        if not self.success and self.validation is None:
+            # A successful bounded read carries no validation block; a refusal's
+            # rejection lives only in ``validation.errors`` and must be present.
+            raise ValueError("Refused get_blob_content response requires validation")
         return self
 
 
@@ -3773,6 +3768,10 @@ MANIFEST: Mapping[str, ToolRedaction] = MappingProxyType(
             argument_model=CreateBlobArgumentsModel,
             response_model=_ToolResultResponseModel,
         ),
+        "report_composer_bug": ToolRedaction(
+            argument_model=ReportComposerBugArgumentsModel,
+            response_model=_ToolResultResponseModel,
+        ),
         "update_blob": ToolRedaction(
             argument_model=UpdateBlobArgumentsModel,
             response_model=_ToolResultResponseModel,
@@ -3883,7 +3882,7 @@ MANIFEST: Mapping[str, ToolRedaction] = MappingProxyType(
         ),
         "get_pipeline_state": ToolRedaction(
             policy=ToolRedactionPolicy(
-                known_argument_keys=("component",),
+                known_argument_keys=("component", "since_start", "field_path", "offset_chars", "expected_sha256"),
                 handles_no_sensitive_data=True,
                 handles_no_sensitive_data_reason_struct=_GET_PIPELINE_STATE_REASON,
             )
@@ -4326,10 +4325,16 @@ def redact_tool_call_response(
         # an oversized structure.
         over_budget = frozenset(key for key, value in response.items() if not _response_within_projection_budget(value, depth=1))
         response_fields = entry.response_model.model_fields
-        if any(key not in response_fields or response_fields[key].is_required() for key in over_budget):
-            # A required typed field (validation / affected_nodes on the shared
+        if any(
+            key not in response_fields or response_fields[key].is_required() or key in _TOOL_RESULT_ENVELOPE_KEYS for key in over_budget
+        ):
+            # A typed framing field (validation / affected_nodes on the shared
             # ToolResult shadow) cannot take a string sentinel before
-            # validation, and an undeclared key has no field to degrade.
+            # validation, and an undeclared key has no field to degrade. The
+            # framing keys are named as well as the required ones: the bounded
+            # file reads declare ``validation`` optional because a success
+            # omits it, and an over-budget block there must still degrade the
+            # whole row rather than be withheld from a refusal that needs it.
             telemetry.response_projection_limit(tool_name=tool_name, scope="row")
             return dict(_RESPONSE_PROJECTION_LIMIT)
         # Walk the response via its Pydantic model schema.

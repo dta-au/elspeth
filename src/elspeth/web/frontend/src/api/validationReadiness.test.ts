@@ -24,6 +24,13 @@ describe("safe request rejection admission", () => {
     expect("request_rejection" in historical.blockers[0]).toBe(false);
   });
 
+  it("admits a context-limit rejection recognised from the SDK class or a fixed wording", () => {
+    const contextLimit = { ...rejection, reason_code: "context_length_exceeded" };
+    expect(isSafeRequestRejection({ ...contextLimit, reason_source: "sdk_class" })).toBe(true);
+    expect(isSafeRequestRejection({ ...contextLimit, reason_source: "message_pattern" })).toBe(true);
+    expect(isSafeRequestRejection({ ...contextLimit, reason_source: "provider_prose" })).toBe(false);
+  });
+
   it("distinguishes absent and unrecognized reasons without accepting raw prose", () => {
     expect(isSafeRequestRejection({ ...rejection, reason_code: null, reason_disposition: "absent" })).toBe(true);
     expect(isSafeRequestRejection({ ...rejection, reason_code: null, reason_disposition: "unrecognized" })).toBe(true);

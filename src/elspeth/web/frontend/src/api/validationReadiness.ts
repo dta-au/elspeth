@@ -18,7 +18,7 @@ export function isSafeRequestRejection(value: unknown): value is SafeRequestReje
     value.category === "request_rejected" && value.exception_type === "BadRequestError" &&
     (known || code === null) &&
     (disposition === "retained" || disposition === "absent" || disposition === "unrecognized" || disposition === "unavailable") &&
-    (source === "sdk_body" || source === "http_response" || source === "unavailable") &&
+    (source === "sdk_body" || source === "http_response" || source === "sdk_class" || source === "message_pattern" || source === "unavailable") &&
     (disposition === "retained") === known && !(known && source === "unavailable") &&
     (value.diagnostic_reference === null || typeof value.diagnostic_reference === "string" &&
       /^provider-failure:[0-9a-f]{64}$/.test(value.diagnostic_reference)) && value.retryable === false

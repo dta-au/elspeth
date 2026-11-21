@@ -6,7 +6,9 @@ import asyncio
 import contextlib
 import json
 import os
+import shutil
 import sqlite3
+import tempfile
 import threading
 import uuid
 from collections.abc import Callable, Iterator, Mapping
@@ -24,6 +26,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.pool import StaticPool
 from tests.fixtures.identities import grant_test_pipeline_user
+from tests.helpers.prompt_guard_audit import assert_prompt_guard_check_shape, assert_prompt_guard_wire_payload
 from tests.helpers.session_fences import seed_session_operation_fence
 from tests.integration.web.conftest import _make_session
 from tests.property.web.composer.strategies import (
@@ -295,7 +298,7 @@ def _make_harness(tmp_path: Path, *, session_state: SessionState = "empty") -> _
     def shield_response(request: httpx.Request) -> httpx.Response:
         assert request.url.host == _GUARD_HOST
         payload = json.loads(request.content)
-        assert payload["userPrompt"] == _CURRENT_REQUEST
+        assert_prompt_guard_wire_payload(payload, user_prompt=_CURRENT_REQUEST)
         guard_http_requests.append(payload)
         return httpx.Response(
             200,
@@ -442,35 +445,25 @@ def _assert_guard_row(harness: _Harness, row: Any) -> None:
     assert len(envelopes) == 1 and envelopes[0]["_kind"] == "prompt_guard_audit"
     assert json.loads(row.content) == envelopes[0]
     check = envelopes[0]["check"]
-    assert set(check) == {
-        "schema_version",
-        "audit_id",
-        "operation_id",
-        "operation_epoch",
-        "role",
-        "adapter",
-        "mode",
-        "policy_fingerprint",
-        "request_hash",
-        "disposition",
-        "reason",
-        "started_at",
-        "duration_ms",
-    }
-    assert check["schema_version"] == 1
+    assert_prompt_guard_check_shape(check)
     assert str(uuid.UUID(check["audit_id"])) == check["audit_id"]
     assert check["operation_id"] == harness.compose_context.fence.operation_id
     assert check["operation_epoch"] == harness.compose_context.fence.operation_epoch
     assert (check["role"], check["adapter"], check["mode"]) == ("advisor", "azure_prompt_shields", "required")
     assert (check["disposition"], check["reason"]) == ("allow", "clean")
-    assert len(harness.guard_requests) == 1
-    request = harness.guard_requests[0]
-    assert request.role == "advisor" and request.user_prompt == _CURRENT_REQUEST
+    # First check in the session: the user prompt and the documents are
+    # inspected in separate calls, so no document verdict depends on a prompt.
+    assert len(harness.guard_requests) == 2
+    prompt_request, document_request = harness.guard_requests
+    assert prompt_request.role == "advisor" and prompt_request.user_prompt == _CURRENT_REQUEST and prompt_request.documents == ()
+    assert document_request.role == "advisor" and document_request.user_prompt == "" and document_request.documents
     assert check["policy_fingerprint"] == harness.guard_policy_fingerprint
-    assert check["request_hash"] == request.request_hash
+    assert check["request_hash"] == prompt_request.request_hash == document_request.request_hash
+    assert check["units_reused"] == 0 and check["units_scanned"] > 1
     assert harness.guard_http_requests
-    assert all(payload["userPrompt"] == _CURRENT_REQUEST for payload in harness.guard_http_requests)
-    assert tuple(document for payload in harness.guard_http_requests for document in payload["documents"]) == request.documents
+    for payload in harness.guard_http_requests:
+        assert_prompt_guard_wire_payload(payload, user_prompt=_CURRENT_REQUEST)
+    assert tuple(document for payload in harness.guard_http_requests for document in payload["documents"]) == document_request.documents
 
 
 def _provider_accounting_rows(harness: _Harness) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
@@ -826,7 +819,7 @@ def _drive_single_example_trace(
 ) -> _TraceOutcome:
     if failure_injection_point != "none":
         cancellation_arrival_time = "after_response_yielded"
-    tmp_path = Path(os.environ.get("PYTEST_TMPDIR", "/tmp")) / f"cl_pp_prop_{uuid.uuid4().hex}"
+    tmp_path = Path(os.environ.get("PYTEST_TMPDIR") or tempfile.gettempdir()) / f"cl_pp_prop_{uuid.uuid4().hex}"
     tmp_path.mkdir(parents=True, exist_ok=True)
     harness = _make_harness(tmp_path, session_state=session_state)
     body: BaseException | None = None
@@ -848,6 +841,10 @@ def _drive_single_example_trace(
             if body is not None and cleanup is not body:
                 raise BaseExceptionGroup("Property trace body and owned cleanup outcomes", [body, cleanup]) from None
             raise
+        finally:
+            # One directory per generated example: without this each run of the
+            # file leaves its examples' directories behind in the temp root.
+            shutil.rmtree(tmp_path, ignore_errors=True)
 
 
 def _drive_single_example_trace_with(

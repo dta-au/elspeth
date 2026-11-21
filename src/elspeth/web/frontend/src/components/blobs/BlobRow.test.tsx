@@ -412,10 +412,33 @@ describe("BlobRow status indicator (WCAG 1.4.1 non-colour cue)", () => {
   });
 });
 
+describe("BlobRow two-line layout", () => {
+  it("shows the whole name, breakable at its separators, with Edit prompt leading the action line", () => {
+    const filename = "eligibility_criterion_12_user_prompt.txt";
+    const { container } = render(
+      <BlobRow
+        blob={makeBlob({ status: "ready", filename })}
+        sessionId="session-1"
+        onDownload={vi.fn()}
+        onDelete={vi.fn()}
+        onUseAsInput={vi.fn()}
+        onEditPrompt={vi.fn()}
+      />,
+    );
+    const name = container.querySelector(".blob-row-filename");
+    expect(name).toHaveTextContent(filename);
+    expect(name?.querySelectorAll("wbr").length).toBeGreaterThan(0);
+    const actions = container.querySelector(".blob-row-actions") as HTMLElement;
+    const buttons = Array.from(actions.querySelectorAll("button"));
+    expect(buttons[0]).toHaveTextContent("Edit prompt");
+    expect(buttons[0]).toHaveClass("blob-row-edit-prompt");
+  });
+});
+
 describe("BlobRow creator badge", () => {
   it.each([
     ["user", "Created by user", "user"],
-    ["assistant", "Created by assistant", "assistant"],
+    ["assistant", "Created by Composer", "assistant"],
     ["pipeline", "Created by pipeline", "pipeline"],
   ] as const)(
     "exposes the %s creator cue to assistive tech",

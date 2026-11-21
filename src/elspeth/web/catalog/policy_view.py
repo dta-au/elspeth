@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import threading
+from collections import OrderedDict
 from collections.abc import Mapping
-from typing import TYPE_CHECKING
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Final
 
 from elspeth.contracts.plugin_capabilities import PluginCapability
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginKind, PluginSchemaInfo, PluginSummary
+from elspeth.web.catalog.validation_reuse import VALIDATION_REUSE_COUNTER, MutationEpoch
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
 from elspeth.web.plugin_policy.profiles import LoweredPluginConfig, OperatorProfileRegistry
 
@@ -16,6 +20,25 @@ if TYPE_CHECKING:
     from elspeth.web.composer.state import CompositionState
     from elspeth.web.plugin_policy.validation import PluginPolicyValidationResult, ProfileAwareValidationResult
 
+# At most three distinct states were measured per tool call; eight leaves room
+# without holding more than a handful of states the round already holds.
+_VALIDATION_MEMO_MAX_ENTRIES: Final = 8
+
+
+@dataclass(frozen=True, slots=True)
+class _MemoizedValidation:
+    """One returned verdict, bound to the exact state object it judged.
+
+    The strong reference keeps ``id(state)`` from being reused while the
+    entry lives, and a hit also requires ``entry.state is state``. Neither the
+    content hash nor ``==`` is a safe key: both ignore mapping key order, and
+    authoring errors come out in key order.
+    """
+
+    state: CompositionState
+    mutation_epoch: int
+    result: ProfileAwareValidationResult
+
 
 class PolicyCatalogView:
     def __init__(
@@ -23,17 +46,22 @@ class PolicyCatalogView:
         full: CatalogService,
         snapshot: PluginAvailabilitySnapshot,
         profiles: OperatorProfileRegistry,
+        *,
+        validation_memo_enabled: bool = False,
     ) -> None:
         self._full = full
         self.snapshot = snapshot
         self._profiles: OperatorProfileRegistry | None = profiles
         self._full_items_cache: dict[PluginKind, list[PluginSummary]] = {}
+        self._init_validation_reuse(validation_memo_enabled)
 
     @classmethod
     def for_trained_operator(
         cls,
         full: CatalogService,
         snapshot: PluginAvailabilitySnapshot,
+        *,
+        validation_memo_enabled: bool = False,
     ) -> PolicyCatalogView:
         """Return the explicit full-catalog projection for the local MCP."""
         if not snapshot.is_trained_operator:
@@ -43,7 +71,26 @@ class PolicyCatalogView:
         view.snapshot = snapshot
         view._profiles = None
         view._full_items_cache = {}
+        view._init_validation_reuse(validation_memo_enabled)
         return view
+
+    def _init_validation_reuse(self, validation_memo_enabled: bool) -> None:
+        # The view is built per compose call or per request, so the memo and
+        # the epoch live exactly as long as that; nothing outlives the view.
+        self.mutation_epoch = MutationEpoch()
+        self._validation_memo_enabled = validation_memo_enabled
+        self._validation_memo: OrderedDict[int, _MemoizedValidation] = OrderedDict()
+        self._validation_memo_lock = threading.Lock()
+
+    def record_mutation_tool_end(self) -> None:
+        """Advance the round's mutation epoch and drop every memoized verdict.
+
+        Called by ``execute_tool`` when a mutation-kind tool call ends, in a
+        ``finally``. The round's runtime-preflight cache reads the same epoch.
+        """
+        with self._validation_memo_lock:
+            self.mutation_epoch.advance()
+            self._validation_memo.clear()
 
     def _full_items(self, kind: PluginKind) -> list[PluginSummary]:
         """Return this kind's unrestricted catalog listing, fetched at most once per view.
@@ -247,15 +294,57 @@ class PolicyCatalogView:
         )
 
     def validate_composition_state(self, state: CompositionState) -> ProfileAwareValidationResult:
-        """Return the shared authored/executable validation projection."""
+        """Return the shared authored/executable validation projection.
+
+        With the memo enabled, a second call for the same state object in the
+        same mutation epoch returns the first call's result object. Every other
+        verdict input is fixed for the life of this view: ``snapshot`` is a
+        frozen value set at construction, the profile registry and the catalog
+        are fixed, authoring validation reads no blob record (file markers are
+        a fixed placeholder there), no secret and no filesystem path. A call
+        that raises stores nothing, so the next call runs the validation
+        again. The result is frozen dataclasses and tuples throughout, so
+        handing every caller the one object lets none of them change it for
+        another.
+        """
         from elspeth.web.plugin_policy.validation import validate_authored_composition_state
 
-        return validate_authored_composition_state(
+        if not self._validation_memo_enabled:
+            return validate_authored_composition_state(
+                state,
+                snapshot=self.snapshot,
+                profile_registry=self._profiles,
+                catalog=self._full,
+            )
+        # Sound only while authoring validation is a pure function of the
+        # state, the policy snapshot, the profile registry and the catalog.
+        # A blob, secret, clock or mutable-cache read added inside authoring
+        # validation breaks this memo: add that input to the key, or stop
+        # memoizing.
+        with self._validation_memo_lock:
+            epoch = self.mutation_epoch.value
+            key = id(state)
+            if key in self._validation_memo:
+                entry = self._validation_memo[key]
+                if entry.state is state and entry.mutation_epoch == epoch:
+                    self._validation_memo.move_to_end(key)
+                    VALIDATION_REUSE_COUNTER.add(1, {"layer": "policy_view"})
+                    return entry.result
+        result = validate_authored_composition_state(
             state,
             snapshot=self.snapshot,
             profile_registry=self._profiles,
             catalog=self._full,
         )
+        with self._validation_memo_lock:
+            # A mutation that ended while this ran makes the verdict
+            # unreusable; do not store it under an epoch that has passed.
+            if self.mutation_epoch.value == epoch:
+                self._validation_memo[key] = _MemoizedValidation(state=state, mutation_epoch=epoch, result=result)
+                self._validation_memo.move_to_end(key)
+                while len(self._validation_memo) > _VALIDATION_MEMO_MAX_ENTRIES:
+                    self._validation_memo.popitem(last=False)
+        return result
 
     def post_call_hints(
         self,

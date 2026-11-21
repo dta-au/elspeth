@@ -20,7 +20,7 @@ import re
 import warnings
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, NewType
 from urllib.parse import urlparse
 
 import yaml
@@ -118,9 +118,11 @@ _DYNACONF_INTERNAL_KEYS = frozenset(
         "secrets",
     }
 )
-# The web execution path may substitute up to 1 MiB of inline blob content
-# before this in-memory loader parses resolved YAML. Keep the document cap
-# bounded but above that aggregate payload plus ordinary YAML overhead.
+# The text limit for in-memory pipeline YAML a user, the composer or the CLI
+# supplies. A configuration the web preflight resolved (file-held text
+# substituted in) is not judged by this limit: its size is judged as data
+# (web/execution/_rendered_pipeline_yaml.py) and its rendering, if any, is
+# parsed by load_rendered_pipeline_yaml().
 MAX_IN_MEMORY_PIPELINE_YAML_BYTES = 2 * 1024 * 1024
 MAX_IN_MEMORY_PIPELINE_YAML_NODES = 10_000
 MAX_IN_MEMORY_PIPELINE_YAML_DEPTH = 64
@@ -172,6 +174,34 @@ def load_bounded_pipeline_yaml(yaml_content: str) -> Any:
     """Parse in-memory pipeline YAML with safe construction and local limits."""
     if len(yaml_content.encode("utf-8")) > MAX_IN_MEMORY_PIPELINE_YAML_BYTES:
         raise ValueError(f"YAML content exceeds the {MAX_IN_MEMORY_PIPELINE_YAML_BYTES} byte YAML limit")
+    return _load_within_structure_limits(yaml_content)
+
+
+RenderedPipelineYamlText = NewType("RenderedPipelineYamlText", str)
+"""YAML text :func:`render_pipeline_yaml` rendered from a document in memory."""
+
+
+def render_pipeline_yaml(document: object) -> RenderedPipelineYamlText:
+    """Render an in-memory pipeline configuration as ``yaml.dump(document, default_flow_style=False)``."""
+    return RenderedPipelineYamlText(yaml.dump(document, default_flow_style=False))
+
+
+def load_rendered_pipeline_yaml(rendered: RenderedPipelineYamlText) -> Any:
+    """Parse text this process rendered, under every limit but the text byte limit.
+
+    Node count, nesting depth, alias refusal and safe construction apply
+    exactly as in :func:`load_bounded_pipeline_yaml`, with the same errors.
+    The byte limit does not: the text was rendered here from a document whose
+    size its owner judges as data, and the rendered length is not a measure of
+    that size (``yaml.dump`` escapes non-ASCII text, so the same prompt renders
+    1.2 to 3.3 times longer depending on its language). The argument type is
+    produced only by :func:`render_pipeline_yaml`, so YAML a user or the CLI
+    supplied cannot reach this loader without a visible cast.
+    """
+    return _load_within_structure_limits(rendered)
+
+
+def _load_within_structure_limits(yaml_content: str) -> Any:
     try:
         # Explicit Loader= is intentional: _BoundedInMemoryYamlLoader subclasses
         # SafeLoader and only tightens alias/depth/node limits.

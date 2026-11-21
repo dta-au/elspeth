@@ -220,5 +220,6 @@
     }
   ],
   "secret_requirements": [],
+  "usage_when_not_to_use": "Not for pre-LLM prompt attack screening, and source: INPUT does not satisfy the post-generation output-control role. Use aws_bedrock_prompt_shield before the LLM instead.",
   "web_config_authority": "operator_profiled"
 }

@@ -6,15 +6,15 @@ import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Literal
+from typing import Literal, NotRequired, TypedDict
 
 from pydantic import JsonValue, TypeAdapter
 
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.freeze import FrozenJsonArray, freeze_fields
-from elspeth.web.composer.redaction import SetPipelineArgumentsModel
+from elspeth.web.composer.redaction import SetPipelineArgumentsModel, redact_source_storage_path
 from elspeth.web.composer.response_contracts import AdmittedResponse, ResponseContract
-from elspeth.web.composer.state import EdgeSpec, EdgeType, NodeSpec, NodeType, OutputSpec, SourceSpec
+from elspeth.web.composer.state import CompositionState, EdgeSpec, EdgeType, NodeSpec, NodeType, OutputSpec, SourceSpec
 from elspeth.web.composer.tools._common import (
     _FULL_STATE_COMPONENT_ALIASES,
     _serialize_edge,
@@ -87,7 +87,71 @@ class AuthoringStateResponse:
         freeze_fields(self, "nodes", "edges", "outputs", "sources")
 
 
-type PipelineStateResponse = SourceStateResponse | NodeStateResponse | OutputStateResponse | FullStateResponse | AuthoringStateResponse
+@dataclass(frozen=True, slots=True)
+class StateFieldSet:
+    path: tuple[str, ...]
+    value: JsonValue
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "path", "value")
+
+
+@dataclass(frozen=True, slots=True)
+class StateFieldRemoval:
+    path: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class StateChangesResponse:
+    from_version: int
+    changes: tuple[StateFieldSet | StateFieldRemoval, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class StateInspectionPage:
+    view: Literal["structure", "field", "changes"]
+    field_path: str | None
+    encoding: Literal["text", "json"]
+    content: str
+    offset_chars: int
+    total_chars: int
+    next_offset_chars: int | None
+    sha256: str
+
+
+class StateInspectionPagePayload(TypedDict):
+    view: Literal["structure", "field", "changes"]
+    field_path: str | None
+    encoding: Literal["text", "json"]
+    content: str
+    offset_chars: int
+    total_chars: int
+    next_offset_chars: int | None
+    sha256: str
+
+
+class StateChangePayload(TypedDict):
+    operation: Literal["set", "remove"]
+    path: list[str]
+    value: NotRequired[JsonValue]
+
+
+class StateChangesPayload(TypedDict):
+    baseline_kind: Literal["request_start"]
+    from_version: int
+    projection: Literal["identity_keyed_components"]
+    changes: list[StateChangePayload]
+
+
+type PipelineStateResponse = (
+    SourceStateResponse
+    | NodeStateResponse
+    | OutputStateResponse
+    | FullStateResponse
+    | AuthoringStateResponse
+    | StateChangesResponse
+    | StateInspectionPage
+)
 
 _NODE_TYPE: TypeAdapter[NodeType] = TypeAdapter(NodeType)
 _EDGE_TYPE: TypeAdapter[EdgeType] = TypeAdapter(EdgeType)
@@ -392,7 +456,87 @@ def _authoring_sources(value: object) -> Mapping[str, AuthoringSource]:
     return MappingProxyType({name: _authoring_source(item, named=True) for name, item in _mapping(value).items()})
 
 
+def _field_change(value: object) -> StateFieldSet | StateFieldRemoval:
+    if type(value) is StateFieldSet:
+        _require(type(value.path) is tuple)
+        _frozen_config(value.value)
+        wire = _mapping({"operation": "set", "path": value.path, "value": value.value})
+    elif type(value) is StateFieldRemoval:
+        _require(type(value.path) is tuple)
+        wire = _mapping({"operation": "remove", "path": value.path})
+    else:
+        wire = _mapping(value)
+    path = tuple(_text(item) for item in _array(wire["path"]))
+    _require(bool(path) and path[0] in ("sources", "nodes", "edges", "outputs", "metadata", "nodes_order", "edges_order", "outputs_order"))
+    operation = _text(wire["operation"])
+    if operation == "set":
+        _require(set(wire) == {"operation", "path", "value"})
+        return StateFieldSet(path, _json(wire["value"]))
+    _require(operation == "remove" and set(wire) == {"operation", "path"})
+    return StateFieldRemoval(path)
+
+
+def _changes_projection(state: CompositionState) -> dict[str, JsonValue]:
+    """Keep component identity and ordering separate so insertion never copies its neighbours."""
+    _require(not has_duplicate_component_identities(state))
+    sources = redact_source_storage_path({"sources": {name: _serialize_source(source) for name, source in state.sources.items()}})
+    return {
+        "sources": _json(sources["sources"]),
+        "nodes": {node.id: _json(_serialize_node(node)) for node in state.nodes},
+        "edges": {edge.id: _json(_serialize_edge(edge)) for edge in state.edges},
+        "outputs": {output.name: _json(_serialize_output(output)) for output in state.outputs},
+        "nodes_order": [node.id for node in state.nodes],
+        "edges_order": [edge.id for edge in state.edges],
+        "outputs_order": [output.name for output in state.outputs],
+        "metadata": {"name": state.metadata.name, "description": state.metadata.description},
+    }
+
+
+def has_duplicate_component_identities(state: CompositionState) -> bool:
+    """A stored invalid graph may retain duplicate IDs for validation."""
+    return any(
+        len(set(identities)) != len(identities)
+        for identities in (
+            [node.id for node in state.nodes],
+            [edge.id for edge in state.edges],
+            [output.name for output in state.outputs],
+        )
+    )
+
+
+def pipeline_state_changes(baseline: CompositionState, current: CompositionState) -> StateChangesPayload:
+    """Return every net field change from the turn's original, already disclosed graph."""
+    changes: list[StateFieldSet | StateFieldRemoval] = []
+
+    def compare(old: JsonValue, new: JsonValue, path: tuple[str, ...]) -> None:
+        if type(old) is dict and type(new) is dict:
+            for key in sorted(old.keys() - new.keys()):
+                changes.append(StateFieldRemoval((*path, key)))
+            for key in sorted(new):
+                if key not in old:
+                    changes.append(StateFieldSet((*path, key), new[key]))
+                else:
+                    compare(old[key], new[key], (*path, key))
+        elif type(old) is list and type(new) is list:
+            for index in range(min(len(old), len(new))):
+                compare(old[index], new[index], (*path, str(index)))
+            for index in range(len(old) - 1, len(new) - 1, -1):
+                changes.append(StateFieldRemoval((*path, str(index))))
+            for index in range(len(old), len(new)):
+                changes.append(StateFieldSet((*path, str(index)), new[index]))
+        elif type(old) is not type(new) or old != new:
+            changes.append(StateFieldSet(path, new))
+
+    compare(_changes_projection(baseline), _changes_projection(current), ())
+    return state_changes_payload(StateChangesResponse(baseline.version, tuple(changes)))
+
+
 def _parse(value: object) -> PipelineStateResponse:
+    if type(value) is StateInspectionPage:
+        value = _encode(value)
+    if type(value) is StateChangesResponse:
+        _require(type(value.changes) is tuple)
+        return StateChangesResponse(_integer(value.from_version), tuple(_field_change(item) for item in value.changes))
     if type(value) is SourceStateResponse:
         return SourceStateResponse(_owned_sources(value.sources))
     if type(value) is NodeStateResponse:
@@ -438,6 +582,31 @@ def _parse(value: object) -> PipelineStateResponse:
         return result
     wire = _mapping(value)
     keys = set(wire)
+    if keys == {"view", "field_path", "encoding", "content", "offset_chars", "total_chars", "next_offset_chars", "sha256"}:
+        view = _text(wire["view"])
+        encoding = _text(wire["encoding"])
+        _require(view in ("structure", "field", "changes") and encoding in ("text", "json"))
+        content = _text(wire["content"])
+        offset = _integer(wire["offset_chars"])
+        total = _integer(wire["total_chars"])
+        next_offset = None if wire["next_offset_chars"] is None else _integer(wire["next_offset_chars"])
+        digest = _text(wire["sha256"])
+        _require(0 <= offset <= offset + len(content) <= total)
+        _require(next_offset == (offset + len(content) if offset + len(content) < total else None))
+        _require(len(digest) == 64 and all(character in "0123456789abcdef" for character in digest))
+        return StateInspectionPage(
+            TypeAdapter(Literal["structure", "field", "changes"]).validate_python(view, strict=True),
+            _optional_text(wire["field_path"]),
+            TypeAdapter(Literal["text", "json"]).validate_python(encoding, strict=True),
+            content,
+            offset,
+            total,
+            next_offset,
+            digest,
+        )
+    if keys == {"baseline_kind", "from_version", "projection", "changes"}:
+        _require(_text(wire["baseline_kind"]) == "request_start" and _text(wire["projection"]) == "identity_keyed_components")
+        return StateChangesResponse(_integer(wire["from_version"]), tuple(_field_change(item) for item in _array(wire["changes"])))
     if keys == {"sources"}:
         return SourceStateResponse(_sources(wire["sources"]))
     if keys == {"node"}:
@@ -489,7 +658,40 @@ def _authoring_source_wire(value: AuthoringSource) -> JsonValue:
     )
 
 
+def state_inspection_page_payload(value: StateInspectionPage) -> StateInspectionPagePayload:
+    return {
+        "view": value.view,
+        "field_path": value.field_path,
+        "encoding": value.encoding,
+        "content": value.content,
+        "offset_chars": value.offset_chars,
+        "total_chars": value.total_chars,
+        "next_offset_chars": value.next_offset_chars,
+        "sha256": value.sha256,
+    }
+
+
+def state_changes_payload(value: StateChangesResponse) -> StateChangesPayload:
+    changes: list[StateChangePayload] = []
+    for change in value.changes:
+        if type(change) is StateFieldSet:
+            changes.append({"operation": "set", "path": list(change.path), "value": _json(change.value)})
+        else:
+            _require(type(change) is StateFieldRemoval)
+            changes.append({"operation": "remove", "path": list(change.path)})
+    return {
+        "baseline_kind": "request_start",
+        "from_version": value.from_version,
+        "projection": "identity_keyed_components",
+        "changes": changes,
+    }
+
+
 def _encode(value: PipelineStateResponse) -> JsonValue:
+    if type(value) is StateInspectionPage:
+        return _json(state_inspection_page_payload(value))
+    if type(value) is StateChangesResponse:
+        return _json(state_changes_payload(value))
     if type(value) is SourceStateResponse:
         return {"sources": {name: _json(_serialize_source(source)) for name, source in value.sources.items()}}
     if type(value) is NodeStateResponse:

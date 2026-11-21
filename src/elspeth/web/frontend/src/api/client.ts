@@ -1,5 +1,6 @@
 import { canonicalUuid, operationKind, validateComposerRecoveryBody, decodeComposerOperationAck, decodeComposerOperationSnapshot, decodeComposerOperationFailurePage } from "./composerOperationDecoder";
 import { authFetch, currentAuthGeneration, isCurrentAuthGeneration, responseOwnsCredential } from "./authSession";
+import { BLOB_LIST_MAX_FILES, BLOB_LIST_PAGE_SIZE, BlobListTruncatedError } from "./blobListing";
 // ============================================================================
 // ELSPETH API Client
 //
@@ -1588,12 +1589,51 @@ export async function uploadBlob(
   return parseResponse<BlobMetadata>(response);
 }
 
-/** List all blobs for a session. */
+/**
+ * List every blob for a session, newest first.
+ *
+ * The route returns one page per request (100 by default, 500 at most), so
+ * this pages until the session is exhausted. Every "is this file in the
+ * session?" check reads the result as the whole session; a single default
+ * page made files older than the newest 50 read as absent.
+ *
+ * Rows are de-duplicated by id: a file created between two page requests
+ * shifts the offset window by one and repeats a row. A file deleted between
+ * two requests can hide one row until the next load.
+ *
+ * Throws `BlobListTruncatedError` (carrying the newest files) when the
+ * session holds more than `BLOB_LIST_MAX_FILES`.
+ */
 export async function listBlobs(sessionId: string): Promise<BlobMetadata[]> {
-  const response = await authFetch(`/api/sessions/${sessionId}/blobs`, {
-    headers: authHeaders(),
-  });
-  return parseResponse<BlobMetadata[]>(response);
+  const blobs: BlobMetadata[] = [];
+  const seen = new Set<string>();
+  let offset = 0;
+  for (;;) {
+    // At the ceiling, one more row is enough to tell "exactly at the
+    // ceiling" from "more files exist".
+    const atCeiling = offset >= BLOB_LIST_MAX_FILES;
+    const limit = atCeiling ? 1 : BLOB_LIST_PAGE_SIZE;
+    const response = await authFetch(
+      `/api/sessions/${sessionId}/blobs?limit=${limit}&offset=${offset}`,
+      { headers: authHeaders() },
+    );
+    const page = await parseResponse<BlobMetadata[]>(response);
+    if (atCeiling) {
+      if (page.length > 0) throw new BlobListTruncatedError(blobs);
+      return blobs;
+    }
+    let added = 0;
+    for (const blob of page) {
+      if (seen.has(blob.id)) continue;
+      seen.add(blob.id);
+      blobs.push(blob);
+      added += 1;
+    }
+    // A short page is the last one. A full page that adds nothing means the
+    // window did not advance, so stop instead of requesting it forever.
+    if (page.length < limit || added === 0) return blobs;
+    offset += page.length;
+  }
 }
 
 /**

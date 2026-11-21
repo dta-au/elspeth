@@ -26,6 +26,7 @@ from elspeth.web.composer.prompt_guard_rendering import json_argument_content_pa
 from elspeth.web.composer.provider_gateway import ProviderGateway
 from elspeth.web.composer.provider_quota import ProviderInvocationFamily
 from elspeth.web.composer.service import _REPLY_ONLY_HISTORY_PREFIX, _reply_only_messages
+from tests.helpers.prompt_guard_audit import assert_prompt_guard_wire_payload
 from tests.unit.web.composer._helpers import _make_settings
 from tests.unit.web.composer.test_prompt_guard_admission import _checks
 from tests.unit.web.composer.test_prompt_guard_admission import authority as _authority
@@ -149,7 +150,9 @@ async def test_reply_quotes_exact_wire_and_preserves_guard_coverage(authority, m
     assert ("TOOL_DATA_CANARY" in documents) is not whole_reference
     assert "REGISTERED_CATALOG_CANARY" not in documents and "OWNED_SYSTEM_CANARY" not in documents
     assert "REGISTERED_ASSISTANT_REFERENCE" not in documents
-    assert all(request["userPrompt"] == _USER for request in inspected)
+    for request in inspected:
+        assert_prompt_guard_wire_payload(request, user_prompt=_USER)
+    assert [request for request in inspected if request["userPrompt"]] == [{"userPrompt": _USER, "documents": []}]
     assert [check["disposition"] for check in _checks(engine)] == ["allow"]
     coordinator.assert_completed()
 
@@ -299,7 +302,9 @@ async def test_actual_planner_quote_dense_intent_reaches_azure_decoded(tmp_path,
         model_overrides={"prompt_guard_mount": gateway.prompt_guard_mount, "prompt_guard_mode": "required"},
     )
     assert len(completion.requests) == 1
-    assert all(request["userPrompt"] == intent for request in inspected)
+    for request in inspected:
+        assert_prompt_guard_wire_payload(request, user_prompt=intent)
+    assert [request for request in inspected if request["userPrompt"]] == [{"userPrompt": intent, "documents": []}]
     assert intent in "\n".join(document for request in inspected for document in request["documents"])
 
 

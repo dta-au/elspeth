@@ -34,9 +34,13 @@ fields and declare only the truly required subset in required_input_fields.
 from __future__ import annotations
 
 import copy
+import functools
+import sys
+import threading
+from collections import OrderedDict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple, Protocol, cast
 
 from jinja2 import Environment, meta
 from jinja2.compiler import find_undeclared
@@ -209,21 +213,301 @@ def template_loads_name(template_string: str, name: str) -> bool:
 
 _ATTRIBUTE_KEYWORD_FILTERS: frozenset[str] = frozenset({"map", "join", "sort", "unique", "sum", "min", "max"})
 _ATTRIBUTE_POSITIONAL_FILTERS: frozenset[str] = frozenset({"selectattr", "rejectattr", "groupby"})
-MAX_JINJA_TEMPLATE_BYTES = 16 * 1024
+# Largest template the parser is given, in UTF-8 bytes. The node, depth and
+# expression bounds are checked only after the whole text is parsed, so this
+# sets how long a refusal can take: about 3.2 ms per KB, 0.2 s at this value
+# (measured 2026-11-21 in the template-bound sizing study, against 0.05 s at the
+# old 16 KiB). An ordinary prompt of this size costs about 5 ms to compile and
+# 7 ms per row to render; about 16,000 tokens. The memory the three analysis
+# caches below keep does not grow with this value: they share one byte budget.
+# What grows with it is the time to refuse. One constant for every template the engine
+# parses: LLM transform prompts and query templates, RAG query templates
+# (plugins/transforms/rag), LLM-source prompts (plugins/sources/llm) and the
+# Azure blob sink's path templates (plugins/sinks/azure_blob_sink.py).
+MAX_JINJA_TEMPLATE_BYTES = 64 * 1024
+# Entry bound of the three template-analysis caches below. Validation walks a
+# graph's templates in the same order every time, and an LRU smaller than that
+# walk misses on every call: at 128 a 400-template walk scored 0 hits on its
+# second pass (measured 2026-11-20). The bound covers one walk of the largest
+# plausible graph, 50 LLM steps x 64 queries plus their prompts (~3,250 texts),
+# each analysed with and without ``row_attribute`` (~6,500 keys). It applies to
+# each cache; the memory all three keep is bounded by the byte budget below.
+_TEMPLATE_ANALYSIS_CACHE_ENTRIES = 8192
+# The one byte budget the three caches share, in PROCESS bytes as
+# ``sys.getsizeof`` reports them, not UTF-8 bytes: a template holding one
+# character outside the BMP is stored at 4 bytes per character, so a 64 KiB
+# UTF-8 template can occupy 256 KiB (262,192 bytes measured). Counted: each
+# entry's bookkeeping, its value (the field set and every name in it; a wide
+# template's set can be ~8x its own text, 513 KB for a 64 KB template naming
+# 5,508 fields, measured), and each key object ONCE, however many entries in
+# however many caches hold it. The three caches key on the caller's own
+# ``str``, so one text analysed by all three, with and without
+# ``row_attribute``, is counted once. Not counted: memory the caller would hold
+# anyway. Over-counted, which only makes the bound conservative: interned or
+# shared names inside values, and key objects such as ``"row"`` that outlive
+# the cache. The entry count alone stopped bounding memory once one template
+# may be 64 KiB: 8,192 such entries hold over 512 MiB of text per cache.
+# Sizing: one pipeline's template text is at most its inline file text
+# (``BLOB_INLINE_AGGREGATE_BYTE_CAP``, going to 4 MiB) plus its inline YAML
+# (``MAX_IN_MEMORY_PIPELINE_YAML_BYTES``, 2 MiB), ~6 MiB of UTF-8, at most
+# ~24 MiB in memory at 4 bytes per character and counted once. Bookkeeping and
+# ordinary values add at most ~3 x 8,192 entries x ~0.75 KiB (measured), ~18 MiB.
+# So one worst-case walk costs ~42 MiB, and 128 MiB holds three of them (several
+# sessions or prompt versions) with the second pass still hitting. 128 MiB is
+# also the most the three caches together retain, by this estimate; per-cache
+# budgets would count shared text up to four times and allow 3 x the budget.
+# A pipeline of maximally wide templates (values ~8x text) cannot be held
+# whole: its walk misses and re-analyses, but memory stays bounded.
+_TEMPLATE_ANALYSIS_BUDGET_BYTES = 128 * 1024 * 1024
+# Bookkeeping per entry beyond its value and key objects: its slots in its
+# cache's order and in the shared order, the (value, entry) pair, the entry
+# record and the key tuple. Measured on CPython 3.14 and rounded up.
+_TEMPLATE_ANALYSIS_ENTRY_OVERHEAD_BYTES = 512
+# Bookkeeping per distinct key object in the shared ledger: the record and its
+# dict slot. Measured on CPython 3.14 and rounded up.
+_TEMPLATE_ANALYSIS_HELD_OBJECT_OVERHEAD_BYTES = 192
+
+
+class TemplateAnalysisCacheInfo(NamedTuple):
+    """``functools`` ``cache_info()`` fields, plus the shared byte budget and the bytes it currently holds."""
+
+    hits: int
+    misses: int
+    maxsize: int
+    currsize: int
+    maxbytes: int
+    currbytes: int
+
+
+class _EntryOwner(Protocol):
+    """The cache an entry lives in, as the shared budget sees it: only able to drop a key."""
+
+    def __delitem__(self, key: tuple[object, ...], /) -> None: ...
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class _AnalysisEntry:
+    """One retained analysis. Hashed by identity, so the shared recency order can hold it."""
+
+    owner: _EntryOwner
+    key: tuple[object, ...]
+    cost: int
+
+
+@dataclass(slots=True)
+class _HeldObject:
+    """A key object the budget counts once, and how many entries hold it."""
+
+    key_object: object
+    size: int
+    users: int
+
+
+class _TemplateAnalysisBudget:
+    """The byte budget the three template-analysis caches share, and the one lock that guards it and them.
+
+    ``order`` holds every entry of every cache, least recently used first;
+    over budget, the oldest entry anywhere is evicted. ``held`` counts each
+    key object once by identity: an equal but distinct string is separate
+    memory and is counted separately. Every method runs with ``lock`` held.
+    """
+
+    def __init__(self, max_bytes: int) -> None:
+        self.max_bytes = max_bytes
+        self.lock = threading.Lock()
+        self.order: OrderedDict[_AnalysisEntry, None] = OrderedDict()
+        self.held: dict[int, _HeldObject] = {}
+        self.retained_bytes = 0
+
+    def admit(self, entry: _AnalysisEntry) -> None:
+        """Count an entry its cache has just stored, then evict the oldest entries until the budget holds."""
+        self.order[entry] = None
+        self.retained_bytes += entry.cost
+        for key_object in entry.key:
+            if id(key_object) in self.held:
+                self.held[id(key_object)].users += 1
+            else:
+                size = sys.getsizeof(key_object) + _TEMPLATE_ANALYSIS_HELD_OBJECT_OVERHEAD_BYTES
+                self.held[id(key_object)] = _HeldObject(key_object, size, 1)
+                self.retained_bytes += size
+        while self.retained_bytes > self.max_bytes:
+            self.forget(next(iter(self.order)))
+
+    def forget(self, entry: _AnalysisEntry) -> None:
+        """Drop an entry from its cache and the order, releasing each key object no other entry holds."""
+        del self.order[entry]
+        del entry.owner[entry.key]
+        self.retained_bytes -= entry.cost
+        for key_object in entry.key:
+            record = self.held[id(key_object)]
+            record.users -= 1
+            if record.users == 0:
+                del self.held[id(key_object)]
+                self.retained_bytes -= record.size
+
+
+_TEMPLATE_ANALYSIS_BUDGET = _TemplateAnalysisBudget(_TEMPLATE_ANALYSIS_BUDGET_BYTES)
+
+
+class _TemplateAnalysisCache[*Ts, R](Protocol):
+    """The ``functools.lru_cache`` surface the analysis caches keep: call, ``cache_info()``, ``cache_clear()``, ``__wrapped__``."""
+
+    __wrapped__: Callable[[*Ts], R]
+    cache_info: Callable[[], TemplateAnalysisCacheInfo]
+    cache_clear: Callable[[], None]
+
+    def __call__(self, *args: *Ts) -> R: ...
+
+
+def _template_analysis_cache[*Ts, R](
+    value_bytes: Callable[[R], int],
+    *,
+    budget: _TemplateAnalysisBudget = _TEMPLATE_ANALYSIS_BUDGET,
+    max_entries: int = _TEMPLATE_ANALYSIS_CACHE_ENTRIES,
+) -> Callable[[Callable[[*Ts], R]], _TemplateAnalysisCache[*Ts, R]]:
+    """A least-recently-used memo of one pure analysis, bounded by ``max_entries`` and by the shared ``budget``.
+
+    As with ``functools.lru_cache``: an exception is never cached, the
+    analysis runs outside the lock, and concurrent misses on one key may both
+    compute (the first stored result is kept). An entry that alone exceeds
+    the budget is computed and returned but never retained, so one oversize
+    text cannot empty the caches for nothing. ``value_bytes`` estimates what
+    a value keeps alive; it runs once, when the entry is stored.
+    """
+
+    def decorate(function: Callable[[*Ts], R]) -> _TemplateAnalysisCache[*Ts, R]:
+        lock = budget.lock
+        order = budget.order
+        entries: OrderedDict[tuple[object, ...], tuple[R, _AnalysisEntry]] = OrderedDict()
+        hits = 0
+        misses = 0
+
+        def cached(*args: *Ts) -> R:
+            nonlocal hits, misses
+            with lock:
+                if args in entries:
+                    entries.move_to_end(args)
+                    value, entry = entries[args]
+                    order.move_to_end(entry)
+                    hits += 1
+                    return value
+                misses += 1
+            value = function(*args)
+            cost = _TEMPLATE_ANALYSIS_ENTRY_OVERHEAD_BYTES + value_bytes(value)
+            if cost + sum(sys.getsizeof(arg) + _TEMPLATE_ANALYSIS_HELD_OBJECT_OVERHEAD_BYTES for arg in args) > budget.max_bytes:
+                return value
+            with lock:
+                if args not in entries:
+                    entry = _AnalysisEntry(entries, args, cost)
+                    entries[args] = (value, entry)
+                    budget.admit(entry)
+                    if len(entries) > max_entries:
+                        budget.forget(next(iter(entries.values()))[1])
+            return value
+
+        def cache_info() -> TemplateAnalysisCacheInfo:
+            with lock:
+                return TemplateAnalysisCacheInfo(hits, misses, max_entries, len(entries), budget.max_bytes, budget.retained_bytes)
+
+        def cache_clear() -> None:
+            nonlocal hits, misses
+            with lock:
+                for _value, entry in list(entries.values()):
+                    budget.forget(entry)
+                hits = 0
+                misses = 0
+
+        functools.update_wrapper(cached, function)
+        cache = cast("_TemplateAnalysisCache[*Ts, R]", cached)
+        cache.cache_info = cache_info
+        cache.cache_clear = cache_clear
+        return cache
+
+    return decorate
+
+
+def _no_value_bytes(_value: None) -> int:
+    return 0
+
+
+def _name_set_bytes(names: frozenset[str]) -> int:
+    """The set and every name in it: the parser makes the names, so the entry is their only holder."""
+    return sys.getsizeof(names) + sum(map(sys.getsizeof, names))
+
+
+def _field_usage_bytes(usage: Jinja2FieldExtraction) -> int:
+    """The record, its field set and its kinds tuple; the kind strings are module constants and are not counted."""
+    return sys.getsizeof(usage) + _name_set_bytes(usage.fields) + sys.getsizeof(usage.dynamic_accesses)
+
+
+class TemplateSourceRefusedError(ValueError):
+    """Template text refused before or during analysis: over a source bound, or nested too deeply to analyse.
+
+    A ``ValueError``, so every caller that handled these refusals as
+    ``ValueError`` still does; a caller that must not catch every
+    ``ValueError`` (the advisor summary) catches this type.
+    """
+
+
+class TemplateSourceTooLargeError(TemplateSourceRefusedError):
+    """A template's source is over ``MAX_JINJA_TEMPLATE_BYTES``; carries both figures.
+
+    A ``ValueError``, so every caller that already handles the size refusal
+    still does; a caller that knows the template's position names it with
+    :func:`template_size_refusal`.
+    """
+
+    def __init__(self, size_bytes: int, limit_bytes: int) -> None:
+        self.size_bytes = size_bytes
+        self.limit_bytes = limit_bytes
+        super().__init__(f"Template exceeds {limit_bytes} UTF-8 bytes")
+
+
+class PromptTemplateRefusal(ValueError):
+    """A template refused for its size or nesting, in a sentence that names its position and quotes no template text.
+
+    The plugin validators raise it, so pydantic reports it as a validation
+    error; authoring validation shows it as written, where it shows other
+    plugin option errors only in a generic sentence.
+    """
+
+
+def template_nesting_refusal(position: str) -> str:
+    """The refusal for a template whose loops or blocks nest deeper than Python's compiler allows."""
+    return f"{position} is too deeply nested to compile: its loops or blocks nest deeper than Python allows. Flatten the nesting."
+
+
+def template_number_literal_refusal(position: str) -> str:
+    """The refusal for a template holding an integer literal longer than Python will read."""
+    return f"{position} contains a number literal too long to read. Shorten the number or quote it as text."
+
+
+def template_size_refusal(position: str, size_bytes: int, limit_bytes: int) -> str:
+    """The refusal for one prompt template over the bound, naming where it sits."""
+    return (
+        f"{position} is {size_bytes} bytes; the limit for one prompt template is {limit_bytes} bytes. "
+        "Shorten it, or move reference text into a file_inject step and read it from the row."
+    )
 
 
 def validate_jinja_source(source: str) -> None:
     """Bound parser input before Jinja sees a web or YAML authored template."""
     if len(source) > MAX_JINJA_TEMPLATE_BYTES or len(source.encode("utf-8")) > MAX_JINJA_TEMPLATE_BYTES:
-        raise ValueError(f"Template exceeds {MAX_JINJA_TEMPLATE_BYTES} UTF-8 bytes")
+        raise TemplateSourceTooLargeError(len(source.encode("utf-8")), MAX_JINJA_TEMPLATE_BYTES)
+    _validate_bounded_jinja_source(source)
+
+
+@_template_analysis_cache(_no_value_bytes)
+def _validate_bounded_jinja_source(source: str) -> None:
+    """Reuse pure checks of exact bounded text; size admission runs first."""
     if source.count("{%") > 64 or source.count("{{") > 256:
-        raise ValueError("Template has too many Jinja expressions or blocks")
+        raise TemplateSourceRefusedError("Template has too many Jinja expressions or blocks")
     depth = 0
     for character in source:
         if character in "([":
             depth += 1
             if depth > 64:
-                raise ValueError("Template expression nesting exceeds 64")
+                raise TemplateSourceRefusedError("Template expression nesting exceeds 64")
         elif character in ")]":
             depth = max(0, depth - 1)
 
@@ -260,8 +544,92 @@ class Jinja2FieldExtraction:
         return tuple(kind for kind in self.dynamic_accesses if kind not in ROW_API_MISUSE_KINDS)
 
 
+# The deepest template tree admitted, counted from the root's children at 1.
+# The sandbox refuses deeper trees before compiling
+# (``plugins/infrastructure/templates.py`` ``_check_template_ast`` imports this
+# number) and the field analysis below refuses the same depth, so the analysis
+# never refuses a template the sandbox compiles.
+MAX_TEMPLATE_AST_DEPTH = 64
+
+
+class TemplateTooDeeplyNestedError(TemplateSourceRefusedError):
+    """A template nests deeper than the analysis walks; the analysis recurses, so it refuses first."""
+
+    def __init__(self) -> None:
+        super().__init__(f"Template is too deeply nested to analyse (more than {MAX_TEMPLATE_AST_DEPTH} levels)")
+
+
+def int_literal_too_long_to_render(value: int) -> bool:
+    """Whether Python refuses to write ``value`` as decimal text, decided without converting it.
+
+    Python refuses an int with more decimal digits than
+    ``sys.get_int_max_str_digits()`` (4300 by default; the sign is not counted:
+    measured, ``repr(-(10**4300 - 1))`` renders and ``repr(10**4300)`` refuses).
+    A value has more than D digits exactly when ``abs(value) >= 10**D``. Since
+    ``2**(3*D) = 8**D < 10**D``, a value of at most ``3*D`` bits is under the
+    limit; only a longer one is compared with ``10**D``, integer arithmetic on a
+    number of about ``3.33*D`` bits. A limit of 0 disables Python's check, so
+    nothing is refused.
+    """
+    limit = sys.get_int_max_str_digits()
+    if limit == 0 or value.bit_length() <= 3 * limit:
+        return False
+    smallest_too_long: int = 10**limit  # int ** int is typed Any (a negative exponent gives a float); limit > 0 here
+    return abs(value) >= smallest_too_long
+
+
+class TemplateNumberLiteralTooLongError(TemplateSourceRefusedError):
+    """An integer literal Python will not convert between text and int (``sys.get_int_max_str_digits()`` digits).
+
+    A decimal literal over the limit fails in Jinja's lexer (``int()``); a hex,
+    octal or binary one is read, but its value cannot be written back as
+    decimal text, which Jinja's code generator does for every constant.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("Template contains a number literal too long to read")
+
+
+class _FieldExtractionEnvironment(Environment):
+    """Plain parse for analysis, with the depth bound the sandbox applies before compiling.
+
+    The analysis visitors and Jinja's own scope analysis recurse over the
+    tree, and the parser recurses over the text, so a deep chain could raise
+    ``RecursionError`` here. Both become :class:`TemplateTooDeeplyNestedError`,
+    a ``ValueError`` like the size refusal, which callers already handle. The
+    depth is measured without recursion. The sandbox refuses the same depth
+    (``plugins/infrastructure/templates.py`` ``_check_template_ast``), so no
+    template that compiles is refused here.
+    """
+
+    def parse(self, source: str, name: str | None = None, filename: str | None = None) -> Template:
+        try:
+            ast = super().parse(source, name=name, filename=filename)
+        except RecursionError as exc:
+            raise TemplateTooDeeplyNestedError() from exc
+        except ValueError as exc:
+            # Jinja's lexer reads an integer literal with ``int()``, which refuses
+            # more than 4300 digits with a bare ValueError. Its string unescape is
+            # already wrapped as TemplateSyntaxError, so a bare ValueError from
+            # this call is that literal. A subclass (an owned refusal, a Unicode
+            # error) is not this cause and is re-raised unchanged.
+            if type(exc) is not ValueError:
+                raise
+            raise TemplateNumberLiteralTooLongError() from exc
+        pending = [(child, 1) for child in ast.iter_child_nodes()]
+        while pending:
+            node, depth = pending.pop()
+            if depth > MAX_TEMPLATE_AST_DEPTH:
+                raise TemplateTooDeeplyNestedError()
+            if type(node) is Const and type(node.value) is int and int_literal_too_long_to_render(node.value):
+                # jinja2.meta runs the code generator, which writes repr() of every constant.
+                raise TemplateNumberLiteralTooLongError()
+            pending.extend((child, depth + 1) for child in node.iter_child_nodes())
+        return ast
+
+
 def _create_field_extraction_environment() -> Environment:
-    return Environment(autoescape=True)
+    return _FieldExtractionEnvironment(autoescape=True)
 
 
 def extract_jinja2_field_usage(
@@ -292,6 +660,12 @@ def extract_jinja2_field_usage(
     ``row.source_row`` / ``row['source_row']`` as the row.
     """
     validate_jinja_source(template_string)
+    return _cached_jinja2_field_usage(template_string, namespace, row_attribute)
+
+
+@_template_analysis_cache(_field_usage_bytes)
+def _cached_jinja2_field_usage(template_string: str, namespace: str, row_attribute: str | None) -> Jinja2FieldExtraction:
+    """Reuse immutable analysis of exact text and parameters."""
     env = _create_field_extraction_environment()
     ast = env.parse(template_string)
     if row_attribute is not None:
@@ -316,6 +690,12 @@ def extract_jinja2_context_fields(template_string: str, namespace: str = "row", 
     between them.
     """
     validate_jinja_source(template_string)
+    return _cached_jinja2_context_fields(template_string, namespace, row_attribute)
+
+
+@_template_analysis_cache(_name_set_bytes)
+def _cached_jinja2_context_fields(template_string: str, namespace: str, row_attribute: str) -> frozenset[str]:
+    """Keep row and context analyses distinct after source admission."""
     ast = _create_field_extraction_environment().parse(template_string)
     ast = _NestedRowRoot(namespace, row_attribute, _nested_row_root(namespace, row_attribute)).visit(ast)
     return _field_usage(ast, namespace).fields

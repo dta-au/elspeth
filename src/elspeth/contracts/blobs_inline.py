@@ -229,8 +229,31 @@ def is_headless_blob_ref_fragment(value: object) -> bool:
     return type(mode) is str and mode in ALLOWED_BLOB_REF_MODES
 
 
+BLOB_INLINE_AGGREGATE_FIELD_PATH: Final = "(aggregate)"
+"""Field path an oversized entry carries when the pipeline's total, not one file, is over its cap."""
+
+
+def inline_blob_total_refusal(total_bytes: int, cap_bytes: int, binding_count: int) -> str:
+    """The one sentence every site uses to refuse file-held text over the pipeline total.
+
+    ``binding_count`` counts references, not distinct files: the total is
+    counted once per place a file is bound, because each binding is resolved
+    and stored again.
+    """
+    return (
+        f"File-held text totals {total_bytes} bytes across {binding_count} file bindings; the limit is {cap_bytes} bytes. "
+        "A file bound in more than one place counts once per place. Remove a binding or shorten the largest files."
+    )
+
+
 class BlobContentResolutionError(Exception):
-    """Batched recoverable failures from inline blob content resolution."""
+    """Batched recoverable failures from inline blob content resolution.
+
+    ``aggregate_binding_count`` is the number of bindings counted toward the
+    pipeline total; it is set exactly when ``oversized`` carries the
+    :data:`BLOB_INLINE_AGGREGATE_FIELD_PATH` entry, and that refusal's
+    sentence is then part of the message.
+    """
 
     missing: tuple[str, ...]
     oversized: tuple[tuple[str, int, int], ...]
@@ -238,6 +261,7 @@ class BlobContentResolutionError(Exception):
     not_ready: tuple[tuple[str, str], ...]
     cross_session: tuple[str, ...]
     malformed: tuple[tuple[str, str], ...]
+    aggregate_binding_count: int | None
 
     def __init__(
         self,
@@ -248,6 +272,7 @@ class BlobContentResolutionError(Exception):
         not_ready: list[tuple[str, str]] | tuple[tuple[str, str], ...] | None = None,
         cross_session: list[str] | tuple[str, ...] | None = None,
         malformed: list[tuple[str, str]] | tuple[tuple[str, str], ...] | None = None,
+        aggregate_binding_count: int | None = None,
     ) -> None:
         self.missing = tuple(missing or ())
         self.oversized = tuple(oversized or ())
@@ -255,6 +280,10 @@ class BlobContentResolutionError(Exception):
         self.not_ready = tuple(not_ready or ())
         self.cross_session = tuple(cross_session or ())
         self.malformed = tuple(malformed or ())
+        has_total_refusal = any(field_path == BLOB_INLINE_AGGREGATE_FIELD_PATH for field_path, _size, _cap in self.oversized)
+        if has_total_refusal != (aggregate_binding_count is not None):
+            raise ValueError("BlobContentResolutionError: aggregate_binding_count is required exactly for a total refusal")
+        self.aggregate_binding_count = aggregate_binding_count
         super().__init__(self._summary())
 
     def _summary(self) -> str:
@@ -269,4 +298,8 @@ class BlobContentResolutionError(Exception):
         non_zero = [f"{key}={value}" for key, value in counts.items() if value]
         if not non_zero:
             return "Blob inline content resolution failed"
-        return "Blob inline content resolution failed: " + ", ".join(non_zero)
+        summary = "Blob inline content resolution failed: " + ", ".join(non_zero)
+        if self.aggregate_binding_count is None:
+            return summary
+        totals = [(size, cap) for field_path, size, cap in self.oversized if field_path == BLOB_INLINE_AGGREGATE_FIELD_PATH]
+        return f"{summary}. " + " ".join(inline_blob_total_refusal(size, cap, self.aggregate_binding_count) for size, cap in totals)

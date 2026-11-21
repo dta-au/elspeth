@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
 from dataclasses import fields as dataclass_fields
 from hashlib import sha256
 from types import SimpleNamespace
 
 import pytest
+from rfc8785 import CanonicalizationError, IntegerDomainError
 
 from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.sink_effects import (
     AuditExportFormat,
@@ -19,6 +22,7 @@ from elspeth.contracts.sink_effects import (
     AuditExportSnapshotChunkInput,
     SinkEffectAuditExportSnapshotInput,
     SinkEffectInputKind,
+    SinkEffectMember,
     SinkEffectMemberCandidate,
     SinkEffectRole,
     _create_restricted_audit_export_snapshot_reader,
@@ -31,6 +35,7 @@ from elspeth.core.landscape.execution.sink_effect_identity import (
     MAX_LINEAGE_PARENTS,
     compute_audit_export_effect_identity,
     compute_pipeline_effect_identity,
+    compute_pipeline_effect_request_hashes,
     resolve_sink_effect_members,
 )
 
@@ -566,3 +571,109 @@ def test_export_cross_mapping_fails_before_hashing() -> None:
     forged.signer_key_id = "different-key"
     with pytest.raises((TypeError, ValueError), match=r"signer|snapshot"):
         compute_audit_export_effect_identity(forged, {"path": "safe/export.json"}, sink_node_id="audit-export", role=SinkEffectRole.PRIMARY)
+
+
+def _plain_member(ordinal: int, **changes: object) -> SinkEffectMember:
+    row = {"v": ordinal}
+    lineage_json = "[]"
+    member = SinkEffectMember(
+        ordinal=ordinal,
+        token_id=f"token-{ordinal}",
+        row_id=f"row-{ordinal}",
+        ingest_sequence=ordinal,
+        lineage_json=lineage_json,
+        lineage_hash=sha256(lineage_json.encode()).hexdigest(),
+        payload_hash=sha256(canonical_json(row).encode()).hexdigest(),
+        row=row,
+    )
+    return replace(member, **changes) if changes else member
+
+
+def _raising_members() -> Iterator[SinkEffectMember]:
+    raise RuntimeError("members iterated")
+    yield _plain_member(0)
+
+
+_GOOD_PIPELINE_INPUT: dict[str, object] = {
+    "run_id": "run-1",
+    "sink_node_id": "sink-1",
+    "role": SinkEffectRole.PRIMARY,
+    "sink_config": {"format": "json"},
+    "target_config": {"path": "safe/output.json"},
+    "members": (_plain_member(0), _plain_member(1)),
+}
+
+# (input change, exact exception type, exact message), in the full identity's refusal order.
+_PIPELINE_REFUSALS: dict[str, tuple[dict[str, object], type[BaseException], str]] = {
+    "role_not_exact": ({"role": "primary"}, TypeError, "role must be exact SinkEffectRole"),
+    "run_id_empty": ({"run_id": ""}, ValueError, "run_id and sink_node_id must be non-empty"),
+    "sink_node_id_empty": ({"sink_node_id": ""}, ValueError, "run_id and sink_node_id must be non-empty"),
+    "members_empty": ({"members": ()}, ValueError, "pipeline identity requires exact non-empty members"),
+    "member_not_exact": ({"members": (_plain_member(0), object())}, ValueError, "pipeline identity requires exact non-empty members"),
+    "members_not_dense": ({"members": (_plain_member(0), _plain_member(2))}, ValueError, "pipeline members must be dense and ordered"),
+    "members_reversed": ({"members": (_plain_member(1), _plain_member(0))}, ValueError, "pipeline members must be dense and ordered"),
+    "sink_config_credential": ({"sink_config": {"password": "hunter2hunter2"}}, ValueError, "sink_config must be credential-free"),
+    "target_config_credential": (
+        {"target_config": {"url": "https://user:pass@example.com/x"}},
+        ValueError,
+        "target_config must be credential-free",
+    ),
+    # Two defects: the earlier check wins, before members are iterated.
+    "role_and_members_none": ({"role": "primary", "members": None}, TypeError, "role must be exact SinkEffectRole"),
+    "run_id_and_raising_members": ({"run_id": "", "members": _raising_members()}, ValueError, "run_id and sink_node_id must be non-empty"),
+    "members_and_sink_config": (
+        {"members": (_plain_member(0), _plain_member(2)), "sink_config": {"password": "hunter2hunter2"}},
+        ValueError,
+        "pipeline members must be dense and ordered",
+    ),
+    # Refused by the identity encodings, not by an explicit check.
+    "ingest_sequence_beyond_2_53": (
+        {"members": (_plain_member(0), _plain_member(1, ingest_sequence=2**53))},
+        IntegerDomainError,
+        "9007199254740992 exceeds safe integer domain for JSON floats",
+    ),
+    "run_id_lone_surrogate": ({"run_id": "run-\ud800"}, CanonicalizationError, "input contains non-UTF-8 codepoints"),
+    "sink_node_id_lone_surrogate": ({"sink_node_id": "sink-\udfff"}, CanonicalizationError, "input contains non-UTF-8 codepoints"),
+    "token_id_lone_surrogate": (
+        {"members": (_plain_member(0, token_id="token-\ud800"), _plain_member(1))},
+        CanonicalizationError,
+        "input contains non-UTF-8 codepoints",
+    ),
+    "row_id_lone_surrogate": (
+        {"members": (_plain_member(0), _plain_member(1, row_id="row-\udc00"))},
+        CanonicalizationError,
+        "input contains non-UTF-8 codepoints",
+    ),
+}
+
+
+@pytest.mark.parametrize("function", [compute_pipeline_effect_identity, compute_pipeline_effect_request_hashes])
+@pytest.mark.parametrize("case", list(_PIPELINE_REFUSALS))
+def test_pipeline_identity_and_request_hashes_refuse_alike_in_order(function: Callable[..., object], case: str) -> None:
+    """The engine's request-hash path refuses exactly what the full identity
+    refuses, with the same exception and message and in the same order, before
+    the caller persists anything."""
+    change, error_type, message = _PIPELINE_REFUSALS[case]
+    if case == "run_id_and_raising_members":
+        change = {**change, "members": _raising_members()}
+    with pytest.raises(error_type) as caught:
+        function(**{**_GOOD_PIPELINE_INPUT, **change})
+    assert type(caught.value) is error_type
+    assert str(caught.value) == message
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {},
+        {"members": [_plain_member(0), _plain_member(1)]},
+        {"members": (_plain_member(0), _plain_member(1, ingest_sequence=2**53 - 1))},
+        {"run_id": "run-é中"},
+        {"role": SinkEffectRole.FAILSINK, "sink_node_id": "failsink-1"},
+    ],
+    ids=["tuple", "list", "max_safe_ingest_sequence", "non_ascii_run_id", "failsink"],
+)
+def test_request_hashes_are_the_full_identitys_two_hashes(change: dict[str, object]) -> None:
+    pipeline_input = {**_GOOD_PIPELINE_INPUT, **change}
+    identity = compute_pipeline_effect_identity(**pipeline_input)
+    assert compute_pipeline_effect_request_hashes(**pipeline_input) == (identity.config_hash, identity.requested_target_hash)

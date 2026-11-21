@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import cProfile
 import json
+import pstats
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -23,12 +25,14 @@ from elspeth.contracts.errors import (
     SinkTransactionalInvariantError,
 )
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.hashing import stable_hash as contracts_stable_hash
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.contracts.sink_effects import (
     RestrictedSinkEffectContext,
     SinkEffectCommitResult,
+    SinkEffectMember,
     SinkEffectPlan,
     SinkEffectPrepareRequest,
     SinkEffectReconcileResult,
@@ -38,6 +42,8 @@ from elspeth.contracts.sink_effects import (
 from elspeth.contracts.types import NodeID, SinkName
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.errors import LandscapeRecordError
+from elspeth.core.landscape.execution import sink_effect_reservation as sink_effect_reservation_module
+from elspeth.core.landscape.execution.sink_effect_identity import compute_pipeline_effect_identity
 from elspeth.core.landscape.execution.sink_effect_reservation import SinkEffectReservation
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import (
@@ -64,6 +70,7 @@ from tests.fixtures.sink_effects import (
     PartitioningObservableSink,
     ReaffirmingObservableSink,
 )
+from tests.fixtures.stores import MockPayloadStore
 
 
 @pytest.mark.parametrize(
@@ -2174,5 +2181,158 @@ def test_primary_validation_rejection_terminalizes_states_and_outcomes(tmp_path:
             assert outcome is not None
             assert outcome.outcome is TerminalOutcome.FAILURE
             assert outcome.path is TerminalPath.UNROUTED
+    finally:
+        db.close()
+
+
+def _profiled_calls(profiler: cProfile.Profile, function: Callable[..., object]) -> int:
+    """Count calls of one exact function object's code in a cProfile run."""
+    code = function.__code__
+    key = (code.co_filename, code.co_firstlineno, code.co_name)
+    stats = pstats.Stats(profiler).stats
+    return int(stats[key][1]) if key in stats else 0
+
+
+def test_engine_hands_resolved_members_to_the_reservation_identity_on_failsink_recovery(tmp_path: Path) -> None:
+    """The engine computes no effect identity: the reservation derives it, and
+    every stored identity equals the full public recipe.
+
+    Fresh primary, a linked failsink effect left RESERVED (not finalized) by an
+    interrupted prepare, and the recovered re-drive that finds and completes it.
+    On each path the stored effect, stream, artifact and member identities must
+    equal ``compute_pipeline_effect_identity`` over the stored members, and the
+    engine must not have called that function at all.
+    """
+    payload_store = MockPayloadStore()
+    db = LandscapeDB(f"sqlite:///{tmp_path / 'identity-once.db'}")
+    try:
+        factory = make_factory(db, payload_store=payload_store)
+        run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
+        source_id = register_test_node(factory.data_flow, run.run_id, "source", node_type=NodeType.SOURCE, plugin_name="source")
+        primary_id = register_test_node(
+            factory.data_flow, run.run_id, "primary", node_type=NodeType.SINK, plugin_name="partitioning-primary"
+        )
+        failsink_id = register_test_node(
+            factory.data_flow, run.run_id, "failsink", node_type=NodeType.SINK, plugin_name="partitioning-failsink"
+        )
+        edge = factory.data_flow.register_edge(
+            primary_id, failsink_id, "__failsink__", RoutingMode.DIVERT, coordination_token=leader_coordination_token(factory, run.run_id)
+        )
+        accepted, diverted = _effect_tokens(
+            factory, run_id=run.run_id, source_id=source_id, rows=[{"value": 1}, {"value": 2, "divert": True}]
+        )
+        primary_target = DuplicateObservableTarget()
+        failsink_target = DuplicateObservableTarget()
+        ctx = PluginContext(run_id=run.run_id, config={}, landscape=factory.plugin_audit_writer(), node_id=primary_id)
+        pending = PendingOutcome(outcome=TerminalOutcome.SUCCESS, path=TerminalPath.DEFAULT_FLOW)
+
+        def write(active_factory: RecorderFactory, failsink: PartitioningObservableSink) -> object:
+            primary = PartitioningObservableSink(primary_target, name="primary")
+            primary.node_id = primary_id
+            failsink.node_id = failsink_id
+            return SinkExecutor(
+                active_factory.execution,
+                active_factory.data_flow,
+                SpanFactory(),
+                run.run_id,
+                factory=active_factory,
+                worker_id="worker-a",
+                coordination_token=leader_coordination_token(active_factory, run.run_id),
+            ).write(
+                primary,
+                [accepted, diverted],
+                ctx,
+                1,
+                sink_name="output",
+                pending_outcome=pending,
+                effect_mode="write",
+                failsink=failsink,
+                failsink_name="failsink",
+                failsink_effect_mode="write",
+                failsink_edge_id=edge.edge_id,
+                join_group_id_by_token={t.token_id: None for t in [accepted, diverted]},
+            )
+
+        profiler = cProfile.Profile()
+        profiler.enable()
+        try:
+            with pytest.raises(RuntimeError, match="between primary and failsink"):
+                write(factory, PartitioningObservableSink(failsink_target, name="failsink", fail_prepare_once=True, divert_rows=False))
+            interrupted = {effect.role: effect for effect in factory.execution.sink_effects.get_effects_for_run(run.run_id)}
+            assert interrupted[SinkEffectRole.FAILSINK].state is SinkEffectState.RESERVED
+            recovered_factory = make_factory(db, payload_store=payload_store)
+            write(recovered_factory, PartitioningObservableSink(failsink_target, name="failsink", divert_rows=False))
+        finally:
+            profiler.disable()
+
+        # Positive control: the instrument sees the reservation's own derivation.
+        assert _profiled_calls(profiler, sink_effect_reservation_module._pipeline_identity) >= 3
+        assert _profiled_calls(profiler, compute_pipeline_effect_identity) == 0
+        assert failsink_target.publication_count == 1
+
+        effects = {effect.role: effect for effect in recovered_factory.execution.sink_effects.get_effects_for_run(run.run_id)}
+        assert set(effects) == {SinkEffectRole.PRIMARY, SinkEffectRole.FAILSINK}
+        # The recovered failsink effect is the one the interrupted write reserved.
+        assert effects[SinkEffectRole.FAILSINK].effect_id == interrupted[SinkEffectRole.FAILSINK].effect_id
+        diverted_outcome = recovered_factory.data_flow.get_token_outcome(diverted.token_id)
+        assert diverted_outcome is not None and diverted_outcome.error_hash is not None
+        pending_by_role = {
+            SinkEffectRole.PRIMARY: {"error_hash": None, "outcome": "success", "path": "default_flow"},
+            SinkEffectRole.FAILSINK: {
+                "error_hash": diverted_outcome.error_hash,
+                "outcome": "transient",
+                "path": "sink_fallback_to_failsink",
+                "primary_effect_id": effects[SinkEffectRole.PRIMARY].effect_id,
+            },
+        }
+        for role, effect in effects.items():
+            durable = recovered_factory.execution.sink_effects.get_members(effect.effect_id)
+            members = tuple(
+                SinkEffectMember(
+                    ordinal=record.ordinal,
+                    token_id=record.token_id,
+                    row_id=record.row_id,
+                    ingest_sequence=record.ingest_sequence,
+                    lineage_json=record.lineage_json,
+                    lineage_hash=record.lineage_hash,
+                    payload_hash=record.payload_hash,
+                    row=json.loads(payload_store.retrieve(record.payload_hash)),
+                    pending_identity_hash=contracts_stable_hash(pending_by_role[role]),
+                    primary_effect_id=record.primary_effect_id,
+                )
+                for record in durable
+            )
+            name = "primary" if role is SinkEffectRole.PRIMARY else "failsink"
+            expected = compute_pipeline_effect_identity(
+                run_id=run.run_id,
+                sink_node_id=effect.sink_node_id,
+                role=role,
+                sink_config={
+                    "effect_mode": "write",
+                    "sink_name": "output" if role is SinkEffectRole.PRIMARY else "failsink",
+                    "sink_type": f"{PartitioningObservableSink.__module__}.{PartitioningObservableSink.__qualname__}",
+                },
+                target_config={"path": f"{name}.jsonl"},
+                members=members,
+            )
+            assert effect.state is SinkEffectState.FINALIZED
+            assert (
+                effect.effect_id,
+                effect.config_hash,
+                effect.membership_or_manifest_hash,
+                effect.group_payload_hash,
+                effect.stream_id,
+                effect.artifact_id,
+                effect.artifact_idempotency_key,
+            ) == (
+                expected.effect_id,
+                expected.config_hash,
+                expected.membership_or_manifest_hash,
+                expected.group_payload_hash,
+                expected.stream_id,
+                expected.artifact_id,
+                expected.artifact_idempotency_key,
+            )
+            assert tuple(record.member_effect_id for record in durable) == tuple(expected.member_ids)
     finally:
         db.close()

@@ -23,6 +23,7 @@ from __future__ import annotations
 # Slice 4 — additional imports for shared validation/repair helpers.
 import json
 import re
+import unicodedata
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -88,6 +89,7 @@ from elspeth.web.composer.state import (
     ValidationSummary,
     _coalesce_branch_connections,
     _coalesce_branch_names,
+    _connection_consumer_claims,
     _serialize_branches,
 )
 from elspeth.web.composer.tool_result_envelope import APPLIED_COMPONENT_KEYS, ValidationGuidance
@@ -95,12 +97,14 @@ from elspeth.web.execution.schemas import ValidationResult
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
     REQUIRED_CONTROL_AUTO_WIRED_USER_TERM,
+    SERVER_STAGED_PIPELINE_DECISION_USER_TERMS,
     SOURCE_AUTHORING_KEY,
     SOURCE_COMPONENT_ID,
     InterpretationRequirement,
     ServerStagedRequiredControlUserTerm,
     UnknownInterpretationRequirementError,
     composer_pipeline_decision_user_term_error,
+    is_server_staged_review,
     parse_interpretation_requirements,
     project_planner_context_interpretation_requirement,
     prompt_review_draft_from_options,
@@ -652,24 +656,21 @@ class _FullPipelineStatePayload(TypedDict):
     inspection: _FullPipelineStateInspectionPayload
 
 
-class _RepairToolCall(TypedDict):
-    tool: str
-    arguments: Mapping[str, object]
-
-
 class _AffectedConsumer(TypedDict):
     id: str
-    current_input: str
-    new_input: str
 
 
 class _GraphRepairSuggestion(TypedDict):
+    """The facts of one duplicate consumer: the shared connection and every node reading it.
+
+    Facts only (Composer invariant 1): no server-proposed names, no gate, no
+    tool calls, no node payloads. The model builds the repair from the skill.
+    """
+
     code: str
     connection: str
-    strategy: str
     reason: str
     affected_consumers: list[_AffectedConsumer]
-    tool_sequence: list[_RepairToolCall]
 
 
 def _semantic_contracts_payload(
@@ -739,20 +740,6 @@ def _repair_identifier_fragment(value: str, *, fallback: str) -> str:
     return fragment
 
 
-def _unique_name(candidate: str, reserved: set[str]) -> str:
-    """Return candidate or a suffixed variant that does not collide with reserved."""
-    if candidate not in reserved:
-        reserved.add(candidate)
-        return candidate
-
-    index = 2
-    while f"{candidate}_{index}" in reserved:
-        index += 1
-    unique = f"{candidate}_{index}"
-    reserved.add(unique)
-    return unique
-
-
 def _reserved_connection_names(state: CompositionState) -> set[str]:
     """Collect existing route/connection/sink names a repair branch must avoid."""
     names: set[str] = {output.name for output in state.outputs}
@@ -787,134 +774,40 @@ def _reserved_connection_names(state: CompositionState) -> set[str]:
     return names
 
 
+_DUPLICATE_CONSUMER_REASON: Final = (
+    "One connection can feed one processing node; every node listed reads this one. "
+    "Change only the input bindings; preserve existing node options."
+)
+
+
 def _duplicate_consumer_repair_suggestions(
     state: CompositionState,
     validation: ValidationSummary,
 ) -> list[_GraphRepairSuggestion]:
-    """Build copyable repair skeletons for duplicate-consumer validation failures."""
+    """State the facts of each duplicate-consumer error: the connection and every node that reads it.
+
+    The consumers come from the same claim list the validator names in the
+    error (``_connection_consumer_claims``), in the same order, each node id
+    once even when one barrier binds the connection through two branches.
+    """
     duplicate_error_components = {error.component for error in validation.errors if error.error_code == "duplicate_connection_consumer"}
     if not duplicate_error_components:
         return []
 
-    # ``branch_alias`` is None for an ordinary ``node.input`` consumer and
-    # names the branch slot for a row_union consumer. The row_union's own
-    # ``input`` is only an adapter placeholder and must never be repaired as
-    # though it were an independent consumption edge.
-    consumers_by_connection: dict[str, list[tuple[NodeSpec, str | None]]] = {}
-    for node in state.nodes:
-        if node.node_type in ("coalesce", "queue", "row_union"):
-            continue
-        consumers_by_connection.setdefault(node.input, []).append((node, None))
-    for node in state.nodes:
-        if node.node_type != "row_union":
-            continue
-        for row_union_branch_alias, branch_connection in zip(
-            _coalesce_branch_names(node.branches),
-            _coalesce_branch_connections(node.branches),
-            strict=True,
-        ):
-            if row_union_branch_alias == branch_connection:
-                continue
-            consumers_by_connection.setdefault(branch_connection, []).append((node, row_union_branch_alias))
-
-    reserved_node_ids = {node.id for node in state.nodes}
-    reserved_connection_names = _reserved_connection_names(state)
+    claims = _connection_consumer_claims(state.nodes)
     suggestions: list[_GraphRepairSuggestion] = []
-
-    for connection_name, consumer_nodes in sorted(consumers_by_connection.items()):
-        if len(consumer_nodes) < 2 or f"connection:{connection_name}" not in duplicate_error_components:
+    for connection_name in sorted({claimed for claimed, _node_id, _description in claims}):
+        if f"connection:{connection_name}" not in duplicate_error_components:
             continue
-
-        connection_fragment = _repair_identifier_fragment(connection_name, fallback="connection")
-        gate_id = _unique_name(f"fork_{connection_fragment}", reserved_node_ids)
-        branch_names = [
-            _unique_name(
-                f"{connection_fragment}_to_{_repair_identifier_fragment(binding[0].id, fallback='node')}",
-                reserved_connection_names,
-            )
-            for binding in consumer_nodes
-        ]
-        gate_args: dict[str, object] = {
-            "id": gate_id,
-            "node_type": "gate",
-            "plugin": None,
-            "input": connection_name,
-            "on_success": None,
-            "on_error": None,
-            "options": {},
-            "condition": "True",
-            "routes": {"true": "fork", "false": "fork"},
-            "fork_to": branch_names,
-            "branches": None,
-            "policy": None,
-            "merge": None,
-            "trigger": None,
-            "output_mode": None,
-            "expected_output_count": None,
-        }
-        tool_sequence: list[_RepairToolCall] = []
-        affected_consumers: list[_AffectedConsumer] = []
-        # One row_union can contribute two (node, alias) bindings when two of
-        # its aliases share a connection. Every patch for a node must land on
-        # one running payload: re-serializing the original node per binding
-        # emits two upsert_node calls for the same id, and the second reverts
-        # the first. Insertion order preserves the cross-node sequence.
-        patched_consumers: dict[str, dict[str, Any]] = {}
-        for (node, consumer_branch_alias), branch_name in zip(consumer_nodes, branch_names, strict=True):
-            if node.id not in patched_consumers:
-                # Widened deliberately: this is a repair-call argument the loop
-                # below re-keys, not the node payload the census reports, so it
-                # must not borrow ``_SetPipelineNodePayload``'s closed key set.
-                # Built from the AUTHORING projection, not the diagnostic
-                # ``_serialize_node``: every call here is replayed through
-                # upsert_node, which refuses runtime-owned options (a resolved
-                # LLM prompt's node-level approved_prompt_artifact_hash) and
-                # resolver-owned review linkage, so the diagnostic shape made
-                # the first call fail and the rest half-apply.
-                patched_consumers[node.id] = dict(_serialize_set_pipeline_node(node))
-            patched_consumer = patched_consumers[node.id]
-            if consumer_branch_alias is None:
-                patched_consumer["input"] = branch_name
-            else:
-                # _serialize_node writes "branches" as exactly ``dict`` (mapping
-                # form), exactly ``list`` (alias form), or None — a closed owned
-                # union built by _serialize_branches, so the nominal check is exact.
-                patched_branches = patched_consumer["branches"]
-                if type(patched_branches) is not dict:
-                    patched_branches = dict(
-                        zip(
-                            _coalesce_branch_names(node.branches),
-                            _coalesce_branch_connections(node.branches),
-                            strict=True,
-                        )
-                    )
-                patched_branches[consumer_branch_alias] = branch_name
-                patched_consumer["branches"] = patched_branches
-                # ``input`` is only the adapter placeholder for the first
-                # branch connection; re-derive it from the accumulated mapping
-                # so it stays consistent no matter which aliases were repaired.
-                patched_consumer["input"] = next(iter(patched_branches.values()))
-            affected_consumers.append(
-                {
-                    "id": node.id,
-                    "current_input": connection_name,
-                    "new_input": branch_name,
-                }
-            )
-        tool_sequence.extend({"tool": "upsert_node", "arguments": patched_consumer} for patched_consumer in patched_consumers.values())
-        tool_sequence.append({"tool": "upsert_node", "arguments": gate_args})
-        tool_sequence.append({"tool": "preview_pipeline", "arguments": {}})
+        consumer_ids = dict.fromkeys(node_id for claimed, node_id, _description in claims if claimed == connection_name)
         suggestions.append(
             {
-                "code": "duplicate_consumer_connection",
+                "code": "duplicate_connection_consumer",
                 "connection": connection_name,
-                "strategy": "insert_fork_gate",
-                "reason": "One connection can feed one processing node. Give each consumer a unique branch input, then insert a fork gate that consumes the shared connection and publishes those branch inputs from gate.fork_to.",
-                "affected_consumers": affected_consumers,
-                "tool_sequence": tool_sequence,
+                "reason": _DUPLICATE_CONSUMER_REASON,
+                "affected_consumers": [{"id": node_id} for node_id in consumer_ids],
             }
         )
-
     return suggestions
 
 
@@ -1927,8 +1820,9 @@ _SOURCE_VALIDATION_FAILURE_DESCRIPTION: Final[str] = (
 
 _STEP_DESCRIPTION_DESCRIPTION: Final[str] = (
     "One short sentence of plain prose saying what this step does, shown to reviewers "
-    "on the Spec tab. Supply it when creating the step and refresh it whenever you "
-    "change what the step does. Informational only — never affects validation or execution."
+    "on the Spec tab. Supply it for new steps. Preserve it during routing-only edits or explicit "
+    "content-preservation requests; refresh it only when the requested change includes the step's "
+    "purpose or description. Informational only — never affects validation or execution."
 )
 
 
@@ -2874,9 +2768,9 @@ def _normalize_echoed_interpretation_requirements(
     does NOT match — a single differing field included — is left verbatim for
     the gate to reject, so the elspeth-4496f61e30 forgery guard is untouched
     for non-matching values, and a forged "resolved" row on a component with
-    no stored counterpart never matches anything. The server-staged
-    required-control disclosure row is never normalized: only the
-    required-control finalizer may stage its user_term.
+    no stored counterpart never matches anything. A server-staged
+    required-control row is never normalized to a shell; the separate
+    boundary drops its exact echo and keeps the stored row.
 
     Returns the (possibly rewritten) options and whether any row was reduced.
     """
@@ -2920,6 +2814,131 @@ def _normalize_echoed_interpretation_requirements(
     if not normalized_any:
         return options, False
     return {**options, INTERPRETATION_REQUIREMENTS_KEY: normalized_rows}, True
+
+
+@observation_boundary(
+    tier=3,
+    source="model-supplied composer node options payload",
+    source_param="options",
+    suppresses=("R1", "R5"),
+    invariant="only an exact echo of a stored server-staged row is dropped; changed model rows remain for admission; malformed stored rows raise",
+)
+def _server_staged_requirement_boundary(
+    options: Mapping[str, object], *, stored_options: Mapping[str, object] | None, node_id: str
+) -> tuple[Mapping[str, object], str | None]:
+    if stored_options is None or INTERPRETATION_REQUIREMENTS_KEY not in options:
+        return options, None
+    if INTERPRETATION_REQUIREMENTS_KEY not in stored_options:
+        return options, None
+    stored_rows = stored_options[INTERPRETATION_REQUIREMENTS_KEY]
+    if not isinstance(stored_rows, (list, tuple)):
+        raise AuditIntegrityError(f"Stored interpretation requirements for node {node_id!r} are not rows")
+    echoes: dict[str, str] = {}
+    for stored in stored_rows:
+        if not isinstance(stored, Mapping):
+            raise AuditIntegrityError(f"Stored interpretation requirement for node {node_id!r} is not a row")
+        term = stored["user_term"]
+        if not isinstance(term, str):
+            raise AuditIntegrityError(f"Stored interpretation requirement for node {node_id!r} has no valid user term")
+        if not is_server_staged_review(stored["kind"], term):
+            continue
+        shell = {
+            "kind": stored["kind"],
+            "user_term": term,
+            "draft": stored["draft"],
+        }
+        if "display_title" in stored:
+            shell["display_title"] = stored["display_title"]
+        for view in (stored, project_planner_context_interpretation_requirement(stored), shell):
+            echoes[stable_hash(deep_thaw(view))] = term
+    if not echoes:
+        return options, None
+    supplied_rows = options[INTERPRETATION_REQUIREMENTS_KEY]
+    if supplied_rows == []:
+        term = next(iter(echoes.values()))
+        return options, (
+            f"Node '{node_id}' carries a server-staged review ({term}) that only the user can resolve, on its card. "
+            "interpretation_requirements [] would clear it. Nothing was changed. To edit the node, "
+            "re-send it without interpretation_requirements; the review is kept."
+        )
+    if not isinstance(supplied_rows, list):
+        return options, None
+    kept = [
+        row
+        for row in supplied_rows
+        if (isinstance(row, Mapping) and type(row.get("user_term")) is ServerStagedRequiredControlUserTerm)
+        or not isinstance(row, Mapping)
+        or stable_hash(deep_thaw(row)) not in echoes
+    ]
+    if len(kept) == len(supplied_rows):
+        return options, None
+    rewritten = dict(options)
+    if kept:
+        rewritten[INTERPRETATION_REQUIREMENTS_KEY] = kept
+    else:
+        del rewritten[INTERPRETATION_REQUIREMENTS_KEY]
+    return rewritten, None
+
+
+# Single letters from other scripts that render like a Latin letter, and two
+# digits that render like letters, mapped to that letter (lower case). This is a
+# fixed subset for one comparison, not a general confusables table: characters
+# outside it compare as themselves.
+_RESERVED_TERM_LOOKALIKES = str.maketrans(
+    {
+        "\u0430": "a",
+        "\u0441": "c",
+        "\u0501": "d",
+        "\u0435": "e",
+        "\u0261": "g",
+        "\u04bb": "h",
+        "\u0456": "i",
+        "\u0458": "j",
+        "\u043a": "k",
+        "\u04cf": "l",
+        "\u043e": "o",
+        "\u0440": "p",
+        "\u051b": "q",
+        "\u0455": "s",
+        "\u0443": "y",
+        "\u0445": "x",
+        "\u051d": "w",
+        "\u03b1": "a",
+        "\u03b5": "e",
+        "\u03b9": "i",
+        "\u03ba": "k",
+        "\u03bd": "v",
+        "\u03bf": "o",
+        "\u03c1": "p",
+        "\u03c4": "t",
+        "\u03c5": "u",
+        "\u03c7": "x",
+        "\u0131": "i",
+        "\u0269": "i",
+        "\u0251": "a",
+        "\u0142": "l",
+        "0": "o",
+        "1": "l",
+    }
+)
+# Letters with no visible glyph (Hangul and braille fillers).
+_INVISIBLE_LETTERS = frozenset("\u115f\u1160\u3164\uffa0\u2800")
+
+
+def _reserved_term_skeleton(term: str) -> str:
+    """Fold a term for comparison with the reserved server terms.
+
+    Compatibility forms are decomposed, invisible and combining characters are
+    dropped, case is folded, and the fixed look-alike letters above map to
+    their Latin letter. Every other character is kept as itself, so a term in
+    another script, or one that mixes scripts, does not match.
+    """
+    kept = "".join(
+        char
+        for char in unicodedata.normalize("NFKD", term)
+        if unicodedata.category(char) not in {"Cf", "Mn", "Me", "Cc", "Zs"} and not char.isspace() and char not in _INVISIBLE_LETTERS
+    )
+    return kept.casefold().translate(_RESERVED_TERM_LOOKALIKES)
 
 
 @observation_boundary(
@@ -3024,7 +3043,10 @@ def _resolver_owned_interpretation_requirement_error(
             or not draft.strip()
         ):
             return malformed_error
-        if user_term == REQUIRED_CONTROL_AUTO_WIRED_USER_TERM and not server_staged_auto_wire:
+        # Admission compares reserved-term skeletons; persisted ownership uses
+        # the original kind and term. Only the nominal marker can author one.
+        reserved_term = _reserved_term_skeleton(user_term) in SERVER_STAGED_PIPELINE_DECISION_USER_TERMS
+        if reserved_term and not server_staged_auto_wire:
             return (
                 f"{tool_name} options.{INTERPRETATION_REQUIREMENTS_KEY}[{index}] uses "
                 f"server-owned user_term '{REQUIRED_CONTROL_AUTO_WIRED_USER_TERM}'. "
