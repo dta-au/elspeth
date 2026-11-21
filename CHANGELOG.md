@@ -224,6 +224,21 @@ Behaviour you will see:
   composer no longer tells you it removed something it did not. A pipeline
   name can be replaced but not cleared: `null`, an empty name or a
   whitespace-only name is refused.
+- Editing an LLM prompt's wording no longer resets the vague terms you already
+  approved. A term whose wording slot, definition and evidence are unchanged
+  keeps its approved definition. The prompt review card reopens instead,
+  showing each kept definition in place, and the pipeline does not run until
+  you approve it. A term that was removed, renamed or re-drafted is reviewed
+  again, as before.
+- Wiring a file onto one query's template while the node's main prompt has a
+  term review still pending is now refused, with the steps to fix it (approve
+  the pending term, then wire the file again). Previously that query silently
+  stopped receiving the term under review. Binding a file to the node's main
+  prompt is still the way to replace the prompt for every query.
+- A pipeline whose bound file's stored content no longer matches its record
+  (changed or missing on disk) is now reported as a validation problem on that
+  file, instead of failing with a server error when you validate or run it.
+  Upload the file again and rebind it to recover.
 - `upsert_node` accepts `routing_only=true` to rewire a step without re-sending
   it. It changes only an existing transform's `input`, `on_success` and
   `on_error` and keeps its plugin, options (file-held prompts included) and
