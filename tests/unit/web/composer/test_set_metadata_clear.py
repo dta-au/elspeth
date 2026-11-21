@@ -148,6 +148,26 @@ def test_null_name_is_refused_and_state_is_untouched() -> None:
     assert "cannot be cleared" in name_schema["description"].lower()
 
 
+@pytest.mark.parametrize("blank", ["", "   ", "\t\n"])
+def test_blank_name_is_refused_and_state_is_untouched(blank: str) -> None:
+    """An empty or whitespace-only name is a cleared name, which set_metadata cannot do."""
+    state = _state()
+
+    with pytest.raises(ToolArgumentError) as exc_info:
+        _set_metadata({"name": blank}, state)
+
+    assert exc_info.value.argument == "set_metadata arguments"
+    assert state.metadata.name == "Orders"
+
+
+def test_a_name_with_surrounding_spaces_is_still_a_name() -> None:
+    """Only a name with no visible character is refused; the supplied text is stored as sent."""
+    result = _set_metadata({"name": "  Orders v2  "}, _state())
+
+    assert result.success is True
+    assert result.updated_state.metadata.name == "  Orders v2  "
+
+
 def test_schema_admits_null_for_description_only() -> None:
     validator = Draft202012Validator(_set_metadata_schema()["parameters"])
 

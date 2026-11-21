@@ -30,7 +30,7 @@ from elspeth.web.composer.redaction import (
     SpliceTransformArgumentsModel,
     _JsonInteger,
     _NodeTriggerModel,
-    _OmittableString,
+    _PipelineName,
     _StrictTimeoutSeconds,
 )
 from elspeth.web.composer.state import (
@@ -183,9 +183,9 @@ class _RemoveByIdArgumentsModel(BaseModel):
 
 class _SetMetadataPatchModel(BaseModel):
     # An omitted field is unchanged; read the supplied set with exclude_unset.
-    # name refuses null: PipelineMetadata.name is a non-optional str.
+    # name refuses null and blank text: a set name is always a visible name.
     # description admits null, which clears it to the empty default.
-    name: _OmittableString = None
+    name: _PipelineName = None
     description: str | None = None
 
     model_config = ConfigDict(extra="forbid")
