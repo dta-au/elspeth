@@ -730,7 +730,10 @@ commit as audited pipeline versions without a separate Accept click. A
 full-pipeline proposal auto-commits only after a green runtime preflight and
 while the session remains in auto-apply mode. Otherwise it remains pending for
 review. With **Approval required**, mutations wait as proposals for explicit
-Accept or Reject. The authority chip in the chat header shows the current mode.
+Accept or Reject. The web UI has no control for this mode and does not display
+it; a session is switched to it only through the session's composer-preferences
+API (`PATCH /api/sessions/{session_id}/composer/preferences`, `trust_mode:
+"explicit_approve"`).
 Follow-up messages can refine the draft without starting over. Committing a
 pipeline change never executes it; **Run pipeline** is a separate action.
 

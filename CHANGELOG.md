@@ -223,6 +223,35 @@ Behaviour you will see:
 - The inspector names a source or sink step's file.
 - Hide or show the conversation from the left end of the title bars, or with
   Ctrl+\.
+- Refusals and failures now say what happened where you are looking:
+  - A YAML import refused because the paste contains a credential says so and
+    tells you to use a secret reference, instead of claiming the paste is empty
+    or too large.
+  - A refused chat upload says why (quota, size or file type) next to the
+    upload button, instead of sending you to the file manager.
+  - Archiving or renaming a session that the server refuses shows the server's
+    reason, for example "Cancel the run first.", instead of "Please try again."
+  - If starting a run loses its connection, the message says the start could
+    not be confirmed and asks you to check Run history, instead of pointing at
+    results that may belong to an earlier run.
+  - When your sign-in expires, the sign-in page says it expired and asks you to
+    sign in again. Unsent chat and unsaved prompt text is not kept.
+- Recovery in place:
+  - If creating a new session fails while Composer is working, the current
+    session keeps receiving that turn's updates instead of staying busy.
+  - A prompt file that fails to load in the editor can be retried in place,
+    and the disabled Save says why.
+  - If the tutorial's audit summary fails to load, a Retry button loads it
+    again.
+- The session picker and its search include all your sessions, not only the 50
+  most recently updated.
+- Pressing Enter to confirm an input-method candidate (for example Japanese,
+  Chinese or Korean) no longer sends a half-typed chat message.
+- Uploads show that they are in progress: chat says "Uploading <file>…" and
+  the Upload buttons are unavailable until the upload finishes.
+- The Composer guide and user manual now say that approval mode cannot be set
+  or seen in the web UI and is switched only through the session preferences
+  API.
 
 ### Large pipelines and performance
 
