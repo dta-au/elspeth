@@ -214,9 +214,10 @@ Behaviour you will see:
   a user supplied.
 - The file list loads every file in the session (up to 10,000), not only the
   newest 50, so older prompt files no longer read as "not in this session".
-- The Workflow panel gains a Files section listing each session file with the
-  steps and fields that use it, with Show node and Edit file actions and a
-  "Filter by file or step" box. The file manager gains a wiring pad that sends
+- The Workflow panel gains a Files section listing each file the pipeline
+  uses, with the step and fields that use it (one row per step), Show node and
+  Edit file actions, and a "Filter by file or step" box. Files no step uses are
+  listed only in the file manager. The file manager gains a wiring pad that sends
   your chosen prompt connections to the composer as an ordinary chat request,
   and can filter files.
 - The inspector names a source or sink step's file.
