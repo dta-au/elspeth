@@ -340,6 +340,11 @@ Behaviour you will see:
   `completion_tokens` and `total_tokens` when the response reports them as
   non-negative integers, never content; this is a recorded exception to the
   logging policy because the gateway has no audit store of its own.
+- LLM gateway: adapters may also log `stop_reason_category` and six response
+  block counts (`content_block_count`, `text_block_count`, `tool_block_count`,
+  `other_block_count`, `empty_text_block_count`, `malformed_tool_block_count`).
+  These are categories and counts, never content; the built-in adapter does
+  not emit them.
 - `/api/ready` checks database connectivity on every probe and the schema
   against the current models on the first probe and then at most once every
   60 seconds, reporting the last `CURRENT` result between checks. A result
