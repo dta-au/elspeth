@@ -323,40 +323,39 @@ YAML import limit of 524,288.
 
 ### Limits a large graph meets (measured on candidate 5)
 
-**Aggregate file-held text: 1 MiB.** The text bound to a graph's files may
-total at most 1,048,576 bytes (`BLOB_INLINE_AGGREGATE_BYTE_CAP`). Measured
-through the real import:
+**Aggregate file-held text: 4 MiB.** The text bound to a graph's files may
+total at most 4,194,304 bytes (`BLOB_INLINE_AGGREGATE_BYTE_CAP`). Each file
+at a template position must also stay under the template limit (64 KiB), so
+a graph near the total needs many files. Measured through the real import
+(`tests/unit/scripts/staging/test_large_graph_fixture.py`):
 
 | Fixture | Files | Bytes | Result |
 | --- | --- | --- | --- |
-| `--preset acceptance --total-prompt-bytes 943718` (0.9 MiB) | 39 | 943,718 | imports, valid |
-| `--preset acceptance --total-prompt-bytes 1153433` (1.1 MiB) | 39 | 1,153,433 | HTTP 500 at import |
+| `--preset single-node --queries-per-llm-step 100 --total-prompt-bytes 3774873` (0.9 × cap) | 101 | 3,774,873 | imports, valid |
+| `--preset single-node --queries-per-llm-step 100 --total-prompt-bytes 4294304` (cap + 100,000) | 101 | 4,294,304 | HTTP 413 `prompt_file_too_large` at import |
 
-Over the cap, the import's prompt-review snapshot raises
-`PromptFileTooLargeError`, which no handler maps: the user gets an internal
-server error, not the size refusal, and no graph is saved.
+Over the cap the import is refused with the figures and "Nothing was
+imported"; no graph is saved.
 
 **State scan: 4,096 values.** The server scans the whole state for
 credential material and refuses one whose scan visits more than 4,096
 values (`CredentialTraversalPolicy.max_nodes`). The manifest's
-`state_scan_values_at_import` is that count for the graph as the YAML import
-scans it, measured with the server's own importer and scan. A file-held
-template's marker is bound after that scan, so the stored state counts more:
+`state_scan_values_at_import` is that count for the graph as the YAML
+alone reads, measured with the server's own importer and scan. Each file-held
+template's marker adds values once bound, and the import scans the state with
+the markers bound:
 
-| Fixture (single-node) | Values at import | Values stored | Result |
+| Fixture (single-node) | Values in the YAML | Values bound | Result |
 | --- | --- | --- | --- |
 | 251 file-held queries | 3,080 | 4,092 | imports, valid, readable |
-| 252 file-held queries | 3,092 | 4,108 | imports; `GET /state` then answers 409 "The saved graph is unavailable" |
+| 252 file-held queries | 3,092 | 4,108 | HTTP 422 at import; nothing saved |
 | 309 inline queries (400 B) | 4,085 | 4,094 | imports, valid |
 | 310 inline queries (400 B) | 4,098 | - | HTTP 422 at import |
 
 In this generator's query shape a file-held query adds 16 stored values and
-an inline one 13. At 252 file-held queries the import accepts the graph and
-the session's graph can no longer be opened: the read path's editable-draft
-check fails it for credential material (`checkpoint_credential_material`).
-The inline refusal at 310 is `credential_material_rejected` with category
-`traversal_limit`, and its text tells the user the content "appears to
-contain a credential".
+an inline one 13. Both refusals are `credential_material_rejected` with
+category `traversal_limit`, and the text tells the user the content "appears
+to contain a credential" (the credential-scan size limit is 0.8.17 work).
 
 ### `file_inject` content
 

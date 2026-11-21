@@ -395,27 +395,32 @@ def test_inline_queries_just_under_the_scan_limit_import_and_just_over_are_refus
     assert "credential_material_rejected" in str(refused.value)
 
 
+# Near the aggregate cap each query file must also stay under the template
+# limit (every query is a template position), so these graphs spread the
+# text over 100 file-held queries rather than the acceptance preset's 39 files.
+_NEAR_CAP_QUERIES = 100
+
+
 def test_file_held_text_just_under_the_aggregate_cap_validates(tmp_path: Path) -> None:
     _, aggregate = lgf._inline_blob_caps()
-    _, _, _, summary = _set_up(tmp_path, lgf.preset_spec("acceptance", total_prompt_bytes=int(0.9 * aggregate)))
+    spec = lgf.preset_spec("single-node", queries_per_llm_step=_NEAR_CAP_QUERIES, total_prompt_bytes=int(0.9 * aggregate))
+    _, _, _, summary = _set_up(tmp_path, spec)
     assert type(summary) is dict, summary
     assert summary["valid"] is True
 
 
-def test_file_held_text_just_over_the_aggregate_cap_fails_the_import_with_an_unhandled_server_error(tmp_path: Path) -> None:
-    """The import's prompt-review snapshot raises ``PromptFileTooLargeError`` and no handler maps it: HTTP 500.
-
-    A user gets an internal server error instead of the size refusal. When a
-    handler maps it, this test goes red and should assert that refusal.
-    """
+def test_file_held_text_just_over_the_aggregate_cap_is_refused_at_import_and_nothing_is_saved(tmp_path: Path) -> None:
+    """Over the cap the import answers 413 ``prompt_file_too_large`` with the figures, and no graph is saved."""
     _, aggregate = lgf._inline_blob_caps()
     server = _server(tmp_path / "server", raise_server_exceptions=False)
     client = _client(server)
     session = client.post_json("/api/sessions", {"title": "over"})["id"]
-    over = _written(tmp_path, lgf.preset_spec("acceptance", total_prompt_bytes=int(1.1 * aggregate)))
-    with pytest.raises(ApiError, match="/state/yaml returned HTTP 500") as refused:
+    spec = lgf.preset_spec("single-node", queries_per_llm_step=_NEAR_CAP_QUERIES, total_prompt_bytes=aggregate + 100_000)
+    over = _written(tmp_path, spec)
+    with pytest.raises(ApiError, match=r"/state/yaml returned HTTP 413.*prompt_file_too_large") as refused:
         setup_fixture(client, session, over, emit=Events())
-    assert refused.value.status == 500
+    assert refused.value.status == 413
+    assert "Nothing was imported" in str(refused.value)
     assert client.get_json(f"/api/sessions/{session}/state") is None
 
 
@@ -441,23 +446,19 @@ def test_251_file_held_queries_keep_the_stored_state_within_the_scan_bound(tmp_p
     require_no_credential_material_in_state(state, surface="fixture_test")
 
 
-def test_252_file_held_queries_import_but_the_stored_state_crosses_the_scan_bound_and_cannot_be_read(tmp_path: Path) -> None:
-    """The import scans the YAML's state; the file markers bound afterwards add values it never saw.
+def test_252_file_held_queries_are_refused_at_import_and_nothing_is_saved(tmp_path: Path) -> None:
+    """The import scans the state with its file markers bound, so a graph over the bound never reaches the store.
 
-    The import is accepted, the stored state is over the bound, and reading it
-    back fails the editable-checkpoint check (``checkpoint_credential_material``):
-    ``GET /state`` answers 409 "The saved graph is unavailable". When the import
-    refuses this graph instead, this test goes red and should assert that.
+    The YAML alone is under the bound; the bound state is over it, and the
+    import refuses it (``credential_material_rejected``, category
+    ``traversal_limit``) instead of saving a graph that could not be opened.
     """
-    server, client, session, loaded = _file_held_queries(tmp_path, 252)
+    _, client, session, loaded = _file_held_queries(tmp_path, 252)
     assert loaded.manifest["measures"]["state_scan_values_at_import"] <= SCAN_LIMIT
-    with pytest.raises(ApiError, match=r"GET .*/state returned HTTP 409.*composition_state_unavailable"):
+    with pytest.raises(ApiError, match=r'/state/yaml returned HTTP 422.*"category":"traversal_limit"') as refused:
         setup_fixture(client, session, loaded, emit=Events())
-    state = _stored_state(server, session)
-    finding = find_credential_material(state.to_dict())
-    assert finding is not None and finding.category == "traversal_limit"
-    with pytest.raises(CredentialMaterialRefused):
-        require_no_credential_material_in_state(state, surface="fixture_test")
+    assert "credential_material_rejected" in str(refused.value)
+    assert client.get_json(f"/api/sessions/{session}/state") is None
 
 
 def test_setup_refuses_a_session_that_already_has_a_graph(tmp_path: Path) -> None:

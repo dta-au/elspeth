@@ -728,8 +728,8 @@ def scan_values_of_state(state: CompositionState) -> int:
 
 
 def build_fixture(spec: FixtureSpec) -> Fixture:
-    if spec.total_prompt_bytes < 4000 or spec.total_prompt_bytes > 4_000_000:
-        raise UsageError("--total-prompt-bytes must be between 4000 and 4000000")
+    if spec.total_prompt_bytes < 4000 or spec.total_prompt_bytes > 8_000_000:
+        raise UsageError("--total-prompt-bytes must be between 4000 and 8000000")
     if not 1 <= spec.queries_per_llm_step <= MAX_QUERIES or not 1 <= spec.large_queries <= MAX_QUERIES:
         raise UsageError(f"--queries-per-llm-step and --large-queries must be 1-{MAX_QUERIES}")
     if not 1 <= spec.inject_files <= 8:
