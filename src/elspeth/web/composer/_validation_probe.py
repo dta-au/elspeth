@@ -186,7 +186,7 @@ def deferred_created_fields(plugin: str, options: object) -> frozenset[str] | No
     or of each ``lookups[].output``; ``file_inject`` writes ``output_field``
     (``mode: select``) or each ``files.<name>.output_field`` (``mode: all``).
     Every other plugin, or a shape that does not read cleanly, is ``None``:
-    the caller then says "the fields this step adds" without naming any.
+    the caller then says "the fields this step reads and adds" without naming any.
     """
     if type(options) is not dict:
         return None

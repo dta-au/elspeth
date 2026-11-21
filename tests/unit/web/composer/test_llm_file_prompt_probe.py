@@ -351,9 +351,19 @@ def test_an_explicit_null_queries_key_is_single_prompt_mode(tmp_path: Path) -> N
     assert _codes(summary) == ([], [])
 
 
-# Formerly test_a_marker_at_a_non_prompt_llm_option_still_defers_with_zero_guarantees (stage 2a, vote arm (a)).
-def test_a_marker_at_a_non_prompt_llm_option_defers_and_forwards_only_upstream_guarantees(tmp_path: Path) -> None:
-    """``llm`` is a known pass-through: deferring, it votes with what it forwards (``review``), never with what it adds."""
+# Formerly test_a_marker_at_a_non_prompt_llm_option_still_defers_with_zero_guarantees (stage 2a, vote arm (a)),
+# then test_a_marker_at_a_non_prompt_llm_option_defers_and_forwards_only_upstream_guarantees (stage 2a).
+def test_a_marker_at_a_non_prompt_llm_option_forwards_upstream_guarantees_and_leaves_its_additions_to_the_preflight(
+    tmp_path: Path,
+) -> None:
+    """``llm`` is a known pass-through: deferring, it votes with what it forwards (``review``), never with what it adds.
+
+    Stage 2b: ``response_field`` itself is in the file, so no config shape
+    names what the step adds, and ``summary`` could be it. The sink edge is
+    left unchecked and the generic notice says so; the runtime preflight
+    reads the name (``test_deferred_possible_additions.py`` drives it with a
+    file naming ``summary``, another field, and a misspelling).
+    """
     _, state = _state(tmp_path, prompt_template=GOOD_PROMPT, options={"response_field": _marker()})
 
     prepared = prepare_validation_probe_options(state.nodes[0].options, plugin="llm")
@@ -361,11 +371,11 @@ def test_a_marker_at_a_non_prompt_llm_option_defers_and_forwards_only_upstream_g
     errors, warnings = _codes(summary)
 
     assert prepared["response_field"] == _marker()
-    assert errors == ["sink_contract_violation"]
+    assert errors == []
     assert warnings == ["contract_probe_deferred"]
-    assert "guarantees: [review]. Missing fields: [summary]." in summary.errors[0].message
+    assert not [contract for contract in summary.edge_contracts if contract.from_id == "classify"]
     assert [warning.message for warning in summary.warnings if warning.error_code == "contract_probe_deferred"] == [
-        "Node 'classify' (llm) reads an attached file that this check does not open, so the fields this step adds, "
+        "Node 'classify' (llm) reads an attached file that this check does not open, so the fields this step reads and adds, "
         "their types and whether they can be empty are checked before the run starts. No change is needed."
     ]
 

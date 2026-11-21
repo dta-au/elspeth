@@ -90,6 +90,11 @@ def test_blob_contract_probe_reports_deferral_without_promoting_guarantees(tmp_p
     contract (with an observed upstream the join abstains; behind a fixed one
     it forwards ``product`` and nothing it authors), and the notice is the
     named one, not the generic text the old pin matched.
+
+    Stage 2b: behind the fixed upstream the graph is valid too. ``description``
+    is an ``output`` key, so the join could add it once its table is read;
+    the sink edge is left unchecked (no edge contract, neither satisfied nor
+    refused) and the runtime preflight decides it.
     """
     summary = _pin_graph(tmp_path / "observed", uuid4(), _PIN_TABLE, required=required).validate()
     behind_fixed = _pin_graph(tmp_path / "fixed", uuid4(), _PIN_TABLE, required=required, fixed_upstream=True).validate()
@@ -101,10 +106,13 @@ def test_blob_contract_probe_reports_deferral_without_promoting_guarantees(tmp_p
     for checked in (summary, behind_fixed):
         for contract in checked.edge_contracts:
             assert "description" not in contract.producer_guarantees, contract.to_dict()
-    # Behind a fixed upstream the join votes with what it forwards, never its own authored field.
-    [enrich_contract] = [contract for contract in behind_fixed.edge_contracts if contract.from_id == "enrich"]
-    assert enrich_contract.producer_guarantees == ("product",)
-    assert not enrich_contract.satisfied
+    # Behind a fixed upstream: nothing about ``description`` is refused, and the edge to the sink
+    # carries no verdict either way. The fixed sink still rejects the forwarded ``product`` (the
+    # extras direction, as for the inline twin): that is the only error, and it names no missing field.
+    behind_fixed_errors = [(entry.error_code, entry.component) for entry in behind_fixed.errors]
+    assert behind_fixed_errors == ([] if required else [("sink_locked_extras", "output:results")]), behind_fixed_errors
+    assert not any("Missing fields" in entry.message for entry in behind_fixed.errors)
+    assert not [contract for contract in behind_fixed.edge_contracts if contract.from_id == "enrich"]
     assert [warning.message for warning in behind_fixed.warnings if warning.error_code == "contract_probe_deferred"] == [_PIN_NOTICE]
 
 

@@ -6243,6 +6243,115 @@ def _check_schema_contracts(
 
         return _effective_producer_vote(producer, visited_fan_in_ids=visited_fan_in_ids)
 
+    # The fields deferring nodes could add, resolved along exactly the paths
+    # the vote walks (pass-throughs, gates, fan-ins), memoized per producer
+    # for this walk like the structural vote. Kept beside the vote, never in
+    # it: a possible addition is not a guarantee and reaches no edge contract.
+    _possible_additions_memo: dict[str, _PossibleAdditions] = {}
+    # Only a marker can defer a probe, so a graph without one has nothing to
+    # walk, and the notice sweep below asks only these nodes.
+    marker_holding_node_ids = frozenset(
+        candidate.id
+        for candidate in nodes
+        if candidate.node_type in {"transform", "aggregation"}
+        and candidate.plugin is not None
+        and holds_inline_content_reference(deep_thaw(candidate.options))
+    )
+
+    def _possibly_added(producer: ProducerEntry, missing: frozenset[str]) -> frozenset[str]:
+        """The ``missing`` fields a deferring node on ``producer``'s path could add; walks only when there is a question."""
+        if not missing or not marker_holding_node_ids:
+            return frozenset()
+        return _producer_possible_additions(producer).among(missing)
+
+    def _connection_possible_additions(connection_name: str, *, visited: frozenset[str]) -> _PossibleAdditions:
+        producer = resolver.find_producer_for(connection_name)
+        if producer is None:
+            return _NO_POSSIBLE_ADDITIONS
+        return _producer_possible_additions(producer, visited=visited)
+
+    def _producer_possible_additions(producer: ProducerEntry, *, visited: frozenset[str] = frozenset()) -> _PossibleAdditions:
+        """What deferring nodes on ``producer``'s vote path could add beyond its guarantees."""
+        if producer.producer_id in visited:
+            return _NO_POSSIBLE_ADDITIONS
+        if producer.producer_id in _possible_additions_memo:
+            return _possible_additions_memo[producer.producer_id]
+        additions = _producer_possible_additions_uncached(producer, visited=visited | {producer.producer_id})
+        _possible_additions_memo[producer.producer_id] = additions
+        return additions
+
+    def _fan_in_possible_additions(arms: list[tuple[tuple[bool, frozenset[str]], _PossibleAdditions]]) -> _PossibleAdditions:
+        """An intersecting fan-in: a field is possible where EVERY arm guarantees it or could add it.
+
+        Subtracting what every arm guarantees leaves only what the vote's
+        intersection does not already carry.
+        """
+        guaranteed = [fields if participates else frozenset() for (participates, fields), _additions in arms]
+        bounded = [
+            fields | additions.fields for fields, (_vote, additions) in zip(guaranteed, arms, strict=True) if not additions.unbounded
+        ]
+        certain = frozenset.intersection(*guaranteed) if guaranteed else frozenset()
+        if not bounded:
+            return _PossibleAdditions(unbounded=bool(arms))
+        return _PossibleAdditions(frozenset.intersection(*bounded) - certain)
+
+    def _producer_possible_additions_uncached(producer: ProducerEntry, *, visited: frozenset[str]) -> _PossibleAdditions:
+        if is_source_producer_id(producer.producer_id):
+            return _NO_POSSIBLE_ADDITIONS
+        producer_node = node_by_id[producer.producer_id]
+        if producer_node.node_type == "gate":
+            return _connection_possible_additions(producer_node.input, visited=visited)
+        if producer_node.node_type == "queue":
+            return _fan_in_possible_additions(
+                [
+                    (
+                        _producer_entry_propagation_vote(arm, visited_fan_in_ids=visited),
+                        _producer_possible_additions(arm, visited=visited),
+                    )
+                    for arm in resolver.queue_predecessors(producer_node.id)
+                ]
+            )
+        if producer_node.node_type in {"row_union", "coalesce"}:
+            if producer_node.node_type == "coalesce" and producer_node.merge != "union":
+                # Nested merges guarantee branch NAMES; unmirrored merges abstain.
+                return _NO_POSSIBLE_ADDITIONS
+            branches = [
+                (
+                    _connection_propagation_vote(connection, visited_fan_in_ids=visited),
+                    _connection_possible_additions(connection, visited=visited),
+                )
+                for connection in _coalesce_branch_connections(producer_node.branches)
+            ]
+            if producer_node.node_type == "coalesce" and producer_node.policy == "require_all":
+                # Every branch arrives: the merged row carries any branch's additions.
+                combined = _NO_POSSIBLE_ADDITIONS
+                for _vote, additions in branches:
+                    combined = combined.union(additions)
+                return combined
+            return _fan_in_possible_additions(branches)
+        if producer_node.node_type not in {"transform", "aggregation"} or producer_node.plugin is None:
+            return _NO_POSSIBLE_ADDITIONS
+        try:
+            transform = probe_cache.transform(producer_node.plugin, producer_node)
+        except DeferredBlobContractProbe:
+            created = deferred_created_fields(producer_node.plugin, deep_thaw(producer_node.options))
+            own = _PossibleAdditions(unbounded=True) if created is None else _PossibleAdditions(created)
+            if producer_node.plugin not in _known_pass_through_plugins():
+                return own
+            return own.union(_connection_possible_additions(producer_node.input, visited=visited))
+        except Exception as exc:
+            if not _is_config_probe_exception(exc):
+                raise
+            return _NO_POSSIBLE_ADDITIONS
+        output_schema_config = transform._output_schema_config
+        open_contract = output_schema_config is None or output_schema_config.allows_extra_fields
+        if not (transform.passes_through_input or (transform.forwards_input_fields and open_contract)):
+            # Its output is its own and constructed: nothing upstream can add to it.
+            return _NO_POSSIBLE_ADDITIONS
+        inherited = _connection_possible_additions(producer_node.input, visited=visited)
+        closed_names = output_schema_config.closed_field_names() if output_schema_config is not None else None
+        return inherited if closed_names is None else inherited.within(closed_names)
+
     def _mirrored_coalesce_merged_guarantees(producer: ProducerEntry) -> frozenset[str] | None:
         """Return a coalesce's merged guarantee set, or None to abstain.
 
@@ -7392,21 +7501,34 @@ def _check_schema_contracts(
                 if string_type_error is not None:
                     errors.append(string_type_error)
 
+        # A field a node upstream could add once its file is read is neither
+        # guaranteed nor missing: the runtime preflight decides it on the
+        # bytes (``contract_probe_deferred`` names the node). Only the fields
+        # nothing on the path could supply are reported, in the error and in
+        # the edge contract.
         if contract_required:
             contract_missing_fields = contract_required - producer_guaranteed
-            edge_contracts.append(
-                EdgeContract(
-                    from_id=actual_producer.producer_id,
-                    to_id=node.id,
-                    producer_guarantees=tuple(sorted(producer_guaranteed)),
-                    consumer_requires=tuple(sorted(contract_required)),
-                    missing_fields=tuple(sorted(contract_missing_fields)),
-                    satisfied=not contract_missing_fields,
+            contract_possibly_added = _possibly_added(actual_producer, contract_missing_fields)
+            contract_missing_fields -= contract_possibly_added
+            # Only an edge whose every missing field could be added is left
+            # without a verdict. Fields nothing could add stay an unsatisfied
+            # entry: the source data-contract review reads it to offer the
+            # card that would let the source promise them.
+            if contract_missing_fields or not contract_possibly_added:
+                edge_contracts.append(
+                    EdgeContract(
+                        from_id=actual_producer.producer_id,
+                        to_id=node.id,
+                        producer_guarantees=tuple(sorted(producer_guaranteed)),
+                        consumer_requires=tuple(sorted(contract_required)),
+                        missing_fields=tuple(sorted(contract_missing_fields)),
+                        satisfied=not contract_missing_fields,
+                    )
                 )
-            )
 
         if consumer_required:
             missing_fields = consumer_required - producer_guaranteed
+            missing_fields -= _possibly_added(actual_producer, missing_fields)
             if missing_fields:
                 error_component = (
                     _producer_owner(actual_producer) if is_source_producer_id(actual_producer.producer_id) else f"node:{node.id}"
@@ -7516,6 +7638,10 @@ def _check_schema_contracts(
             producer_closed = producer_schema is not None and not producer_schema.allows_extra_fields
             if (producer_participates or producer_guaranteed) and producer_closed:
                 declared_missing = declared_input - consumer_required - producer_guaranteed
+                # A closed producer bounds what deferring nodes behind it could
+                # add to its own declared names (``_PossibleAdditions.within``);
+                # an optional one among them is decided before the run.
+                declared_missing -= _possibly_added(actual_producer, declared_missing)
                 if declared_missing:
                     errors.append(
                         _err(
@@ -7679,16 +7805,21 @@ def _check_schema_contracts(
             # satisfaction verdict the composer cannot support.
             if sink_required and (producer_guaranteed or producer_participates):
                 missing_fields = sink_required - producer_guaranteed
-                edge_contracts.append(
-                    EdgeContract(
-                        from_id=actual_producer.producer_id,
-                        to_id=f"output:{output.name}",
-                        producer_guarantees=tuple(sorted(producer_guaranteed)),
-                        consumer_requires=tuple(sorted(sink_required)),
-                        missing_fields=tuple(sorted(missing_fields)),
-                        satisfied=not missing_fields,
+                # As at the node consumers above: what a deferring node on the
+                # path could add is decided before the run, not refused here.
+                possibly_added = _possibly_added(actual_producer, missing_fields)
+                missing_fields -= possibly_added
+                if missing_fields or not possibly_added:
+                    edge_contracts.append(
+                        EdgeContract(
+                            from_id=actual_producer.producer_id,
+                            to_id=f"output:{output.name}",
+                            producer_guarantees=tuple(sorted(producer_guaranteed)),
+                            consumer_requires=tuple(sorted(sink_required)),
+                            missing_fields=tuple(sorted(missing_fields)),
+                            satisfied=not missing_fields,
+                        )
                     )
-                )
                 if missing_fields:
                     errors.append(
                         _err(
@@ -8335,9 +8466,7 @@ def _check_schema_contracts(
         return False
 
     for deferred_node in nodes:
-        if deferred_node.node_type not in {"transform", "aggregation"} or deferred_node.plugin is None:
-            continue
-        if not holds_inline_content_reference(deep_thaw(deferred_node.options)):
+        if deferred_node.id not in marker_holding_node_ids or deferred_node.plugin is None:
             continue
         if _nested_path_file_reference_errors(deferred_node):
             continue
@@ -8349,17 +8478,47 @@ def _check_schema_contracts(
     return tuple(errors), tuple(contract_warnings), tuple(edge_contracts)
 
 
+@dataclass(frozen=True, slots=True)
+class _PossibleAdditions:
+    """Fields a node whose contract waits on a file could add on a producer's path: never a guarantee.
+
+    A missing-field check subtracts these from what it reports, because the
+    runtime preflight decides them on the file's bytes. ``fields`` are the
+    names the deferring nodes' config shapes fix (``deferred_created_fields``);
+    ``unbounded`` means a deferring node on the path adds fields its config
+    cannot name, so any missing field could be one of them.
+    """
+
+    fields: frozenset[str] = frozenset()
+    unbounded: bool = False
+
+    def union(self, other: _PossibleAdditions) -> _PossibleAdditions:
+        return _PossibleAdditions(self.fields | other.fields, self.unbounded or other.unbounded)
+
+    def within(self, declared: frozenset[str]) -> _PossibleAdditions:
+        """What survives a closed schema declaring ``declared``: nothing else passes it."""
+        return _PossibleAdditions(declared if self.unbounded else self.fields & declared)
+
+    def among(self, missing: frozenset[str]) -> frozenset[str]:
+        """The missing fields one of these could supply."""
+        return missing if self.unbounded else missing & self.fields
+
+
+_NO_POSSIBLE_ADDITIONS: Final = _PossibleAdditions()
+
+
 def _deferred_contract_notice(node: NodeSpec) -> ValidationEntry:
     """The ``contract_probe_deferred`` notice: node, fields and fact, in two sentences, no content.
 
     Names come from the node's config shape (``deferred_created_fields``)
     only where they are certain; otherwise the notice says "the fields this
-    step adds" without naming any. It carries no repair hint: nothing on the
+    step reads and adds" without naming any: the file may hold a field the
+    step reads (``blob_text_expand.blob_ref_field``) as well as one it adds. It carries no repair hint: nothing on the
     node is wrong, and the runtime preflight decides the question.
     """
     plugin = node.plugin if node.plugin is not None else node.node_type
     created = deferred_created_fields(plugin, deep_thaw(node.options))
-    fields = f"the fields it adds ({', '.join(sorted(created))})" if created else "the fields this step adds"
+    fields = f"the fields it adds ({', '.join(sorted(created))})" if created else "the fields this step reads and adds"
     return ValidationEntry(
         f"node:{node.id}",
         f"Node '{node.id}' ({plugin}) reads an attached file that this check does not open, so {fields}, "
