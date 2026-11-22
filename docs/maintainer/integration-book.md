@@ -19,8 +19,8 @@ note says so.
 1. The short version below (two minutes), then this book end to end (about
    35 minutes).
 2. [AGENTS.md](../../AGENTS.md), the covenant for every agent. If this book
-   and AGENTS.md disagree, stop and ask the integrator. The known
-   disagreements are listed below.
+   and AGENTS.md disagree, stop and ask the integrator. There are no known
+   disagreements (see below).
 3. [CONTRIBUTING.md § Whole-tree gates](../../CONTRIBUTING.md#whole-tree-gates-and-conventions-you-will-hit),
    before you write code.
 4. The headers of the three canonical scripts:
@@ -44,18 +44,14 @@ note says so.
 | | Product rulings about composer behaviour |
 | | Lock file locations, current box numbers if the box owner changes them |
 
-**Known disagreements with AGENTS.md**
+**Disagreements with AGENTS.md**
 
-| Topic | AGENTS.md | This book | Where |
-|---|---|---|---|
-| Compatibility | Compatibility "is permitted and must be considered" | The maintainer's later policy: none before 1.0. OPEN | Section 4 |
-| Where work lives | Project work stays in the project folder; never `/tmp` | Temp files go under `~/.pt/<session>/<lane>`, on disk outside the project; project work still stays in the repo or a worktree | Section 7 |
-| Full suite | Full suite before merging changes whose effects cannot be bounded | Scoped tests per lane, with the AGENTS.md full-suite run kept for unbounded changes | Section 6 |
-| Pull requests | Agents may create draft PRs autonomously | Lanes never open PRs; the integrator opens release PRs to `main` | Section 5 |
-| Signature worklists | Agents stage key-free worklists for the operator | Stage one only when the maintainer asks, once, on the final tree | Section 10 |
-
-Where the book is stricter, follow the book. Where it is looser, follow
-AGENTS.md and ask the integrator.
+None known. On 2026-11-23, at the maintainer's request, AGENTS.md was aligned
+with this book on five topics: compatibility (section 4), temp files under
+`~/.pt/<session>/<lane>` (section 7), scoped lane tests with one full gate on
+the release branch (section 6), lanes not opening PRs (section 5), and staging
+signature worklists only when the maintainer asks (section 10). If you find a
+new disagreement, follow the stricter text and tell the integrator.
 
 **Glossary**
 
@@ -367,10 +363,8 @@ Never use the question dialog tool.
   line still stands as its own rule under the 2026-11-23 policy is not
   recorded. Either way, stop and raise any change that would alter or reject
   a valid pipeline YAML that loads and runs today.
-- **OPEN: AGENTS.md says otherwise.** AGENTS.md § Project delivery posture
-  says compatibility "is permitted and must be considered" from 0.8.5 onward.
-  The maintainer ruled the policy above and said to leave the AGENTS.md text
-  as it is. Until he aligns them, these hold:
+- AGENTS.md § Project delivery posture states the same policy, aligned on
+  2026-11-23 at the maintainer's request. What still holds:
   - no migrations, resets, wipes or downgrades of any store without his
     approval;
   - preserve/refuse contracts stay as they are;
@@ -1083,6 +1077,11 @@ and there are no tutorial-special paths. Read them there.
 - [ ] Create a worktree under `.claude/worktrees/`, link `.venv`, and confirm
       `elspeth.__file__` resolves inside it, with both source roots on
       PYTHONPATH (section 6).
+- [ ] If the lane runs browser or frontend tests, link
+      `src/elspeth/web/frontend/node_modules` from the main checkout, only
+      when `package-lock.json` is byte-identical to the main checkout's.
+      `--link-venv` does not do this, and a missing module shows up as
+      failing tests, not as a setup error.
 - [ ] Set `TMPDIR` and basetemp under `~/.pt/<session>/<lane>` (temp only;
       project work stays in the worktree).
 - [ ] Write the lane's `run.sh` (lock, cores, workers, stop file, refusals)
