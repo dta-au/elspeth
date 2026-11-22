@@ -11,6 +11,7 @@ as the crash, after an earlier turn of the same request already committed.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from typing import Any
 from unittest.mock import patch
@@ -20,6 +21,7 @@ from sqlalchemy import text
 
 from elspeth.web.composer import tool_batch as tool_batch_module
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
+from elspeth.web.composer.invariants import InvariantError
 from elspeth.web.composer.protocol import ComposerPluginCrashError
 from elspeth.web.composer.service import ComposerServiceImpl
 from tests.unit.web.composer._helpers import _clean_advisor_checkpoint
@@ -129,3 +131,42 @@ async def test_checkpoint_failure_on_the_crashing_turn_is_kept_beside_the_crash(
         # Both turns are durable: nothing is replayed.
         assert stored_ids == ["call_applied", "call_crash"]
         assert carried_ids == []
+
+
+@pytest.mark.asyncio
+async def test_crash_on_a_turn_that_was_neither_persisted_nor_rolled_back_is_an_invariant_failure(
+    composer_service_with_real_sessions: ComposerServiceImpl,
+    result_session_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crashed tool turn is always persisted or recorded as rolled back; anything else must not pass as an ordinary crash.
+
+    The persist step is made to report neither, which current code cannot
+    produce. The loop refuses to raise a crash whose audit standing is
+    unknown, and keeps the handler's exception as the cause.
+    """
+    monkeypatch.setattr(AdvisorCheckpointOwner, "_run_advisor_checkpoint", _clean_advisor_checkpoint)
+    service = composer_service_with_real_sessions
+    provider = _two_turns_second_crashes(monkeypatch)
+    real_persist = service._persist_turn_audit
+    persists = 0
+
+    async def _persist_reporting_neither(**kwargs: Any) -> Any:
+        nonlocal persists
+        persists += 1
+        outcome = await real_persist(**kwargs)
+        if persists == 2:
+            return dataclasses.replace(
+                outcome,
+                persisted_tool_call_turn=False,
+                persisted_assistant_matches_current_dispatch=False,
+                unwind_audit_failed=False,
+            )
+        return outcome
+
+    monkeypatch.setattr(service, "_persist_turn_audit", _persist_reporting_neither)
+
+    with patch.object(service._provider_gateway, "_call_llm", new=provider), pytest.raises(InvariantError) as raised:
+        await service.compose("Rename, then crash", [], _stage1_valid_preview_state(), session_id=result_session_id)
+
+    assert type(raised.value.__cause__) is _SecondToolCrash

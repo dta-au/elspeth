@@ -48,6 +48,7 @@ from elspeth.web.composer._compose_loop_carriers import (
     _AdvisorProviderFailure,
     _CallModelOutcome,
     _DispatchOutcome,
+    _PluginCrash,
     _ToolBatchCancellationRequested,
     _ToolOutcome,
 )
@@ -1208,8 +1209,7 @@ async def run_tool_batch(
     # performs audit writes from this list; cancellation before Step 2
     # leaves the DB unchanged for the current assistant response.
     tool_outcomes: list[_ToolOutcome] = []
-    plugin_crash: ComposerPluginCrashError | None = None
-    plugin_crash_cause: BaseException | None = None
+    plugin_crash: _PluginCrash | None = None
     advisor_failure: Exception | None = None
     advisor_compose_timeout: Literal["pre_call", "in_flight"] | None = None
     pre_state_id: str | None = current_state_id
@@ -3080,14 +3080,16 @@ async def run_tool_batch(
                     error_message=type(tool_exc).__name__,
                     post_version=state.version,
                 )
-                plugin_crash = ComposerPluginCrashError.capture(
-                    tool_exc,
-                    state=state,
-                    initial_version=initial_version,
-                    tool_invocations=recorder.invocations,
-                    llm_calls=recorder.llm_calls,
+                plugin_crash = _PluginCrash(
+                    error=ComposerPluginCrashError.capture(
+                        tool_exc,
+                        state=state,
+                        initial_version=initial_version,
+                        tool_invocations=recorder.invocations,
+                        llm_calls=recorder.llm_calls,
+                    ),
+                    cause=tool_exc,
                 )
-                plugin_crash_cause = tool_exc
                 break
             all_cache_hits = False
             _append_tool_outcome(
@@ -3638,14 +3640,16 @@ async def run_tool_batch(
                 error_message=type(tool_exc).__name__,
                 post_version=state.version,
             )
-            plugin_crash = ComposerPluginCrashError.capture(
-                tool_exc,
-                state=state,
-                initial_version=initial_version,
-                tool_invocations=recorder.invocations,
-                llm_calls=recorder.llm_calls,
+            plugin_crash = _PluginCrash(
+                error=ComposerPluginCrashError.capture(
+                    tool_exc,
+                    state=state,
+                    initial_version=initial_version,
+                    tool_invocations=recorder.invocations,
+                    llm_calls=recorder.llm_calls,
+                ),
+                cause=tool_exc,
             )
-            plugin_crash_cause = tool_exc
             break
 
         # SUCCESS path — the helper already recorded
@@ -3818,7 +3822,6 @@ async def run_tool_batch(
         turn_has_discovery=turn_has_discovery,
         all_cache_hits=all_cache_hits,
         plugin_crash=plugin_crash,
-        plugin_crash_cause=plugin_crash_cause,
         advisor_failure=advisor_failure,
         advisor_compose_timeout=advisor_compose_timeout,
         assistant_message=assistant_message,
