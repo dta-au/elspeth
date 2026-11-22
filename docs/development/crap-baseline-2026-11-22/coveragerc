@@ -1,0 +1,13 @@
+[run]
+branch = true
+source = src/elspeth
+[paths]
+source =
+    src/elspeth
+    /__w/elspeth/elspeth/*/src/elspeth
+[report]
+exclude_lines =
+    pragma: no cover
+    if TYPE_CHECKING:
+    raise NotImplementedError
+    @abstractmethod
