@@ -204,7 +204,7 @@ For ordinary build/edit turns, the action path is:
 | Edit intent | Use |
 | --- | --- |
 | Create a new pipeline or perform an intentional full rebuild | `set_pipeline`, or bounded construction batches as described below |
-| Perform a one-transform insertion between existing nodes on a direct linear path | `splice_transform`: one call, with or without `edges`; the server re-points the successor's `input`. If it is refused, use `upsert_node` for the new node and re-point the successor's `input`, also with `upsert_node` (with `routing_only=true` when the successor is a transform) |
+| Perform a one-transform insertion between existing nodes on a direct linear path | `splice_transform`: one call, with or without `edges`; the server re-points the successor's `input`. Neither endpoint may have an `on_error` other than none or `discard`. If it is refused, use `upsert_node` for the new node and re-point the successor's `input`, also with `upsert_node` (with `routing_only=true` when the successor is a transform) |
 | Make an option-only edit to an existing node | `patch_node_options` |
 | Replace an inline or structured LLM prompt's whole text with new text | `patch_node_options` with `prompt_template` (the new text) and `prompt_template_parts: null` |
 | Change a small exact span of an inline or structured LLM prompt | `inspect_prompt_targets`, then `change_substring` |

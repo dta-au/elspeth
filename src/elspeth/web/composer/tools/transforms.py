@@ -1503,7 +1503,11 @@ def _splice_topology_error(
         ):
             return "splice_transform does not support gates, forks, queues, coalesces, or branched paths."
         if type(node) is NodeSpec and node.on_error not in (None, "discard"):
-            return "splice_transform does not support predecessors or successors with routed error branches."
+            return (
+                "splice_transform does not support predecessors or successors with routed error branches. "
+                "Instead, add the new step with upsert_node, then re-point the successor's input with "
+                "upsert_node with routing_only=true."
+            )
 
     if inserted is None:
         predecessor_output = predecessor.on_success
