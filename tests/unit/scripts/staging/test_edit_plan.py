@@ -603,6 +603,47 @@ def test_a_description_written_on_a_component_the_edit_did_not_create_is_still_u
     assert "/nodes/classify/description" in changes.unrelated
 
 
+def described(output: str, nodes: str | None = None) -> dict[str, Any]:
+    state = graph()
+    state["outputs"][0]["description"] = output
+    if nodes is not None:
+        for item in state["nodes"]:
+            item["description"] = nodes
+    return state
+
+
+def test_a_targets_own_description_rewritten_with_the_fact_it_names_is_reported_as_corrected() -> None:
+    # The live case (gold plan edit 12, output-path): the path moved and the output's description followed it.
+    before = described("Write every row to out.jsonl.")
+    after = copy.deepcopy(before)
+    after["outputs"][0]["options"]["path"] = "errors.jsonl"
+    after["outputs"][0]["description"] = "Write every row to errors.jsonl."
+    edit = resolved([{"ends_with": "/outputs/out/options/path", "value": "errors.jsonl"}])
+    assert edit_plan.targeted_components(edit) == {("outputs", "out")}
+    assert edit_plan.own_description_corrections(edit, edit_plan.graph_view(before), edit_plan.graph_view(after)) == [
+        "own_description_corrected:/outputs/out/description"
+    ]
+
+
+def test_only_a_target_counts_and_only_a_rewrite_from_one_text_to_another_is_a_correction() -> None:
+    edit = resolved([{"ends_with": "/outputs/out/options/path", "value": "errors.jsonl"}])
+    before = described("Write every row to out.jsonl.", nodes="Classifies rows.")
+    other = copy.deepcopy(before)
+    other["nodes"][0]["description"] = "Classifies rows for errors.jsonl."  # a component the edit does not target
+    added = described("", nodes="Classifies rows.")
+    added_after = described("Write every row to errors.jsonl.", nodes="Classifies rows.")
+    removed = described("", nodes="Classifies rows.")
+    view = edit_plan.graph_view
+    assert edit_plan.own_description_corrections(edit, view(before), view(other)) == []
+    assert edit_plan.own_description_corrections(edit, view(added), view(added_after)) == []
+    assert edit_plan.own_description_corrections(edit, view(before), view(removed)) == []
+    # Metadata, a chain, a new step and may_change never make a component a target.
+    assert edit_plan.targeted_components(resolved([{"equals": "/metadata/name", "value": "x"}])) == set()
+    assert edit_plan.targeted_components(resolved([new_step()], may_change=["/nodes/classify/options/model"])) == set()
+    # A pointer at the whole component (a removal) targets nothing inside it.
+    assert edit_plan.targeted_components(resolved([{"absent": "/nodes/classify"}])) == set()
+
+
 def test_a_file_prompt_hash_cleared_to_null_is_server_written_on_any_node() -> None:
     # "summarise" holds its prompt in a file, "classify" inline (graph()).
     before = graph()
