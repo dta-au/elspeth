@@ -261,6 +261,15 @@ Behaviour you will see:
   was quoted text, where the redactor could rewrite call identifiers so they
   no longer matched their originals. The request sent to the model is
   unchanged.
+- Changing a JSON output's options no longer tells the composer that the
+  output's write-failure choice is missing when one is already saved.
+- After changing one option of a source or an output, the composer is no
+  longer given advice about options the change did not touch, such as a
+  reminder about a fixed schema it set earlier.
+- When you ask the composer to empty the pipeline (for example, to remove its
+  source and output), the reply no longer says the composer failed to build
+  and asks you to retry. It says the pipeline is empty and needs a source and
+  an output.
 - `upsert_node` accepts `routing_only=true` to rewire a step without re-sending
   it. It changes only an existing transform's `input`, `on_success` and
   `on_error` and keeps its plugin, options (file-held prompts included) and
@@ -567,6 +576,13 @@ Behaviour you will see:
   prefix (`node:`, `output:`, `sink:`, `source:`) and a pending review stored
   as a sentence or as its bare kind compare equal. A step whose query
   templates are held in files is judged as file-held, as the server does.
+- The edit battery gains a prompt-wording plan
+  (`composer_prompt_edits_50.json`): 54 chat edits to the file-held prompts of
+  a 30-step graph, each judged byte for byte on the stored file, with file
+  sizes, byte-exactness and output tokens recorded per edit.
+- The battery's judge accepts an edit that keeps the edited component's own
+  description true, reporting the rewrite as `own_description_corrected`
+  instead of failing the edit.
 
 Automatic image publication from main remains held. The 0.8.16 tag and
 container publication follow successful required checks and the protected
