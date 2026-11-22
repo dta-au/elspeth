@@ -8,6 +8,36 @@ The full history is in the repository's releases and commit history.
 
 ---
 
+## Unreleased (0.8.17 integration branch)
+
+Work in progress on the 0.8.17 integration branch. This section grows as
+changes land and is not a release.
+
+### Upgrade notes
+
+- **Changed (design change):** a pipeline that previously passed composer
+  validation with only a "Contract check skipped" warning, but then failed
+  when the run started, now fails composer validation. No pipeline that could
+  run before is refused. Only pipelines the runtime was already refusing at
+  run start are now refused earlier, at validation.
+
+### Fixed
+
+- Composer validation now refuses a step that requires named fields when it
+  sits behind a queue or row_union whose inputs do not all guarantee them. The
+  runtime build already refused these pipelines; the composer reported them
+  valid with a "Contract check skipped" warning, so the failure appeared only
+  at run start.
+- If the runtime check behind `diff_pipeline` failed internally after an
+  earlier tool call in the same turn had changed the pipeline, that change was
+  dropped instead of being saved with the failed turn. It is now saved, as it
+  already was when a tool handler crashed.
+- When a stored conversation row fails the composer's history integrity
+  check, the error now names the row (id, sequence number, role), so the
+  damaged row can be found.
+
+---
+
 ## 0.8.16 - 2026-11-21
 
 Web Composer fixes for large pipelines, long sessions and prompts held in
