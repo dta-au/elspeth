@@ -830,8 +830,64 @@ def prompt_shield_recommendation_warning_pairs(
     ``warnings`` list and they are excluded from the blocking contract.
     """
 
+    return tuple(
+        (f"node:{finding.node_id}", _prompt_shield_warning_message((finding.node_id,), finding.producer_names, finding.draft))
+        for finding in _prompt_shield_findings(state, shield_available=shield_available)
+    )
+
+
+def prompt_shield_recommendation_warning_groups(
+    state: CompositionState,
+    *,
+    shield_available: bool | None = None,
+) -> tuple[tuple[str, str], ...]:
+    """Return the prompt-shield advisory once per distinct text, naming every node.
+
+    :func:`prompt_shield_recommendation_warning_pairs` yields one near-identical
+    entry per unshielded LLM node, so a 25-LLM graph carried 13 KB of repeats
+    on every tool result and turn-start message. Here findings sharing the same
+    producer set and draft collapse into one entry:
+
+    - a group of ONE node keeps the per-node entry exactly (``node:<id>`` and
+      the same message bytes);
+    - a group of two or more is ``("pipeline", message)`` whose message names
+      EVERY node id in the group. There is deliberately no cap: a truncated
+      list would leave nodes named nowhere — not in the tool result, not in
+      ``preview_pipeline``, not in the stored row.
+
+    Ids are sorted within a group and groups ordered by their first id, so the
+    same graph yields the same bytes whatever order its nodes were inserted in.
+    """
+
+    grouped: dict[tuple[tuple[str, ...], str], list[str]] = {}
+    for finding in _prompt_shield_findings(state, shield_available=shield_available):
+        grouped.setdefault((finding.producer_names, finding.draft), []).append(finding.node_id)
+    groups = sorted(((tuple(sorted(node_ids)), key) for key, node_ids in grouped.items()), key=lambda group: group[0])
+    return tuple(
+        (
+            f"node:{node_ids[0]}" if len(node_ids) == 1 else "pipeline",
+            _prompt_shield_warning_message(node_ids, producer_names, draft),
+        )
+        for node_ids, (producer_names, draft) in groups
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _PromptShieldFinding:
+    """One unshielded LLM node: its id, the untrusted producers found (sorted), and the draft."""
+
+    node_id: str
+    producer_names: tuple[str, ...]
+    draft: str
+
+
+def _prompt_shield_findings(
+    state: CompositionState,
+    *,
+    shield_available: bool | None,
+) -> tuple[_PromptShieldFinding, ...]:
     graph = _output_stream_graph(state.nodes)
-    warnings: list[tuple[str, str]] = []
+    findings: list[_PromptShieldFinding] = []
     for node in state.nodes:
         if not node_has_capability(node, PluginCapability.LLM):
             continue
@@ -839,25 +895,38 @@ def prompt_shield_recommendation_warning_pairs(
             continue  # State A — already shielded, silent
         if _llm_has_shield_recommendation(node):
             continue  # review already staged on this node
-        untrusted_producers = _llm_untrusted_content_producers(node, graph)
-        if untrusted_producers:
-            # Name the producer actually found. Hardcoding "web_scrape" made the
-            # sentence assert a plugin that need not be in the pipeline at all.
-            named = " and ".join(sorted(untrusted_producers))
-            lead = (
-                f"LLM node {node.id!r} consumes untrusted or externally controlled upstream content "
-                f"produced by {named} without an authorized prompt-injection shield between them. "
-            )
+        # Name the producer actually found. Hardcoding "web_scrape" made the
+        # sentence assert a plugin that need not be in the pipeline at all.
+        producer_names = tuple(sorted(_llm_untrusted_content_producers(node, graph)))
+        if producer_names:
             draft = PROMPT_SHIELD_AVAILABLE_DRAFT if shield_available is True else PROMPT_SHIELD_WARNING_DRAFT
         else:
             # Provenance-honest draft: no declared untrusted producer exists in
             # this graph, so the producer-specific constants would be false —
             # and the staged review card carries the DRAFT alone, discarding
-            # this computed lead, so the draft itself must tell the truth.
-            lead = f"LLM node {node.id!r} has no authorized prompt-injection shield in front of it. "
+            # the computed lead, so the draft itself must tell the truth.
             draft = PROMPT_SHIELD_LOCAL_CONTENT_AVAILABLE_DRAFT if shield_available is True else PROMPT_SHIELD_LOCAL_CONTENT_WARNING_DRAFT
-        warnings.append((f"node:{node.id}", f"{lead}{draft}"))
-    return tuple(warnings)
+        findings.append(_PromptShieldFinding(node_id=node.id, producer_names=producer_names, draft=draft))
+    return tuple(findings)
+
+
+def _prompt_shield_warning_message(node_ids: Sequence[str], producer_names: tuple[str, ...], draft: str) -> str:
+    """Lead naming every node in ``node_ids``, then the draft; one id keeps the per-node wording."""
+
+    if len(node_ids) == 1:
+        subject = f"LLM node {node_ids[0]!r}"
+        consumes, has, it = "consumes", "has", "it"
+    else:
+        subject = "LLM nodes " + ", ".join(repr(node_id) for node_id in node_ids)
+        consumes, has, it = "consume", "have", "them"
+    if producer_names:
+        lead = (
+            f"{subject} {consumes} untrusted or externally controlled upstream content "
+            f"produced by {' and '.join(producer_names)} without an authorized prompt-injection shield between them. "
+        )
+    else:
+        lead = f"{subject} {has} no authorized prompt-injection shield in front of {it}. "
+    return f"{lead}{draft}"
 
 
 def _llm_untrusted_content_producers(

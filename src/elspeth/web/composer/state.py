@@ -10224,9 +10224,9 @@ class CompositionState:
         _warn = ValidationEntry
         warnings.extend(numeric_contract_warnings)
         warnings.extend(semantic_warnings)
-        from elspeth.web.interpretation_state import prompt_shield_recommendation_warning_pairs
+        from elspeth.web.interpretation_state import prompt_shield_recommendation_warning_groups
 
-        for component, message in prompt_shield_recommendation_warning_pairs(self):
+        for component, message in prompt_shield_recommendation_warning_groups(self):
             warnings.append(_warn(component, message, "medium"))
 
         # Build connection-field targets (wiring that doesn't require edges)
