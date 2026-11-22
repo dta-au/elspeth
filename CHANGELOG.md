@@ -239,6 +239,28 @@ Behaviour you will see:
   (changed or missing on disk) is now reported as a validation problem on that
   file, instead of failing with a server error when you validate or run it.
   Upload the file again and rebind it to recover.
+- In sessions where changes need approval, accepting a proposed prompt, model,
+  prompt-file or rewire edit now shows its review card at once, instead of
+  leaving the pipeline blocked with nothing to approve. The card is saved in
+  the same step as the accepted change. A card left out (a prompt file over
+  the inline size limit, or a review the writer refuses) is logged once, as it
+  is for automatic saves.
+- On an LLM step whose prompt has parts, the exact `set_pipeline` arguments
+  read and the applied-component echo no longer carry the prompt review's
+  stored draft, which keeps the wording from before a term was amended.
+  Writing that read back through `set_pipeline`, `upsert_node` or
+  `patch_node_options` keeps the approved prompt review and the stored order
+  of review rows.
+- The prompt-injection shield advisory is now given once per distinct advisory
+  instead of once per unshielded LLM node. It still names every affected node.
+  On a 25-LLM chain the advisory shrinks from 13,337 bytes to 1,419 on every
+  tool result and state message. A graph with one unshielded LLM node sees the
+  same entry as before.
+- After a reply stage (the review-card handoff), the advisor no longer
+  receives every tool call and tool result of the turn twice. The second copy
+  was quoted text, where the redactor could rewrite call identifiers so they
+  no longer matched their originals. The request sent to the model is
+  unchanged.
 - `upsert_node` accepts `routing_only=true` to rewire a step without re-sending
   it. It changes only an existing transform's `input`, `on_success` and
   `on_error` and keeps its plugin, options (file-held prompts included) and
