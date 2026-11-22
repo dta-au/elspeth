@@ -39,7 +39,16 @@ interface PromptDraftState {
   drafts: Readonly<Record<string, PromptDraft>>;
   /** Slots whose editor is open right now, so a row does not repeat the editor's own tag. */
   openEditors: Readonly<Record<string, true>>;
+  /**
+   * Slots with a save in flight. While one is pending, a draft typed back to
+   * its starting text is kept: the save is about to replace that text, so
+   * the reversion is itself an unsaved change.
+   */
+  savesInFlight: Readonly<Record<string, true>>;
   setEditorOpen: (slot: PromptDraftSlot, open: boolean) => void;
+  beginSave: (slot: PromptDraftSlot) => void;
+  /** A save failed: the file still holds the starting text, so a draft equal to it holds nothing. */
+  saveFailed: (slot: PromptDraftSlot) => void;
   /** Record an edit. A new draft takes `base`; an existing one keeps its own base. */
   edit: (slot: PromptDraftSlot, base: { blobId: string; baseSha256: string; baseText: string }, text: string) => void;
   /** Point a draft at the current file version: the user's explicit choice to save it there. */
@@ -63,6 +72,20 @@ function without(drafts: Readonly<Record<string, PromptDraft>>, key: string): Re
 export const usePromptDraftStore = create<PromptDraftState>((set) => ({
   drafts: {},
   openEditors: {},
+  savesInFlight: {},
+  beginSave(slot) {
+    set((state) => ({ savesInFlight: { ...state.savesInFlight, [promptDraftKey(slot)]: true } }));
+  },
+  saveFailed(slot) {
+    set((state) => {
+      const key = promptDraftKey(slot);
+      const savesInFlight: Record<string, true> = { ...state.savesInFlight };
+      delete savesInFlight[key];
+      const current = state.drafts[key];
+      if (current && current.text === current.baseText) return { savesInFlight, drafts: without(state.drafts, key) };
+      return { savesInFlight };
+    });
+  },
   setEditorOpen(slot, open) {
     set((state) => {
       const key = promptDraftKey(slot);
@@ -78,8 +101,11 @@ export const usePromptDraftStore = create<PromptDraftState>((set) => ({
       const key = promptDraftKey(slot);
       const current = state.drafts[key];
       const draft: PromptDraft = current ? { ...current, text } : { ...slot, ...base, text };
-      // Typing back to the exact text the draft started from leaves nothing unsaved.
-      if (draft.text === draft.baseText) return current ? { drafts: without(state.drafts, key) } : state;
+      // Typing back to the exact text the draft started from leaves nothing
+      // unsaved, unless a save in flight is about to replace that text.
+      if (draft.text === draft.baseText && !(key in state.savesInFlight)) {
+        return current ? { drafts: without(state.drafts, key) } : state;
+      }
       return { drafts: { ...state.drafts, [key]: draft } };
     });
   },
@@ -97,15 +123,18 @@ export const usePromptDraftStore = create<PromptDraftState>((set) => ({
   settleSaved(slot, savedText, sha256) {
     set((state) => {
       const key = promptDraftKey(slot);
+      const savesInFlight: Record<string, true> = { ...state.savesInFlight };
+      delete savesInFlight[key];
       const current = state.drafts[key];
-      if (!current) return state;
-      if (current.text === savedText) return { drafts: without(state.drafts, key) };
-      // Typed on while the save was in flight: keep the newer text on the saved base.
-      return { drafts: { ...state.drafts, [key]: { ...current, baseText: savedText, baseSha256: sha256 } } };
+      if (!current) return { savesInFlight };
+      if (current.text === savedText) return { savesInFlight, drafts: without(state.drafts, key) };
+      // Typed on (or back to the old text) while the save was in flight: keep
+      // the newer text on the saved base.
+      return { savesInFlight, drafts: { ...state.drafts, [key]: { ...current, baseText: savedText, baseSha256: sha256 } } };
     });
   },
   reset() {
-    set({ drafts: {}, openEditors: {} });
+    set({ drafts: {}, openEditors: {}, savesInFlight: {} });
   },
 }));
 

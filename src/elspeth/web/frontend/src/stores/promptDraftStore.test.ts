@@ -36,6 +36,35 @@ describe("promptDraftStore", () => {
     expect(usePromptDraftStore.getState().drafts).toEqual({});
   });
 
+  it("keeps text typed back to the original while a save is in flight, as unsaved on the saved base", () => {
+    const store = usePromptDraftStore.getState();
+    store.edit(slot, base, "edited");
+    store.beginSave(slot);
+    store.edit(slot, base, "original");
+    expect(usePromptDraftStore.getState().drafts[promptDraftKey(slot)]).toMatchObject({ text: "original" });
+    store.settleSaved(slot, "edited", "e".repeat(64));
+    expect(usePromptDraftStore.getState().drafts[promptDraftKey(slot)]).toMatchObject({ text: "original", baseText: "edited", baseSha256: "e".repeat(64) });
+    expect(usePromptDraftStore.getState().savesInFlight).toEqual({});
+  });
+
+  it("drops text typed back to the original when the save in flight fails", () => {
+    const store = usePromptDraftStore.getState();
+    store.edit(slot, base, "edited");
+    store.beginSave(slot);
+    store.edit(slot, base, "original");
+    store.saveFailed(slot);
+    expect(usePromptDraftStore.getState().drafts).toEqual({});
+    expect(usePromptDraftStore.getState().savesInFlight).toEqual({});
+  });
+
+  it("keeps a still-edited draft when its save fails", () => {
+    const store = usePromptDraftStore.getState();
+    store.edit(slot, base, "edited");
+    store.beginSave(slot);
+    store.saveFailed(slot);
+    expect(usePromptDraftStore.getState().drafts[promptDraftKey(slot)]).toMatchObject({ text: "edited", baseText: "original" });
+  });
+
   it("re-bases a draft only when the user asks", () => {
     const store = usePromptDraftStore.getState();
     store.edit(slot, base, "mine");
