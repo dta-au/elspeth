@@ -52,6 +52,7 @@ note says so.
 | Where work lives | Project work stays in the project folder; never `/tmp` | Temp files go under `~/.pt/<session>/<lane>`, on disk outside the project; project work still stays in the repo or a worktree | Section 7 |
 | Full suite | Full suite before merging changes whose effects cannot be bounded | Scoped tests per lane, with the AGENTS.md full-suite run kept for unbounded changes | Section 6 |
 | Pull requests | Agents may create draft PRs autonomously | Lanes never open PRs; the integrator opens release PRs to `main` | Section 5 |
+| Signature worklists | Agents stage key-free worklists for the operator | Stage one only when the maintainer asks, once, on the final tree | Section 10 |
 
 Where the book is stricter, follow the book. Where it is looser, follow
 AGENTS.md and ask the integrator.
@@ -1031,9 +1032,11 @@ bodies, issues, and summary lists of entry titles.
 - The operator signs when the package or release is complete (AGENTS.md).
   Record tier-model signature churn in each HANDOFF as an operator
   obligation.
-- Agents still prepare signature worklists key-free through the
-  `elspeth-judge` `stage_*` tools, as AGENTS.md describes, and the operator
-  signs.
+- Stage a signature worklist (the key-free `elspeth-judge` `stage_*` tools)
+  only when the maintainer asks for one, and then once, on the final tree.
+  Until then, leave signature churn recorded in the HANDOFF and stage
+  nothing. [M 2026-11-23] An expected-failure (xfail) signature test is not
+  a defect to fix; leave it as it is.
 - [M 2026-11-21] "there's a key in the .env for agentic use". Agents may load
   the provider key from the main checkout's `.env`. Never print, paste, log
   or commit its value; refer to it by variable name. It draws on the same
