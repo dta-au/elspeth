@@ -155,21 +155,27 @@ async def test_a_run_whose_lease_ran_out_unreleased_is_offered_to_recovery_only_
     first_engine, _second_engine, first, second = deployment
     _register_live_instance(first_engine, first.session_operation_owner_instance_id)
     run, _context = await _create_running_run(first, first_engine)
-    _expire_fence(first_engine, run.session_id)
+    try:
+        _expire_fence(first_engine, run.session_id)
 
-    # The database is shared by this file's tests, so each reading asks about this run only.
-    async def offered(service: SessionServiceImpl) -> bool:
-        return run.id in [record.id for record in await service.list_recoverable_run_records()]
+        # The database is shared by this file's tests, so each reading asks about this run only.
+        async def offered(service: SessionServiceImpl) -> bool:
+            return run.id in [record.id for record in await service.list_recoverable_run_records()]
 
-    while_the_owner_lives = {"to the owner's own sweep": await offered(first), "to another process's sweep": await offered(second)}
-    _expire_instance(first_engine, first.session_operation_owner_instance_id)
-    after_the_owner_is_gone = await offered(second)
+        while_the_owner_lives = {"to the owner's own sweep": await offered(first), "to another process's sweep": await offered(second)}
+        _expire_instance(first_engine, first.session_operation_owner_instance_id)
+        after_the_owner_is_gone = await offered(second)
 
-    assert while_the_owner_lives == {"to the owner's own sweep": False, "to another process's sweep": False}
-    assert after_the_owner_is_gone
-    assert (await second.get_run(run.id)).status == "running"
-    # Settle the run so that the tests after this one start with nothing to recover.
-    await second.cancel_all_orphaned_run_records(max_age_seconds=0, reason="recovered")
+        assert while_the_owner_lives == {"to the owner's own sweep": False, "to another process's sweep": False}
+        assert after_the_owner_is_gone
+        assert (await second.get_run(run.id)).status == "running"
+    finally:
+        # Settle the run even when an assertion fails, so the tests after this one start with nothing
+        # to recover. Recovery settles a run only once its fence and its owner's membership have both
+        # expired; both writes are idempotent, so repeating them here is safe.
+        _expire_fence(first_engine, run.session_id)
+        _expire_instance(first_engine, first.session_operation_owner_instance_id)
+        await second.cancel_all_orphaned_run_records(max_age_seconds=0, reason="recovered")
 
 
 @pytest.mark.asyncio
