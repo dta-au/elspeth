@@ -20915,7 +20915,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "366439004953a9ab",
             1,
             None,
-            line=213,
+            line=218,
             connection_escape=True,
         ),
         WriterIdentity(

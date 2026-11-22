@@ -89,6 +89,15 @@ def _get_ready(client: TestClient, app: FastAPI) -> Any:
 
 
 class TestRouteReusesShapeVerdict:
+    @pytest.fixture(autouse=True)
+    def _deadlines_out_of_play(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # These tests count schema reflections through the real route. A
+        # CPU-starved runner can take a first reflection past the 2 s probe
+        # deadline, which would turn a reflection count into a timing result.
+        # The deadlines themselves are covered in test_readiness.py.
+        monkeypatch.setattr(readiness, "PROBE_DEADLINE_SECONDS", 60.0)
+        monkeypatch.setattr(readiness, "READINESS_REQUEST_TIMEOUT_SECONDS", 120.0)
+
     def test_probes_within_the_interval_do_not_reflect_again(self, tmp_path: Path, spies: dict[str, _ProbeSpy]) -> None:
         app = create_app(_settings(tmp_path))
         client = TestClient(app)

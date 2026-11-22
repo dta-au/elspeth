@@ -47,6 +47,11 @@ _SCHEMA_KINDS: tuple[SchemaKind, ...] = ("session", "landscape")
 # Connectivity is still proven on every probe, and any failed probe discards
 # the verdict (see SchemaShapeVerdicts).
 SCHEMA_SHAPE_REFRESH_SECONDS: Final[float] = 60.0
+# Per-probe deadline inside one readiness request, and the bound on the whole
+# request. A probe past its deadline reports "probe timed out"; its worker keeps
+# its single-flight registration until it returns.
+PROBE_DEADLINE_SECONDS: Final[float] = 2.0
+READINESS_REQUEST_TIMEOUT_SECONDS: Final[float] = 5.0
 READINESS_CHECK_NAMES: tuple[str, ...] = (
     "auth_mode",
     "session_db",
@@ -470,7 +475,7 @@ async def readiness_report(
     schema_verdicts = runner.schema_verdicts
     tasks: list[asyncio.Task[_ProbeResult]] = []
     try:
-        async with asyncio.timeout(5.0):
+        async with asyncio.timeout(READINESS_REQUEST_TIMEOUT_SECONDS):
             tasks = [
                 asyncio.create_task(
                     runner.run(
@@ -610,7 +615,7 @@ class ReadinessProbeRunner:
         # Registration therefore must remain outside the registry lock.
         source.add_done_callback(source_done)
         wrapped.add_done_callback(wrapped_done)
-        deadline = loop.time() + 2.0
+        deadline = loop.time() + PROBE_DEADLINE_SECONDS
         try:
             while not wrapped.done():
                 remaining = deadline - loop.time()
