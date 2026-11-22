@@ -550,7 +550,7 @@ Never use the question dialog tool.
   - Hygiene: [M] "clean up worktrees, branches, make sure any dependabot stuff
     lands, and generally do hygiene". Use `scripts/worktree-cleanup.sh`. Land
     Dependabot through CI. Merged and read-only worktrees and branches go
-    under the peer rule (section 8). List anything dirty, unmerged or holding
+    to the lead integrator for verification (section 8). List anything dirty, unmerged or holding
     unlanded work for the maintainer; do not remove it.
 
 ## 6. Testing
@@ -845,9 +845,13 @@ the integrator's order rules [I] unless marked [M].
 - **End-of-work cleanup.** [M 2026-11-23] "extend the deletion rule to
   include ordinary deletion of worktrees/branches at the end of a line of
   effort when the work has merged into the release branch or was a read only
-  activity. (the no lone zone rule)". The same peer rule applies: make the
-  case to a peer session and get its explicit authority. Reading (the lead
-  integrator's): the peer checks
+  activity. (the no lone zone rule)", and [M 2026-11-23] "modify the rule so
+  its explicitly the lead integrator that' sthe peer, this aligns with the 'no
+  lead integrator means all stop'". So make the case to the **lead
+  integrator** and get its explicit authority; any other peer is not enough.
+  With no identifiable lead integrator, nothing is deleted. Reading, pending
+  the maintainer: when the lead integrator deletes its own trees, the other
+  integrator verifies. Reading (the lead integrator's): it checks
   - merged: the tip is an ancestor of the release or integration branch; for
     a squash or rebuild, the content difference is zero, or only what the
     landing integrator recorded;
