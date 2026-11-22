@@ -27,6 +27,7 @@ import asyncio
 import hashlib
 import os
 import threading
+import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -40,6 +41,7 @@ from elspeth.contracts.blobs import BlobIntegrityError, BlobNotFoundError, BlobR
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.secrets import SecretInventoryItem
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
+from elspeth.web import async_workers
 from elspeth.web import config as web_config
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer import composer_preflight as preflight_module
@@ -282,6 +284,14 @@ def _build_rig(tmp_path: Path, *, reuse_enabled: bool = True, with_blob_service:
         storage=storage,
         state=_blob_state(blob_id),
     )
+
+
+async def _abandoned_workers_finished() -> None:
+    """Wait for every worker this test left running to return and give back its admission."""
+    deadline = time.monotonic() + 5.0
+    while async_workers.outstanding_admissions() != 0 and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+    assert async_workers.outstanding_admissions() == 0
 
 
 @pytest.fixture
@@ -827,6 +837,9 @@ async def test_an_evidence_read_that_outlasts_the_budget_raises_the_timeout(rig:
             await rig.preflight(deadline=asyncio.get_running_loop().time() + 0.05)
     finally:
         rig.blobs.gate.set()
+        # The timed-out read is still running in its worker, which keeps its
+        # admission until it returns. Opening the gate only lets it continue.
+        await _abandoned_workers_finished()
     assert type(raised.value.original_exc) is TimeoutError
 
 
