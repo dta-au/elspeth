@@ -377,15 +377,19 @@ def _handle_patch_output_options(
             f"_execute_patch_output_options succeeded for output '{sink_name}' but "
             "the post-mutation state does not contain it — invariant violation."
         )
-    # The write-failure choice is a field of the output beside ``options``,
-    # not an option key; the plugin hint reads it from the snapshot.
+    # Hints speak only about the option keys this patch touched. The
+    # write-failure choice is a field of the output beside ``options``, not an
+    # option key; the plugin hint reads it from the snapshot.
     return _attach_post_call_hints(
         result,
         context.catalog,
         plugin_type="sink",
         tool_name="patch_output_options",
         plugin_name=output.plugin,
-        config_snapshot={**output.options, "on_write_failure": output.on_write_failure},
+        config_snapshot={
+            **{key: output.options[key] for key in validated.patch if key in output.options},
+            "on_write_failure": output.on_write_failure,
+        },
     )
 
 

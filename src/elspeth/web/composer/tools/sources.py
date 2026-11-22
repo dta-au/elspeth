@@ -2278,17 +2278,19 @@ def _handle_patch_source_options(
     result = _execute_patch_source_options(arguments, state, context)
     if not result.success:
         return result
-    source_name = PatchSourceOptionsArgumentsModel.model_validate(arguments).source_name
+    validated = PatchSourceOptionsArgumentsModel.model_validate(arguments)
+    source_name = validated.source_name
     if source_name not in result.updated_state.sources:
         return result
     source = result.updated_state.sources[source_name]
+    # Hints speak only about the option keys this patch touched.
     return _attach_post_call_hints(
         result,
         context.catalog,
         plugin_type="source",
         tool_name="patch_source_options",
         plugin_name=source.plugin,
-        config_snapshot=source.options,
+        config_snapshot={key: source.options[key] for key in validated.patch if key in source.options},
     )
 
 
