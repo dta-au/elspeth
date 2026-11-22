@@ -841,9 +841,10 @@ class TestBuildSystemPrompt:
         assert "`default_content` is not accepted either: use `on_miss: null` or `on_miss: fail`" in flattened
         # Scoped to this plugin: other planner-created content keeps its own rules.
         assert "This rule is specific to `file_inject`; it changes nothing about a source or prompt text you author." in flattened
-        # Non-duplication: the upload instruction and the marker shape each appear once.
+        # Non-duplication: the upload instruction and the file_inject creation marker each appear once.
+        # (reference_join states the same marker shape for its own tables.)
         assert flattened.count("save the text as a file and upload it") == 1
-        assert flattened.count('"mode": "inline_content"') == 1
+        assert flattened.count(steps[-1]) == 1
 
     def test_capability_core_teaches_file_inject_modes(self) -> None:
         """The shared core carries the mode semantics once; the interaction skill does not repeat them."""

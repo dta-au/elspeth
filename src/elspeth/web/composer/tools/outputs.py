@@ -82,8 +82,9 @@ _SET_OUTPUT_DECLARATION = ToolDeclaration(
                 "type": "string",
                 "description": (
                     "Sink name: BOTH the sink's identifier (used by patch_output_options/"
-                    "remove_output) AND the connection-name the sink consumes — it MUST equal "
-                    "some upstream's on_success value; it need not match any node id."
+                    "remove_output) AND the connection-name the sink consumes. Something upstream must send rows "
+                    "to it: a source's `on_success` or `on_validation_failure`, a step's `on_success`, `on_error`, "
+                    "`routes` or `fork_to`, or another output's `on_write_failure`. It need not match any node id."
                 ),
             },
             "plugin": {"type": "string", "description": "Sink plugin name (e.g. 'csv', 'json')."},

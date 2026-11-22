@@ -44,6 +44,17 @@ def wire_argument_repair_message(tool: WireTool) -> str:
     raise AssertionError(f"Tool {tool.name!r} has no rejecting wire wrapper")
 
 
+_CONTENT_HASH_FORM: Final[str] = (
+    'expected_content_hash must be JSON null (not the string "null") or the blob\'s 64-character lowercase hex `content_hash`.'
+)
+# A malformed hash fails the field's pattern, whose only rendered message is "Validation failed".
+_CONTENT_HASH_REPAIR: Final[Mapping[str, str]] = {
+    "get_blob_content": _CONTENT_HASH_FORM
+    + " At offset 0 you may send null; to continue a paged read, send the `content_hash` the previous page returned.",
+    "read_attachment": _CONTENT_HASH_FORM,
+}
+
+
 def arg_error_payload(exc: ToolArgumentError, tool_name: str) -> Mapping[str, Any]:
     """Build the structured payload for an ARG_ERROR audit record and LLM tool message.
 
@@ -76,6 +87,10 @@ def arg_error_payload(exc: ToolArgumentError, tool_name: str) -> Mapping[str, An
             "Omit llm_draft to use the exact staged draft. If there is no staged draft, "
             "ask the user for a nonempty review draft within these bounds. Keep the existing document and pipeline content unchanged."
         )
+    elif tool_name in _CONTENT_HASH_REPAIR and any(
+        violation.code is SchemaViolationCode.INVALID and violation.loc == ("expected_content_hash",) for violation in exc.schema_violations
+    ):
+        payload["repair_instruction"] = _CONTENT_HASH_REPAIR[tool_name]
     elif tool_name == "set_pipeline" and any(
         violation.loc
         in {

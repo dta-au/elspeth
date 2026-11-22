@@ -806,7 +806,12 @@ class ReferenceJoinConfig(TransformDataConfig):
         }
         compiled: list[_CompiledLookup] = []
         if self.tables is None and self.lookups is None:
-            values = {name: value for name, value in self.model_dump().items() if name not in {"tables", "lookups"}}
+            # An option the author left out stays out, so a required one is reported as required.
+            values = {
+                name: value
+                for name, value in self.model_dump().items()
+                if name not in {"tables", "lookups"} and (value is not None or name in self.model_fields_set)
+            }
             cfg = _SingleReferenceJoinConfig.model_validate(values)
             compiled.append(_CompiledLookup(None, cfg, cfg._validated_index))
         else:
@@ -887,7 +892,7 @@ class ReferenceJoin(BaseTransform):
     name = "reference_join"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:6b310e8be342a48d"
+    source_file_hash: str | None = "sha256:2a288aea64d9837e"
     config_model = ReferenceJoinConfig
     passes_through_input = True
     usage_when_to_use: str = (
