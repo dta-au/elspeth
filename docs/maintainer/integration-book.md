@@ -849,9 +849,17 @@ the integrator's order rules [I] unless marked [M].
   its explicitly the lead integrator that' sthe peer, this aligns with the 'no
   lead integrator means all stop'". So make the case to the **lead
   integrator** and get its explicit authority; any other peer is not enough.
-  With no identifiable lead integrator, nothing is deleted. Reading, pending
-  the maintainer: when the lead integrator deletes its own trees, the other
-  integrator verifies. Reading (the lead integrator's): it checks
+  With no identifiable lead integrator, nothing is deleted.
+- **The lead integrator's own close-outs.** [M 2026-11-23] "ok, when the lead
+  integrator wants to close out a position (process, run, whatever), they get
+  agreeement from the most relevant agent available (or spin up a new one and
+  have it review it independently) - the intent here is to stop accidental
+  error, there's no presumption the agent is hostile". So for its own kills,
+  cancels, deletions and closes, the lead integrator gets agreement from the
+  most relevant agent available, or from a fresh independent reviewer. Keep it
+  proportionate: the check catches mistakes; it does not police.
+- **What the lead integrator checks before a deletion.** Reading (the lead
+  integrator's): it checks
   - merged: the tip is an ancestor of the release or integration branch; for
     a squash or rebuild, the content difference is zero, or only what the
     landing integrator recorded;
