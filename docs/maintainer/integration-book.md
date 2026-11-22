@@ -187,10 +187,12 @@ integrator so the book is corrected.
 
 **What always goes to the maintainer**
 
-- Hard-to-reverse changes: deleting data, branches (local or remote),
-  worktrees or volumes; wiping, resetting, migrating or downgrading a store;
-  rewriting history or force-pushing. (Process kills and local CI cancels do
-  not: see section 8.)
+- Hard-to-reverse changes: deleting data or volumes; deleting a branch or
+  worktree that holds unmerged or uncommitted work, or an unmerged published
+  remote branch; wiping, resetting, migrating or downgrading a store;
+  rewriting history or force-pushing. (Process kills, local CI cancels and
+  end-of-work cleanup of merged or read-only worktrees and branches do not:
+  see section 8.)
 - Moving scope between releases, and any serious finding after a lock
   (section 4).
 - A session-store epoch change or a database CHECK constraint change.
@@ -547,8 +549,9 @@ Never use the question dialog tool.
   handover to the next integrator, then declare done to all peers.
   - Hygiene: [M] "clean up worktrees, branches, make sure any dependabot stuff
     lands, and generally do hygiene". Use `scripts/worktree-cleanup.sh`. Land
-    Dependabot through CI. List anything dirty, unmerged or holding unlanded
-    work for the maintainer; do not remove it.
+    Dependabot through CI. Merged and read-only worktrees and branches go
+    under the peer rule (section 8). List anything dirty, unmerged or holding
+    unlanded work for the maintainer; do not remove it.
 
 ## 6. Testing
 
@@ -839,8 +842,24 @@ the integrator's order rules [I] unless marked [M].
 - **CI is a process.** [M 2026-11-23] "I don't see how locally hosted CI is not
   part of that". A CI cancel on the self-hosted runners falls under this rule;
   do not ask the maintainer.
-- **Hard to reverse stays with the maintainer:** deleting data, branches,
-  worktrees or volumes, and wiping shared state.
+- **End-of-work cleanup.** [M 2026-11-23] "extend the deletion rule to
+  include ordinary deletion of worktrees/branches at the end of a line of
+  effort when the work has merged into the release branch or was a read only
+  activity. (the no lone zone rule)". The same peer rule applies: make the
+  case to a peer session and get its explicit authority. Reading (the lead
+  integrator's): the peer checks
+  - merged: the tip is an ancestor of the release or integration branch; for
+    a squash or rebuild, the content difference is zero, or only what the
+    landing integrator recorded;
+  - read-only: no commits or unique content beyond its base;
+  - every tree: clean `git status`, ignored content inspected and not needed,
+    and not in use.
+  Then use `scripts/worktree-cleanup.sh`, or a plain `git worktree remove` (no
+  force) and `git branch -d` (`-D` only for a verified squash or rebuild), and
+  report each tip hash.
+- **Hard to reverse stays with the maintainer:** deleting data or volumes,
+  deleting unmerged or dirty work, deleting an unmerged published remote
+  branch, wiping shared state, and anything the peer is unsure of.
 - Why: a parent-PID walk once sent SIGTERM to every session on the box. Single
   sessions have also misattributed runs and mistaken their own `pgrep` shell
   for a new run. The safeguard is the second pair of eyes.
