@@ -499,7 +499,7 @@ def canonicalize_authored_node_review_requirements(
     ``interpretation_state._coerce_requirement`` however MANDATES ``id`` and
     ``status`` (only ``draft`` / ``event_id`` / ``accepted_*`` default), and the
     always-on prompt-injection-shield advisory walk in
-    ``CompositionState.validate`` (``prompt_shield_recommendation_warning_pairs``
+    ``CompositionState.validate`` (``prompt_shield_recommendation_warning_groups``
     -> ``_llm_has_shield_recommendation`` -> ``_requirements``) reaches that
     parser through a path with no ``try``/``except``. So the exact short form the
     skill asks the planner to author raised ``KeyError('id')`` and escaped the
