@@ -356,6 +356,21 @@ def test_every_shipped_edit_names_its_tools_and_no_message_names_a_tool(plan_pat
         assert tool in coverage["exercised"]
 
 
+SHIPPED_PLANS = ("composer_file_bindings.json", "composer_gold_50.json", "composer_mixed_50.json", "composer_prompt_edits_50.json")
+
+
+def test_the_shipped_plans_are_the_ones_these_tests_run() -> None:
+    """A new plan file must be added here, and run end to end by a test (the prompt plan's is test_prompt_edit_plan.py)."""
+    assert tuple(sorted(path.name for path in DEFAULT_PLAN.parent.glob("*.json"))) == SHIPPED_PLANS
+
+
+@pytest.mark.parametrize("name", SHIPPED_PLANS)
+def test_every_shipped_plan_loads_and_no_message_names_a_tool(name: str) -> None:
+    plan = load_plan(DEFAULT_PLAN.parent / name)
+    assert not [edit["id"] for edit in plan.edits if any(tool in edit["message"] for tool in battery.EDITING_TOOLS)]
+    assert plan.forbidden_tools == ("set_pipeline",)
+
+
 @pytest.mark.parametrize("plan_path", [DEFAULT_PLAN, MIXED_PLAN])
 def test_every_new_output_edit_allows_the_collision_policy_set_output_requires(plan_path: Path) -> None:
     outputs = [expectation for edit in load_plan(plan_path).edits for expectation in edit["expect"] if "new_output" in expectation]

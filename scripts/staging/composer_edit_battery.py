@@ -63,7 +63,19 @@ Safety properties (named by tests in
   the named node and kind, only on a turn whose verdict is otherwise clean
   (expectations hold, nothing unexpected changed, no new validation error, no
   tool finding), and only when the card shows exactly the node's current
-  prompt. The approval itself may change only server-written fields.
+  prompt. The approval itself may change only server-written fields. An edit
+  may name one card on each of several nodes (a message that changes two
+  steps); a card marked ``blocks_run`` must have its pending-review error on the
+  graph before it is approved, or the edit fails and nothing is approved.
+* A no-op edit (every expectation ``unchanged``) is sent only when the graph
+  already meets it, and passes only when the graph, the step's file binding and
+  every session file (by id and content hash) are as they were.
+* Each edit records its provider output tokens (``completion_tokens``, from the
+  audit rows' per-call counts); the summary totals them.
+* An edit with ``exact`` text or ``unchanged`` expectations records, per prompt,
+  its size in bytes before and after and whether it is byte-exact
+  (``text_checks``, ``byte_exact``), read with :meth:`EditBattery.read_bytes`
+  from the bytes the server returns; the summary counts them (``byte_exact``).
 """
 
 from __future__ import annotations
@@ -87,8 +99,10 @@ from scripts.staging.edit_plan import (
     TEMPORARY_PREFIX,
     FileContext,
     Plan,
+    approvals,
     as_found_differences,
     attachment_mime_type,
+    byte_records,
     card_kind,
     check_expectations,
     classify_changes,
@@ -97,12 +111,14 @@ from scripts.staging.edit_plan import (
     expected_new_error,
     graph_view,
     is_empty_graph,
+    is_no_op,
     leftover_findings,
     load_plan,
     named_components,
     new_component_notes,
     new_validation_errors,
     preconditions,
+    prompt_slots,
     render_was,
     resolve_edits,
     resolve_targets,
@@ -248,6 +264,12 @@ def _evidence_total(results: Sequence[Mapping[str, Any]], key: str) -> int | Non
     return sum(values) if values and all(type(value) is int for value in values) else None
 
 
+def _completion_tokens_total(results: Sequence[Mapping[str, Any]]) -> int | None:
+    """Output tokens over the sent edits; None when any edit's total is unknown (or was saved before it was recorded)."""
+    values = [result["evidence"]["completion_tokens"] if "completion_tokens" in result["evidence"] else None for result in results]
+    return sum(value for value in values if type(value) is int) if values and all(type(value) is int for value in values) else None
+
+
 def _used_tools(results: Sequence[Mapping[str, Any]]) -> set[str]:
     return {
         name
@@ -276,20 +298,23 @@ def _profile_owned(edit: Mapping[str, Any]) -> JsonObject:
     return {"profile_owned": edit["profile_owned"]} if "profile_owned" in edit else {}
 
 
-def _is_the_approved_review(edit: Mapping[str, Any], key: str) -> bool:
-    """Whether a new validation error (``new_validation_errors`` key) is the pending card this edit approves.
-
-    Exactly that node and kind: a pending review on any other node or of another kind is not covered.
-    """
-    if edit["approve"] is None:
-        return False
+def _is_the_review(spec: Mapping[str, Any], key: str) -> bool:
+    """Whether a new validation error (``new_validation_errors`` key) is the pending card of one ``approve`` entry."""
     code, component, message = json.loads(key)
     return (
         code == REVIEW_PENDING_CODE
-        and component == edit["approve"]["node"]
+        and component == spec["node"]
         and type(message) is str
-        and message.startswith(edit["approve"]["kind"] + " review pending")
+        and message.startswith(spec["kind"] + " review pending")
     )
+
+
+def _is_the_approved_review(edit: Mapping[str, Any], key: str) -> bool:
+    """Whether a new validation error (``new_validation_errors`` key) is a pending card this edit approves.
+
+    Exactly a node and kind it names: a pending review on any other node or of another kind is not covered.
+    """
+    return any(_is_the_review(spec, key) for spec in approvals(edit))
 
 
 def summarise(checkpoint: Mapping[str, Any]) -> JsonObject:
@@ -361,6 +386,7 @@ def summarise(checkpoint: Mapping[str, Any]) -> JsonObject:
             "tool_busy_ms": _evidence_total(sent, "tool_busy_ms"),
             "server_ms_outside_provider_and_tools": _evidence_total(sent, "server_ms_outside_provider_and_tools"),
             "provider_calls": sum(result["evidence"]["provider_calls"] for result in sent),
+            "completion_tokens": _completion_tokens_total(sent),
             "tool_calls": sum(tools.values()),
             "tool_calls_by_name": dict(sorted(tools.items())),
             "polls": sum(result["timing"]["polls"] for result in sent),
@@ -368,11 +394,32 @@ def summarise(checkpoint: Mapping[str, Any]) -> JsonObject:
         "server_time_share_of_span": round(server / span, 4) if server is not None and span else None,
         "non_provider_share_of_wall": round((wall - busy) / wall, 4) if wall is not None and busy is not None and wall else None,
         "history_shed": {"edits": len(shed), "passed": sum(1 for result in shed if result["passed"])},
+        "byte_exact": byte_exact_summary(sent),
         "edits_with_complete_tool_timings": sum(1 for result in sent if result["evidence"]["tool_timings_complete"]),
         "end_reviews_recorded": sum(len(result["evidence"]["end_reviews"]) for result in sent),
         "end_reviews": end_review_summary(sent),
         "baseline_graph_counts": checkpoint["baseline_graph_counts"] if "baseline_graph_counts" in checkpoint else None,
         "not_available_from_api": list(UNAVAILABLE_FROM_API),
+    }
+
+
+def byte_exact_summary(sent: Sequence[Mapping[str, Any]]) -> JsonObject:
+    """How many sent edits were judged byte for byte, how many were exact, and which were not (with the first differing byte)."""
+    checked = [result for result in sent if "byte_exact" in result]
+    return {
+        "edits_checked": len(checked),
+        "exact": sum(1 for result in checked if result["byte_exact"] is True),
+        "not_exact": [
+            {
+                "number": result["number"],
+                "id": result["id"],
+                "first_difference_at": [
+                    record["first_difference_at"] for record in result["text_checks"] if record["byte_exact"] is not True
+                ],
+            }
+            for result in checked
+            if result["byte_exact"] is not True
+        ],
     }
 
 
@@ -579,8 +626,12 @@ class EditBattery:
                 self.sleep(self.poll_seconds)
         return rows, base + len(rows), self.settle_reads, False
 
+    def read_bytes(self, marker: Mapping[str, Any]) -> bytes:
+        """A file's bytes exactly as the server returns them."""
+        return self.client.download(f"/api/sessions/{self.session_id}/blobs/{marker['blob_ref']}/content")
+
     def read_text(self, marker: Mapping[str, Any]) -> str:
-        data = self.client.download(f"/api/sessions/{self.session_id}/blobs/{marker['blob_ref']}/content")
+        data = self.read_bytes(marker)
         try:
             return data.decode("utf-8")
         except UnicodeDecodeError:
@@ -683,10 +734,19 @@ class EditBattery:
 
         Each approval is saved (``save``) as soon as it is made, so a resumed run counts it.
         When the edit names a ``card`` kind, a card of another kind is a finding and is not
-        approved (:func:`~scripts.staging.edit_plan.card_kind`).
+        approved (:func:`~scripts.staging.edit_plan.card_kind`). An edit may name several
+        cards (one per node); each is looked for and checked on its own.
         """
         findings: list[str] = []
-        approve = edit["approve"]
+        for approve in approvals(edit):
+            findings.extend(self.approve_review(approve, state, approved, save))
+        return findings
+
+    def approve_review(
+        self, approve: Mapping[str, Any], state: Mapping[str, Any], approved: list[JsonObject], save: Callable[[], None]
+    ) -> list[str]:
+        """Resolve the pending cards of one ``approve`` entry (node and kind); return card findings."""
+        findings: list[str] = []
         nodes = {node["id"]: node for node in state["nodes"]}
         for event in self.pending_reviews():
             if event["kind"] != approve["kind"]:
@@ -725,6 +785,10 @@ class EditBattery:
     def session_files(self) -> list[JsonObject]:
         return [require_dict(item, "file") for item in list_pages(self.client, f"/api/sessions/{self.session_id}/blobs")]
 
+    def file_digests(self) -> dict[str, str]:
+        """Each session file's content hash, by file id."""
+        return {str(item["id"]): str(item["content_hash"]) for item in self.session_files()}
+
     def judge(
         self, edit: Mapping[str, Any], baseline_state: Mapping[str, Any], before_state: Mapping[str, Any], after_state: Mapping[str, Any]
     ) -> tuple[list[str], list[str], list[str]]:
@@ -735,8 +799,10 @@ class EditBattery:
         """
         before, after = graph_view(before_state), graph_view(after_state)
         files = self.file_context() if uses_files(edit) else None
-        failures, covered = check_expectations(edit, before, after, graph_view(baseline_state), self.read_text, files=files)
-        named = named_components(edit) | ({edit["approve"]["node"]} if edit["approve"] is not None else set())
+        failures, covered = check_expectations(
+            edit, before, after, graph_view(baseline_state), self.read_text, files=files, read_bytes=self.read_bytes
+        )
+        named = named_components(edit) | {spec["node"] for spec in approvals(edit)}
         changes = classify_changes(before, after, [*covered, *edit["may_change"]], named=named)
         return failures, changes.unrelated, changes.server_written
 
@@ -784,16 +850,32 @@ class EditBattery:
                 edit, operation, evidence, findings, before_state, after_state, baseline_state, deferred=deferred
             )
             warnings.extend(new_component_notes(edit, graph_view(before_state), graph_view(after_state)))
-            if edit["approve"] is not None and not findings:
+            # Byte-exact prompts: each one's size before and after and whether it is exactly as asked (an approval changes no file).
+            records = byte_records(edit, graph_view(before_state), graph_view(after_state), self.read_text, self.read_bytes)
+            if records:
+                extra["text_checks"] = records
+                extra["byte_exact"] = all(record["byte_exact"] is True for record in records)
+            specs = approvals(edit)
+            if specs and not findings:
+                # A card that must block the run: its pending-review error is on the graph before the approval.
+                findings.extend(
+                    f"review_did_not_block_run:{spec['node']}"
+                    for spec in specs
+                    if "blocks_run" in spec and not any(_is_the_review(spec, item.split(":", 1)[1]) for item in deferred)
+                )
+            if specs and not findings:
                 # Only a turn with a clean verdict earns an approval; the approval may change server-written fields only.
                 findings.extend(self.approve_reviews(edit, after_state, approved, save))
-                if not approved and "card" in edit["approve"]:
-                    # An edit that names the card kind requires the card: binding a prompt file always opens one.
-                    findings.append(f"expected_review_card_missing:{edit['approve']['node']}")
-                elif not approved:
-                    warnings.append("no_pending_review_card_to_approve")
+                for spec in specs:
+                    if any(item["node_id"] == spec["node"] and item["kind"] == spec["kind"] for item in approved):
+                        continue
+                    if "card" in spec:
+                        # An edit that names the card kind requires the card: binding a prompt file always opens one.
+                        findings.append(f"expected_review_card_missing:{spec['node']}")
+                    else:
+                        warnings.append("no_pending_review_card_to_approve")
                 approved_state = self.state()
-                approval = classify_changes(graph_view(after_state), graph_view(approved_state), [], named={edit["approve"]["node"]})
+                approval = classify_changes(graph_view(after_state), graph_view(approved_state), [], named={spec["node"] for spec in specs})
                 findings.extend("approval_changed:" + path for path in approval.unrelated)
                 server_written = [*server_written, *approval.server_written]
                 after_state = approved_state
@@ -877,7 +959,9 @@ class EditBattery:
         }
         checkpoint["results"].append(result)
         if not self.keep_going:
-            checkpoint["stopped_reason"] = f"edit {edit['number']} ({edit['id']}) was not sent: its change already holds"
+            checkpoint["stopped_reason"] = f"edit {edit['number']} ({edit['id']}) was not sent: " + (
+                "the no-op it asks for is not already met" if is_no_op(edit) else "its change already holds"
+            )
         self.store.write(self.name, checkpoint)
         emit("edit_result", number=edit["number"], id=edit["id"], status="not_sent", passed=False, findings=findings)
         return result
@@ -897,10 +981,14 @@ class EditBattery:
                 graph_view(checkpoint["baseline"]),
                 self.read_text,
                 files=self.file_context() if uses_files(edit) else None,
+                read_bytes=self.read_bytes,
             )
             if already:
                 return self.not_sent(checkpoint, edit, live, already)
             results.append({"number": edit["number"], "id": edit["id"], "operation_id": str(uuid4()), "base_state_id": live["id"]})
+            if is_no_op(edit):
+                # A no-op must leave every session file as it is: saved before the message is sent.
+                results[-1]["files_before"] = self.file_digests()
             self.store.write(self.name, checkpoint)
         result = results[index]
         if "submitted_at" not in result:
@@ -925,6 +1013,9 @@ class EditBattery:
             approved=result["approvals"],
             save=lambda: self.store.write(self.name, checkpoint),
         )
+        if "files_before" in result:
+            fields["findings"].extend(no_op_file_findings(result["files_before"], self.file_digests()))
+            fields["passed"] = not fields["findings"]
         evidence = fields["evidence"]
         wall = round((observed_at - result["submitted_at"]) * 1000)
         result.update(
@@ -953,6 +1044,11 @@ class EditBattery:
         )
         if "graph_counts" in fields:
             result["graph_counts"] = fields["graph_counts"]
+        # Per edit: output tokens over its provider calls, and for a byte-exact plan each prompt's sizes and verdict.
+        result["completion_tokens"] = evidence["completion_tokens"]
+        if "text_checks" in fields:
+            result["text_checks"] = fields["text_checks"]
+            result["byte_exact"] = fields["byte_exact"]
         checkpoint["last_state"] = after_state
         checkpoint["rows_seen"] = rows_seen
         if evidence["history"]["shed_history_after"] is not None:
@@ -969,6 +1065,8 @@ class EditBattery:
             },
             tools=evidence["tool_calls_by_name"],
             provider_calls=evidence["provider_calls"],
+            completion_tokens=evidence["completion_tokens"],
+            **({"byte_exact": result["byte_exact"], "text_checks": result["text_checks"]} if "text_checks" in result else {}),
             **({"graph_counts": result["graph_counts"]} if "graph_counts" in result else {}),
         )
         return result
@@ -1012,6 +1110,14 @@ class EditBattery:
         self.store.write(f"{self.name}-summary", summary)
         emit("edit_battery_summary", **summary)
         return summary
+
+
+def no_op_file_findings(before: Mapping[str, str], after: Mapping[str, str]) -> list[str]:
+    """A no-op turn's file findings: a session file added, removed or with other bytes than before the turn."""
+    findings = [f"no_op_file_added:{blob_id}" for blob_id in sorted(set(after) - set(before))]
+    findings += [f"no_op_file_removed:{blob_id}" for blob_id in sorted(set(before) - set(after))]
+    findings += [f"no_op_file_changed:{blob_id}" for blob_id in sorted(set(before) & set(after)) if before[blob_id] != after[blob_id]]
+    return findings
 
 
 def referenced_files(state: Mapping[str, Any]) -> set[str]:
@@ -1122,11 +1228,11 @@ def next_cleanup_edit(
                 edges_touching=[node_id, *(item for _, item in feeders), *consumers],
             )
     for node_id in view["nodes"]:
-        for key, label in (("prompt_template", "prompt"), ("system_prompt", "system prompt")):
-            pointer = f"/nodes/{escape(node_id)}/options/{key}"
+        for label, pointer in prompt_slots(view, node_id):
             _, text = text_at(view, pointer, read_text)
             if text is None:
                 continue
+            key = pointer.rsplit("/options/", 1)[1].replace("/", "-")
             for sentence in _MARKER_SENTENCE.findall(text):
                 if text.count(sentence) == 1:
                     return _cleanup_edit(

@@ -1,0 +1,1596 @@
+{
+  "format": "elspeth-composer-edit-plan/2",
+  "name": "composer-prompt-edits-50",
+  "description": "Prompt wording changed by chat on prompts held in files, for the 30-step acceptance fixture (fx-acc30: scripts.staging.large_graph_fixture --preset acceptance --steps 30 --llm-steps 14 --total-prompt-bytes 300000). A marker sentence is added after a named sentence, changed and removed in system prompts, prompts and query templates of every LLM step, in files the user uploaded and in files the Composer writes; two steps in one message; one step several times in a row; and no-op requests. Every file text is judged byte for byte, every review card must block the run until approved, and the graph is left as found.",
+  "forbidden_tools": [
+    "set_pipeline"
+  ],
+  "targets": {
+    "cs1_assessment": {
+      "kind": "named_llm_step",
+      "id": "cs1_assessment"
+    },
+    "cs1_scoring": {
+      "kind": "named_llm_step",
+      "id": "cs1_scoring"
+    },
+    "cs2_assessment": {
+      "kind": "named_llm_step",
+      "id": "cs2_assessment"
+    },
+    "cs2_scoring": {
+      "kind": "named_llm_step",
+      "id": "cs2_scoring"
+    },
+    "cs1_evidence_check": {
+      "kind": "named_llm_step",
+      "id": "cs1_evidence_check"
+    },
+    "cs2_evidence_check": {
+      "kind": "named_llm_step",
+      "id": "cs2_evidence_check"
+    },
+    "cross_case_comparison": {
+      "kind": "named_llm_step",
+      "id": "cross_case_comparison"
+    },
+    "risk_review": {
+      "kind": "named_llm_step",
+      "id": "risk_review"
+    },
+    "equity_review": {
+      "kind": "named_llm_step",
+      "id": "equity_review"
+    },
+    "overall_rubric": {
+      "kind": "named_llm_step",
+      "id": "overall_rubric"
+    },
+    "moderation_summary": {
+      "kind": "named_llm_step",
+      "id": "moderation_summary"
+    },
+    "additional_review_1": {
+      "kind": "named_llm_step",
+      "id": "additional_review_1"
+    },
+    "additional_review_2": {
+      "kind": "named_llm_step",
+      "id": "additional_review_2"
+    },
+    "feedback_letter": {
+      "kind": "named_llm_step",
+      "id": "feedback_letter"
+    }
+  },
+  "edits": [
+    {
+      "id": "cs1a-system-add",
+      "message": "In the system prompt of the step {cs1_assessment}, add the sentence \"Battery marker cs1 assessment system one.\" directly after the sentence \"Outcome plan review review plan plan is consider relevant describe standard.\", on the same line with one space between them.",
+      "expect": [
+        {
+          "text": "/nodes/{cs1_assessment}/options/system_prompt",
+          "replace": [
+            "Outcome plan review review plan plan is consider relevant describe standard.",
+            "Outcome plan review review plan plan is consider relevant describe standard. Battery marker cs1 assessment system one."
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_any": [
+        "create_blob",
+        "update_blob"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{cs1_assessment}",
+        "card": "agent_written",
+        "blocks_run": true
+      }
+    },
+    {
+      "id": "cs1a-system-remove",
+      "message": "In the system prompt of the step {cs1_assessment}, remove the sentence \"Battery marker cs1 assessment system one.\" and the one space before it.",
+      "expect": [
+        {
+          "text": "/nodes/{cs1_assessment}/options/system_prompt",
+          "replace": [
+            " Battery marker cs1 assessment system one.",
+            ""
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_any": [
+        "create_blob",
+        "update_blob"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{cs1_assessment}",
+        "card": "agent_written",
+        "blocks_run": true
+      }
+    },
+    {
+      "id": "cs1a-prompt-add",
+      "message": "In the prompt of the step {cs1_assessment}, add the sentence \"Battery marker cs1 assessment prompt one.\" directly after the sentence \"Each example is with justify weight plan complete guidance consider outcome to for observation standard review each.\", on the same line with one space between them.",
+      "expect": [
+        {
+          "text": "/nodes/{cs1_assessment}/options/prompt_template",
+          "replace": [
+            "Each example is with justify weight plan complete guidance consider outcome to for observation standard review each.",
+            "Each example is with justify weight plan complete guidance consider outcome to for observation standard review each. Battery marker cs1 assessment prompt one."
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_any": [
+        "create_blob",
+        "update_blob"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{cs1_assessment}",
+        "card": "agent_written",
+        "blocks_run": true
+      }
+    },
+    {
+      "id": "cs1a-prompt-remove",
+      "message": "In the prompt of the step {cs1_assessment}, remove the sentence \"Battery marker cs1 assessment prompt one.\" and the one space before it.",
+      "expect": [
+        {
+          "text": "/nodes/{cs1_assessment}/options/prompt_template",
+          "replace": [
+            " Battery marker cs1 assessment prompt one.",
+            ""
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_any": [
+        "create_blob",
+        "update_blob"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{cs1_assessment}",
+        "card": "agent_written",
+        "blocks_run": true
+      }
+    },
+    {
+      "id": "cs1s-accuracy-add",
+      "message": "In the template of the query cs1_accuracy in the step {cs1_scoring}, add the sentence \"Battery marker cs1 accuracy query one.\" directly after the sentence \"Relevant rubric the and with history finding assess.\", on the same line with one space between them.",
+      "expect": [
+        {
+          "text": "/nodes/{cs1_scoring}/options/queries/cs1_accuracy/template",
+          "replace": [
+            "Relevant rubric the and with history finding assess.",
+            "Relevant rubric the and with history finding assess. Battery marker cs1 accuracy query one."
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_any": [
+        "create_blob",
+        "update_blob"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{cs1_scoring}",
+        "card": "agent_written",
+        "blocks_run": true
+      }
+    },
+    {
+      "id": "cs1s-accuracy-remove",
+      "message": "In the template of the query cs1_accuracy in the step {cs1_scoring}, remove the sentence \"Battery marker cs1 accuracy query one.\" and the one space before it.",
+      "expect": [
+        {
+          "text": "/nodes/{cs1_scoring}/options/queries/cs1_accuracy/template",
+          "replace": [
+            " Battery marker cs1 accuracy query one.",
+            ""
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_any": [
+        "create_blob",
+        "update_blob"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{cs1_scoring}",
+        "card": "agent_written",
+        "blocks_run": true
+      }
+    },
+    {
+      "id": "cs1s-rubric-add",
+      "message": "In the system prompt of the step {cs1_scoring}, add the sentence \"Battery marker cs1 rubric one.\" directly after the sentence \"Complete follow summary outcome rubric measure band band band consider finding case.\", on the same line with one space between them.",
+      "expect": [
+        {
+          "text": "/nodes/{cs1_scoring}/options/system_prompt",
+          "replace": [
+            "Complete follow summary outcome rubric measure band band band consider finding case.",
+            "Complete follow summary outcome rubric measure band band band consider finding case. Battery marker cs1 rubric one."
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_any": [
+        "create_blob",
+        "update_blob"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{cs1_scoring}",
+        "card": "agent_written",
+        "blocks_run": true
+      }
+    },
+    {
+      "id": "cs1s-rubric-remove",
+      "message": "In the system prompt of the step {cs1_scoring}, remove the sentence \"Battery marker cs1 rubric one.\" and the one space before it.",
+      "expect": [
+        {
+          "text": "/nodes/{cs1_scoring}/options/system_prompt",
+          "replace": [
+            " Battery marker cs1 rubric one.",
+            ""
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_any": [
+        "create_blob",
+        "update_blob"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{cs1_scoring}",
+        "card": "agent_written",
+        "blocks_run": true
+      }
+    },
+    {
+      "id": "cs2a-system-add",
+      "message": "In the system prompt of the step {cs2_assessment}, add the sentence \"Battery marker cs2 assessment system one.\" directly after the sentence \"Evidence describe concise to finding note compare of a to history for.\", on the same line with one space between them.",
+      "expect": [
+        {
+          "text": "/nodes/{cs2_assessment}/options/system_prompt",
+          "replace": [
+            "Evidence describe concise to finding note compare of a to history for.",
+            "Evidence describe concise to finding note compare of a to history for. Battery marker cs2 assessment system one."
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_any": [
+        "create_blob",
+        "update_blob"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{cs2_assessment}",
+        "card": "agent_written",
+        "blocks_run": true
+      }
+    },
+    {
+      "id": "cs2a-system-remove",
+      "message": "In the system prompt of the step {cs2_assessment}, remove the sentence \"Battery marker cs2 assessment system one.\" and the one space before it.",
+      "expect": [
+        {
+          "text": "/nodes/{cs2_assessment}/options/system_prompt",
+          "replace": [
+            " Battery marker cs2 assessment system one.",
+            ""
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_any": [
+        "create_blob",
+        "update_blob"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{cs2_assessment}",
+        "card": "agent_written",
+        "blocks_run": true
+      }
+    },
+    {
+      "id": "cs2s-reasoning-add",
+      "message": "In the template of the query cs2_reasoning in the step {cs2_scoring}, add the sentence \"Battery marker cs2 reasoning query one.\" directly after the sentence \"Plan context guidance assess with for weight reason.\", on the same line with one space between them.",
+      "expect": [
+        {
+          "text": "/nodes/{cs2_scoring}/options/queries/cs2_reasoning/template",
+          "replace": [
+            "Plan context guidance assess with for weight reason.",
+            "Plan context guidance assess with for weight reason. Battery marker cs2 reasoning query one."
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_any": [
+        "create_blob",
+        "update_blob"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{cs2_scoring}",
+        "card": "agent_written",
+        "blocks_run": true
+      }
+    },
+    {
+      "id": "cs2s-reasoning-remove",
+      "message": "In the template of the query cs2_reasoning in the step {cs2_scoring}, remove the sentence \"Battery marker cs2 reasoning query one.\" and the one space before it.",
+      "expect": [
+        {
+          "text": "/nodes/{cs2_scoring}/options/queries/cs2_reasoning/template",
+          "replace": [
+            " Battery marker cs2 reasoning query one.",
+            ""
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_any": [
+        "create_blob",
+        "update_blob"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{cs2_scoring}",
+        "card": "agent_written",
+        "blocks_run": true
+      }
+    },
+    {
+      "id": "cs1e-prompt-add",
+      "message": "In the prompt of the step {cs1_evidence_check}, add the sentence \"Battery marker cs1 evidence prompt one.\" directly after the sentence \"Summary finding risk relevant reason and consistent reason rubric for record assess reason concise note record describe.\", on the same line with one space between them.",
+      "expect": [
+        {
+          "text": "/nodes/{cs1_evidence_check}/options/prompt_template",
+          "replace": [
+            "Summary finding risk relevant reason and consistent reason rubric for record assess reason concise note record describe.",
+            "Summary finding risk relevant reason and consistent reason rubric for record assess reason concise note record describe. Battery marker cs1 evidence prompt one."
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_any": [
+        "create_blob",
+        "update_blob"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{cs1_evidence_check}",
+        "card": "agent_written",
+        "blocks_run": true
+      }
+    },
+    {
+      "id": "cs1e-prompt-remove",
+      "message": "In the prompt of the step {cs1_evidence_check}, remove the sentence \"Battery marker cs1 evidence prompt one.\" and the one space before it.",
+      "expect": [
+        {
+          "text": "/nodes/{cs1_evidence_check}/options/prompt_template",
+          "replace": [
+            " Battery marker cs1 evidence prompt one.",
+            ""
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_any": [
+        "create_blob",
+        "update_blob"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{cs1_evidence_check}",
+        "card": "agent_written",
+        "blocks_run": true
+      }
+    },
+    {
+      "id": "cs2e-system-add",
+      "message": "In the system prompt of the step {cs2_evidence_check}, add the sentence \"Battery marker cs2 evidence system one.\" directly after the sentence \"Plan score example evidence risk clear for explain rubric review score reason risk case.\", on the same line with one space between them.",
+      "expect": [
+        {
+          "text": "/nodes/{cs2_evidence_check}/options/system_prompt",
+          "replace": [
+            "Plan score example evidence risk clear for explain rubric review score reason risk case.",
+            "Plan score example evidence risk clear for explain rubric review score reason risk case. Battery marker cs2 evidence system one."
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_any": [
+        "create_blob",
+        "update_blob"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{cs2_evidence_check}",
+        "card": "agent_written",
+        "blocks_run": true
+      }
+    },
+    {
+      "id": "cs2e-system-remove",
+      "message": "In the system prompt of the step {cs2_evidence_check}, remove the sentence \"Battery marker cs2 evidence system one.\" and the one space before it.",
+      "expect": [
+        {
+          "text": "/nodes/{cs2_evidence_check}/options/system_prompt",
+          "replace": [
+            " Battery marker cs2 evidence system one.",
+            ""
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_any": [
+        "create_blob",
+        "update_blob"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{cs2_evidence_check}",
+        "card": "agent_written",
+        "blocks_run": true
+      }
+    },
+    {
+      "id": "ccc-prompt-add",
+      "message": "In the prompt of the step {cross_case_comparison}, add the sentence \"Battery marker comparison prompt one.\" directly after the sentence \"Consistent clear explain justify complete relevant case relevant relevant score.\", on the same line with one space between them.",
+      "expect": [
+        {
+          "text": "/nodes/{cross_case_comparison}/options/prompt_template",
+          "replace": [
+            "Consistent clear explain justify complete relevant case relevant relevant score.",
+            "Consistent clear explain justify complete relevant case relevant relevant score. Battery marker comparison prompt one."
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_any": [
+        "create_blob",
+        "update_blob"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{cross_case_comparison}",
+        "card": "agent_written",
+        "blocks_run": true
+      }
+    },
+    {
+      "id": "ccc-prompt-remove",
+      "message": "In the prompt of the step {cross_case_comparison}, remove the sentence \"Battery marker comparison prompt one.\" and the one space before it.",
+      "expect": [
+        {
+          "text": "/nodes/{cross_case_comparison}/options/prompt_template",
+          "replace": [
+            " Battery marker comparison prompt one.",
+            ""
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_any": [
+        "create_blob",
+        "update_blob"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{cross_case_comparison}",
+        "card": "agent_written",
+        "blocks_run": true
+      }
+    },
+    {
+      "id": "risk-system-add",
+      "message": "In the system prompt of the step {risk_review}, add the sentence \"Battery marker risk one.\" directly after the sentence \"Is with complete consider rubric consider describe score is consistent weight.\", on the same line with one space between them.",
+      "expect": [
+        {
+          "text": "/nodes/{risk_review}/options/system_prompt",
+          "replace": [
+            "Is with complete consider rubric consider describe score is consistent weight.",
+            "Is with complete consider rubric consider describe score is consistent weight. Battery marker risk one."
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_any": [
+        "create_blob",
+        "update_blob"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{risk_review}",
+        "card": "agent_written",
+        "blocks_run": true
+      }
+    },
+    {
+      "id": "risk-system-change-1",
+      "message": "In the system prompt of the step {risk_review}, change the sentence \"Battery marker risk one.\" to \"Battery marker risk two.\".",
+      "expect": [
+        {
+          "text": "/nodes/{risk_review}/options/system_prompt",
+          "replace": [
+            "Battery marker risk one.",
+            "Battery marker risk two."
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_any": [
+        "create_blob",
+        "update_blob"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{risk_review}",
+        "card": "agent_written",
+        "blocks_run": true
+      }
+    },
+    {
+      "id": "risk-system-change-2",
+      "message": "In the system prompt of the step {risk_review}, change the sentence \"Battery marker risk two.\" to \"Battery marker risk three.\".",
+      "expect": [
+        {
+          "text": "/nodes/{risk_review}/options/system_prompt",
+          "replace": [
+            "Battery marker risk two.",
+            "Battery marker risk three."
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_any": [
+        "create_blob",
+        "update_blob"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{risk_review}",
+        "card": "agent_written",
+        "blocks_run": true
+      }
+    },
+    {
+      "id": "risk-system-no-op",
+      "message": "Make sure the system prompt of the step {risk_review} contains the sentence \"Battery marker risk three.\".",
+      "expect": [
+        {
+          "unchanged": "/nodes/{risk_review}/options/system_prompt",
+          "contains": "Battery marker risk three."
+        }
+      ]
+    },
+    {
+      "id": "risk-system-remove",
+      "message": "In the system prompt of the step {risk_review}, remove the sentence \"Battery marker risk three.\" and the one space before it.",
+      "expect": [
+        {
+          "text": "/nodes/{risk_review}/options/system_prompt",
+          "replace": [
+            " Battery marker risk three.",
+            ""
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_any": [
+        "create_blob",
+        "update_blob"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{risk_review}",
+        "card": "agent_written",
+        "blocks_run": true
+      }
+    },
+    {
+      "id": "risk-safety-add",
+      "message": "In the template of the query risk_safety in the step {risk_review}, add the sentence \"Battery marker risk safety query one.\" directly after the sentence \"Of consistent describe clear follow the evidence evidence measure finding history.\", on the same line with one space between them.",
+      "expect": [
+        {
+          "text": "/nodes/{risk_review}/options/queries/risk_safety/template",
+          "replace": [
+            "Of consistent describe clear follow the evidence evidence measure finding history.",
+            "Of consistent describe clear follow the evidence evidence measure finding history. Battery marker risk safety query one."
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_any": [
+        "create_blob",
+        "update_blob"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{risk_review}",
+        "card": "agent_written",
+        "blocks_run": true
+      }
+    },
+    {
+      "id": "risk-safety-remove",
+      "message": "In the template of the query risk_safety in the step {risk_review}, remove the sentence \"Battery marker risk safety query one.\" and the one space before it.",
+      "expect": [
+        {
+          "text": "/nodes/{risk_review}/options/queries/risk_safety/template",
+          "replace": [
+            " Battery marker risk safety query one.",
+            ""
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_any": [
+        "create_blob",
+        "update_blob"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{risk_review}",
+        "card": "agent_written",
+        "blocks_run": true
+      }
+    },
+    {
+      "id": "equity-system-move",
+      "message": "Write a new file named battery_equity_system.txt holding the whole text of the system prompt of the step {equity_review} with the sentence \"Battery marker equity system one.\" added directly after the sentence \"Of rubric of assess threshold to explain relevant of note plan.\" (on the same line, one space between them), and use the new file as the system prompt of the step {equity_review} instead.",
+      "expect": [
+        {
+          "bound": "/nodes/{equity_review}/options/system_prompt",
+          "file": "battery_equity_system.txt"
+        },
+        {
+          "text": "/nodes/{equity_review}/options/system_prompt",
+          "replace": [
+            "Of rubric of assess threshold to explain relevant of note plan.",
+            "Of rubric of assess threshold to explain relevant of note plan. Battery marker equity system one."
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_all": [
+        "create_blob",
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{equity_review}",
+        "card": "agent_written",
+        "blocks_run": true
+      }
+    },
+    {
+      "id": "equity-system-change",
+      "message": "In the system prompt of the step {equity_review}, change the sentence \"Battery marker equity system one.\" to \"Battery marker equity system two.\".",
+      "expect": [
+        {
+          "text": "/nodes/{equity_review}/options/system_prompt",
+          "replace": [
+            "Battery marker equity system one.",
+            "Battery marker equity system two."
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_any": [
+        "create_blob",
+        "update_blob"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{equity_review}",
+        "card": "agent_written",
+        "blocks_run": true
+      }
+    },
+    {
+      "id": "equity-system-remove",
+      "message": "In the system prompt of the step {equity_review}, remove the sentence \"Battery marker equity system two.\" and the one space before it.",
+      "expect": [
+        {
+          "text": "/nodes/{equity_review}/options/system_prompt",
+          "replace": [
+            " Battery marker equity system two.",
+            ""
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_any": [
+        "create_blob",
+        "update_blob"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{equity_review}",
+        "card": "agent_written",
+        "blocks_run": true
+      }
+    },
+    {
+      "id": "moderation-prompt-move",
+      "message": "Write a new file named battery_moderation_prompt.txt holding the whole text of the prompt of the step {moderation_summary} with the sentence \"Battery marker moderation prompt one.\" added directly after the sentence \"Criterion finding rubric measure finding assess measure case outcome benefit evidence record example review outcome criterion assess.\" (on the same line, one space between them), and use the new file as the prompt of the step {moderation_summary} instead.",
+      "expect": [
+        {
+          "bound": "/nodes/{moderation_summary}/options/prompt_template",
+          "file": "battery_moderation_prompt.txt"
+        },
+        {
+          "text": "/nodes/{moderation_summary}/options/prompt_template",
+          "replace": [
+            "Criterion finding rubric measure finding assess measure case outcome benefit evidence record example review outcome criterion assess.",
+            "Criterion finding rubric measure finding assess measure case outcome benefit evidence record example review outcome criterion assess. Battery marker moderation prompt one."
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_all": [
+        "create_blob",
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{moderation_summary}",
+        "card": "agent_written",
+        "blocks_run": true
+      }
+    },
+    {
+      "id": "moderation-prompt-remove",
+      "message": "In the prompt of the step {moderation_summary}, remove the sentence \"Battery marker moderation prompt one.\" and the one space before it.",
+      "expect": [
+        {
+          "text": "/nodes/{moderation_summary}/options/prompt_template",
+          "replace": [
+            " Battery marker moderation prompt one.",
+            ""
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_any": [
+        "create_blob",
+        "update_blob"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{moderation_summary}",
+        "card": "agent_written",
+        "blocks_run": true
+      }
+    },
+    {
+      "id": "overall-rubric-add",
+      "message": "In the system prompt of the step {overall_rubric}, add the sentence \"Battery marker overall rubric one.\" directly after the sentence \"Context measure context risk compare complete rubric panel explain.\", on the same line with one space between them.",
+      "expect": [
+        {
+          "text": "/nodes/{overall_rubric}/options/system_prompt",
+          "replace": [
+            "Context measure context risk compare complete rubric panel explain.",
+            "Context measure context risk compare complete rubric panel explain. Battery marker overall rubric one."
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_any": [
+        "create_blob",
+        "update_blob"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{overall_rubric}",
+        "card": "agent_written",
+        "blocks_run": true
+      }
+    },
+    {
+      "id": "overall-rubric-remove",
+      "message": "In the system prompt of the step {overall_rubric}, remove the sentence \"Battery marker overall rubric one.\" and the one space before it.",
+      "expect": [
+        {
+          "text": "/nodes/{overall_rubric}/options/system_prompt",
+          "replace": [
+            " Battery marker overall rubric one.",
+            ""
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_any": [
+        "create_blob",
+        "update_blob"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{overall_rubric}",
+        "card": "agent_written",
+        "blocks_run": true
+      }
+    },
+    {
+      "id": "overall-ethics-add",
+      "message": "In the template of the query overall_ethics in the step {overall_rubric}, add the sentence \"Battery marker overall ethics query one.\" directly after the sentence \"With example summary evidence of review panel case plan of weight case outcome concise standard.\", on the same line with one space between them.",
+      "expect": [
+        {
+          "text": "/nodes/{overall_rubric}/options/queries/overall_ethics/template",
+          "replace": [
+            "With example summary evidence of review panel case plan of weight case outcome concise standard.",
+            "With example summary evidence of review panel case plan of weight case outcome concise standard. Battery marker overall ethics query one."
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_any": [
+        "create_blob",
+        "update_blob"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{overall_rubric}",
+        "card": "agent_written",
+        "blocks_run": true
+      }
+    },
+    {
+      "id": "overall-ethics-change",
+      "message": "In the template of the query overall_ethics in the step {overall_rubric}, change the sentence \"Battery marker overall ethics query one.\" to \"Battery marker overall ethics query two.\".",
+      "expect": [
+        {
+          "text": "/nodes/{overall_rubric}/options/queries/overall_ethics/template",
+          "replace": [
+            "Battery marker overall ethics query one.",
+            "Battery marker overall ethics query two."
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_any": [
+        "create_blob",
+        "update_blob"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{overall_rubric}",
+        "card": "agent_written",
+        "blocks_run": true
+      }
+    },
+    {
+      "id": "overall-ethics-remove",
+      "message": "In the template of the query overall_ethics in the step {overall_rubric}, remove the sentence \"Battery marker overall ethics query two.\" and the one space before it.",
+      "expect": [
+        {
+          "text": "/nodes/{overall_rubric}/options/queries/overall_ethics/template",
+          "replace": [
+            " Battery marker overall ethics query two.",
+            ""
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_any": [
+        "create_blob",
+        "update_blob"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{overall_rubric}",
+        "card": "agent_written",
+        "blocks_run": true
+      }
+    },
+    {
+      "id": "reviews-system-add",
+      "message": "Two changes: in the system prompt of the step {additional_review_1}, add the sentence \"Battery marker review one system.\" directly after the sentence \"Of note complete plan and record in criterion weight criterion compare case complete consistent band with example.\"; and in the system prompt of the step {additional_review_2}, add the sentence \"Battery marker review two system.\" directly after the sentence \"Observation describe in relevant of for level case summary observation.\". In both, the new sentence goes on the same line with one space between them.",
+      "expect": [
+        {
+          "text": "/nodes/{additional_review_1}/options/system_prompt",
+          "replace": [
+            "Of note complete plan and record in criterion weight criterion compare case complete consistent band with example.",
+            "Of note complete plan and record in criterion weight criterion compare case complete consistent band with example. Battery marker review one system."
+          ],
+          "form": "file",
+          "exact": true
+        },
+        {
+          "text": "/nodes/{additional_review_2}/options/system_prompt",
+          "replace": [
+            "Observation describe in relevant of for level case summary observation.",
+            "Observation describe in relevant of for level case summary observation. Battery marker review two system."
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_any": [
+        "create_blob",
+        "update_blob"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": [
+        {
+          "kind": "llm_prompt_template",
+          "node": "{additional_review_1}",
+          "card": "agent_written",
+          "blocks_run": true
+        },
+        {
+          "kind": "llm_prompt_template",
+          "node": "{additional_review_2}",
+          "card": "agent_written",
+          "blocks_run": true
+        }
+      ]
+    },
+    {
+      "id": "reviews-system-remove",
+      "message": "Two changes: in the system prompt of the step {additional_review_1}, remove the sentence \"Battery marker review one system.\" and the one space before it; and in the system prompt of the step {additional_review_2}, remove the sentence \"Battery marker review two system.\" and the one space before it.",
+      "expect": [
+        {
+          "text": "/nodes/{additional_review_1}/options/system_prompt",
+          "replace": [
+            " Battery marker review one system.",
+            ""
+          ],
+          "form": "file",
+          "exact": true
+        },
+        {
+          "text": "/nodes/{additional_review_2}/options/system_prompt",
+          "replace": [
+            " Battery marker review two system.",
+            ""
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_any": [
+        "create_blob",
+        "update_blob"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": [
+        {
+          "kind": "llm_prompt_template",
+          "node": "{additional_review_1}",
+          "card": "agent_written",
+          "blocks_run": true
+        },
+        {
+          "kind": "llm_prompt_template",
+          "node": "{additional_review_2}",
+          "card": "agent_written",
+          "blocks_run": true
+        }
+      ]
+    },
+    {
+      "id": "letter-and-safety-add",
+      "message": "Two changes: in the prompt of the step {feedback_letter}, add the sentence \"Battery marker letter prompt one.\" directly after the sentence \"Evidence assess review consistent reason rubric assess case weight summary weight weight justify clear in is.\"; and in the template of the query cs2_safety in the step {cs2_scoring}, add the sentence \"Battery marker cs2 safety query one.\" directly after the sentence \"Evidence criterion consistent plan example observation band in criterion clear reason weight consistent a guidance evidence assess.\". In both, the new sentence goes on the same line with one space between them.",
+      "expect": [
+        {
+          "text": "/nodes/{feedback_letter}/options/prompt_template",
+          "replace": [
+            "Evidence assess review consistent reason rubric assess case weight summary weight weight justify clear in is.",
+            "Evidence assess review consistent reason rubric assess case weight summary weight weight justify clear in is. Battery marker letter prompt one."
+          ],
+          "form": "file",
+          "exact": true
+        },
+        {
+          "text": "/nodes/{cs2_scoring}/options/queries/cs2_safety/template",
+          "replace": [
+            "Evidence criterion consistent plan example observation band in criterion clear reason weight consistent a guidance evidence assess.",
+            "Evidence criterion consistent plan example observation band in criterion clear reason weight consistent a guidance evidence assess. Battery marker cs2 safety query one."
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_any": [
+        "create_blob",
+        "update_blob"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": [
+        {
+          "kind": "llm_prompt_template",
+          "node": "{feedback_letter}",
+          "card": "agent_written",
+          "blocks_run": true
+        },
+        {
+          "kind": "llm_prompt_template",
+          "node": "{cs2_scoring}",
+          "card": "agent_written",
+          "blocks_run": true
+        }
+      ]
+    },
+    {
+      "id": "letter-and-safety-remove",
+      "message": "Two changes: in the prompt of the step {feedback_letter}, remove the sentence \"Battery marker letter prompt one.\" and the one space before it; and in the template of the query cs2_safety in the step {cs2_scoring}, remove the sentence \"Battery marker cs2 safety query one.\" and the one space before it.",
+      "expect": [
+        {
+          "text": "/nodes/{feedback_letter}/options/prompt_template",
+          "replace": [
+            " Battery marker letter prompt one.",
+            ""
+          ],
+          "form": "file",
+          "exact": true
+        },
+        {
+          "text": "/nodes/{cs2_scoring}/options/queries/cs2_safety/template",
+          "replace": [
+            " Battery marker cs2 safety query one.",
+            ""
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_any": [
+        "create_blob",
+        "update_blob"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": [
+        {
+          "kind": "llm_prompt_template",
+          "node": "{feedback_letter}",
+          "card": "agent_written",
+          "blocks_run": true
+        },
+        {
+          "kind": "llm_prompt_template",
+          "node": "{cs2_scoring}",
+          "card": "agent_written",
+          "blocks_run": true
+        }
+      ]
+    },
+    {
+      "id": "letter-system-no-op",
+      "message": "Make sure the system prompt of the step {feedback_letter} contains the sentence \"Risk context for the of finding case weight case consider panel.\".",
+      "expect": [
+        {
+          "unchanged": "/nodes/{feedback_letter}/options/system_prompt",
+          "contains": "Risk context for the of finding case weight case consider panel."
+        }
+      ]
+    },
+    {
+      "id": "overall-evidence-no-op",
+      "message": "Make sure the template of the query overall_evidence in the step {overall_rubric} contains the sentence \"Outcome history each is context with in with is risk for history.\".",
+      "expect": [
+        {
+          "unchanged": "/nodes/{overall_rubric}/options/queries/overall_evidence/template",
+          "contains": "Outcome history each is context with in with is risk for history."
+        }
+      ]
+    },
+    {
+      "id": "review-1-prompt-add",
+      "message": "In the prompt of the step {additional_review_1}, add the sentence \"Battery marker review one prompt.\" directly after the sentence \"Risk observation level concise score reason explain assess assess summary explain.\", on the same line with one space between them.",
+      "expect": [
+        {
+          "text": "/nodes/{additional_review_1}/options/prompt_template",
+          "replace": [
+            "Risk observation level concise score reason explain assess assess summary explain.",
+            "Risk observation level concise score reason explain assess assess summary explain. Battery marker review one prompt."
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_any": [
+        "create_blob",
+        "update_blob"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{additional_review_1}",
+        "card": "agent_written",
+        "blocks_run": true
+      }
+    },
+    {
+      "id": "review-1-prompt-remove",
+      "message": "In the prompt of the step {additional_review_1}, remove the sentence \"Battery marker review one prompt.\" and the one space before it.",
+      "expect": [
+        {
+          "text": "/nodes/{additional_review_1}/options/prompt_template",
+          "replace": [
+            " Battery marker review one prompt.",
+            ""
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_any": [
+        "create_blob",
+        "update_blob"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{additional_review_1}",
+        "card": "agent_written",
+        "blocks_run": true
+      }
+    },
+    {
+      "id": "letter-system-add",
+      "message": "In the system prompt of the step {feedback_letter}, add the sentence \"Battery marker letter system one.\" directly after the sentence \"Panel observation summary rubric rubric standard measure record panel relevant reason weight.\", on the same line with one space between them.",
+      "expect": [
+        {
+          "text": "/nodes/{feedback_letter}/options/system_prompt",
+          "replace": [
+            "Panel observation summary rubric rubric standard measure record panel relevant reason weight.",
+            "Panel observation summary rubric rubric standard measure record panel relevant reason weight. Battery marker letter system one."
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_any": [
+        "create_blob",
+        "update_blob"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{feedback_letter}",
+        "card": "agent_written",
+        "blocks_run": true
+      }
+    },
+    {
+      "id": "letter-system-change",
+      "message": "In the system prompt of the step {feedback_letter}, change the sentence \"Battery marker letter system one.\" to \"Battery marker letter system two.\".",
+      "expect": [
+        {
+          "text": "/nodes/{feedback_letter}/options/system_prompt",
+          "replace": [
+            "Battery marker letter system one.",
+            "Battery marker letter system two."
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_any": [
+        "create_blob",
+        "update_blob"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{feedback_letter}",
+        "card": "agent_written",
+        "blocks_run": true
+      }
+    },
+    {
+      "id": "letter-system-remove",
+      "message": "In the system prompt of the step {feedback_letter}, remove the sentence \"Battery marker letter system two.\" and the one space before it.",
+      "expect": [
+        {
+          "text": "/nodes/{feedback_letter}/options/system_prompt",
+          "replace": [
+            " Battery marker letter system two.",
+            ""
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_any": [
+        "create_blob",
+        "update_blob"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{feedback_letter}",
+        "card": "agent_written",
+        "blocks_run": true
+      }
+    },
+    {
+      "id": "moderation-system-add",
+      "message": "In the system prompt of the step {moderation_summary}, add the sentence \"Battery marker moderation system one.\" directly after the sentence \"Standard guidance record finding explain with review history guidance risk explain panel level.\", on the same line with one space between them.",
+      "expect": [
+        {
+          "text": "/nodes/{moderation_summary}/options/system_prompt",
+          "replace": [
+            "Standard guidance record finding explain with review history guidance risk explain panel level.",
+            "Standard guidance record finding explain with review history guidance risk explain panel level. Battery marker moderation system one."
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_any": [
+        "create_blob",
+        "update_blob"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{moderation_summary}",
+        "card": "agent_written",
+        "blocks_run": true
+      }
+    },
+    {
+      "id": "moderation-system-remove",
+      "message": "In the system prompt of the step {moderation_summary}, remove the sentence \"Battery marker moderation system one.\" and the one space before it.",
+      "expect": [
+        {
+          "text": "/nodes/{moderation_summary}/options/system_prompt",
+          "replace": [
+            " Battery marker moderation system one.",
+            ""
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_any": [
+        "create_blob",
+        "update_blob"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{moderation_summary}",
+        "card": "agent_written",
+        "blocks_run": true
+      }
+    },
+    {
+      "id": "equity-prompt-add",
+      "message": "In the prompt of the step {equity_review}, add the sentence \"Battery marker equity prompt one.\" directly after the sentence \"History compare for complete record each consider panel context finding outcome.\", on the same line with one space between them.",
+      "expect": [
+        {
+          "text": "/nodes/{equity_review}/options/prompt_template",
+          "replace": [
+            "History compare for complete record each consider panel context finding outcome.",
+            "History compare for complete record each consider panel context finding outcome. Battery marker equity prompt one."
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_any": [
+        "create_blob",
+        "update_blob"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{equity_review}",
+        "card": "agent_written",
+        "blocks_run": true
+      }
+    },
+    {
+      "id": "equity-prompt-remove",
+      "message": "In the prompt of the step {equity_review}, remove the sentence \"Battery marker equity prompt one.\" and the one space before it.",
+      "expect": [
+        {
+          "text": "/nodes/{equity_review}/options/prompt_template",
+          "replace": [
+            " Battery marker equity prompt one.",
+            ""
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_any": [
+        "create_blob",
+        "update_blob"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{equity_review}",
+        "card": "agent_written",
+        "blocks_run": true
+      }
+    },
+    {
+      "id": "cs2a-prompt-add",
+      "message": "In the prompt of the step {cs2_assessment}, add the sentence \"Battery marker cs2 assessment prompt one.\" directly after the sentence \"For justify finding complete weight score describe score a plan weight benefit explain note level consider compare threshold.\", on the same line with one space between them.",
+      "expect": [
+        {
+          "text": "/nodes/{cs2_assessment}/options/prompt_template",
+          "replace": [
+            "For justify finding complete weight score describe score a plan weight benefit explain note level consider compare threshold.",
+            "For justify finding complete weight score describe score a plan weight benefit explain note level consider compare threshold. Battery marker cs2 assessment prompt one."
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_any": [
+        "create_blob",
+        "update_blob"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{cs2_assessment}",
+        "card": "agent_written",
+        "blocks_run": true
+      }
+    },
+    {
+      "id": "cs2a-prompt-remove",
+      "message": "In the prompt of the step {cs2_assessment}, remove the sentence \"Battery marker cs2 assessment prompt one.\" and the one space before it.",
+      "expect": [
+        {
+          "text": "/nodes/{cs2_assessment}/options/prompt_template",
+          "replace": [
+            " Battery marker cs2 assessment prompt one.",
+            ""
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_any": [
+        "create_blob",
+        "update_blob"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{cs2_assessment}",
+        "card": "agent_written",
+        "blocks_run": true
+      }
+    },
+    {
+      "id": "overall-completeness-add",
+      "message": "In the template of the query overall_completeness in the step {overall_rubric}, add the sentence \"Battery marker overall completeness query one.\" directly after the sentence \"Follow in score to review standard of and justify reason the a and.\", on the same line with one space between them.",
+      "expect": [
+        {
+          "text": "/nodes/{overall_rubric}/options/queries/overall_completeness/template",
+          "replace": [
+            "Follow in score to review standard of and justify reason the a and.",
+            "Follow in score to review standard of and justify reason the a and. Battery marker overall completeness query one."
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_any": [
+        "create_blob",
+        "update_blob"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{overall_rubric}",
+        "card": "agent_written",
+        "blocks_run": true
+      }
+    },
+    {
+      "id": "overall-completeness-remove",
+      "message": "In the template of the query overall_completeness in the step {overall_rubric}, remove the sentence \"Battery marker overall completeness query one.\" and the one space before it.",
+      "expect": [
+        {
+          "text": "/nodes/{overall_rubric}/options/queries/overall_completeness/template",
+          "replace": [
+            " Battery marker overall completeness query one.",
+            ""
+          ],
+          "form": "file",
+          "exact": true
+        }
+      ],
+      "tools_any": [
+        "create_blob",
+        "update_blob"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "{overall_rubric}",
+        "card": "agent_written",
+        "blocks_run": true
+      }
+    }
+  ]
+}

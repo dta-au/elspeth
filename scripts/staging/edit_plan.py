@@ -37,7 +37,11 @@ Expectation forms (exactly one operator key each):
 * ``{"text": PTR, "append": S}`` / ``{"text": PTR, "replace": [OLD, NEW]}`` /
   ``{"text": PTR, "remove": S}`` -- a prompt's text, inline or in a bound file,
   changed exactly so; an optional ``"form": "inline" | "file"`` pins where the
-  text must live afterwards
+  text must live afterwards. ``append`` and ``remove`` ignore trailing whitespace;
+  ``replace`` compares the strictly decoded text. ``"exact": true`` (``replace`` only)
+  compares raw bytes instead: the bytes after must be the bytes before with that one
+  replacement, a bound file's bytes must match its pinned ``sha256``, and a failure
+  names the first differing byte offset (:func:`exact_text_record`)
 * ``{"new_node": ID, "fields": {...}, "one_of": {...}, "option_keys": [...]}`` -- a node
   that did not exist, with the listed fields, each ``one_of`` field one of the listed
   values, only the listed option keys, and every other field unset except a
@@ -55,6 +59,12 @@ Expectation forms (exactly one operator key each):
   text that file must hold (trailing whitespace ignored)
 * ``{"files": [NAME, ...]}`` -- the session files the whole graph points at, by file
   name and counted once per binding, are exactly these
+* ``{"unchanged": PTR, "contains": S}`` -- a no-op request: the value at PTR is the same
+  after the turn as before (a file binding points at the same file, and that file's bytes
+  are the bytes its marker pins), and its text holds S exactly once. Before the edit is sent
+  the text must already hold S once (the request is already met); an edit whose every
+  expectation is ``unchanged`` names no tools, and the battery also requires the session's
+  files to be the same, by id and content hash, after the turn
 
 File-binding plans (``composer_file_bindings.json``) add, all optional and unused by the
 other plans: a plan ``start`` of ``"empty"`` (the attempt must start on an empty
@@ -66,6 +76,13 @@ expected to introduce, such as ``no_source_configured`` when it empties the pipe
 and an ``approve`` ``card`` of ``"user_files"`` or ``"agent_written"`` (the card must be
 there, and be of that kind: every prompt slot bound to a file the user uploaded, or
 not).
+
+The prompt-wording plan (``composer_prompt_edits_50.json``) adds, also optional: a
+``named_llm_step`` target (the LLM step with that id, holding at least one prompt in a
+file), ``unchanged`` expectations (above), an ``approve`` that lists several cards (one
+per step, for a message that changes two steps), and an approve ``blocks_run`` flag (the
+step's ``interpretation_review_pending`` error must be on the graph before the battery
+approves the card: the run stays blocked until the card is approved).
 """
 
 from __future__ import annotations
@@ -86,12 +103,14 @@ PLAN_DIR = Path(__file__).resolve().parent / "edit_plans"
 DEFAULT_PLAN = PLAN_DIR / "composer_gold_50.json"
 MIXED_PLAN = PLAN_DIR / "composer_mixed_50.json"
 FILE_BINDINGS_PLAN = PLAN_DIR / "composer_file_bindings.json"
+PROMPT_EDITS_PLAN = PLAN_DIR / "composer_prompt_edits_50.json"
 
 TARGET_KINDS = frozenset(
     {
         "first_source",
         "consumer_of",
         "llm_node",
+        "named_llm_step",
         "first_output",
         "source_without_option",
         "secret_holder",
@@ -118,8 +137,10 @@ OPERATORS = (
     "renamed_node",
     "bound",
     "files",
+    "unchanged",
 )
 FILE_OPERATORS = ("bound", "files")
+_APPROVE_KEYS = frozenset({"kind", "node", "card", "blocks_run"})
 PLAN_STARTS = ("empty",)
 PASS_RULES = ("gold", "all_passed_as_found")
 ATTACHMENT_DIR = "files"
@@ -179,6 +200,7 @@ _TARGET_ARGS: Mapping[str, frozenset[str]] = {
     "first_output": frozenset(),
     "consumer_of": frozenset({"target"}),
     "llm_node": frozenset({"prompt"}),
+    "named_llm_step": frozenset({"id"}),
     "source_without_option": frozenset({"plugin", "option"}),
     "secret_holder": frozenset(),
     "secret_option_of": frozenset({"target"}),
@@ -187,6 +209,7 @@ _TARGET_ARGS: Mapping[str, frozenset[str]] = {
 }
 
 type ReadText = Callable[[Mapping[str, Any]], str]
+type ReadBytes = Callable[[Mapping[str, Any]], bytes]
 
 
 # ── graph view and pointers ────────────────────────────────────────────────
@@ -383,6 +406,8 @@ def _check_target(name: str, spec: object, targets: Mapping[str, Any]) -> None:
         raise UsageError(f"target {name!r} must name an earlier target")
     if kind == "llm_node" and spec["prompt"] not in ("inline", "file"):
         raise UsageError(f"target {name!r} prompt must be inline or file")
+    if kind == "named_llm_step" and (type(spec["id"]) is not str or not spec["id"]):
+        raise UsageError(f"target {name!r} id must name a step")
     if kind == "operator" and not ("optional" in spec and spec["optional"] is True):
         raise UsageError(f"target {name!r} is named by the operator only, so it must be optional")
 
@@ -405,8 +430,14 @@ def _check_edit(edit: object, targets: Mapping[str, Any], seen: set[str], forbid
             raise UsageError(f"edit {label}: {key} must be a non-empty list of strings")
     if "may_change" in edit and any(prefix in ("/edges", "/nodes", "/outputs", "/sources", "/") for prefix in edit["may_change"]):
         raise UsageError(f"edit {label}: may_change must name specific paths, not a whole collection; use edges_touching for edges")
-    if "tools_any" not in edit and "tools_all" not in edit:
+    if is_no_op(edit):
+        # A no-op request is met by changing nothing: it names no tools and approves no card.
+        if {"tools_any", "tools_all", "approve", "may_change", "edges_touching", "attach", "new_errors"} & set(edit):
+            raise UsageError(f"edit {label}: a no-op edit (every expectation unchanged) names no tools, card, allowed change or file")
+    elif "tools_any" not in edit and "tools_all" not in edit:
         raise UsageError(f"edit {label}: every edit names its acceptable tools (tools_any and/or tools_all)")
+    elif any("unchanged" in expectation for expectation in edit["expect"]):
+        raise UsageError(f"edit {label}: unchanged expectations make a no-op edit and cannot be mixed with others")
     named = [tool for key in ("tools_any", "tools_all") if key in edit for tool in edit[key]]
     if set(named) & set(forbidden):
         raise UsageError(f"edit {label}: expects a forbidden tool")
@@ -414,14 +445,22 @@ def _check_edit(edit: object, targets: Mapping[str, Any], seen: set[str], forbid
         raise UsageError(f"edit {label}: the message names a tool; describe the change, not the tool")
     if "approve" in edit:
         approve = edit["approve"]
+        specs = approve if type(approve) is list else [approve]
         if (
-            type(approve) is not dict
-            or not {"kind", "node"} <= set(approve) <= {"kind", "node", "card"}
-            or approve["kind"] not in REVIEW_KINDS
-            or ("card" in approve and approve["card"] not in CARD_KINDS)
+            not specs
+            or not all(
+                type(spec) is dict
+                and {"kind", "node"} <= set(spec) <= _APPROVE_KEYS
+                and spec["kind"] in REVIEW_KINDS
+                and ("card" not in spec or spec["card"] in CARD_KINDS)
+                and ("blocks_run" not in spec or spec["blocks_run"] is True)
+                for spec in specs
+            )
+            or len({(spec["node"], spec["kind"]) for spec in specs}) != len(specs)
         ):
             raise UsageError(
-                f"edit {label}: approve must be {{kind, node}} with kind in {sorted(REVIEW_KINDS)}, and an optional card in {list(CARD_KINDS)}"
+                f"edit {label}: approve must be {{kind, node}} (or a list of them, one per node) with kind in {sorted(REVIEW_KINDS)}, "
+                f"an optional card in {list(CARD_KINDS)} and an optional blocks_run true"
             )
     if "attach" in edit:
         names = edit["attach"]
@@ -436,6 +475,20 @@ def _check_edit(edit: object, targets: Mapping[str, Any], seen: set[str], forbid
     for name in _NAME.findall(json.dumps(edit)):
         if name not in targets:
             raise UsageError(f"edit {label}: placeholder {{{name}}} is not a plan target")
+
+
+def is_no_op(edit: Mapping[str, Any]) -> bool:
+    """Whether every expectation of an edit is ``unchanged``: a request the graph already meets."""
+    expect = edit["expect"]
+    return type(expect) is list and bool(expect) and all(type(item) is dict and "unchanged" in item for item in expect)
+
+
+def approvals(edit: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """A resolved edit's cards to approve: none, the one ``approve`` names, or each of a list."""
+    approve = edit["approve"] if "approve" in edit else None
+    if approve is None:
+        return []
+    return list(approve) if type(approve) is list else [approve]
 
 
 def _str_map(value: object) -> bool:
@@ -454,6 +507,13 @@ def _check_expectation(label: str, expectation: object) -> None:
         valid = keys == {operator, "value"} and (operator == "equals" or type(expectation["value"]) is str)
     elif operator in ("present", "absent", "restored"):
         valid = keys == {operator}
+    elif operator == "unchanged":
+        valid = (
+            keys == {"unchanged", "contains"}
+            and type(expectation["unchanged"]) is str
+            and type(expectation["contains"]) is str
+            and bool(expectation["contains"].strip())
+        )
     elif operator == "bound":
         valid = (
             {"bound", "file"} <= keys <= {"bound", "file", "content"}
@@ -508,8 +568,10 @@ def _check_expectation(label: str, expectation: object) -> None:
         changes = [key for key in TEXT_CHANGES if key in expectation]
         valid = (
             len(changes) == 1
-            and keys <= {"text", "form", *TEXT_CHANGES}
+            and keys <= {"text", "form", "exact", *TEXT_CHANGES}
             and ("form" not in expectation or expectation["form"] in ("inline", "file"))
+            # Byte-exact judging is defined for a replacement only: append and remove ignore trailing whitespace.
+            and ("exact" not in expectation or (expectation["exact"] is True and changes[0] == "replace"))
             and (
                 type(expectation[changes[0]]) is str
                 if changes[0] != "replace"
@@ -566,6 +628,8 @@ def _describe(spec: Mapping[str, Any]) -> str:
         return f"the option holding a secret reference on {{{spec['target']}}}"
     if kind == "secret_name_of":
         return f"the secret named on {{{spec['target']}}}"
+    if kind == "named_llm_step":
+        return f"the LLM step {spec['id']} with a prompt held in a file"
     return {
         "first_source": "a source",
         "first_output": "an output",
@@ -649,6 +713,9 @@ def _find_target(spec: Mapping[str, Any], view: Mapping[str, Any], resolved: Map
         return None
     if kind == "source_without_option":
         return next((name for name in view["sources"] if _fits(spec, view, resolved, name)), None)
+    if kind == "named_llm_step":
+        named: str = spec["id"]
+        return named if _fits(spec, view, resolved, named) else None
     if kind == "consumer_of":
         route = _route_of(view, resolved[spec["target"]])
         consumers = [node_id for node_id, node in view["nodes"].items() if route is not None and node["input"] == route]
@@ -684,6 +751,9 @@ def _fits(spec: Mapping[str, Any], view: Mapping[str, Any], resolved: Mapping[st
         return value in [key for key, _name in _secret_slots(view["nodes"][resolved[spec["target"]]])]
     if kind == "secret_name_of":
         return value in [name for _key, name in _secret_slots(view["nodes"][resolved[spec["target"]]])]
+    if kind == "named_llm_step":
+        # By id (an override may name another step), an LLM step with at least one prompt held in a file.
+        return value in view["nodes"] and view["nodes"][value]["plugin"] == "llm" and _approval_hash_deferred(view["nodes"][value])
     return value in view["nodes"] and _prompt_form(view["nodes"][value]) == spec["prompt"]
 
 
@@ -705,7 +775,7 @@ def render_was(baseline: Mapping[str, Any], pointer: str) -> str:
     return json.dumps(value)
 
 
-_POINTER_KEYS = frozenset({"equals", "ends_with", "present", "absent", "restored", "text", "bound"})
+_POINTER_KEYS = frozenset({"equals", "ends_with", "present", "absent", "restored", "text", "bound", "unchanged"})
 
 
 def profile_owned_pointers(expect: Sequence[Mapping[str, Any]], baseline: Mapping[str, Any]) -> list[str]:
@@ -807,7 +877,8 @@ def named_components(edit: Mapping[str, Any]) -> set[str]:
             named.update(expectation["renamed_node"].values())
         elif "new_node" in expectation or "new_output" in expectation:
             named.add(expectation["new_node"] if "new_node" in expectation else expectation["new_output"])
-        elif "files" in expectation:
+        elif "files" in expectation or "unchanged" in expectation:
+            # A no-op names no component: a server-written field changed on its step is an unrelated change.
             continue
         else:
             pointers.append(expectation[next(key for key in OPERATORS if key in expectation)])
@@ -896,6 +967,106 @@ def _text_ok(expectation: Mapping[str, Any], before: str | None, after: str | No
         return before.count(old) == 1 and after == before.replace(old, new)
     removed: str = expectation["remove"]
     return before.count(removed) == 1 and after.rstrip() == before.replace(removed, "").rstrip()
+
+
+def prompt_bytes_at(
+    view: Mapping[str, Any], pointer: str, read_text: ReadText, read_bytes: ReadBytes | None
+) -> tuple[str | None, bytes | None, object]:
+    """``(form, raw bytes, value)`` of a prompt at ``pointer``: a bound file's bytes as the server holds them, or inline text as UTF-8."""
+    found, value = value_at(view, pointer)
+    if not found:
+        return None, None, None
+    if type(value) is str:
+        return "inline", value.encode("utf-8"), value
+    if type(value) is dict and "blob_ref" in value:
+        data = read_bytes(value) if read_bytes is not None else read_text(value).encode("utf-8")
+        return "file", data, value
+    return None, None, value
+
+
+def first_difference(expected: bytes, actual: bytes) -> int | None:
+    """The first byte offset where two byte strings differ (the shorter one's length when one is a prefix); None when equal."""
+    if expected == actual:
+        return None
+    return next((index for index, (a, b) in enumerate(zip(expected, actual, strict=False)) if a != b), min(len(expected), len(actual)))
+
+
+def exact_text_record(
+    expectation: Mapping[str, Any],
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+    read_text: ReadText,
+    read_bytes: ReadBytes | None,
+) -> JsonObject:
+    """The byte-exact verdict of one ``text`` ``replace`` expectation with ``"exact": true``.
+
+    The expected bytes are the prompt's bytes before the edit with the one requested
+    replacement made (the old text must occur there exactly once), compared with the
+    bytes after the edit as they are: no stripping, no newline or Unicode normalisation,
+    so a changed final newline, CRLF for LF or a decomposed character is a difference.
+    A bound file's bytes must also be the bytes its marker pins (``sha256``). Returns
+    ``pointer``, ``bytes_before``, ``bytes_after``, ``byte_exact``, ``first_difference_at``
+    and ``detail`` (``None`` when exact, else the reason, for the finding).
+    """
+    pointer = expectation["text"]
+    _, was, _ = prompt_bytes_at(before, pointer, read_text, read_bytes)
+    form, now, value = prompt_bytes_at(after, pointer, read_text, read_bytes)
+    record: JsonObject = {
+        "pointer": pointer,
+        "bytes_before": len(was) if was is not None else None,
+        "bytes_after": len(now) if now is not None else None,
+        "byte_exact": False,
+        "first_difference_at": None,
+        "detail": None,
+    }
+    if was is None or now is None:
+        record["detail"] = "no_prompt_text_before" if was is None else "no_prompt_text_after"
+        return record
+    old, new = (item.encode("utf-8") for item in expectation["replace"])
+    if was.count(old) != 1:
+        record["detail"] = f"anchor_count_{was.count(old)}"
+        return record
+    if "form" in expectation and form != expectation["form"]:
+        record["detail"] = f"form_{form}"
+        return record
+    expected = was.replace(old, new)
+    offset = first_difference(expected, now)
+    if offset is not None:
+        record["first_difference_at"] = offset
+        record["detail"] = f"first_difference_at_byte_{offset}_expected_{len(expected)}_bytes_got_{len(now)}"
+        return record
+    if type(value) is dict and not ("sha256" in value and value["sha256"] == hashlib.sha256(now).hexdigest()):
+        record["detail"] = "bytes_differ_from_pinned_sha256"
+        return record
+    record["byte_exact"] = True
+    return record
+
+
+def byte_records(
+    edit: Mapping[str, Any], before: Mapping[str, Any], after: Mapping[str, Any], read_text: ReadText, read_bytes: ReadBytes | None
+) -> list[JsonObject]:
+    """Per prompt an edit changes byte-exactly (``exact`` text) or asks to leave as it is (``unchanged``): sizes and verdict."""
+    records: list[JsonObject] = []
+    for expectation in edit["expect"]:
+        if "text" in expectation and "exact" in expectation:
+            records.append(exact_text_record(expectation, before, after, read_text, read_bytes))
+        elif "unchanged" in expectation:
+            pointer = expectation["unchanged"]
+            _, was, _ = prompt_bytes_at(before, pointer, read_text, read_bytes)
+            _, now, _ = prompt_bytes_at(after, pointer, read_text, read_bytes)
+            exact = _unchanged_ok(expectation, before, after, read_text) and was is not None and was == now
+            offset = first_difference(was, now) if was is not None and now is not None else None
+            records.append(
+                {
+                    "pointer": pointer,
+                    "bytes_before": len(was) if was is not None else None,
+                    "bytes_after": len(now) if now is not None else None,
+                    "byte_exact": exact,
+                    "first_difference_at": offset,
+                    "detail": None if exact else "not_unchanged",
+                }
+            )
+    return records
 
 
 def _members(chain: Mapping[str, Any]) -> list[str]:
@@ -1095,6 +1266,25 @@ def _bound_ok(expectation: Mapping[str, Any], view: Mapping[str, Any], files: Fi
     return ok
 
 
+def _text_holds_once(value: object, text: str | None, wanted: str) -> bool:
+    """The text holds ``wanted`` exactly once; for a file, its bytes are also the bytes the marker pins."""
+    if text is None or text.count(wanted) != 1:
+        return False
+    if type(value) is dict:
+        return "sha256" in value and value["sha256"] == hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return True
+
+
+def _unchanged_ok(expectation: Mapping[str, Any], before: Mapping[str, Any], after: Mapping[str, Any], read_text: ReadText) -> bool:
+    pointer = expectation["unchanged"]
+    was_found, was = value_at(before, pointer)
+    now_found, now = value_at(after, pointer)
+    if not was_found or not now_found or differences(was, now):
+        return False
+    _, text = text_at(after, pointer, read_text)
+    return _text_holds_once(now, text, expectation["contains"])
+
+
 def _edge_paths(view: Mapping[str, Any], components: Sequence[str]) -> list[str]:
     wanted = set(components)
     return ["/edges/" + escape(key) for key in view["edges"] if set(key.split("|")[:2]) & wanted]
@@ -1108,10 +1298,14 @@ def check_expectations(
     read_text: ReadText,
     *,
     files: FileContext | None = None,
+    read_bytes: ReadBytes | None = None,
 ) -> tuple[list[str], list[str]]:
     """``(failures, covered pointers)``: each failure names the expectation that did not hold.
 
     ``files`` is needed only by the file expectations (``bound``, ``files``); without it they fail.
+    ``read_bytes`` reads a file's raw bytes for an ``exact`` text expectation; without it the
+    text ``read_text`` returns is encoded back to UTF-8 (lossless: ``read_text`` decodes strictly).
+    An ``exact`` failure carries its reason after the pointer (``first_difference_at_byte_N...``).
     """
     failures: list[str] = []
     covered: list[str] = []
@@ -1123,6 +1317,10 @@ def check_expectations(
         if operator == "files":
             pointer = "files"
             ok = files is not None and referenced_file_names(after, files) == sorted(expectation["files"])
+        elif operator == "unchanged":
+            # Not added to ``covered``: any change at the pointer is also an unrelated change.
+            pointer = expectation["unchanged"]
+            ok = _unchanged_ok(expectation, before, after, read_text)
         elif operator == "bound":
             pointer = expectation["bound"]
             covered.append(pointer)
@@ -1166,6 +1364,12 @@ def check_expectations(
             elif operator == "restored":
                 was_found, was = value_at(baseline, pointer)
                 ok = _blank(found, value) if _blank(was_found, was) else (found and not differences(was, value))
+            elif "exact" in expectation:
+                record = exact_text_record(expectation, before, after, read_text, read_bytes)
+                ok = record["byte_exact"] is True
+                if not ok:
+                    failures.append(f"{label}:text:{pointer}:{record['detail']}")
+                    continue
             else:
                 _, before_text = text_at(before, pointer, read_text)
                 form, after_text = text_at(after, pointer, read_text)
@@ -1183,11 +1387,29 @@ def preconditions(
     read_text: ReadText,
     *,
     files: FileContext | None = None,
+    read_bytes: ReadBytes | None = None,
 ) -> list[str]:
-    """Expectations that already hold on the current graph: the edit would pass with nothing changed."""
-    failures, _ = check_expectations(edit, current, current, baseline, read_text, files=files)
+    """Expectations that already hold on the current graph: the edit would pass with nothing changed.
+
+    An ``unchanged`` expectation is the other way round: it names a no-op request, so it must
+    already hold (its text holds the asked-for sentence once); one that does not is the finding.
+    """
+    failures, _ = check_expectations(edit, current, current, baseline, read_text, files=files, read_bytes=read_bytes)
     failed = {item.split(":", 1)[0] for item in failures}
-    return [f"precondition:expect[{index}]_already_holds" for index in range(len(edit["expect"])) if f"expect[{index}]" not in failed]
+    found: list[str] = []
+    for index, expectation in enumerate(edit["expect"]):
+        holds = f"expect[{index}]" not in failed
+        if "exact" in expectation:
+            # The sentence to replace must be in the text exactly once, or the edit cannot be judged.
+            detail = exact_text_record(expectation, current, current, read_text, read_bytes)["detail"]
+            if type(detail) is str and detail.startswith("anchor_count_"):
+                found.append(f"precondition:expect[{index}]_{detail}")
+        if "unchanged" in expectation:
+            if not holds:
+                found.append(f"precondition:expect[{index}]_no_op_not_already_met")
+        elif holds:
+            found.append(f"precondition:expect[{index}]_already_holds")
+    return found
 
 
 @dataclass(frozen=True, slots=True)
@@ -1335,6 +1557,23 @@ def tool_warnings(evidence: Mapping[str, Any]) -> list[str]:
     ]
 
 
+def prompt_slots(view: Mapping[str, Any], node_id: str) -> list[tuple[str, str]]:
+    """``(label, pointer)`` of a node's prompt slots: its prompt, its system prompt and each query's template.
+
+    The label is how a chat message names the slot (``prompt``, ``system prompt``,
+    ``template of the query NAME``). Pointers are listed whether or not the slot is set.
+    """
+    base = f"/nodes/{escape(node_id)}/options"
+    slots = [("prompt", f"{base}/prompt_template"), ("system prompt", f"{base}/system_prompt")]
+    options = view["nodes"][node_id]["options"]
+    queries = options["queries"] if "queries" in options else None
+    entries = list(queries.items()) if type(queries) is dict else list(enumerate(queries)) if type(queries) is list else []
+    for name, entry in entries:
+        if type(entry) is dict and "template" in entry:
+            slots.append((f"template of the query {name}", f"{base}/queries/{escape(str(name))}/template"))
+    return slots
+
+
 def leftover_findings(state: Mapping[str, Any], read_text: ReadText) -> list[str]:
     """Traces of an earlier battery attempt: temporary steps or outputs, marker text in prompts, the battery's pipeline name."""
     view = graph_view(state)
@@ -1343,25 +1582,30 @@ def leftover_findings(state: Mapping[str, Any], read_text: ReadText) -> list[str
     if "name" in view["metadata"] and type(view["metadata"]["name"]) is str and view["metadata"]["name"].startswith("Battery check"):
         found.append("/metadata/name")
     for node_id in view["nodes"]:
-        for key in ("prompt_template", "system_prompt"):
-            _, text = text_at(view, f"/nodes/{escape(node_id)}/options/{key}", read_text)
+        for _, pointer in prompt_slots(view, node_id):
+            _, text = text_at(view, pointer, read_text)
             if text is not None and any(marker in text for marker in MARKER_TEXTS):
-                found.append(f"/nodes/{node_id}/options/{key}")
+                found.append(pointer)
     return found
 
 
 def as_found_differences(baseline_state: Mapping[str, Any], final_state: Mapping[str, Any], read_text: ReadText) -> list[str]:
     """Differences between the final graph and the attempt's starting graph that a plan should have undone.
 
-    Prompts compare by their text (a re-bound file with the same text is the same
-    prompt) with trailing whitespace ignored; server-written fields are ignored.
+    Prompts (each prompt, system prompt and query template) compare by their text (a
+    re-bound file with the same text is the same prompt) with trailing whitespace ignored;
+    server-written fields are ignored.
     """
     before, after = graph_view(baseline_state), graph_view(final_state)
     for view in (before, after):
-        for node_id, node in view["nodes"].items():
-            for key in ("prompt_template", "system_prompt"):
-                form, text = text_at(view, f"/nodes/{escape(node_id)}/options/{key}", read_text)
+        for node_id in view["nodes"]:
+            for _, pointer in prompt_slots(view, node_id):
+                form, text = text_at(view, pointer, read_text)
                 if text is not None:
-                    node["options"][key] = {"form": form, "text": text.rstrip()}
+                    parts = _segments(pointer)
+                    owner: Any = view
+                    for part in parts[:-1]:
+                        owner = owner[int(part)] if type(owner) is list else owner[part]
+                    owner[parts[-1]] = {"form": form, "text": text.rstrip()}
     changes = classify_changes(before, after, [])
     return changes.unrelated
