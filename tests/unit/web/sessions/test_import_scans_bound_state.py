@@ -1,14 +1,11 @@
 """YAML import scans the state as it will be stored, after file markers are bound.
 
-``POST /api/sessions/{id}/state/yaml`` scanned the imported state for
-credential material before re-attaching the file markers named by
-``inline_blob_bindings``. The stored state carries one marker per bound file,
-so it holds more values than the scan saw. One LLM step with 252 file-held
-query templates scanned within the traversal bound at import and over it once
-stored, so the import was accepted and ``GET /state`` then answered 409. The
-route now scans the bound state before it saves; at 252 queries the import is
-refused with the existing ``credential_material_rejected`` 422 and nothing is
-stored. At 251 queries the import is accepted, stored, and opens.
+``POST /api/sessions/{id}/state/yaml`` scans the state for credential
+material as it will be stored, with the file markers named by
+``inline_blob_bindings`` bound, before it saves. For one LLM step with 252
+file-held query templates the import is refused with the existing
+``credential_material_rejected`` 422 and nothing is stored. At 251 queries the
+import is accepted, stored, and opens.
 """
 
 from __future__ import annotations

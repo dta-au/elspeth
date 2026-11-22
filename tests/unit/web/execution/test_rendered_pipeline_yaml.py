@@ -348,7 +348,7 @@ def test_the_resolved_bound_admits_the_limit_and_refuses_one_byte_over_in_any_la
 
 @pytest.mark.parametrize("language", ["en", "zh", "ru"])
 def test_a_resolved_configuration_holding_the_whole_file_text_cap_passes_its_bound(language: str) -> None:
-    """Read from the constants, so it holds at today's cap and at any ruled cap.
+    """Read from the constants, so it holds at today's cap and at any new cap.
 
     The configuration is the cap's worth of file text plus the settings around
     it; it passes the resolved bound and loads as settings, whatever language

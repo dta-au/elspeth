@@ -291,11 +291,7 @@ def test_failed_carried_approval_rolls_back_bytes_state_and_every_row(tmp_path: 
 
 
 def test_save_refuses_when_a_sibling_file_was_never_approved(tmp_path: Path) -> None:
-    """The node was approved with file A alone; the agent then added file B with no review.
-
-    No card is pending, so only the save-side attestation check stands between
-    this save and an approval row for B that nobody reviewed.
-    """
+    """The node was approved with file A alone; file B was added later with no review. The save is refused."""
     client, service, blob_service, session_id, file_a, _second, events = _live_prompt_setup(tmp_path)
     _approve_card(service, blob_service, session_id, events["first"])
     assert [snapshot.node_id for snapshot in _admit(service, blob_service, session_id)] == ["first"]
@@ -339,7 +335,7 @@ def _unreviewed_two_file_node(tmp_path: Path) -> tuple[Any, Any, Any, str, dict[
 
 
 def test_save_refuses_a_two_file_node_that_has_no_approval_at_all(tmp_path: Path) -> None:
-    """A single-file node's first save has nothing to compare; a two-file node gets no such pass."""
+    """A two-file node with no approval of any kind: the save is refused."""
     client, _service, blob_service, session_id, file_a, _file_b = _unreviewed_two_file_node(tmp_path)
 
     refused = _save(client, session_id, file_a["id"], "file A after", file_a["content_hash"])

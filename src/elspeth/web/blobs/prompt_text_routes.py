@@ -327,12 +327,10 @@ def create_prompt_text_router() -> APIRouter:
                     # saved file is approved by this save. The node's other
                     # files are carried forward with the bytes they already had
                     # approved, which the check below proves in this transaction
-                    # before any row is written. Known limitation: a carried row
-                    # is recorded with the same EDITOR_SAVE trigger as the saved
-                    # file's row (no schema change in this fix); it is told apart
-                    # only by its blob_id differing from the saved blob's row at
-                    # the same approved_at. A dedicated provenance value is
-                    # follow-up work.
+                    # before any row is written. A carried row is recorded with
+                    # the same EDITOR_SAVE trigger as the saved file's row; its
+                    # blob_id differs from the saved blob's row at the same
+                    # approved_at.
                     saved_snapshot = _current_snapshot(conn, approval_request, _current_node_options(conn, approval_request))
                     assert_editor_save_may_carry_approvals(conn, prior=attested_snapshot, saved=saved_snapshot, saved_blob_id=blob_id)
                     for file_binding in saved_snapshot.bindings:

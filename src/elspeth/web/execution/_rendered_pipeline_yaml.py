@@ -51,7 +51,7 @@ from elspeth.core.config import (
 # 2 MiB supplied-YAML limit already bounds) plus the file-held text
 # substituted into it (which BLOB_INLINE_AGGREGATE_BYTE_CAP bounds). Four
 # times the file-text cap holds both with room to spare for any cap of at
-# least 2/3 MiB, and moves with the cap when the cap is ruled to change.
+# least 2/3 MiB, and moves with the cap when the cap changes.
 MAX_RESOLVED_PIPELINE_TEXT_BYTES: Final = 4 * BLOB_INLINE_AGGREGATE_BYTE_CAP
 
 _PlainScalar = str | int | float | bool | None

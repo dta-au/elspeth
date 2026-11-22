@@ -351,7 +351,7 @@ def test_authorship_is_decided_by_one_function_that_fails_toward_sending() -> No
 
 
 def test_import_and_fork_descriptions_are_written_only_through_their_named_helpers() -> None:
-    """A writer that spells the description inline again would escape the authorship match: red."""
+    """The import and fork descriptions are written only through their named helpers."""
     import_prefix = _seam("elspeth.web.shareable_reviews.importer", "SHARED_IMPORT_DESCRIPTION_PREFIX")
     import_helper = _seam("elspeth.web.shareable_reviews.importer", "shared_import_description")
     fork_prefix = _seam("elspeth.web.blobs.service", "SESSION_FORK_COPY_DESCRIPTION_PREFIX")

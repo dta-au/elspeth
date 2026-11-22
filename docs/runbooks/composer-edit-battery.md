@@ -288,7 +288,7 @@ the workload, and the battery's `setup` action creates it in a session. All
 names, fields and text are made up from a seed; the same seed and arguments
 give the same bytes.
 
-The `acceptance` preset is wired like a real assessment graph rather than one
+The `acceptance` preset is wired like a multi-step assessment graph rather than one
 big LLM block: a CSV source with a fixed schema of 14 fields, bound to an
 uploaded file, with validation failures routed to the error sink; a
 `file_inject` step with file-held content; two case-study chains (an
@@ -622,8 +622,8 @@ python -m scripts.staging.composer_edit_battery run --plan scripts/staging/edit_
 
 ## Prompt-wording plan
 
-`scripts/staging/edit_plans/composer_prompt_edits_50.json` measures the
-operator's main workflow: changing the wording of a prompt held in a file by
+`scripts/staging/edit_plans/composer_prompt_edits_50.json` measures a
+common workflow: changing the wording of a prompt held in a file by
 asking in chat. It is written for one fixture, `fx-acc30`, the acceptance
 preset with 30 steps, 14 LLM steps, 17 queries and 43 prompt files the user
 uploaded:

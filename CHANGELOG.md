@@ -232,9 +232,8 @@ Behaviour you will see:
   again, as before.
 - Wiring a file onto one query's template while the node's main prompt has a
   term review still pending is now refused, with the steps to fix it (approve
-  the pending term, then wire the file again). Previously that query silently
-  stopped receiving the term under review. Binding a file to the node's main
-  prompt is still the way to replace the prompt for every query.
+  the pending term, then wire the file again). Binding a file to the node's
+  main prompt is still the way to replace the prompt for every query.
 - A pipeline whose bound file's stored content no longer matches its record
   (changed or missing on disk) is now reported as a validation problem on that
   file, instead of failing with a server error when you validate or run it.

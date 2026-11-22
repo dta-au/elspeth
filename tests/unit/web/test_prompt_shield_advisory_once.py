@@ -201,7 +201,7 @@ def test_delta_after_adding_one_unshielded_llm_is_one_new_and_one_resolved() -> 
 # --- Controls: green on base -------------------------------------------------
 
 # sha256 of json.dumps(entry.to_dict(), sort_keys=True), measured on the base
-# tree 69ad78343 before the change (.claude/lanes/s18/producer-once/measure.py).
+# tree 69ad78343 before the change.
 _BASE_SINGLE_LOCAL_SHA256 = "fc051569319a9ef78b7ae8cbda1a3218d4d03b8ddecf481a87e98e1d842fd313"
 _BASE_SINGLE_UNTRUSTED_SHA256 = "e745128a2c096173d22eb418907c6ec075372fe19a55ee01dc071e0a7e040bd5"
 
