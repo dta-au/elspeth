@@ -1199,6 +1199,13 @@ def _execute_set_source(
     return _mutation_result(new_state, affected, data=data)
 
 
+def _kept_description_hints(source_name: str, source: SourceSpec) -> tuple[str, ...]:
+    """One fact line when a rebind kept the source's stored description; its text is never quoted."""
+    if source.description is None:
+        return ()
+    return (f"Source '{source_name}' kept its stored description; it may still describe the earlier file.",)
+
+
 def _execute_set_source_from_blob(
     arguments: dict[str, Any],
     state: CompositionState,
@@ -1341,7 +1348,12 @@ def _execute_set_source_from_blob(
         )
     echo_note = _echoed_metadata_note(requirement_echo=requirement_echo, authoring_echo=authoring_echo)
     data = {"server_owned_metadata_note": echo_note} if echo_note is not None else {}
-    return _mutation_result(new_state, (_source_component_id(source_name),), data={**data, "source_blob": resolved.payload})
+    return _mutation_result(
+        new_state,
+        (_source_component_id(source_name),),
+        data={**data, "source_blob": resolved.payload},
+        post_call_hints=_kept_description_hints(source_name, source),
+    )
 
 
 def _resolve_source_blobs(
@@ -1626,6 +1638,7 @@ def _execute_set_source_from_blobs(
         new_state,
         (_source_component_id(source_name),),
         data={**data, "source_blobs": list(payloads)},
+        post_call_hints=_kept_description_hints(source_name, source),
     )
 
 
