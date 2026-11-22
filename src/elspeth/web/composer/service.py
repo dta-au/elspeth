@@ -3625,29 +3625,23 @@ class ComposerServiceImpl:
                 # prior successful tool-call mutation. If persistence
                 # succeeded, re-capture with the post-persist failed_turn
                 # so the route layer's _handle_plugin_crash sees the
-                # complete partial-state story; otherwise raise the
-                # original capture as-is.
+                # complete partial-state story.
+                crash = dispatch.plugin_crash
                 if persisted_tool_call_turn:
                     persisted_plugin_crash = ComposerPluginCrashError.capture(
-                        dispatch.plugin_crash.original_exc,
+                        crash.error.original_exc,
                         state=state,
                         initial_version=initial_version,
                         tool_invocations=(),
                         llm_calls=recorder.llm_calls,
                         failed_turn=failed_turn,
                     )
-                    if dispatch.plugin_crash_cause is None:
-                        if pending_checkpoint_failures:
-                            raise persisted_plugin_crash from BaseExceptionGroup(
-                                "Tool failure retained checkpoint failures", pending_checkpoint_failures
-                            )
-                        raise persisted_plugin_crash
                     if pending_checkpoint_failures:
                         raise persisted_plugin_crash from BaseExceptionGroup(
                             "Tool failure retained checkpoint failures",
-                            (dispatch.plugin_crash_cause, *pending_checkpoint_failures),
+                            (crash.cause, *pending_checkpoint_failures),
                         )
-                    raise persisted_plugin_crash from dispatch.plugin_crash_cause
+                    raise persisted_plugin_crash from crash.cause
                 if persist.unwind_audit_failed:
                     # P4 rolled back. Preserve only this unpersisted turn's
                     # suffix: recorder.invocations is request-cumulative, so
@@ -3655,43 +3649,26 @@ class ComposerServiceImpl:
                     # would duplicate already committed rows when the route
                     # drains the crash.
                     current_invocation_count = len(dispatch.tool_outcomes)
-                    if current_invocation_count == 0 or current_invocation_count > len(dispatch.plugin_crash.tool_invocations):
+                    if current_invocation_count == 0 or current_invocation_count > len(crash.error.tool_invocations):
                         raise InvariantError("plugin crash dispatch must carry one invocation per current-turn tool outcome")
                     unpersisted_plugin_crash = ComposerPluginCrashError.capture(
-                        dispatch.plugin_crash.original_exc,
+                        crash.error.original_exc,
                         state=state,
                         initial_version=initial_version,
-                        tool_invocations=dispatch.plugin_crash.tool_invocations[-current_invocation_count:],
+                        tool_invocations=crash.error.tool_invocations[-current_invocation_count:],
                         llm_calls=recorder.llm_calls,
                         failed_turn=failed_turn,
                     )
-                    if dispatch.plugin_crash_cause is None:
-                        if pending_checkpoint_failures:
-                            raise unpersisted_plugin_crash from BaseExceptionGroup(
-                                "Tool failure retained checkpoint failures", pending_checkpoint_failures
-                            )
-                        raise unpersisted_plugin_crash
                     if pending_checkpoint_failures:
                         raise unpersisted_plugin_crash from BaseExceptionGroup(
                             "Tool failure retained checkpoint failures",
-                            (dispatch.plugin_crash_cause, *pending_checkpoint_failures),
+                            (crash.cause, *pending_checkpoint_failures),
                         )
-                    raise unpersisted_plugin_crash from dispatch.plugin_crash_cause
-                # No session/audit target was configured, so nothing in the
-                # request-cumulative crash carrier has been persisted yet.
-                if dispatch.plugin_crash_cause is None:
-                    if pending_checkpoint_failures:
-                        raise dispatch.plugin_crash from BaseExceptionGroup(
-                            "Tool failure retained checkpoint failures", pending_checkpoint_failures
-                        )
-                    raise dispatch.plugin_crash
-                if pending_checkpoint_failures:
-                    raise dispatch.plugin_crash from BaseExceptionGroup(
-                        "Tool failure retained checkpoint failures",
-                        (dispatch.plugin_crash_cause, *pending_checkpoint_failures),
-                    )
-                raise dispatch.plugin_crash from dispatch.plugin_crash_cause
-
+                    raise unpersisted_plugin_crash from crash.cause
+                # A tool turn is either persisted or its rollback is recorded:
+                # compose is refused before the loop when there is no session
+                # to persist to. Reaching this line means neither happened.
+                raise InvariantError("plugin crash on a tool turn that was neither persisted nor rolled back") from crash.cause
             if dispatch.advisor_failure is not None:
                 # The advisor boundary deliberately preserves unclassified
                 # controlled-code faults instead of laundering them into a

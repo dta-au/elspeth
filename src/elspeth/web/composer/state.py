@@ -5207,6 +5207,7 @@ def _check_schema_contracts(
         *,
         connection_name: str,
         warnings: list[ValidationEntry],
+        fan_in_abstentions: list[ProducerEntry] | None = None,
     ) -> ProducerEntry | None:
         """Schema-specific walk-back with coalesce/fork warning emission.
 
@@ -5218,6 +5219,14 @@ def _check_schema_contracts(
         row_union return the branch intersection, a union coalesce returns the
         builder's own merge — so the abstention is a statement about THIS
         composition rather than about the node kind.
+
+        ``fan_in_abstentions``, when given, receives the queue or row_union
+        entry the walk abstained at because its fan-in vote did not
+        participate. The abstention is right for the sink direction, where the
+        runtime defers to per-row enforcement. A NODE consumer's explicit
+        required fields are not deferred: the runtime refuses that edge, so
+        the node loop reads this to report it. A fan-in whose vote could not
+        be parsed is not recorded; that arm owns its own rejection.
         """
         visited_connections: set[str] = set()
         current_producer = producer
@@ -5262,8 +5271,11 @@ def _check_schema_contracts(
                 # still never compares against a single arbitrary upstream
                 # (elspeth-a5b86149d4) — the intersection is the fan-in-sound
                 # aggregate. When any arm abstains the vote collapses to
-                # abstention: the runtime defers to per-row enforcement, and
-                # the skip warning stays the honest "not yet checked" signal.
+                # abstention: for a sink the runtime defers to per-row
+                # enforcement, and the skip warning stays the honest "not yet
+                # checked" signal. A node consumer's explicit required fields
+                # are not deferred; ``fan_in_abstentions`` carries the queue
+                # to the node loop, which reports them.
                 try:
                     queue_participates, _queue_fields = _producer_entry_propagation_vote(
                         current_producer,
@@ -5277,6 +5289,9 @@ def _check_schema_contracts(
                     # ``_mirrored_coalesce_merged_guarantees`` sibling already does
                     # rather than crashing /validate with an unhandled ValueError.
                     queue_participates = False
+                else:
+                    if not queue_participates and fan_in_abstentions is not None:
+                        fan_in_abstentions.append(current_producer)
                 if queue_participates:
                     return current_producer
                 warnings.append(
@@ -5297,9 +5312,11 @@ def _check_schema_contracts(
                 # skipping here let the composer author union-consumer
                 # requirements the engine then deterministically rejected at
                 # /validate (battery-2026-08-06 g08-s2/s3). When any branch
-                # abstains the vote collapses to abstention: the runtime defers
-                # to per-row enforcement, and the skip warning stays the honest
-                # "not yet checked" signal.
+                # abstains the vote collapses to abstention: for a sink the
+                # runtime defers to per-row enforcement, and the skip warning
+                # stays the honest "not yet checked" signal. A node consumer's
+                # explicit required fields are not deferred (see the queue
+                # rule above).
                 try:
                     union_participates, _union_fields = _producer_entry_propagation_vote(
                         current_producer,
@@ -5311,6 +5328,9 @@ def _check_schema_contracts(
                     # sit later in ``nodes``, so this can be the first parse of
                     # its schema block. Abstain rather than crash /validate.
                     union_participates = False
+                else:
+                    if not union_participates and fan_in_abstentions is not None:
+                        fan_in_abstentions.append(current_producer)
                 if union_participates:
                     return current_producer
                 warnings.append(
@@ -5353,6 +5373,7 @@ def _check_schema_contracts(
         connection_name: str,
         *,
         warnings: list[ValidationEntry],
+        fan_in_abstentions: list[ProducerEntry] | None = None,
     ) -> ProducerEntry | None:
         producer = resolver.find_producer_for(connection_name)
         if producer is None:
@@ -5361,6 +5382,7 @@ def _check_schema_contracts(
             producer,
             connection_name=connection_name,
             warnings=warnings,
+            fan_in_abstentions=fan_in_abstentions,
         )
 
     def _producer_owner(producer: ProducerEntry) -> str:
@@ -7496,9 +7518,11 @@ def _check_schema_contracts(
         ):
             continue
 
+        fan_in_abstentions: list[ProducerEntry] = []
         actual_producer = _walk_to_real_producer(
             node.input,
             warnings=contract_warnings,
+            fan_in_abstentions=fan_in_abstentions,
         )
         if actual_producer is None:
             # The presence walk abstained. That is right for the direction it
@@ -7518,6 +7542,36 @@ def _check_schema_contracts(
                     )
                     if extras_error is not None:
                         errors.append(extras_error)
+            # Engine parity: the node direction does not defer on abstention
+            # (see ``_parse_producer_guarantees``). A queue or row_union whose
+            # vote abstained guarantees nothing, and the runtime's Phase-1
+            # name check refuses a consumer's EXPLICIT required fields against
+            # it at build ("guarantees: (none - dynamic schema)"). Skipping
+            # here validated that pipeline green with only the skip warning.
+            # Fields a deferring node on the path could still add are left to
+            # the run check, as on the resolved-producer path below.
+            if consumer_required and fan_in_abstentions:
+                abstaining_fan_in = fan_in_abstentions[0]
+                fan_in_missing = consumer_required - _possibly_added(abstaining_fan_in, consumer_required)
+                if fan_in_missing:
+                    errors.append(
+                        _err(
+                            f"node:{node.id}",
+                            f"Schema contract violation: '{abstaining_fan_in.producer_id}' -> '{node.id}'. "
+                            f"Consumer ({node.plugin or node.node_type}) requires fields: [{_format_fields(consumer_required)}]. "
+                            f"Producer ({_producer_label(abstaining_fan_in)}) guarantees: [{_format_fields(frozenset())}]. "
+                            f"Missing fields: [{_format_fields(fan_in_missing)}].",
+                            "high",
+                            "schema_contract_violation",
+                            # Same redaction judgment as the resolved-producer
+                            # site below: identifiers + field names only.
+                            contract=SchemaContractDetail(
+                                producer=abstaining_fan_in.producer_id,
+                                consumer=node.id,
+                                missing_fields=tuple(sorted(fan_in_missing)),
+                            ),
+                        )
+                    )
             continue
         if actual_producer.producer_id in parse_failed_producers:
             continue

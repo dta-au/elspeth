@@ -310,12 +310,24 @@ class _TerminateOutcome:
 
 
 @dataclass(frozen=True, slots=True)
+class _PluginCrash:
+    """A tool-handler crash together with the exception that caused it.
+
+    The two always travel as one value: there is no crash without its cause,
+    so the driver has no "cause missing" case to handle.
+    """
+
+    error: ComposerPluginCrashError
+    cause: BaseException
+
+
+@dataclass(frozen=True, slots=True)
 class _DispatchOutcome:
     """Result of dispatching one tool batch (Phase P3 → P4 → P5).
 
     Replaces the per-iteration scratch locals (``turn_has_mutation``,
     ``turn_has_discovery``, ``all_cache_hits``, ``tool_outcomes``,
-    ``plugin_crash``, ``plugin_crash_cause``, ``pre_state_id``,
+    ``plugin_crash``, ``pre_state_id``,
     ``decoded_args_by_call_id``) with a single visible boundary.
 
     State mutation happens *inside* P3 (every successful tool call
@@ -349,8 +361,7 @@ class _DispatchOutcome:
     all_cache_hits: bool
 
     # Plugin-crash carrier — P4 must propagate this AFTER persist
-    plugin_crash: ComposerPluginCrashError | None
-    plugin_crash_cause: BaseException | None
+    plugin_crash: _PluginCrash | None
 
     # First-party advisor failure — unlike plugin_crash this keeps the
     # original exception type, but follows the same persist-before-propagate
