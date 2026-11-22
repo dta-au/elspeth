@@ -26,7 +26,6 @@ EXPECTED_METRIC_NAMES = {
     # ``{{interpretation:<term>}}`` placeholder at runtime.
     "composer.interpretation_placeholder_unresolved_at_runtime_total",
     "execution.progress.broadcast_dropped_total",
-    "execution.loop_bridge_slow_total",
     # 0.6.0 multi-worker: runs cancelled by startup / periodic orphan
     # cleanup (emitted from web/app.py orphan-cleanup sites).
     "execution.orphaned_runs_cancelled_total",
@@ -72,7 +71,6 @@ def test_telemetry_field_names_match_spec_exactly():
         # Phase 5b Task 5 follow-on (F-17 / F-21).
         "interpretation_placeholder_unresolved_at_runtime_total",
         "progress_broadcast_dropped_total",
-        "execution_loop_bridge_slow_total",
         # 0.6.0 multi-worker: orphan-run cleanup lifecycle counter.
         "orphaned_runs_cancelled_total",
         # ── Phase 8 fields ──

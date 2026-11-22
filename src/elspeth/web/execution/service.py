@@ -24,13 +24,12 @@ from collections.abc import Callable, Coroutine, Mapping, Sequence
 from concurrent.futures import CancelledError as FutureCancelledError
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
-from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path, PurePath
-from types import CoroutineType, MappingProxyType
-from typing import TYPE_CHECKING, Any, Final, Literal, TypeVar, cast
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
 from uuid import UUID
 
 import structlog
@@ -230,7 +229,7 @@ from elspeth.web.sessions.protocol import (
     SessionRunStatus,
     SessionServiceProtocol,
 )  # B1: canonical definition
-from elspeth.web.sessions.telemetry import _Counter, _SessionsTelemetry
+from elspeth.web.sessions.telemetry import _SessionsTelemetry
 
 if TYPE_CHECKING:
     from elspeth.core.landscape.database import LandscapeDB
@@ -553,53 +552,6 @@ def _build_web_plugin_policy_evidence(
 
 
 T = TypeVar("T")
-
-#: How long one wait on the event loop lasts before the bridge rechecks that the loop is still running.
-_LOOP_BRIDGE_SLICE_SECONDS: Final[float] = 0.25
-#: A bridged call still waiting after this long is counted once in telemetry.
-_LOOP_BRIDGE_SLOW_SECONDS: Final[float] = 30.0
-#: The run whose pipeline thread is making bridged calls, for the slow-call counter.
-_BRIDGED_RUN_ID: ContextVar[str] = ContextVar("elspeth_bridged_run_id", default="")
-
-
-class ExecutionLoopUnavailableError(RuntimeError):
-    """The event loop stopped before it finished a call a pipeline thread was waiting on.
-
-    Deliberately not an ``OSError`` or ``TimeoutError``: the failure-path
-    handlers treat those as a transient store fault and carry on writing, and
-    nothing can be written through a stopped loop.
-    """
-
-
-def _bridged_operation_name(coro: Coroutine[Any, Any, Any]) -> str:
-    if type(coro) is CoroutineType:
-        return coro.__qualname__
-    return type(coro).__name__
-
-
-def _run_on_loop[R](coro: Coroutine[Any, Any, R], loop: asyncio.AbstractEventLoop, slow_calls: _Counter) -> R:
-    """Schedule ``coro`` on ``loop`` from another thread and wait for its real end."""
-    future = asyncio.run_coroutine_threadsafe(coro, loop)
-    started = time.monotonic()
-    slow_reported = False
-    while True:
-        try:
-            return future.result(timeout=_LOOP_BRIDGE_SLICE_SECONDS)
-        except TimeoutError:
-            if future.done():
-                # The awaited call ended with a timeout of its own; this
-                # re-raises it. Only a slice that ran out means "still running".
-                return future.result()
-        if loop.is_closed() or not loop.is_running():
-            if future.done():
-                return future.result()
-            future.cancel()
-            raise ExecutionLoopUnavailableError(
-                f"event loop stopped before it finished {_bridged_operation_name(coro)}; whether that call took effect is unknown"
-            )
-        if not slow_reported and time.monotonic() - started >= _LOOP_BRIDGE_SLOW_SECONDS:
-            slow_reported = True
-            slow_calls.add(1, attributes={"run_id": _BRIDGED_RUN_ID.get(), "operation": _bridged_operation_name(coro)})
 
 
 def _state_has_secret_ref_sites(state: CompositionState, env_ref_names: frozenset[str]) -> bool:
@@ -1953,15 +1905,12 @@ class ExecutionServiceImpl:
         in a ThreadPoolExecutor worker thread. This helper schedules the
         coroutine on the main event loop and blocks until it completes.
 
-        The wait lasts as long as the loop can still run the call. A caller
-        that gave up while the coroutine kept running would act on a result it
-        never saw: the pipeline thread would record the run as failed and the
-        abandoned call could still write its own outcome afterwards. The wait
-        ends early only when the loop is closed or stopped, with
-        ``ExecutionLoopUnavailableError``. A wait past
-        ``_LOOP_BRIDGE_SLOW_SECONDS`` is counted once and continues.
+        R6 fix: 30-second timeout prevents indefinite hangs if the event loop
+        cannot run the scheduled coroutine during shutdown or another
+        infrastructure stall.
         """
-        return _run_on_loop(coro, self._loop, self._telemetry.execution_loop_bridge_slow_total)
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return future.result(timeout=30.0)
 
     def get_live_run_ids(self) -> frozenset[str]:
         """Return run IDs still owned by an executor thread.
@@ -3770,9 +3719,6 @@ class ExecutionServiceImpl:
         prompt_snapshots: tuple[PromptReviewSnapshot, ...] = ()
         outputs_finalized = False
         terminal_event_persisted = False
-        # Not reset: this thread runs pipelines only, the cleanup below still
-        # bridges calls for this run, and the next run sets its own id.
-        _BRIDGED_RUN_ID.set(run_id)
         try:
             session_operation_lease.guard_external_effect()
             approval_inputs: ApprovalGateInputs | None = None

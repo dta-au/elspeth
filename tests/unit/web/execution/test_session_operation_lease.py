@@ -5099,7 +5099,6 @@ async def test_takeover_before_progress_dml_consumes_no_sequence_and_calls_no_pr
     service = object.__new__(ExecutionServiceImpl)
     service._loop = asyncio.get_running_loop()
     service._session_service = cast(Any, _FencedEventSessionService(authority))
-    service._telemetry = build_sessions_telemetry()
     service._broadcaster = cast(Any, broadcaster)
     run_event = RunEvent(
         run_id=str(run_id),
