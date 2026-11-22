@@ -328,9 +328,11 @@ async def test_the_whole_node_sent_back_as_exported_changes_nothing(
 ) -> None:
     """``get_pipeline_state(component="set_pipeline_arguments")`` sent back as it came.
 
-    The export shows the model's ORIGINAL drafts and no accepted value, a
-    three-field prompt-review row and a model-choice row. Sending all of it
-    back keeps every stored option, the user's amended definition included.
+    The export shows the model's ORIGINAL drafts and no accepted value, and a
+    model-choice row. On this step with prompt parts the prompt review is not
+    offered at all (test_read_drops_prompt_review_row.py). Sending all of it
+    back keeps every stored option, the user's amended definition and the
+    prompt review included.
     """
     session = await _session_with_titled_terms(service, tmp_path)
     stored_options = deep_thaw(_options(session.state))
@@ -341,9 +343,9 @@ async def test_the_whole_node_sent_back_as_exported_changes_nothing(
         {"kind", "user_term", "draft", "display_title"},
         {"kind", "user_term", "draft", "display_title"},
         {"kind", "user_term", "draft"},
-        {"kind", "user_term", "draft"},
     ]
-    assert [row["kind"] for row in exported_rows] == ["vague_term", "vague_term", "llm_prompt_template", "llm_model_choice"]
+    assert [row["kind"] for row in exported_rows] == ["vague_term", "vague_term", "llm_model_choice"]
+    assert any(row["kind"] == "llm_prompt_template" for row in stored_options[INTERPRETATION_REQUIREMENTS_KEY])
     assert AUDIENCE_AMENDED not in str(export)
 
     result = execute_tool(tool, export if tool == "set_pipeline" else node, session.state, _mock_catalog())
