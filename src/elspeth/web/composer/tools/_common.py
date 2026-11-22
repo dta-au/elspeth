@@ -349,16 +349,22 @@ def _options_with_pending_requirement(
     resolved hash), the existing requirement is kept — the call is
     idempotent so re-issuing the same mutation does not churn the review
     state. Otherwise the existing requirement of ``replace_kind`` is
-    replaced with the supplied one.
+    replaced with the supplied one. When ``options`` carries no requirement
+    of ``replace_kind`` but ``existing_options`` does, the supplied one is
+    inserted at that stored position rather than appended.
     """
     requirements_value = options[INTERPRETATION_REQUIREMENTS_KEY] if INTERPRETATION_REQUIREMENTS_KEY in options else None
     if requirements_value is not None and not isinstance(requirements_value, (list, tuple)):
         return dict(options)
 
+    stored_position: int | None = None
     if replace_kind is not None:
         trusted_id = _trusted_requirement_id_for_kind(existing_options, replace_kind)
         if trusted_id is not None:
             requirement = {**requirement, "id": trusted_id}
+            # A trusted ID means these stored options parsed and hold that row exactly once.
+            stored_requirements = None if existing_options is None else parse_interpretation_requirements(existing_options)
+            stored_position = [stored["id"] for stored in stored_requirements or ()].index(trusted_id)
 
     requirements: list[Any] = list(requirements_value or ())
     if replace_kind is not None:
@@ -379,7 +385,13 @@ def _options_with_pending_requirement(
             patched[INTERPRETATION_REQUIREMENTS_KEY] = next_requirements
             return patched
 
-    requirements.append(requirement)
+    if stored_position is None:
+        requirements.append(requirement)
+    else:
+        # The author left a server-staged row out (the exact-arguments read
+        # does not offer the prompt review on a step with parts). It goes back
+        # where it is stored, so writing a read back is not a reorder.
+        requirements.insert(min(stored_position, len(requirements)), requirement)
     patched = dict(options)
     patched[INTERPRETATION_REQUIREMENTS_KEY] = requirements
     return patched
@@ -4000,10 +4012,20 @@ class _SetPipelineNodePayload(TypedDict):
 
 
 def _serialize_authoring_options(options: Mapping[str, Any]) -> dict[str, JsonValue]:
-    """Strip all resolver-owned review fields from public authoring shells."""
+    """Strip all resolver-owned review fields from public authoring shells.
+
+    On a step with ``prompt_template_parts`` the prompt-review row is left out
+    altogether. Its ``draft`` is written when the review is staged and never
+    refreshed, so after a term is amended it holds superseded wording, which
+    the model then sent back as the step's prompt. The server derives that
+    step's prompt text from the parts and re-stages the review itself, so the
+    row gives the model nothing to act on. A step without parts keeps the row.
+    Stored state is never built from this projection.
+    """
     serialized = cast(dict[str, JsonValue], deep_thaw(serialize_authoring_review_options(options)))
     if INTERPRETATION_REQUIREMENTS_KEY in serialized:
         requirements = cast(list[dict[str, JsonValue]], serialized[INTERPRETATION_REQUIREMENTS_KEY])
+        server_derives_prompt = "prompt_template_parts" in serialized and serialized["prompt_template_parts"] is not None
         serialized[INTERPRETATION_REQUIREMENTS_KEY] = [
             {
                 "kind": requirement["kind"],
@@ -4012,6 +4034,7 @@ def _serialize_authoring_options(options: Mapping[str, Any]) -> dict[str, JsonVa
                 **({"display_title": requirement["display_title"]} if "display_title" in requirement else {}),
             }
             for requirement in requirements
+            if not (server_derives_prompt and requirement["kind"] == InterpretationKind.LLM_PROMPT_TEMPLATE.value)
         ]
     return serialized
 

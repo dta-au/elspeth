@@ -1656,10 +1656,15 @@ class ComposerServiceImpl:
 
         selected_messages, selected_tools = deepcopy(messages), deepcopy(tools)
         if turn_evidence is not None:
-            # The transcript owner observes the unshed request in the form it takes.
-            turn_evidence.transcript.observe_messages(
-                _reply_stage_messages(messages, turn_evidence=turn_evidence) if reply_stage else messages
-            )
+            # The transcript owner observes the loop's unshed messages. A reply
+            # stage quotes each tool record as text for its request; the owner
+            # already holds those records as their own events, so it is given
+            # the stage's closing instruction and no second copy. Building the
+            # quoted form here is what registers the quoted inspections.
+            observed = messages
+            if reply_stage:
+                observed = [*messages, _reply_stage_messages(messages, turn_evidence=turn_evidence)[-1]]
+            turn_evidence.transcript.observe_messages(observed)
         refusal_scope = _ContextBudgetRefusalScope(
             state=state,
             initial_version=initial_version,

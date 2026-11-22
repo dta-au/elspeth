@@ -455,6 +455,7 @@ def prepare_pending_interpretation_event_drafts_for_state(
     model_version: str | None,
     provider: str | None,
     composer_skill_hash: str | None,
+    skip_unsurfaceable: bool = False,
 ) -> tuple[PreparedInterpretationEventDraft, ...]:
     """Prepare the generic surfacer's event cohort for atomic settlement.
 
@@ -462,7 +463,10 @@ def prepare_pending_interpretation_event_drafts_for_state(
     kind still delegates to ``_backend_surface_args_for_site``, the one pure
     site-to-writer projection shared with asynchronous repair surfacing.
     Callers must reject ``unsurfaceable_pending_interpretation_review_sites``
-    before invoking this function.
+    before invoking this function, unless they pass ``skip_unsurfaceable``:
+    that leaves out exactly the sites the post-commit surfacer skips (the
+    same projection returning ``None``), which stay fail-closed at the
+    run-time gate.
     """
     from elspeth.web.sessions.protocol import PreparedInterpretationEventDraft
 
@@ -475,6 +479,8 @@ def prepare_pending_interpretation_event_drafts_for_state(
     for site in ordered_sites:
         surfaced = _backend_surface_args_for_site(state, site)
         if surfaced is None:
+            if skip_unsurfaceable:
+                continue
             raise InvariantError("atomic interpretation cohort contains an unsurfaceable pending site")
         affected_node_id, user_term, llm_draft = surfaced
         drafts.append(
@@ -875,6 +881,26 @@ class InterpretationSurfacing:
             model_version=self._model_identifier,
             provider=self._provider,
             composer_skill_hash=self._composer_skill_hash,
+        )
+
+    def prepare_surfaceable_pending_interpretation_reviews(self, state: CompositionState) -> tuple[PreparedInterpretationEventDraft, ...]:
+        """Freeze the review cohort an accepted ordinary proposal commits with its head.
+
+        The cohort is what :meth:`surface_pending_interpretation_reviews` would
+        write for this state after an auto-commit: one draft per site the
+        backend can eventize, with the same provenance. A site it cannot
+        eventize is left out rather than refused, as that surfacer leaves it
+        out. The accepted state may carry such a site from before the
+        proposal, and refusing here would make every later accept fail on it.
+        """
+        return prepare_pending_interpretation_event_drafts_for_state(
+            state,
+            surface_origin=InterpretationSurfaceOrigin.COMPOSER_LLM,
+            model_identifier=self._model_identifier,
+            model_version=self._model_identifier,
+            provider=self._provider,
+            composer_skill_hash=self._composer_skill_hash,
+            skip_unsurfaceable=True,
         )
 
     async def surface_pending_interpretation_reviews(
