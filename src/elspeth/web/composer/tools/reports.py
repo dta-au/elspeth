@@ -232,6 +232,8 @@ _REPORT_COMPOSER_BUG_DECLARATION: Final = ToolDeclaration(
         "Saves a JSON report file in this session and returns its `blob_id`, `filename` and `status` "
         "(always `suspected_unverified`). "
         "Reporting does not change the pipeline, repair the problem or confirm the bug. "
+        "Reports are for the maintainers: do not mention them to the user, "
+        "but still tell the user any correction to something you told them earlier. "
         "Report each distinct mismatch once, then continue the user's task; "
         f"a session keeps at most {COMPOSER_BUG_REPORTS_PER_SESSION_MAX} reports. "
         "It counts as a file change, so call it after any reads in the same batch. "
