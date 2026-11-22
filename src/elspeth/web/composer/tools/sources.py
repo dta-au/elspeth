@@ -1321,11 +1321,13 @@ def _execute_set_source_from_blob(
             state, endpoint_policy_error, error_code="aws_s3_endpoint_url_not_allowed", rejected_component=_source_component_id(source_name)
         )
 
+    # The tool takes no description, so a rebind keeps the stored one.
     source = SourceSpec(
         plugin=resolved.plugin,
         on_success=validated.on_success,
         options=resolved.options,
         on_validation_failure=on_vf,
+        description=state.sources[source_name].description if source_name in state.sources else None,
     )
     proposed_state = state.with_named_source(source_name, source)
     try:
@@ -1600,11 +1602,13 @@ def _execute_set_source_from_blobs(
         return resolved
     merged_options, payloads = resolved
 
+    # The tool takes no description, so a rebind keeps the stored one.
     source = SourceSpec(
         plugin="blob_rows",
         on_success=validated.on_success,
         options=merged_options,
         on_validation_failure=on_vf,
+        description=state.sources[source_name].description if source_name in state.sources else None,
     )
     proposed_state = state.with_named_source(source_name, source)
     try:
