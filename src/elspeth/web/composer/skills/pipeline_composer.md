@@ -808,8 +808,12 @@ facts, or gate conditions, then bind the blob as the source. For a
 blob with `wire_blob_inline_ref` at
 `node:<node_id>.options.reference_content` for the single-table form. For named
 `tables` and ordered `lookups`, wire each blob at
-`node:<node_id>.options.tables.<table_name>.reference_content`. Set
-`reference_format` to `csv` or `json` in that table. A later lookup's `key_field`
+`node:<node_id>.options.tables.<table_name>.reference_content`. When the call
+creates the node or the table, set that `reference_content` to
+`{"blob_ref": "<blob_id>", "mode": "inline_content", "sha256": "<content_hash>"}`
+with the blob's id and the `content_hash` from `get_blob_metadata`. If a table is
+already held as text, `wire_blob_inline_ref` at its path replaces the text with
+the file. Set `reference_format` to `csv` or `json` in that table. A later lookup's `key_field`
 may consume an earlier lookup's exact output; only external keys are upstream
 requirements. Preserve each lookup's miss policy and the node's error route.
 These tables are transform configuration, not additional sources.
