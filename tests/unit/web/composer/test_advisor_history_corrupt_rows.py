@@ -110,6 +110,32 @@ def test_a_corrupt_stored_row_stops_the_turn_and_the_error_names_the_row(corrupt
     assert str(bad_row.id) in str(refused.value)
 
 
+@pytest.mark.parametrize(
+    ("entry", "original_error"),
+    [(None, TypeError), (7, TypeError), ("not an object", AttributeError), ([], AttributeError)],
+    ids=["null", "number", "text", "list"],
+)
+def test_a_stored_tool_call_entry_that_is_not_an_object_is_refused_as_an_integrity_fault_naming_the_row(
+    entry: Any, original_error: type[Exception]
+) -> None:
+    """The entry cannot even be inspected, so no check gets to refuse it; the turn must still stop as an integrity fault."""
+    session_id = uuid4()
+    bad_row = _stored_row(session_id, "tool", "{}", sequence_no=1, tool_call_id="call-1", tool_calls=[entry])
+    current = _current(session_id)
+
+    with pytest.raises(AuditIntegrityError) as refused:
+        AdvisorTranscriptHistory.from_records(
+            session_id=str(session_id),
+            actor_user_id="actor",
+            current_request_id=str(current.id),
+            request="Continue",
+            records=[bad_row, current],
+        )
+
+    assert str(bad_row.id) in str(refused.value)
+    assert type(refused.value.__cause__) is original_error
+
+
 def test_a_history_without_the_current_request_is_refused_without_blaming_a_row() -> None:
     """Nothing is wrong with any stored row here; the request the turn is for is simply not among them."""
     session_id = uuid4()

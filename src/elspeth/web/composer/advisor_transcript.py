@@ -226,6 +226,16 @@ class AdvisorTranscriptHistory:
                 raise
             row = row_being_read[0]
             raise AuditIntegrityError(f"{exc} (stored row id={row.id}, sequence_no={row.sequence_no}, role={row.role})") from exc
+        except (TypeError, AttributeError) as exc:
+            # A stored envelope whose shape is so wrong that reading it fails
+            # before any check can refuse it (an entry that is not an object).
+            if not row_being_read:
+                raise
+            row = row_being_read[0]
+            raise AuditIntegrityError(
+                f"Stored history row is malformed: reading it raised {type(exc).__name__} "
+                f"(stored row id={row.id}, sequence_no={row.sequence_no}, role={row.role})"
+            ) from exc
 
     @classmethod
     def _from_records(
