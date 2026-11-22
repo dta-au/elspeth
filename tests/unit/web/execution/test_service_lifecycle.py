@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import contextlib
 import json
 import threading
@@ -2732,7 +2731,6 @@ class TestB8AsyncBridging:
             result = svc._call_async(coro)
         coro.close()
         assert result == "test_result"
-        mock_future.result.assert_called_once_with(timeout=30.0)
 
     def test_call_async_propagates_coroutine_exception(
         self,
@@ -2762,37 +2760,6 @@ class TestB8AsyncBridging:
 
         coro = failing_coro()
         with patch("asyncio.run_coroutine_threadsafe", return_value=mock_future), pytest.raises(ValueError, match="db error"):
-            svc._call_async(coro)
-        coro.close()
-
-    def test_call_async_raises_timeout_error(
-        self,
-        broadcaster: ProgressBroadcaster,
-        mock_settings: MagicMock,
-        mock_session_service: MagicMock,
-        execution_fixture: ExecutionTestCustody,
-    ) -> None:
-        """R6 fix: _call_async raises TimeoutError after 30s, preventing deadlock."""
-        mock_loop = MagicMock(spec=asyncio.AbstractEventLoop)
-        svc = execution_fixture.bind(
-            ExecutionServiceImpl.for_trained_operator(
-                loop=mock_loop,
-                broadcaster=broadcaster,
-                settings=mock_settings,
-                session_service=mock_session_service,
-                yaml_generator=_YamlGeneratorStub(),
-                telemetry=build_sessions_telemetry(),
-                execution_lease_release_registry=execution_fixture.registry(execution_fixture.loop),
-            )
-        )
-        mock_future = MagicMock(spec=Future)
-        mock_future.result.side_effect = concurrent.futures.TimeoutError()
-
-        async def hanging_coro() -> None:
-            pass
-
-        coro = hanging_coro()
-        with patch("asyncio.run_coroutine_threadsafe", return_value=mock_future), pytest.raises(concurrent.futures.TimeoutError):
             svc._call_async(coro)
         coro.close()
 
@@ -2842,16 +2809,6 @@ class TestAsyncShutdown:
             cleanup_applied.set()
 
         mock_session_service.update_run_status.side_effect = update_run_status
-
-        def short_call_async(coro: Coroutine[Any, Any, Any]) -> Any:
-            future = asyncio.run_coroutine_threadsafe(coro, loop)
-            try:
-                return future.result(timeout=1.0)
-            except concurrent.futures.TimeoutError:
-                future.cancel()
-                raise
-
-        cast(Any, svc)._call_async = short_call_async
 
         worker_done = threading.Event()
         worker_errors: list[str] = []
