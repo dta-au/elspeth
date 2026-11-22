@@ -2908,7 +2908,8 @@ def _execute_get_pipeline_state(
         if round_trip_error is not None:
             return _failure_result(
                 state,
-                f"Pipeline cannot be represented as exact set_pipeline arguments: {round_trip_error}.",
+                f"Pipeline cannot be represented as exact set_pipeline arguments: {round_trip_error}. "
+                "Read the node or output you need by its id instead.",
                 error_code="round_trip_unavailable",
             )
         assert exact_arguments is not None
@@ -2994,6 +2995,8 @@ _GET_PIPELINE_STATE_DECLARATION = ToolDeclaration(
                     "Accepted full-state aliases: omit component, pass 'full', 'all', 'pipeline', "
                     "or pass the empty string. Use 'set_pipeline_arguments' for the flat authoring document; "
                     'the web set_pipeline call requires {"pipeline": <document>}. '
+                    "That document is refused when a source bound with set_source_from_blob is named other than 'source' "
+                    "or sits beside other sources; then read the node or output by its id instead. "
                     "Ordinary inspection output is diagnostic only."
                 ),
             },

@@ -559,6 +559,8 @@ class TestStep3DiscoveryTierMigration:
                             "Accepted full-state aliases: omit component, pass 'full', 'all', 'pipeline', "
                             "or pass the empty string. Use 'set_pipeline_arguments' for the flat authoring document; "
                             'the web set_pipeline call requires {"pipeline": <document>}. '
+                            "That document is refused when a source bound with set_source_from_blob is named other than 'source' "
+                            "or sits beside other sources; then read the node or output by its id instead. "
                             "Ordinary inspection output is diagnostic only."
                         ),
                     },
