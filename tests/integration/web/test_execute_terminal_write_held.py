@@ -258,7 +258,15 @@ async def _run_with_a_held_write(
     hold: Literal["terminal status", "progress event"] = "terminal status",
     slow_calls: _FakeCounter | None = None,
     lease_seconds: int | None = None,
+    give_up_seconds: float | None = None,
 ) -> AsyncIterator[_HeldRun]:
+    """Start a run whose first write of the ``hold`` kind is held until ``release`` is set.
+
+    ``give_up_seconds`` shortens the bridge's give-up bound only once the held
+    write has been sent. Shortening it for the whole run would also cut an
+    ordinary call that runs slowly (a first, cold call under coverage takes
+    longer than 0.25 s), and the run would end before it reached the held write.
+    """
     for name in ("blobs", "outputs", "runs"):
         (tmp_path / name).mkdir()
     (tmp_path / "payloads").mkdir(mode=0o700)
@@ -345,6 +353,8 @@ async def _run_with_a_held_write(
         )
 
         async def hold_here() -> None:
+            if give_up_seconds is not None:
+                monkeypatch.setattr(service_module, "_LOOP_BRIDGE_GIVE_UP_SECONDS", give_up_seconds)
             run.held.set()
             try:
                 await run.release.wait()
@@ -388,7 +398,10 @@ async def _run_with_a_held_write(
         started = await client.post(f"/api/sessions/{session_id}/execute", headers=headers)
         assert started.status_code == 202, started.text
         run.run_id = started.json()["run_id"]
-        await asyncio.wait_for(run.held.wait(), _BOUND_SECONDS)
+        try:
+            await asyncio.wait_for(run.held.wait(), _BOUND_SECONDS)
+        except TimeoutError:
+            pytest.fail(f"the run did not reach the held write within {_BOUND_SECONDS:.0f} s; bridged calls so far: {run.bridged}")
         real_finalize = app.state.execution_service._finalize_output_blobs
 
         def finalize(run_id: str, *, success: bool, **kwargs: Any) -> Any:
@@ -473,9 +486,8 @@ async def _recover_until_settled(run: _HeldRun) -> None:
 async def test_a_terminal_write_that_never_finishes_frees_the_thread_and_recovery_records_what_the_pipeline_did(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(service_module, "_LOOP_BRIDGE_GIVE_UP_SECONDS", 0.2, raising=False)
     with structlog.testing.capture_logs() as logs:
-        async with _run_with_a_held_write(tmp_path, monkeypatch) as run:
+        async with _run_with_a_held_write(tmp_path, monkeypatch, give_up_seconds=0.2) as run:
             # The write is never released. The thread must leave the run by itself.
             await run.until(run.thread_has_left_the_run)
             await run.until(run.cancelled.is_set)
@@ -527,9 +539,8 @@ async def test_a_progress_write_that_never_finishes_inside_the_engine_ends_with_
     ``running``. The run thread must add nothing, and recovery must carry the
     audit store's answer across.
     """
-    monkeypatch.setattr(service_module, "_LOOP_BRIDGE_GIVE_UP_SECONDS", 0.2, raising=False)
     with structlog.testing.capture_logs() as logs:
-        async with _run_with_a_held_write(tmp_path, monkeypatch, hold="progress event") as run:
+        async with _run_with_a_held_write(tmp_path, monkeypatch, hold="progress event", give_up_seconds=0.2) as run:
             await run.until(run.thread_has_left_the_run)
             await run.until(run.cancelled.is_set)
             left_behind = {
@@ -576,7 +587,6 @@ async def test_a_give_up_the_engine_reports_as_a_shutdown_is_still_not_recorded_
     Here it ends as a graceful shutdown, which the run thread normally
     records as ``cancelled``. After an unsettled call it must record nothing.
     """
-    monkeypatch.setattr(service_module, "_LOOP_BRIDGE_GIVE_UP_SECONDS", 0.2, raising=False)
     real_run = service_module.Orchestrator.run
 
     def run_that_reports_a_shutdown(orchestrator: Any, *args: Any, **kwargs: Any) -> Any:
@@ -586,7 +596,7 @@ async def test_a_give_up_the_engine_reports_as_a_shutdown_is_still_not_recorded_
             raise GracefulShutdownError(1, "engine-run") from swallowed
 
     monkeypatch.setattr(service_module.Orchestrator, "run", run_that_reports_a_shutdown)
-    async with _run_with_a_held_write(tmp_path, monkeypatch, hold="progress event") as run:
+    async with _run_with_a_held_write(tmp_path, monkeypatch, hold="progress event", give_up_seconds=0.2) as run:
         await run.until(run.thread_has_left_the_run)
         await run.until(run.cancelled.is_set)
 
