@@ -2650,11 +2650,17 @@ class TestCompositionStateQueueGuaranteePropagation:
         shared_result = shared_state.validate()
         assert shared_result.is_valid, [e.message for e in shared_result.errors]
 
-    def test_abstaining_arm_collapses_queue_vote_and_keeps_skip_warning(self) -> None:
+    def test_abstaining_arm_collapses_queue_vote_and_refuses_node_requirement(self) -> None:
         # One dynamic (no-guarantee) arm collapses the whole vote to
-        # abstention — mirroring the engine — and the abstention warning
-        # stays: the runtime enforces the requirement per-row, and the
-        # warning is the honest "not yet checked" signal.
+        # abstention — mirroring the engine. An abstaining queue guarantees
+        # nothing, and the engine's Phase-1 name check refuses a NODE
+        # consumer's explicit required fields against it at build, so the
+        # composer refuses too (cross-surface agreement:
+        # test_composer_runtime_agreement_fan_in_walk.py, Shape 34). This
+        # test previously asserted a valid result on the belief that the
+        # runtime enforces the requirement per row; it does that for sinks
+        # only. The skip warning stays: the extras and type checks for this
+        # edge are still not made.
         state = self._state(
             sources={
                 "orders": self._source(guarantees=["llm_response"]),
@@ -2664,8 +2670,26 @@ class TestCompositionStateQueueGuaranteePropagation:
             outputs=(self._sink(),),
         )
         result = state.validate()
-        assert result.is_valid, [e.message for e in result.errors]
+        [entry] = [e for e in result.errors if e.error_code == "schema_contract_violation"]
+        assert entry.contract is not None
+        assert entry.contract.producer == "inbound"
+        assert entry.contract.missing_fields == ("llm_response",)
         assert self._queue_skip_warnings(result) != []
+
+    def test_abstaining_arm_keeps_queue_consumer_without_requirement_valid(self) -> None:
+        # Control for the refusal above: the same abstaining queue feeding a
+        # consumer that requires nothing stays valid, and the SINK's
+        # requirement is deferred to per-row enforcement as the engine does.
+        state = self._state(
+            sources={
+                "orders": self._source(guarantees=["llm_response"]),
+                "refunds": self._source(),
+            },
+            nodes=(self._queue(), self._consumer()),
+            outputs=(self._sink(required=["llm_response"]),),
+        )
+        result = state.validate()
+        assert result.is_valid, [e.message for e in result.errors]
 
     def test_queue_guarantee_flows_through_pass_through_to_sink_check(self) -> None:
         # The _connection_propagation_vote path: a pass-through transform
