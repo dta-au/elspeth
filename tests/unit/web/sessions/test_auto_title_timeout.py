@@ -44,6 +44,10 @@ async def _title_timeout_app(tmp_path, monkeypatch, *, quota_enabled=False, titl
     guards = []
 
     async def inspect(_self, request):
+        if not request.documents:
+            # The user prompt is inspected in its own call; title and primary
+            # checks are told apart by their documents.
+            return PromptGuardDecision("allow", "clean")
         title = any("Conversation excerpt (UNTRUSTED USER DATA" in document for document in request.documents)
         guards.append((title, request))
         if title:

@@ -59,10 +59,19 @@ def json_content_parts(
     for path, units in partitions.items():
         if type(path) is not tuple or type(units) is not tuple or any(type(unit) is not PromptGuardContentPart for unit in units):
             raise AuditIntegrityError("Prompt producer string partition lacks owned semantic units")
-        if any(path[: len(reference)] == reference or reference[: len(path)] == path for reference in reference_paths):
+    # Two paths overlap when one is a prefix of the other. Every check below
+    # is a set lookup of a path's own prefixes, so the cost grows with the
+    # number of paths times their depth, never with the number of path pairs:
+    # a long session transcript carries tens of thousands of string paths.
+    reference_prefixes = {reference[:end] for reference in reference_paths for end in range(len(reference) + 1)}
+    partition_proper_prefixes = {path[:end] for path in partitions for end in range(len(path))}
+    for path in partitions:
+        if path in reference_prefixes or any(path[:end] in reference_paths for end in range(len(path) + 1)):
             raise AuditIntegrityError("Prompt producer string partition overlaps a reference value")
-        if any(other != path and (path[: len(other)] == other or other[: len(path)] == path) for other in partitions):
+        if path in partition_proper_prefixes or any(path[:end] in partitions for end in range(len(path))):
             raise AuditIntegrityError("Prompt producer string partitions overlap")
+    # Paths at or above a reference or partition: such a container is never kept whole.
+    covered_prefixes = reference_prefixes | partition_proper_prefixes | set(partitions)
     visited: set[JsonPath] = set()
     item_separator, key_separator = separators if separators is not None else ((",", ": ") if indent is not None else (", ", ": "))
 
@@ -90,11 +99,7 @@ def json_content_parts(
             yield PromptGuardContentPart('"')
         elif path in reference_paths:
             yield PromptGuardContentPart(encoded, PromptGuardTrust.REFERENCE)
-        elif (
-            isinstance(item, dict | list)
-            and len(encoded) <= _COMPLETE_CONTAINER_CHARACTERS
-            and not any(reference[: len(path)] == path for reference in (*reference_paths, *partitions))
-        ):
+        elif isinstance(item, dict | list) and len(encoded) <= _COMPLETE_CONTAINER_CHARACTERS and path not in covered_prefixes:
             yield PromptGuardContentPart(encoded, inspection_text=_json_inspection_text(encoded))
         elif isinstance(item, dict | list) and item:
             is_object = isinstance(item, dict)

@@ -1,0 +1,835 @@
+"""Edit-plan loading, target resolution and the per-edit verdict checks of the Composer edit battery."""
+
+from __future__ import annotations
+
+import copy
+import json
+import re
+from pathlib import Path
+from typing import Any
+
+import pytest
+from scripts.staging import edit_plan
+from scripts.staging.opslib import UsageError
+
+FILE_TEXT = {"blob-1": "Summarise the row."}
+
+
+def graph() -> dict[str, Any]:
+    """A small graph with the roles the shipped plan needs: a source, its head, an inline and a file prompt."""
+
+    def llm(node_id: str, input_: str, on_success: str, template: object) -> dict[str, Any]:
+        return {
+            "id": node_id,
+            "node_type": "transform",
+            "plugin": "llm",
+            "input": input_,
+            "on_success": on_success,
+            "on_error": "discard",
+            "options": {"prompt_template": template, "model": "m"},
+            "description": None,
+        }
+
+    return {
+        "id": "state-0",
+        "version": 1,
+        "sources": {"rows": {"plugin": "csv", "on_success": "c0", "options": {}, "on_validation_failure": "discard"}},
+        "nodes": [
+            llm("classify", "c0", "c1", "Classify the row."),
+            llm("summarise", "c1", "out", {"blob_ref": "blob-1", "mode": "inline_content", "sha256": "x"}),
+        ],
+        "edges": [
+            {"id": "e1", "from_node": "rows", "to_node": "classify", "edge_type": "on_success", "label": None},
+            {"id": "e2", "from_node": "classify", "to_node": "summarise", "edge_type": "on_success", "label": None},
+        ],
+        "outputs": [{"name": "out", "plugin": "json", "options": {"path": "out.jsonl"}, "on_write_failure": "discard"}],
+        "metadata": {"name": "Pipeline", "description": "Original description."},
+        "is_valid": True,
+        "validation_errors": None,
+    }
+
+
+def read_text(marker: dict[str, Any]) -> str:
+    return FILE_TEXT[marker["blob_ref"]]
+
+
+def write_plan(tmp_path: Path, edits: list[dict[str, Any]], **overrides: Any) -> Path:
+    plan = {
+        "format": edit_plan.PLAN_FORMAT,
+        "name": "test-plan",
+        "description": "",
+        "forbidden_tools": ["set_pipeline"],
+        "targets": {"source": {"kind": "first_source"}, "head": {"kind": "consumer_of", "target": "source"}},
+        "edits": edits,
+    }
+    plan.update(overrides)
+    path = tmp_path / "plan.json"
+    path.write_text(json.dumps(plan))
+    return path
+
+
+# ── the shipped plans ──────────────────────────────────────────────────────
+
+
+def test_shipped_plans_have_fifty_eight_required_edits_and_optional_extras() -> None:
+    # 58 required: 50 for gold plus the 8 max_tokens/temperature edits a profile-bound step skips
+    # (test_shipped_edit_plans checks the profile-bound count stays at 52 or more).
+    for path in (edit_plan.DEFAULT_PLAN, edit_plan.MIXED_PLAN):
+        plan = edit_plan.load_plan(path)
+        optional = {name for name, spec in plan.targets.items() if "optional" in spec and spec["optional"]}
+        required = [edit for edit in plan.edits if not plan.roles_of(edit) & optional]
+        assert len(required) == 58
+        assert len(plan.edits) == 62
+        assert plan.forbidden_tools == ("set_pipeline",)
+
+
+@pytest.mark.parametrize("path", [edit_plan.DEFAULT_PLAN, edit_plan.MIXED_PLAN])
+def test_shipped_plans_carry_no_deployment_or_personal_details(path: Path) -> None:
+    assert not re.search(r"https?://|@|/home/|/Users/|[0-9a-f]{8}-[0-9a-f]{4}-", path.read_text())
+
+
+def test_shipped_plan_resolves_on_a_graph_with_its_roles_and_leaves_no_placeholder() -> None:
+    plan = edit_plan.load_plan(edit_plan.DEFAULT_PLAN)
+    state = graph()
+    targets = edit_plan.resolve_targets(plan, state, {})
+    assert targets == {"source": "rows", "head": "classify", "llm_file": "summarise", "output": "out", "csv_source": "rows"}
+    edits = edit_plan.resolve_edits(plan, targets, state)
+    assert [edit["number"] for edit in edits] == list(range(1, 63))
+    assert [edit["id"] for edit in edits if not edit["applicable"]] == ["secret-switch", "secret-restore"]
+    assert not re.search(r"\{[a-z_]+(:[^}]*)?\}", json.dumps([edit for edit in edits if edit["applicable"]]))
+    restore = next(edit for edit in edits if edit["id"] == "restore-pipeline-name")
+    assert restore["message"] == 'Put the pipeline name back to "Pipeline".'
+    unset = next(edit for edit in edits if edit["id"] == "restore-max-tokens")
+    assert unset["message"].endswith("back to no value (remove the setting).")
+    assert "null" not in unset["message"]
+
+
+def test_a_blank_was_value_never_renders_as_the_word_null() -> None:
+    view = edit_plan.graph_view(graph())
+    assert edit_plan.render_was(view, "/nodes/classify/description") == "no value (remove the setting)"
+    assert edit_plan.render_was(view, "/nodes/classify/options/max_tokens") == "no value (remove the setting)"
+    assert edit_plan.render_was(view, "/metadata/name") == '"Pipeline"'
+
+
+def test_missing_required_target_is_a_usage_error_naming_the_override_flag() -> None:
+    plan = edit_plan.load_plan(edit_plan.DEFAULT_PLAN)
+    state = graph()
+    state["nodes"] = [node for node in state["nodes"] if node["id"] != "summarise"]
+    with pytest.raises(UsageError, match=r"llm_file .*--target NAME=ID"):
+        edit_plan.resolve_targets(plan, state, {})
+
+
+def test_target_override_must_fit_its_role() -> None:
+    plan = edit_plan.load_plan(edit_plan.MIXED_PLAN)
+    assert edit_plan.resolve_targets(plan, graph(), {"llm_inline": "classify"})["llm_inline"] == "classify"
+    with pytest.raises(UsageError, match="llm_inline=summarise"):
+        edit_plan.resolve_targets(plan, graph(), {"llm_inline": "summarise"})
+    with pytest.raises(UsageError, match="not targets"):
+        edit_plan.resolve_targets(plan, graph(), {"nonsense": "classify"})
+
+
+def test_secret_roles_resolve_only_on_a_node_holding_a_secret_reference() -> None:
+    plan = edit_plan.load_plan(edit_plan.DEFAULT_PLAN)
+    state = graph()
+    state["nodes"][1]["options"]["api_key"] = {"secret_ref": "MODEL_KEY"}
+    targets = edit_plan.resolve_targets(plan, state, {"spare_secret": "SPARE"})
+    assert {name: targets[name] for name in ("secret_node", "secret_option", "secret_name", "spare_secret")} == {
+        "secret_node": "summarise",
+        "secret_option": "api_key",
+        "secret_name": "MODEL_KEY",
+        "spare_secret": "SPARE",
+    }
+
+
+TOOLS = {"tools_any": ["set_metadata"]}
+
+
+@pytest.mark.parametrize(
+    ("edit", "match"),
+    [
+        ({"id": "x", "message": "m", "expect": [], **TOOLS}, "at least one expectation"),
+        ({"id": "x", "message": "m", "expect": [{"equals": "/a"}], **TOOLS}, "malformed equals"),
+        ({"id": "x", "message": "m", "expect": [{"equals": "/a", "value": 1, "absent": "/b"}], **TOOLS}, "exactly one"),
+        ({"id": "x", "message": "{nowhere}", "expect": [{"present": "/a"}], **TOOLS}, "not a plan target"),
+        ({"id": "x", "message": "m", "expect": [{"present": "/a"}], "approve": {"kind": "vague_term", "node": "n"}, **TOOLS}, "approve"),
+        ({"id": "x", "message": "m", "expect": [{"text": "/a", "append": "s", "remove": "t"}], **TOOLS}, "malformed text"),
+        ({"id": "x", "message": "m", "expect": [{"present": "/a"}]}, "names its acceptable tools"),
+        ({"id": "x", "message": "use set_metadata", "expect": [{"present": "/a"}], **TOOLS}, "names a tool"),
+        ({"id": "x", "message": "m", "expect": [{"present": "/a"}], "tools_any": ["set_pipeline"]}, "forbidden tool"),
+        ({"id": "x", "message": "m", "expect": [{"present": "/a"}], "may_change": ["/edges"], **TOOLS}, "whole collection"),
+        ({"id": "x", "message": "m", "expect": [{"new_node": "n", "fields": {}}], **TOOLS}, "malformed new_node"),
+    ],
+)
+def test_malformed_plans_are_refused(tmp_path: Path, edit: dict[str, Any], match: str) -> None:
+    with pytest.raises(UsageError, match=match):
+        edit_plan.load_plan(write_plan(tmp_path, [edit]))
+
+
+def test_an_operator_role_must_be_optional(tmp_path: Path) -> None:
+    edit = {"id": "x", "message": "m", "expect": [{"present": "/a"}], **TOOLS}
+    with pytest.raises(UsageError, match="must be optional"):
+        edit_plan.load_plan(write_plan(tmp_path, [edit], targets={"spare": {"kind": "operator"}}))
+
+
+def test_duplicate_edit_ids_are_refused(tmp_path: Path) -> None:
+    edit = {"id": "same", "message": "m", "expect": [{"present": "/metadata"}], **TOOLS}
+    with pytest.raises(UsageError, match="unique"):
+        edit_plan.load_plan(write_plan(tmp_path, [edit, edit]))
+
+
+def test_an_edit_needing_an_absent_optional_role_resolves_as_not_applicable(tmp_path: Path) -> None:
+    edit = {"id": "x", "message": "Use {spare}.", "expect": [{"present": "/a"}], **TOOLS}
+    plan = edit_plan.load_plan(write_plan(tmp_path, [edit], targets={"spare": {"kind": "operator", "optional": True}}))
+    targets = edit_plan.resolve_targets(plan, graph(), {})
+    assert targets == {}
+    assert edit_plan.resolve_edits(plan, targets, graph()) == [{"number": 1, "id": "x", "applicable": False, "missing_roles": ["spare"]}]
+
+
+def _profile_plan(tmp_path: Path) -> edit_plan.Plan:
+    edits = [
+        {
+            "id": "max-tokens",
+            "message": "Set max_tokens on {llm} to 9.",
+            "expect": [{"equals": "/nodes/{llm}/options/max_tokens", "value": 9}],
+            **TOOLS,
+        },
+        {"id": "restore", "message": "Put it back.", "expect": [{"restored": "/nodes/{llm}/options/temperature"}], **TOOLS},
+        {
+            "id": "mixed",
+            "message": "Set max_tokens and rename.",
+            "expect": [{"equals": "/nodes/{llm}/options/max_tokens", "value": 9}, {"equals": "/metadata/name", "value": "x"}],
+            **TOOLS,
+        },
+        {"id": "other-option", "message": "Set it.", "expect": [{"equals": "/nodes/{llm}/options/response_field", "value": "r"}], **TOOLS},
+    ]
+    return edit_plan.load_plan(write_plan(tmp_path, edits, targets={"llm": {"kind": "llm_node", "prompt": "file"}}))
+
+
+def test_an_option_a_bound_profile_owns_makes_its_edits_not_applicable(tmp_path: Path) -> None:
+    plan = _profile_plan(tmp_path)
+    bound = graph()
+    bound["nodes"][1]["options"]["profile"] = "task-role"
+    targets = edit_plan.resolve_targets(plan, bound, {})
+    edits = edit_plan.resolve_edits(plan, targets, bound)
+    assert [(edit["id"], edit["applicable"]) for edit in edits] == [
+        ("max-tokens", False),
+        ("restore", False),
+        ("mixed", True),
+        ("other-option", True),
+    ]
+    assert edits[0] == {
+        "number": 1,
+        "id": "max-tokens",
+        "applicable": False,
+        "missing_roles": [],
+        "profile_owned": ["/nodes/summarise/options/max_tokens"],
+    }
+    assert edits[1]["profile_owned"] == ["/nodes/summarise/options/temperature"]
+
+
+def test_the_same_edits_apply_to_a_step_without_a_profile(tmp_path: Path) -> None:
+    plan = _profile_plan(tmp_path)
+    for unbound in (None, ""):
+        state = graph()
+        if unbound is not None:
+            state["nodes"][1]["options"]["profile"] = unbound
+        edits = edit_plan.resolve_edits(plan, edit_plan.resolve_targets(plan, state, {}), state)
+        assert all(edit["applicable"] for edit in edits)
+
+
+def test_the_profile_owned_options_are_ones_the_server_refuses_on_a_profiled_node() -> None:
+    from elspeth.core.llm_profiles import LLM_PROFILE_PRIVATE_FIELDS
+
+    assert set(edit_plan.PROFILE_OWNED_OPTION_KEYS) <= LLM_PROFILE_PRIVATE_FIELDS
+
+
+# ── verdict checks: each with a positive and a negative control ───────────
+
+
+def resolved(expect: list[dict[str, Any]], may_change: list[str] | None = None) -> dict[str, Any]:
+    return {"expect": expect, "may_change": may_change or [], "edges_touching": [], "tools_any": [], "tools_all": []}
+
+
+def check(expect: list[dict[str, Any]], after: dict[str, Any], before: dict[str, Any] | None = None) -> list[str]:
+    before_view = edit_plan.graph_view(before or graph())
+    failures, _ = edit_plan.check_expectations(
+        resolved(expect), before_view, edit_plan.graph_view(after), edit_plan.graph_view(graph()), read_text
+    )
+    return failures
+
+
+def with_insert(state: dict[str, Any], node_id: str = "battery_a") -> dict[str, Any]:
+    changed = copy.deepcopy(state)
+    changed["sources"]["rows"]["on_success"] = "ca"
+    changed["nodes"].append(
+        {
+            "id": node_id,
+            "node_type": "transform",
+            "plugin": "passthrough",
+            "input": "ca",
+            "on_success": "c0",
+            "on_error": None,
+            "options": {},
+        }
+    )
+    return changed
+
+
+def test_chain_accepts_the_inserted_step_and_rejects_a_bypass_or_a_second_consumer() -> None:
+    expectation = [{"chain": {"from": "rows", "to": "classify", "via": ["battery_a"]}}]
+    assert check(expectation, with_insert(graph())) == []
+    bypass = with_insert(graph())
+    bypass["sources"]["rows"]["on_success"] = "c0"
+    assert check(expectation, bypass) == ["expect[0]:chain:rows>classify"]
+    forked = with_insert(graph())
+    forked["nodes"].append({**forked["nodes"][0], "id": "stray", "input": "c0"})
+    assert check(expectation, forked) == ["expect[0]:chain:rows>classify"]
+    forked_midway = with_insert(graph())
+    forked_midway["nodes"].append({**forked_midway["nodes"][0], "id": "stray", "input": "ca"})
+    assert check(expectation, forked_midway) == ["expect[0]:chain:rows>classify"]
+
+
+def test_text_append_replace_and_remove_are_exact() -> None:
+    pointer = "/nodes/classify/options/prompt_template"
+    after = graph()
+    after["nodes"][0]["options"]["prompt_template"] = "Classify the row.\nBattery marker one."
+    assert check([{"text": pointer, "append": "Battery marker one.", "form": "inline"}], after) == []
+    assert check([{"text": pointer, "append": "Battery marker two."}], after) == [f"expect[0]:text:{pointer}"]
+    replaced = copy.deepcopy(after)
+    replaced["nodes"][0]["options"]["prompt_template"] = "Classify the row.\nBattery marker two."
+    assert check([{"text": pointer, "replace": ["marker one", "marker two"]}], replaced, before=after) == []
+    reworded = copy.deepcopy(replaced)
+    reworded["nodes"][0]["options"]["prompt_template"] = "Classify each row.\nBattery marker two."
+    assert check([{"text": pointer, "replace": ["marker one", "marker two"]}], reworded, before=after) != []
+    assert check([{"text": pointer, "remove": "Battery marker two."}], graph(), before=replaced) == []
+    assert check([{"text": pointer, "remove": "Battery marker two."}], replaced, before=replaced) != []
+
+
+def test_text_reads_a_bound_file_and_pins_its_form() -> None:
+    pointer = "/nodes/summarise/options/prompt_template"
+    FILE_TEXT["blob-2"] = "Summarise the row.\nBattery file marker one."
+    after = graph()
+    after["nodes"][1]["options"]["prompt_template"] = {"blob_ref": "blob-2", "mode": "inline_content", "sha256": "y"}
+    assert check([{"text": pointer, "append": "Battery file marker one.", "form": "file"}], after) == []
+    inline = graph()
+    inline["nodes"][1]["options"]["prompt_template"] = "Summarise the row.\nBattery file marker one."
+    assert check([{"text": pointer, "append": "Battery file marker one.", "form": "file"}], inline) != []
+
+
+def test_restored_compares_with_the_attempt_baseline_and_accepts_null_for_an_absent_setting() -> None:
+    changed = graph()
+    changed["nodes"][0]["options"]["max_tokens"] = 777
+    assert check([{"restored": "/nodes/classify/options/max_tokens"}], changed) != []
+    cleared = graph()
+    cleared["nodes"][0]["options"]["max_tokens"] = None
+    assert check([{"restored": "/nodes/classify/options/max_tokens"}], cleared) == []
+    renamed = graph()
+    renamed["metadata"]["name"] = "Other"
+    assert check([{"restored": "/metadata/name"}], renamed) != []
+    assert check([{"restored": "/metadata/name"}], graph()) == []
+
+
+def test_unrelated_changes_are_every_difference_no_expectation_covers() -> None:
+    before = edit_plan.graph_view(graph())
+    after_state = with_insert(graph())
+    after_state["nodes"][1]["description"] = "drifted"
+    after = edit_plan.graph_view(after_state)
+    _, covered = edit_plan.check_expectations(
+        resolved([{"present": "/nodes/battery_a"}, {"chain": {"from": "rows", "to": "classify", "via": ["battery_a"]}}]),
+        before,
+        after,
+        before,
+        read_text,
+    )
+    assert edit_plan.unrelated_changes(before, after, covered) == ["/nodes/summarise/description"]
+
+
+def test_a_pointer_covers_its_own_subtree_only() -> None:
+    assert edit_plan.covers("/nodes/battery_a", "/nodes/battery_a/options/schema")
+    assert not edit_plan.covers("/nodes/battery_a", "/nodes/battery_ab")
+
+
+def test_new_validation_errors_are_counted_by_occurrence() -> None:
+    before = graph()
+    before["validation_errors"] = [{"error_code": "x", "component": "a", "message": "m"}]
+    after = copy.deepcopy(before)
+    assert edit_plan.new_validation_errors(before, after) == []
+    after["validation_errors"].append({"error_code": "x", "component": "a", "message": "m"})
+    assert len(edit_plan.new_validation_errors(before, after)) == 1
+
+
+def test_a_validation_error_respelt_with_its_component_kind_is_not_new() -> None:
+    # Gold attempt 3, edits 22-25: the server named the same pending-review error's component "cs1_scoring" in one
+    # read and "node:cs1_scoring" in the next; that is one error, not a new one.
+    message = "pipeline_decision review pending for transform 'cs1_scoring': prompt_injection_shield_recommendation"
+    bare = graph()
+    bare["validation_errors"] = [
+        {"error_code": "interpretation_review_pending", "component": "cs1_scoring", "message": message},
+        {"error_code": "sink_failed", "component": "out", "message": "m"},
+    ]
+    prefixed = copy.deepcopy(bare)
+    prefixed["validation_errors"][0]["component"] = "node:cs1_scoring"
+    prefixed["validation_errors"][1]["component"] = "output:out"
+    assert edit_plan.new_validation_errors(bare, prefixed) == []
+    assert edit_plan.new_validation_errors(prefixed, bare) == []
+    # A different component, or the same message on another step, is still new.
+    other = copy.deepcopy(prefixed)
+    other["validation_errors"][0]["component"] = "node:cs2_scoring"
+    assert len(edit_plan.new_validation_errors(bare, other)) == 1
+
+
+def test_a_pending_review_stored_as_a_sentence_or_as_its_bare_kind_is_one_error() -> None:
+    # Gold attempt 3, edits 44-45: the pending llm_prompt_template review on cs1_assessment was stored as the
+    # sentence in one state version and as the bare kind in the next; that is one review, not a new one.
+    sentence = "llm_prompt_template review pending for transform 'cs1_assessment': llm_prompt_template"
+    as_sentence = graph()
+    as_sentence["validation_errors"] = [
+        {"error_code": "interpretation_review_pending", "component": "cs1_assessment", "message": sentence},
+    ]
+    as_kind = copy.deepcopy(as_sentence)
+    as_kind["validation_errors"][0]["message"] = "llm_prompt_template"
+    assert edit_plan.new_validation_errors(as_sentence, as_kind) == []
+    assert edit_plan.new_validation_errors(as_kind, as_sentence) == []
+    # A pending review of another kind, or on another component, is still new.
+    other_kind = copy.deepcopy(as_kind)
+    other_kind["validation_errors"][0]["message"] = "pipeline_decision"
+    assert len(edit_plan.new_validation_errors(as_sentence, other_kind)) == 1
+    other_step = copy.deepcopy(as_kind)
+    other_step["validation_errors"][0]["component"] = "node:cs2_assessment"
+    assert len(edit_plan.new_validation_errors(as_sentence, other_step)) == 1
+    # A second review of the same kind on the same step is counted, not merged away.
+    twice = copy.deepcopy(as_kind)
+    twice["validation_errors"].append(dict(as_sentence["validation_errors"][0]))
+    assert len(edit_plan.new_validation_errors(as_sentence, twice)) == 1
+    # Other error codes still compare their exact message.
+    reworded = graph()
+    reworded["validation_errors"] = [{"error_code": "sink_failed", "component": "out", "message": "m"}]
+    changed = copy.deepcopy(reworded)
+    changed["validation_errors"][0]["message"] = "m changed"
+    assert len(edit_plan.new_validation_errors(reworded, changed)) == 1
+
+
+def test_tool_findings_need_an_acceptable_tool_and_flag_a_forbidden_one_called_and_not_rejected() -> None:
+    edit = {"tools_any": ["change_substring"], "tools_all": []}
+    used = {"tool_outcomes": {"change_substring": {"applied": 1}}}
+    assert edit_plan.tool_findings(edit, used, ["set_pipeline"]) == []
+    rejected = {"tool_outcomes": {"change_substring": {"rejected": 2}}}
+    assert edit_plan.tool_findings(edit, rejected, ["set_pipeline"]) == ["expected_tool_not_used:change_substring"]
+    for stamp in ("applied", "failed", "cancelled", "completed", "unstamped"):
+        rebuilt = {"tool_outcomes": {"change_substring": {"applied": 1}, "set_pipeline": {stamp: 1}}}
+        assert edit_plan.tool_findings(edit, rebuilt, ["set_pipeline"]) == ["forbidden_tool_called:set_pipeline"]
+    refused = {"tool_outcomes": {"change_substring": {"applied": 1}, "set_pipeline": {"rejected": 1}}}
+    assert edit_plan.tool_findings(edit, refused, ["set_pipeline"]) == []
+    both = {"tools_any": [], "tools_all": ["create_blob", "wire_blob_inline_ref"]}
+    assert edit_plan.tool_findings(both, {"tool_outcomes": {"create_blob": {"completed": 1}}}, []) == [
+        "required_tool_not_used:wire_blob_inline_ref"
+    ]
+
+
+def test_refused_tool_calls_are_warnings() -> None:
+    evidence = {"tool_outcomes": {"patch_node_options": {"rejected": 2, "applied": 1}, "set_metadata": {"applied": 1}}}
+    assert edit_plan.tool_warnings(evidence) == ["tool_call_rejected:patch_node_options:2"]
+
+
+# ── preconditions, new components, renames ────────────────────────────────
+
+
+def test_an_expectation_that_already_holds_is_a_precondition_failure() -> None:
+    view = edit_plan.graph_view(graph())
+    holds = resolved([{"equals": "/metadata/name", "value": "Pipeline"}, {"equals": "/metadata/description", "value": "New"}])
+    assert edit_plan.preconditions(holds, view, view, read_text) == ["precondition:expect[0]_already_holds"]
+    pending = resolved([{"equals": "/metadata/name", "value": "Battery check"}])
+    assert edit_plan.preconditions(pending, view, view, read_text) == []
+
+
+def new_step(**fields: Any) -> dict[str, Any]:
+    return {
+        "new_node": "battery_a",
+        "fields": {"plugin": "passthrough", "node_type": "transform", **fields},
+        "option_keys": ["schema"],
+    }
+
+
+def test_a_new_node_is_checked_field_by_field() -> None:
+    assert check([new_step()], with_insert(graph())) == []
+    wrong_plugin = with_insert(graph())
+    wrong_plugin["nodes"][-1]["plugin"] = "field_mapper"
+    assert check([new_step()], wrong_plugin) == ["expect[0]:new_node:/nodes/battery_a"]
+    extra_option = with_insert(graph())
+    extra_option["nodes"][-1]["options"] = {"schema": {"mode": "observed"}, "note": "unasked"}
+    assert check([new_step()], extra_option) == ["expect[0]:new_node:/nodes/battery_a"]
+    # A description on the step the edit creates is allowed (and reported by new_component_notes).
+    described = with_insert(graph())
+    described["nodes"][-1]["description"] = "unasked"
+    assert check([new_step()], described) == []
+    discard = with_insert(graph())
+    discard["nodes"][-1]["on_error"] = "discard"
+    assert check([new_step()], discard) == ["expect[0]:new_node:/nodes/battery_a"]
+    assert check([new_step(on_error="discard")], discard) == []
+    assert check([new_step()], with_insert(graph()), before=with_insert(graph())) == ["expect[0]:new_node:/nodes/battery_a"]
+
+
+def test_a_new_output_checks_its_plugin_path_and_option_keys() -> None:
+    expectation = {
+        "new_output": "battery_out",
+        "fields": {"plugin": "json", "on_write_failure": "discard"},
+        "options": {"path": {"ends_with": "battery_out.jsonl"}},
+        "option_keys": ["path", "format"],
+    }
+    added = graph()
+    added["outputs"].append(
+        {"name": "battery_out", "plugin": "json", "options": {"path": "x/battery_out.jsonl"}, "on_write_failure": "discard"}
+    )
+    assert check([expectation], added) == []
+    other_path = copy.deepcopy(added)
+    other_path["outputs"][-1]["options"]["path"] = "x/elsewhere.jsonl"
+    assert check([expectation], other_path) == ["expect[0]:new_output:/outputs/battery_out"]
+    csv = copy.deepcopy(added)
+    csv["outputs"][-1]["plugin"] = "csv"
+    assert check([expectation], csv) == ["expect[0]:new_output:/outputs/battery_out"]
+    extra = copy.deepcopy(added)
+    extra["outputs"][-1]["options"]["mode"] = "append"
+    assert check([expectation], extra) == ["expect[0]:new_output:/outputs/battery_out"]
+
+
+def test_a_rename_keeps_every_setting_and_plugin() -> None:
+    before = with_insert(graph(), "battery_b")
+    before["nodes"][-1]["options"] = {"schema": {"mode": "observed"}}
+    before["nodes"][-1]["description"] = "Battery step B."
+    renamed = copy.deepcopy(before)
+    renamed["nodes"][-1]["id"] = "battery_d"
+    expectation = [{"renamed_node": {"from": "battery_b", "to": "battery_d"}}]
+    assert check(expectation, renamed, before=before) == []
+    dropped = copy.deepcopy(renamed)
+    dropped["nodes"][-1]["options"] = {}
+    assert check(expectation, dropped, before=before) == ["expect[0]:renamed_node:battery_b>battery_d"]
+    replugged = copy.deepcopy(renamed)
+    replugged["nodes"][-1]["plugin"] = "field_mapper"
+    assert check(expectation, replugged, before=before) == ["expect[0]:renamed_node:battery_b>battery_d"]
+    undescribed = copy.deepcopy(renamed)
+    undescribed["nodes"][-1]["description"] = None
+    assert check(expectation, undescribed, before=before) == ["expect[0]:renamed_node:battery_b>battery_d"]
+    kept_old = copy.deepcopy(renamed)
+    kept_old["nodes"].append(before["nodes"][-1])
+    assert check(expectation, kept_old, before=before) == ["expect[0]:renamed_node:battery_b>battery_d"]
+
+
+# ── the graph view, server-written fields, leftovers ───────────────────────
+
+
+def test_rows_with_distinct_ids_compare_by_id_not_position() -> None:
+    before = graph()
+    before["nodes"][0]["options"]["checks"] = [{"id": "r1", "rule": "a"}, {"id": "r2", "rule": "b"}]
+    reordered = copy.deepcopy(before)
+    reordered["nodes"][0]["options"]["checks"].reverse()
+    assert edit_plan.unrelated_changes(edit_plan.graph_view(before), edit_plan.graph_view(reordered), []) == []
+    edited = copy.deepcopy(reordered)
+    edited["nodes"][0]["options"]["checks"][1]["rule"] = "c"
+    assert edit_plan.unrelated_changes(edit_plan.graph_view(before), edit_plan.graph_view(edited), []) == [
+        "/nodes/classify/options/checks/id=r1/rule"
+    ]
+    positional = copy.deepcopy(before)
+    positional["nodes"][0]["options"]["order"] = ["a", "b"]
+    swapped = copy.deepcopy(positional)
+    swapped["nodes"][0]["options"]["order"] = ["b", "a"]
+    assert edit_plan.unrelated_changes(edit_plan.graph_view(positional), edit_plan.graph_view(swapped), []) != []
+
+
+def test_an_absent_null_or_empty_description_is_the_same_but_the_word_null_is_not() -> None:
+    blank = graph()
+    blank["nodes"][0]["description"] = ""
+    absent = graph()
+    del absent["nodes"][0]["description"]
+    for other in (blank, absent):
+        assert edit_plan.unrelated_changes(edit_plan.graph_view(graph()), edit_plan.graph_view(other), []) == []
+    word = graph()
+    word["nodes"][0]["description"] = "null"
+    assert edit_plan.unrelated_changes(edit_plan.graph_view(graph()), edit_plan.graph_view(word), []) == ["/nodes/classify/description"]
+
+
+def test_server_written_review_fields_are_allowed_by_name_only() -> None:
+    before = graph()
+    after = copy.deepcopy(before)
+    options = after["nodes"][0]["options"]
+    options["interpretation_requirements"] = [{"id": "q1", "kind": "llm_prompt_template", "status": "pending"}]
+    options["approved_prompt_artifact_hash"] = "abc"
+    after["sources"]["rows"]["options"]["source_authoring"] = {"hash": "h"}
+    options["temperature"] = 0.9
+    changes = edit_plan.classify_changes(edit_plan.graph_view(before), edit_plan.graph_view(after), [])
+    assert changes.unrelated == ["/nodes/classify/options/temperature"]
+    assert changes.server_written == [
+        "/nodes/classify/options/approved_prompt_artifact_hash",
+        "/nodes/classify/options/interpretation_requirements",
+        "/sources/rows/options/source_authoring",
+    ]
+
+
+def test_new_component_notes_report_a_description_and_a_placed_output_path() -> None:
+    step = with_insert(graph())
+    step["nodes"][-1]["description"] = "Passes rows through."
+    edit = resolved([new_step()])
+    assert edit_plan.new_component_notes(edit, edit_plan.graph_view(graph()), edit_plan.graph_view(step)) == [
+        "new_component_described:/nodes/battery_a/description"
+    ]
+    assert edit_plan.new_component_notes(edit, edit_plan.graph_view(graph()), edit_plan.graph_view(with_insert(graph()))) == []
+    output = {
+        "new_output": "battery_out",
+        "fields": {"plugin": "json", "on_write_failure": "discard"},
+        "options": {"path": {"ends_with": "battery_out.jsonl"}},
+        "option_keys": ["path"],
+    }
+    placed = graph()
+    placed["outputs"].append(
+        {"name": "battery_out", "plugin": "json", "options": {"path": "outputs/s1/battery_out.jsonl"}, "on_write_failure": "discard"}
+    )
+    assert edit_plan.new_component_notes(resolved([output]), edit_plan.graph_view(graph()), edit_plan.graph_view(placed)) == [
+        "new_output_path_placed:/outputs/battery_out/options/path"
+    ]
+    bare = copy.deepcopy(placed)
+    bare["outputs"][-1]["options"]["path"] = "battery_out.jsonl"
+    assert edit_plan.new_component_notes(resolved([output]), edit_plan.graph_view(graph()), edit_plan.graph_view(bare)) == []
+
+
+def test_a_description_written_on_a_component_the_edit_did_not_create_is_still_unrelated() -> None:
+    after = with_insert(graph())
+    after["nodes"][0]["description"] = "Written beside the insert."
+    edit = resolved([new_step()])
+    failures, covered = edit_plan.check_expectations(
+        edit, edit_plan.graph_view(graph()), edit_plan.graph_view(after), edit_plan.graph_view(graph()), read_text
+    )
+    assert failures == []
+    changes = edit_plan.classify_changes(edit_plan.graph_view(graph()), edit_plan.graph_view(after), covered, named={"battery_a"})
+    # (The insert's own re-route of the source is covered by a chain expectation in a real plan.)
+    assert "/nodes/classify/description" in changes.unrelated
+
+
+def described(output: str, nodes: str | None = None) -> dict[str, Any]:
+    state = graph()
+    state["outputs"][0]["description"] = output
+    if nodes is not None:
+        for item in state["nodes"]:
+            item["description"] = nodes
+    return state
+
+
+def test_a_targets_own_description_rewritten_with_the_fact_it_names_is_reported_as_corrected() -> None:
+    # The live case (gold plan edit 12, output-path): the path moved and the output's description followed it.
+    before = described("Write every row to out.jsonl.")
+    after = copy.deepcopy(before)
+    after["outputs"][0]["options"]["path"] = "errors.jsonl"
+    after["outputs"][0]["description"] = "Write every row to errors.jsonl."
+    edit = resolved([{"ends_with": "/outputs/out/options/path", "value": "errors.jsonl"}])
+    assert edit_plan.targeted_components(edit) == {("outputs", "out")}
+    assert edit_plan.own_description_corrections(edit, edit_plan.graph_view(before), edit_plan.graph_view(after)) == [
+        "own_description_corrected:/outputs/out/description"
+    ]
+
+
+def test_only_a_target_counts_and_only_a_rewrite_from_one_text_to_another_is_a_correction() -> None:
+    edit = resolved([{"ends_with": "/outputs/out/options/path", "value": "errors.jsonl"}])
+    before = described("Write every row to out.jsonl.", nodes="Classifies rows.")
+    other = copy.deepcopy(before)
+    other["nodes"][0]["description"] = "Classifies rows for errors.jsonl."  # a component the edit does not target
+    added = described("", nodes="Classifies rows.")
+    added_after = described("Write every row to errors.jsonl.", nodes="Classifies rows.")
+    removed = described("", nodes="Classifies rows.")
+    view = edit_plan.graph_view
+    assert edit_plan.own_description_corrections(edit, view(before), view(other)) == []
+    assert edit_plan.own_description_corrections(edit, view(added), view(added_after)) == []
+    assert edit_plan.own_description_corrections(edit, view(before), view(removed)) == []
+    # Metadata, a chain, a new step and may_change never make a component a target.
+    assert edit_plan.targeted_components(resolved([{"equals": "/metadata/name", "value": "x"}])) == set()
+    assert edit_plan.targeted_components(resolved([new_step()], may_change=["/nodes/classify/options/model"])) == set()
+    # A pointer at the whole component (a removal) targets nothing inside it.
+    assert edit_plan.targeted_components(resolved([{"absent": "/nodes/classify"}])) == set()
+
+
+def test_a_file_prompt_hash_cleared_to_null_is_server_written_on_any_node() -> None:
+    # "summarise" holds its prompt in a file, "classify" inline (graph()).
+    before = graph()
+    for item in before["nodes"]:
+        item["options"]["approved_prompt_artifact_hash"] = "abc"
+    cleared = copy.deepcopy(before)
+    for item in cleared["nodes"]:
+        item["options"]["approved_prompt_artifact_hash"] = None
+    changes = edit_plan.classify_changes(edit_plan.graph_view(before), edit_plan.graph_view(cleared), [], named=set())
+    assert changes.server_written == ["/nodes/summarise/options/approved_prompt_artifact_hash"]
+    # The inline step's hash going to null is not the file-prompt case: unrelated on a node the edit does not name.
+    assert changes.unrelated == ["/nodes/classify/options/approved_prompt_artifact_hash"]
+    absent = copy.deepcopy(before)
+    del absent["nodes"][1]["options"]["approved_prompt_artifact_hash"]
+    assert edit_plan.classify_changes(edit_plan.graph_view(before), edit_plan.graph_view(absent), [], named=set()).server_written == [
+        "/nodes/summarise/options/approved_prompt_artifact_hash"
+    ]
+
+
+_QUERY = {"input_fields": ["x"], "output_fields": [{"suffix": "s", "type": "string"}]}
+FILE_MARKER = {"blob_ref": "8d737c7a-321f-4158-a6af-877fb4667940", "mode": "inline_content", "sha256": "a" * 64}
+
+
+def test_a_multi_query_steps_hash_cleared_with_its_query_templates_in_files_is_server_written() -> None:
+    # The acceptance fixture's multi-query steps hold their prompts as file-held QUERY templates and have no
+    # prompt_template; the server clears their approved hash like any other file-held step's.
+    query = {**_QUERY, "template": dict(FILE_MARKER)}
+    before = graph()
+    before["nodes"][1]["options"] = {"queries": {"a": query}, "model": "m", "approved_prompt_artifact_hash": "abc"}
+    cleared = copy.deepcopy(before)
+    cleared["nodes"][1]["options"]["approved_prompt_artifact_hash"] = None
+    changes = edit_plan.classify_changes(edit_plan.graph_view(before), edit_plan.graph_view(cleared), [], named=set())
+    assert changes.server_written == ["/nodes/summarise/options/approved_prompt_artifact_hash"]
+    assert changes.unrelated == []
+    inline = copy.deepcopy(before)
+    inline["nodes"][1]["options"]["queries"]["a"]["template"] = "Q {{ row.x }}"
+    inline_cleared = copy.deepcopy(inline)
+    inline_cleared["nodes"][1]["options"]["approved_prompt_artifact_hash"] = None
+    assert edit_plan.classify_changes(edit_plan.graph_view(inline), edit_plan.graph_view(inline_cleared), [], named=set()).unrelated == [
+        "/nodes/summarise/options/approved_prompt_artifact_hash"
+    ]
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        pytest.param({"prompt_template": "Rate {{ row.x }}."}, id="inline-prompt"),
+        pytest.param({"prompt_template": FILE_MARKER}, id="file-prompt"),
+        pytest.param({"prompt_template": "Rate.", "system_prompt": FILE_MARKER}, id="file-system-prompt"),
+        pytest.param({"queries": {"a": {**_QUERY, "template": FILE_MARKER}}}, id="file-query-templates"),
+        pytest.param({"queries": {"a": {**_QUERY, "template": "Q {{ row.x }}"}}}, id="inline-query-templates"),
+        pytest.param({"queries": [{"name": "a", **_QUERY, "template": FILE_MARKER}]}, id="file-query-template-list"),
+        pytest.param({"prompt_template": FILE_MARKER, "queries": {"a": dict(_QUERY)}}, id="query-falls-back-to-file-prompt"),
+        pytest.param({"prompt_template": FILE_MARKER, "queries": {"a": {**_QUERY, "template": "Q"}}}, id="unused-file-prompt"),
+    ],
+)
+def test_the_file_held_test_matches_the_server_that_stores_no_approval_hash(options: dict[str, Any]) -> None:
+    # One definition of "held in a file": the battery's must agree with the server's own, which stores no
+    # approved hash (returns None) exactly when a prompt the step uses is held in a file.
+    from elspeth.web.interpretation_state import approved_prompt_artifact_hash_from_options
+
+    server_defers = approved_prompt_artifact_hash_from_options(options) is None
+    assert edit_plan._approval_hash_deferred({"node_type": "transform", "options": options}) is server_defers
+
+
+def test_a_file_prompt_hash_changed_to_another_value_or_set_from_null_is_unrelated_where_not_named() -> None:
+    before = graph()
+    before["nodes"][1]["options"]["approved_prompt_artifact_hash"] = "abc"
+    other = copy.deepcopy(before)
+    other["nodes"][1]["options"]["approved_prompt_artifact_hash"] = "def"
+    changes = edit_plan.classify_changes(edit_plan.graph_view(before), edit_plan.graph_view(other), [], named=set())
+    assert changes.unrelated == ["/nodes/summarise/options/approved_prompt_artifact_hash"]
+    assert changes.server_written == []
+    unset = graph()
+    unset["nodes"][1]["options"]["approved_prompt_artifact_hash"] = None
+    set_again = copy.deepcopy(unset)
+    set_again["nodes"][1]["options"]["approved_prompt_artifact_hash"] = "abc"
+    assert edit_plan.classify_changes(edit_plan.graph_view(unset), edit_plan.graph_view(set_again), [], named=set()).unrelated == [
+        "/nodes/summarise/options/approved_prompt_artifact_hash"
+    ]
+    # A prompt moved from a file to inline in the same turn is not the server's clearing either.
+    moved = copy.deepcopy(before)
+    moved["nodes"][1]["options"]["approved_prompt_artifact_hash"] = None
+    moved["nodes"][1]["options"]["prompt_template"] = "Summarise the row."
+    assert (
+        "/nodes/summarise/options/approved_prompt_artifact_hash"
+        in edit_plan.classify_changes(edit_plan.graph_view(before), edit_plan.graph_view(moved), [], named=set()).unrelated
+    )
+
+
+def test_server_written_review_fields_count_only_on_the_components_named() -> None:
+    before = graph()
+    after = copy.deepcopy(before)
+    for node in after["nodes"]:
+        node["options"]["interpretation_requirements"] = [{"id": "q1", "kind": "llm_prompt_template", "status": "pending"}]
+        node["options"]["approved_prompt_artifact_hash"] = "abc"
+    after["sources"]["rows"]["options"]["source_authoring"] = {"hash": "h"}
+    changes = edit_plan.classify_changes(edit_plan.graph_view(before), edit_plan.graph_view(after), [], named={"summarise"})
+    assert changes.server_written == [
+        "/nodes/summarise/options/approved_prompt_artifact_hash",
+        "/nodes/summarise/options/interpretation_requirements",
+    ]
+    assert changes.unrelated == [
+        "/nodes/classify/options/approved_prompt_artifact_hash",
+        "/nodes/classify/options/interpretation_requirements",
+        "/sources/rows/options/source_authoring",
+    ]
+    nobody = edit_plan.classify_changes(edit_plan.graph_view(before), edit_plan.graph_view(after), [], named=set())
+    assert nobody.server_written == []
+
+
+def test_an_edit_names_the_components_in_its_pointers_chains_new_and_renamed_steps_and_edge_list() -> None:
+    edit = {
+        "expect": [
+            {"equals": "/nodes/classify/options/max_tokens", "value": 1237},
+            {"chain": {"from": "rows", "to": "summarise", "via": ["battery_a"]}},
+            {"renamed_node": {"from": "battery_b", "to": "battery_d"}},
+            {"new_output": "battery_out", "fields": {}, "option_keys": []},
+            {"equals": "/metadata/name", "value": "x"},
+        ],
+        "may_change": ["/outputs/out/options"],
+        "edges_touching": ["battery_e"],
+    }
+    assert edit_plan.named_components(edit) == {
+        "classify",
+        "rows",
+        "summarise",
+        "battery_a",
+        "battery_b",
+        "battery_d",
+        "battery_out",
+        "out",
+        "battery_e",
+    }
+
+
+def control(node_id: str, input_: str, on_success: str) -> dict[str, Any]:
+    return {
+        "id": node_id,
+        "node_type": "transform",
+        "plugin": "shield",
+        "input": input_,
+        "on_success": on_success,
+        "on_error": "discard",
+        "options": {"interpretation_requirements": [{"id": "d1", "user_term": edit_plan.AUTO_WIRED_CONTROL_TERM, "status": "pending"}]},
+    }
+
+
+def test_an_auto_wired_required_control_is_server_written_and_the_chain_steps_through_it() -> None:
+    after = with_insert(graph())
+    after["sources"]["rows"]["on_success"] = "cx"
+    after["nodes"].append(control("prompt_shield_auto_1", "cx", "ca"))
+    expectation = [new_step(), {"chain": {"from": "rows", "to": "classify", "via": ["battery_a"]}}]
+    assert check(expectation, after) == []
+    before_view, after_view = edit_plan.graph_view(graph()), edit_plan.graph_view(after)
+    _, covered = edit_plan.check_expectations(resolved(expectation), before_view, after_view, before_view, read_text)
+    changes = edit_plan.classify_changes(before_view, after_view, covered)
+    assert changes.unrelated == []
+    assert "/nodes/prompt_shield_auto_1" in changes.server_written
+    impostor = copy.deepcopy(after)
+    impostor["nodes"][-1]["options"]["interpretation_requirements"][0]["user_term"] = "something_else"
+    assert check(expectation, impostor) == ["expect[1]:chain:rows>classify"]
+
+
+def test_leftovers_of_an_earlier_attempt_are_found() -> None:
+    assert edit_plan.leftover_findings(graph(), read_text) == []
+    left = with_insert(graph())
+    left["outputs"].append({"name": "battery_out", "plugin": "json", "options": {}, "on_write_failure": "discard"})
+    left["metadata"]["name"] = "Battery check, second round"
+    FILE_TEXT["blob-3"] = "Summarise the row.\nBattery file marker two."
+    left["nodes"][1]["options"]["prompt_template"] = {"blob_ref": "blob-3", "mode": "inline_content", "sha256": "z"}
+    assert edit_plan.leftover_findings(left, read_text) == [
+        "/nodes/battery_a",
+        "/outputs/battery_out",
+        "/metadata/name",
+        "/nodes/summarise/options/prompt_template",
+    ]
+
+
+def test_as_found_compares_prompts_by_text_and_ignores_server_written_fields() -> None:
+    FILE_TEXT["blob-4"] = "Summarise the row.\n"
+    rebound = graph()
+    rebound["nodes"][1]["options"]["prompt_template"] = {"blob_ref": "blob-4", "mode": "inline_content", "sha256": "w"}
+    rebound["nodes"][1]["options"]["approved_prompt_artifact_hash"] = "new"
+    assert edit_plan.as_found_differences(graph(), rebound, read_text) == []
+    FILE_TEXT["blob-5"] = "Summarise the row differently."
+    changed = graph()
+    changed["nodes"][1]["options"]["prompt_template"] = {"blob_ref": "blob-5", "mode": "inline_content", "sha256": "v"}
+    assert edit_plan.as_found_differences(graph(), changed, read_text) == ["/nodes/summarise/options/prompt_template/text"]

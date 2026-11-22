@@ -35,7 +35,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import cast
+from typing import Final, cast
 
 from fastapi import HTTPException, Request
 from pydantic import ValidationError
@@ -75,6 +75,14 @@ from elspeth.web.shareable_reviews.service import ShareableReviewService, ShareF
 __all__ = ["ImportNotAllowedError", "import_shared_snapshot"]
 
 _FALLBACK_TITLE = "Copy of shared pipeline"
+
+SHARED_IMPORT_DESCRIPTION_PREFIX: Final = "imported from a shared link ("
+"""Start of the ``source_description`` of every file copied in by a shared-link import."""
+
+
+def shared_import_description(payload_digest: str) -> str:
+    """The ``source_description`` an imported file records (readers match :data:`SHARED_IMPORT_DESCRIPTION_PREFIX`)."""
+    return f"{SHARED_IMPORT_DESCRIPTION_PREFIX}{payload_digest})"
 
 
 class ImportNotAllowedError(Exception):
@@ -240,7 +248,7 @@ async def _copy_files(
                     copy.content,
                     mime_type,
                     created_by="user",
-                    source_description=f"imported from a shared link ({payload_digest})",
+                    source_description=shared_import_description(payload_digest),
                     session_operation_context=lease.context,
                 )
             except IdentityStorageQuotaExceededError as exc:

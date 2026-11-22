@@ -581,6 +581,22 @@ export const TOOL_PROJECTORS = {
   upsert_node: (args, currentState, ledger) => {
     ledger.replacementScope = "component";
     const id = asString(args.id);
+    if (args.routing_only === true) {
+      // A routing-only edit keeps the stored step and changes only the routes
+      // it names; diffing the bare arguments would show the plugin and options
+      // being removed, which does not happen.
+      if (id === null) return null;
+      const stored = currentState.nodes.find((node) => node.id === id);
+      if (stored === undefined) return null;
+      const rewired = {
+        ...stored,
+        input: asString(args.input) ?? stored.input,
+        ...("on_success" in args ? { on_success: args.on_success } : {}),
+        ...("on_error" in args ? { on_error: args.on_error } : {}),
+      };
+      const summary = nodeSummary(stored);
+      return [upsertEntry("node", id, stored, summary, summary, rewired)];
+    }
     const afterSummary = nodeSummaryFromArgs(args);
     if (id === null || afterSummary === null) return null;
     const before = currentState.nodes.find((node) => node.id === id);

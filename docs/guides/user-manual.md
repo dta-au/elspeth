@@ -730,7 +730,10 @@ commit as audited pipeline versions without a separate Accept click. A
 full-pipeline proposal auto-commits only after a green runtime preflight and
 while the session remains in auto-apply mode. Otherwise it remains pending for
 review. With **Approval required**, mutations wait as proposals for explicit
-Accept or Reject. The authority chip in the chat header shows the current mode.
+Accept or Reject. The web UI has no control for this mode and does not display
+it; a session is switched to it only through the session's composer-preferences
+API (`PATCH /api/sessions/{session_id}/composer/preferences`, `trust_mode:
+"explicit_approve"`).
 Follow-up messages can refine the draft without starting over. Committing a
 pipeline change never executes it; **Run pipeline** is a separate action.
 
@@ -836,7 +839,8 @@ is admitted, so a pipeline whose `file_inject` content is anything other than
 a file you uploaded does not run.
 
 An attached file can be up to 256 KiB, and all inline attachments in one
-pipeline can total 1 MiB. Files are attached as text. This rule applies only to
+pipeline can total 4 MiB, counting a file once for each place it is attached.
+Files are attached as text. This rule applies only to
 `file_inject`: Composer can still create a source or draft prompt text for you,
 each behind its own review.
 

@@ -909,6 +909,27 @@ describe("sessionStore", () => {
       });
     });
 
+    it("a failed createSession keeps observing the current session's in-flight turn", async () => {
+      const api = await import("@/api/client");
+      const post = deferred<{ message: ChatMessage; state: CompositionState; proposals: CompositionProposal[] }>();
+      vi.mocked(api.sendMessage).mockReturnValueOnce(post.promise);
+      vi.mocked(api.createSession).mockRejectedValueOnce({ status: 503, detail: "Service unavailable." });
+      vi.mocked(api.fetchComposerProgress).mockResolvedValue({ phase: "idle", inflight_requests: 0 } as ComposerProgressSnapshot);
+      useSessionStore.setState({ activeSessionId: "20000000-0000-4000-8000-000000000006" });
+      const pending = useSessionStore.getState().sendMessage("Assess old data");
+      expect(useSessionStore.getState().isComposing).toBe(true);
+      await useSessionStore.getState().createSession();
+      expect(useSessionStore.getState().activeSessionId).toBe("20000000-0000-4000-8000-000000000006");
+      expect(useSessionStore.getState().error).toBe("Service unavailable.");
+      post.resolve({
+        message: { id: "old-reply", session_id: "20000000-0000-4000-8000-000000000006", role: "assistant", content: "Old reply", tool_calls: null, created_at: "2026-10-02T00:00:01Z" },
+        state: makeCompositionState(2), proposals: [],
+      });
+      await pending;
+      expect(useSessionStore.getState().isComposing).toBe(false);
+      expect(useSessionStore.getState().messages.map((message) => message.id)).toContain("old-reply");
+    });
+
     it("createSession requests authoring focus so a collapsed pane cannot hide a new session's composer", async () => {
       // The collapsed-pane preference persists globally (localStorage), so
       // without this a user who collapsed the pane once would find EVERY new

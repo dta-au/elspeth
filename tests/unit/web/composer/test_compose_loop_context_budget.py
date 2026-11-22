@@ -317,7 +317,9 @@ async def test_history_shed_on_the_previous_turn_stays_shed_between_the_marks(
 
 
 @pytest.mark.asyncio
-async def test_three_round_tool_turn_stubs_earlier_results_and_keeps_the_latest_round(delivery_confirmations: list[bool]) -> None:
+async def test_three_round_tool_turn_over_the_high_mark_sends_every_result_of_the_turn_whole(delivery_confirmations: list[bool]) -> None:
+    # Was: the earliest result was stubbed on the last call. Results of the turn in progress are
+    # never segments, so with no earlier turn to leave out the request goes as it is.
     base = await _base_request_bytes()
     delivery_confirmations.clear()
     big = "r" * (base * 3 // 10)
@@ -333,18 +335,15 @@ async def test_three_round_tool_turn_stubs_earlier_results_and_keeps_the_latest_
     for call, request in zip(result.llm_calls, provider.requests, strict=True):
         assert call.context_budget is not None
         _assert_record_matches_request(call, request)
-    assert [call.context_budget.stubbed_tool_call_ids for call in result.llm_calls if call.context_budget is not None] == [
-        (),
-        (),
-        (),
-        ("call-1",),
-    ]
+    assert [call.context_budget.stubbed_tool_call_ids for call in result.llm_calls if call.context_budget is not None] == [(), (), (), ()]
+    last = result.llm_calls[3].context_budget
+    assert last is not None
+    # The last request is over the high mark: there was simply nothing from an earlier turn to leave out.
+    assert last.estimated_tokens_after > service._context_budget_policy.shed_above * service._context_budget_policy.max_prompt_tokens
     tool_messages = {m["tool_call_id"]: m for m in provider.requests[3]["messages"] if m["role"] == "tool"}
     assert set(tool_messages) == {"call-1", "call-2", "call-3"}
-    assert tool_messages["call-1"]["content"] == CONTEXT_BUDGET_TOOL_RESULT_STUB
-    # Protected content is above low; reaching high keeps the newer result.
-    assert big + "2" in tool_messages["call-2"]["content"]
-    assert big + "3" in tool_messages["call-3"]["content"]
+    for index in ("1", "2", "3"):
+        assert big + index in tool_messages[f"call-{index}"]["content"]
     # Every tool call still has its result, in the order the provider requires.
     assistant_ids = [call["id"] for m in provider.requests[3]["messages"] if m["role"] == "assistant" for call in m["tool_calls"]]
     assert assistant_ids == ["call-1", "call-2", "call-3"]
@@ -352,7 +351,8 @@ async def test_three_round_tool_turn_stubs_earlier_results_and_keeps_the_latest_
 
 
 @pytest.mark.asyncio
-async def test_latest_round_with_parallel_tool_calls_keeps_both_results() -> None:
+async def test_parallel_tool_calls_and_the_earlier_round_keep_every_result() -> None:
+    # Was: the earlier round's result was stubbed. Every round of the turn is now sent whole.
     base = await _base_request_bytes()
     tool_data = {
         "call-1": {"rows": "a" * (base * 4 // 10)},
@@ -366,16 +366,16 @@ async def test_latest_round_with_parallel_tool_calls_keeps_both_results() -> Non
 
     last_call = result.llm_calls[2]
     assert last_call.context_budget is not None
-    assert last_call.context_budget.stubbed_tool_call_ids == ("call-1",)
+    assert last_call.context_budget.stubbed_tool_call_ids == ()
     tool_messages = {m["tool_call_id"]: m["content"] for m in provider.requests[2]["messages"] if m["role"] == "tool"}
-    assert tool_messages["call-1"] == CONTEXT_BUDGET_TOOL_RESULT_STUB
+    assert "a" * (base * 4 // 10) in tool_messages["call-1"]
     assert "b" * (base * 2 // 10) in tool_messages["call-2a"]
     assert "c" * (base * 2 // 10) in tool_messages["call-2b"]
     _assert_record_matches_request(last_call, provider.requests[2])
 
 
 @pytest.mark.asyncio
-async def test_tool_result_shorter_than_the_stub_is_never_stubbed() -> None:
+async def test_tool_results_of_the_turn_are_not_stubbed_while_history_is_shed() -> None:
     base = await _base_request_bytes()
     service, _session_id = _service(_cap_for(base))
     plugin_snapshot, policy_catalog = service._policy_context.build("test-user")
@@ -422,7 +422,7 @@ async def test_tool_result_shorter_than_the_stub_is_never_stubbed() -> None:
 
     # The history pushed the request over the high mark, so shedding ran ...
     assert record.shed_history_indices == (1, 3, 5)
-    # ... yet the short earlier result was not stubbed: stubbing it saves nothing.
+    # ... yet no result of the turn was stubbed: only earlier turns are left out.
     assert record.stubbed_tool_call_ids == ()
     assert [m["content"] for m in selected if m["role"] == "tool"] == [short, short]
     # The caller's list is untouched.
@@ -430,36 +430,32 @@ async def test_tool_result_shorter_than_the_stub_is_never_stubbed() -> None:
 
 
 @pytest.mark.asyncio
-async def test_current_message_larger_than_the_cap_is_refused_before_any_provider_call() -> None:
+async def test_current_message_estimated_over_the_token_setting_is_sent_and_recorded_as_over() -> None:
+    """The token setting decides what is left out, never whether the message goes."""
     base = await _base_request_bytes()
     # The message is larger than any protected component (the system prompt
-    # included) yet below the credential guard's per-string bound, so only
-    # the context budget can stop it before dispatch.
+    # included) yet below the credential guard's per-string bound, and the
+    # whole request is far under the byte maximum.
     current_message = "Please build the pipeline. " * (base * 85 // 100 // 27)
     assert len(current_message.encode()) < 262_144
     cap = base // 2
     service, session_id = _service(cap)
     provider = _RecordingProvider(_make_llm_response(content="Done."))
 
-    with (
-        patch("litellm.acompletion", new_callable=AsyncMock, side_effect=provider.complete),
-        pytest.raises(ComposerConvergenceError) as exc_info,
-    ):
-        await service.compose(current_message, [], _empty_state(), session_id=session_id)
+    result = await _compose(service, session_id, [], provider, message=current_message)
 
-    assert provider.requests == []
-    error = exc_info.value
-    assert error.reason == "context_budget_exceeded"
-    # The refusal is not a non-convergence; its message is the user-facing refusal.
-    assert str(error) == "This conversation is too large for the composer to continue. Start a new session, or shorten your request."
-    assert error.llm_calls == ()
-    assert error.evidence["largest_component"] == "current_message"
-    assert error.evidence["ceiling"] == "tokens"
-    assert error.evidence["max_prompt_tokens"] == cap
-    assert error.evidence["max_request_bytes"] == 960 * 1024
-    assert error.evidence["estimated_tokens"] > cap
-    # The protected request plus the oversized message, nothing shed.
-    assert error.evidence["request_bytes"] > len(current_message) + base // 2
+    (request,) = provider.requests
+    assert current_message in [m["content"] for m in request["messages"]]
+    (call,) = result.llm_calls
+    record = call.context_budget
+    assert record is not None
+    assert record.over_estimate is True
+    assert record.max_prompt_tokens == cap
+    assert record.estimated_tokens_after > cap
+    # The protected request plus the oversized message: there was nothing to leave out.
+    assert record.shed_history_indices == () and record.stubbed_tool_call_ids == ()
+    assert record.request_wire_bytes == _wire_bytes(request) > len(current_message) + base // 2
+    assert record.to_dict()["over_estimate"] is True and record.to_dict()["max_prompt_tokens"] == cap
 
 
 @pytest.mark.asyncio
@@ -563,7 +559,8 @@ async def test_a_request_within_the_re_render_margin_sheds_one_more_segment_and_
 @pytest.mark.asyncio
 @_MODELS
 async def test_a_dispatched_request_never_exceeds_either_ceiling(model: str) -> None:
-    """Over ceilings straddling the size after one shed, every request is sent within both ceilings or refused unsent."""
+    """Over ceilings straddling the size after one shed: the byte maximum is never exceeded by a sent request,
+    and a request over the token setting is sent only with everything shed and recorded as over."""
     user_request = _user(0, "Please read the CSV file.")
     # Both ceilings straddle the wire size after one shed.
     _one_shed_content, one_shed_wire = await _measure_sizes(model, [user_request, _SECOND_REPLY])
@@ -571,13 +568,14 @@ async def test_a_dispatched_request_never_exceeds_either_ceiling(model: str) -> 
     deltas = (-3_000, -400, -10, 0, 10, 100, 400)
     ceilings = [(_GENEROUS_TOKENS, one_shed_wire + delta) for delta in deltas]
     ceilings += [(one_shed_wire + delta, 960 * 1024) for delta in deltas]
-    sent = 0
+    sent = overs = 0
     for max_prompt_tokens, max_request_bytes in ceilings:
         provider, outcome = await _compose_or_refusal(
             model, history, max_prompt_tokens=max_prompt_tokens, max_request_bytes=max_request_bytes
         )
         if isinstance(outcome, ComposerConvergenceError):
             assert outcome.reason == "context_budget_exceeded", outcome.reason
+            assert outcome.evidence["ceiling"] == "bytes", (max_prompt_tokens, max_request_bytes)
             assert provider.requests == [] and outcome.llm_calls == ()
             continue
         sent += 1
@@ -586,8 +584,15 @@ async def test_a_dispatched_request_never_exceeds_either_ceiling(model: str) -> 
         # The byte ceiling holds on the bytes of the request actually sent.
         assert _wire_bytes(request) <= max_request_bytes, (max_prompt_tokens, max_request_bytes)
         assert call.context_budget is not None
-        assert call.context_budget.estimated_tokens_after <= max_prompt_tokens, (max_prompt_tokens, max_request_bytes)
-    assert sent >= len(ceilings) - 2  # the two tightest ceilings may refuse; the rest are sent
+        over = call.context_budget.estimated_tokens_after > max_prompt_tokens
+        assert call.context_budget.over_estimate is over, (max_prompt_tokens, max_request_bytes)
+        assert call.context_budget.max_prompt_tokens == max_prompt_tokens
+        if over:
+            overs += 1
+            # Sent over the setting only with the whole earlier conversation left out.
+            assert call.context_budget.shed_history_indices == (0, 1, 2), (max_prompt_tokens, max_request_bytes)
+    assert sent >= len(ceilings) - 2  # the two tightest byte ceilings may refuse; the rest are sent
+    assert overs >= 1  # the tightest token setting is exceeded with everything shed, and still sent
 
 
 @pytest.mark.asyncio
@@ -780,21 +785,18 @@ def _argument_heavy_turn(call_id: str, padding: str) -> Any:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("ceiling", ["tokens", "bytes"])
-async def test_tool_call_arguments_count_toward_both_ceilings(ceiling: str) -> None:
+async def test_tool_call_arguments_count_toward_the_byte_maximum() -> None:
     """An assistant message with tiny content and large tool-call arguments is counted, not measured as its content.
 
     Arguments are protected, so the second request of the turn, which carries
-    them, cannot be fitted: it is refused unsent rather than dispatched over
-    the ceiling.
+    them, cannot be fitted under the byte maximum: it is refused unsent.
     """
     model = "openrouter/openai/gpt-5.5"
     base_content, base_wire = await _measure_sizes(model, [])
     padding = "a" * 200_000
-    # The first request fits with room to spare; the arguments alone carry the second past the ceiling.
+    # The first request fits with room to spare; the arguments alone carry the second past the maximum.
     limit_bytes = base_wire + 100_000
-    max_prompt_tokens, max_request_bytes = (limit_bytes, 960 * 1024) if ceiling == "tokens" else (_GENEROUS_TOKENS, limit_bytes)
-    service, session_id = _service(max_prompt_tokens, composer_model=model, composer_planner_max_request_bytes=max_request_bytes)
+    service, session_id = _service(_GENEROUS_TOKENS, composer_model=model, composer_planner_max_request_bytes=limit_bytes)
     provider = _RecordingProvider(_argument_heavy_turn("call-1", padding), _make_llm_response(content="Done."))
 
     with pytest.raises(ComposerConvergenceError) as exc_info:
@@ -803,7 +805,7 @@ async def test_tool_call_arguments_count_toward_both_ceilings(ceiling: str) -> N
     assert len(provider.requests) == 1
     refusal = exc_info.value
     assert refusal.reason == "context_budget_exceeded"
-    assert refusal.evidence["ceiling"] == ceiling
+    assert refusal.evidence["ceiling"] == "bytes"
     assert refusal.evidence["request_bytes"] > base_wire + len(padding)
     # The refusal names the component that is actually largest on the wire: the tool round
     # whose arguments fill the request, not the largest piece of string content.
@@ -819,6 +821,27 @@ async def test_tool_call_arguments_count_toward_both_ceilings(ceiling: str) -> N
     assert second.request_byte_split is not None and second.context_budget is not None
     assert second.request_byte_split.total_bytes < base_content + 20_000 < limit_bytes
     assert second.context_budget.request_wire_bytes == _wire_bytes(control.requests[1]) > base_wire + len(padding)
+
+
+@pytest.mark.asyncio
+async def test_tool_call_arguments_count_toward_the_token_estimate_and_the_request_is_still_sent() -> None:
+    """The same turn against the token setting: the arguments are counted, and the second request goes anyway."""
+    model = "openrouter/openai/gpt-5.5"
+    _base_content, base_wire = await _measure_sizes(model, [])
+    padding = "a" * 200_000
+    max_prompt_tokens = base_wire + 100_000
+    service, session_id = _service(max_prompt_tokens, composer_model=model)
+    provider = _RecordingProvider(_argument_heavy_turn("call-1", padding), _make_llm_response(content="Done."))
+
+    result = await _compose(service, session_id, [], provider)
+
+    assert len(provider.requests) == 2
+    first, second = (call.context_budget for call in result.llm_calls)
+    assert first is not None and second is not None
+    assert first.over_estimate is False
+    assert second.over_estimate is True
+    assert second.estimated_tokens_after > max_prompt_tokens
+    assert second.request_wire_bytes > base_wire + len(padding)
 
 
 def test_the_wire_measure_counts_tool_call_arguments_and_thinking_blocks_that_the_content_split_leaves_out() -> None:
@@ -936,7 +959,9 @@ async def test_a_turn_that_sheds_nothing_sends_no_notice() -> None:
 
 
 @pytest.mark.asyncio
-async def test_stubbing_tool_results_alone_sends_no_notice() -> None:
+async def test_a_turn_over_the_high_mark_with_no_history_sends_no_notice() -> None:
+    # Was: stubbing tool results alone sent no notice. No result of the turn is stubbed now;
+    # the same turn, over the high mark with nothing earlier to leave out, still sends none.
     base = await _base_request_bytes()
     big = "r" * (base * 3 // 10)
     tool_data = {"call-1": {"rows": big + "1"}, "call-2": {"rows": big + "2"}, "call-3": {"rows": big + "3"}}
@@ -946,7 +971,7 @@ async def test_stubbing_tool_results_alone_sends_no_notice() -> None:
     result = await _compose(service, session_id, [], probe, tool_data=tool_data, progress=probe.sink)
 
     last = result.llm_calls[-1].context_budget
-    assert last is not None and last.stubbed_tool_call_ids == ("call-1",)
+    assert last is not None and last.stubbed_tool_call_ids == () and last.shed_history_indices == ()
     assert probe.notices() == []
 
 
@@ -1006,13 +1031,12 @@ def _two_round_turn(service: ComposerServiceImpl, first: str, second: str) -> li
 
 
 @pytest.mark.asyncio
-async def test_an_escape_heavy_result_that_fits_once_stubbed_in_the_reply_stage_is_stubbed_not_refused() -> None:
-    """A reply-stage saving is measured on the quoted form the reply stage sends.
+async def test_an_escape_heavy_earlier_result_over_the_byte_maximum_in_the_reply_stage_is_refused_not_stubbed() -> None:
+    """The reply stage quotes each tool record as JSON text, so a backslash in a result is four bytes on the wire.
 
-    The reply stage quotes each tool record as JSON text, so a backslash in a
-    result is four bytes on the wire against two in the loop's tool message.
-    Measured on the loop's form, half the result's escapes stay in the size
-    bound once it is stubbed, and a reply that fits would be refused.
+    Was: the earlier result was stubbed to fit, its saving measured on the
+    quoted form. A result of the turn in progress is never stubbed, so a reply
+    whose own turn is over the byte maximum is refused before dispatch.
     """
     first = "\\" * 50_000
     generous, _ = _service(_GENEROUS_TOKENS)
@@ -1020,19 +1044,26 @@ async def test_an_escape_heavy_result_that_fits_once_stubbed_in_the_reply_stage_
     small, small_tools, _ = await _prepare_reply(generous, _two_round_turn(generous, "x", "s"))
     full_wire = request_wire_bytes(unshed, unshed_tools)
     cap = request_wire_bytes(small, small_tools) + 2_000
-    loop_form_saving = len(canonical_json(first).encode("utf-8")) - 2 - len(CONTEXT_BUDGET_TOOL_RESULT_STUB)
-    assert full_wire - loop_form_saving > cap
+    assert full_wire > cap
     service, _ = _service(_GENEROUS_TOKENS, composer_planner_max_request_bytes=cap)
 
-    selected, tools, record = await _prepare_reply(service, _two_round_turn(service, first, "s"))
+    with pytest.raises(ComposerConvergenceError) as caught:
+        await _prepare_reply(service, _two_round_turn(service, first, "s"))
 
-    assert record.stubbed_tool_call_ids == ("call-1",)
-    assert CONTEXT_BUDGET_TOOL_RESULT_STUB in selected[5]["content"]
-    assert request_wire_bytes(selected, tools) <= cap
+    assert caught.value.reason == "context_budget_exceeded"
+    assert caught.value.evidence["ceiling"] == "bytes"
+    assert caught.value.evidence["request_bytes"] == full_wire
+    # Control: just above the turn's own size, the same reply is sent with the result quoted in full.
+    roomy, _ = _service(_GENEROUS_TOKENS, composer_planner_max_request_bytes=full_wire + 1_000)
+    selected, tools, record = await _prepare_reply(roomy, _two_round_turn(roomy, first, "s"))
+    assert record.stubbed_tool_call_ids == ()
+    assert CONTEXT_BUDGET_TOOL_RESULT_STUB not in selected[5]["content"]
+    assert request_wire_bytes(selected, tools) == full_wire
 
 
 @pytest.mark.asyncio
-async def test_the_reply_stage_request_stubs_earlier_tool_results_and_keeps_the_latest_round() -> None:
+async def test_the_reply_stage_request_quotes_every_tool_result_of_the_turn_in_full() -> None:
+    # Was: under the same pressure the earlier round's result was quoted as the stub.
     base = await _base_request_bytes()
     first, second = "f" * (base * 6 // 10), "s" * (base * 6 // 10)
     generous, _ = _service(_GENEROUS_TOKENS)
@@ -1050,27 +1081,28 @@ async def test_the_reply_stage_request_stubs_earlier_tool_results_and_keeps_the_
 
     selected, tools, record = await _prepare_reply(service, llm_messages)
 
-    assert record.stubbed_tool_call_ids == ("call-1",)
-    assert record.estimated_tokens_after < record.estimated_tokens_before <= cap
+    assert record.stubbed_tool_call_ids == ()
+    assert record.estimated_tokens_after == record.estimated_tokens_before
+    assert record.estimated_tokens_before > service._context_budget_policy.shed_above * cap
+    assert selected == unshed
     assert [m["role"] for m in selected[4:]] == ["assistant", "user", "assistant", "user", "system"]
-    # The earlier round's result is quoted as the stub; the latest round is quoted in full.
-    assert first not in selected[5]["content"] and CONTEXT_BUDGET_TOOL_RESULT_STUB in selected[5]["content"]
-    assert second in selected[7]["content"]
+    assert first in selected[5]["content"] and second in selected[7]["content"]
     assert (selected[8]["role"], selected[8]["content"]) == ("system", _REPLY_STAGE_INSTRUCTION)
-    assert message_bytes(selected, tools).total_bytes < full_content - len(first) + 1_000
     assert request_wire_bytes(selected, tools) <= service._context_budget_policy.max_request_bytes
     # The loop's own messages keep their tool roles and full results.
     assert llm_messages == before
 
 
 @pytest.mark.asyncio
-async def test_a_result_stubbed_on_an_earlier_call_stays_stubbed_in_the_reply_stage_request() -> None:
+async def test_a_tool_key_recorded_by_an_earlier_call_does_not_stub_a_reply_stage_result() -> None:
+    # Was: a result stubbed on an earlier call of the turn stayed stubbed in the reply stage.
+    # Such a key (recorded before results of the turn stopped being segments) is now inert.
     base = await _base_request_bytes()
     first, second = "f" * (base * 6 // 10), "s" * (base * 6 // 10)
     generous, _ = _service(_GENEROUS_TOKENS)
     unshed, unshed_tools, _ = await _prepare_reply(generous, _two_round_turn(generous, first, second))
     full_content = message_bytes(unshed, unshed_tools).total_bytes
-    # The unshed reply request sits at 70% of the cap: between the marks, so nothing new is shed.
+    # The unshed reply request sits at 70% of the cap: between the marks.
     service, _ = _service(full_content * 10 // 7)
     earlier = build_llm_call_record(
         model_requested="openrouter/openai/gpt-5.5",
@@ -1092,21 +1124,19 @@ async def test_a_result_stubbed_on_an_earlier_call_stays_stubbed_in_the_reply_st
         ),
     )
 
-    for earlier_calls, expected in (((earlier,), ("call-1",)), ((), ())):
+    for earlier_calls in ((earlier,), ()):
         recorder = SimpleNamespace(llm_calls=earlier_calls, invocations=())
         selected, _tools, record = await _prepare_reply(service, _two_round_turn(service, first, second), recorder)
-        assert record.stubbed_tool_call_ids == expected
-        assert (first in selected[5]["content"]) == (not expected)
+        assert record.stubbed_tool_call_ids == ()
+        assert first in selected[5]["content"] and CONTEXT_BUDGET_TOOL_RESULT_STUB not in selected[5]["content"]
         assert second in selected[7]["content"]
 
-    # Under the low mark too: the reply-stage request is smaller than the loop's, and a
-    # result stubbed earlier in the turn stays stubbed for the rest of the turn.
+    # Under the low mark too.
     recorder = SimpleNamespace(llm_calls=(earlier,), invocations=())
     selected, _tools, record = await _prepare_reply(generous, _two_round_turn(generous, first, second), recorder)
     assert record.estimated_tokens_before < generous._context_budget_policy.shed_to * generous._context_budget_policy.max_prompt_tokens
-    assert record.stubbed_tool_call_ids == ("call-1",)
-    assert first not in selected[5]["content"] and CONTEXT_BUDGET_TOOL_RESULT_STUB in selected[5]["content"]
-    assert second in selected[7]["content"]
+    assert record.stubbed_tool_call_ids == ()
+    assert first in selected[5]["content"] and second in selected[7]["content"]
 
 
 # --- Conservative estimate despite historical measurements ---------------------------------------
@@ -1132,7 +1162,11 @@ async def test_compose_anchor_refutes_authored_pricing() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("metadata", ["missing", "legacy", "oversize"])
-async def test_compose_anchor_authored_metadata_fails_closed(monkeypatch: pytest.MonkeyPatch, metadata: str) -> None:
+async def test_compose_anchor_without_authored_metadata_is_priced_no_lower_than_the_providers_count(
+    monkeypatch: pytest.MonkeyPatch, metadata: str
+) -> None:
+    """Missing or legacy authored metadata no longer selects the arm; an inconsistent value is still refused."""
+
     def anchor_with_metadata(**kwargs: Any) -> Any:
         calls = []
         for call in kwargs["calls"]:
@@ -1164,9 +1198,11 @@ async def test_compose_anchor_authored_metadata_fails_closed(monkeypatch: pytest
     budget = result.llm_calls[1].context_budget
     assert budget is not None
     assert budget.estimated_tokens_after >= 100_000
-    assert budget.pricing_mode == "anchored"
     assert budget.anchor_status == "authored_evidence_unavailable"
+    # The provider counted the first request denser than the policy rate; its density is the rate used.
     assert budget.authored_refuted is True
+    assert budget.pricing_mode == "authored_prefix"
+    assert 1.0 < float(budget.bytes_per_token) < 3.0
 
 
 @pytest.mark.asyncio

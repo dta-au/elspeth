@@ -27,14 +27,21 @@ import type { CompositionState } from "@/types/index";
 import type { InterpretationEvent, PromptReviewSnapshotResponse } from "@/types/interpretation";
 import { getPromptReviewSnapshot } from "@/api/client";
 import { Button } from "@/components/ui";
+import { promptQueryCopyName, promptQueryEntries } from "@/lib/blobBindings";
+import { PromptCopyButton } from "@/components/inspector/PromptCopyButton";
 import { CodeBlock } from "./CodeBlock";
 import {
   PENDING_INTERPRETATION_DISPLAY_TEXT,
   promptReviewDisplay,
+  promptReviewIsUserSuppliedFiles,
+  promptSlotDefinitionLabel,
   promptSlotLabel,
-  promptSlotStatus,
+  promptSlotNotShownLabel,
+  promptSlotViews,
   type PromptDisplayResult,
   type PromptSlotStatus,
+  type PromptSlotView,
+  type PromptSlotViews,
 } from "./promptTemplateDisplay";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import {
@@ -81,6 +88,40 @@ const LEGEND_TEXT: Record<PromptSlotStatus, string> = {
   pending: "Pending — awaiting its own review",
   unknown: "Status not shown here — see its own card",
 };
+
+/**
+ * A legend entry. A slot whose approved definition cannot be shown has its
+ * own entry: it has no card of its own, and the gate note gives the reason.
+ * It shares the "unknown" swatch.
+ */
+type LegendKey = PromptSlotStatus | "not_shown";
+
+const LEGEND_KEYS: readonly LegendKey[] = ["accepted", "pending", "unknown", "not_shown"];
+
+const LEGEND_KEY_TEXT: Record<LegendKey, string> = {
+  ...LEGEND_TEXT,
+  not_shown: "Definition not shown: see the note above",
+};
+
+function slotViewLegendKey(view: PromptSlotView): LegendKey {
+  return view.kind === "not_shown" ? "not_shown" : slotViewStatus(view);
+}
+
+/** The status a slot view is tinted, keyed and announced with. */
+function slotViewStatus(view: PromptSlotView): PromptSlotStatus {
+  if (view.kind === "definition") return "accepted";
+  if (view.kind === "own_card") return view.status;
+  return "unknown";
+}
+
+/** The visible text of a slot mark, in brackets as the delimiter. */
+function slotViewLabel(view: PromptSlotView): string {
+  if (view.kind === "definition") return `[${promptSlotDefinitionLabel(view.userTerm, view.choice, view.value)}]`;
+  if (view.kind === "own_card") return `[${promptSlotLabel(view.userTerm)}: ${SLOT_STATUS_WORDS[view.status]}]`;
+  return `[${promptSlotNotShownLabel(view.userTerm)}]`;
+}
+
+const NO_SLOT_VIEWS: PromptSlotViews = { slots: [], failure: null };
 
 function snapshotLoadReason(err: unknown): string {
   const code = typeof err === "object" && err !== null && "error_type" in err ? (err as { error_type?: unknown }).error_type : undefined;
@@ -470,6 +511,14 @@ export function AcknowledgementCard({
   const llmDraft = event.llm_draft ?? "";
   const userTerm = event.user_term ?? "this term";
 
+  // Wording only. Who wrote the instruction is said only once the stored
+  // snapshot says it: files a user supplied, or (every other loaded case)
+  // the LLM. While the snapshot is loading, or when it cannot be loaded,
+  // the card names no author, so a card for a user's file never shows
+  // "The LLM wrote the instruction", even for a moment. The view gate and
+  // what Approve sends do not read any of this.
+  const promptIsUserSuppliedFiles = promptReview.status === "ready" && promptReviewIsUserSuppliedFiles(promptReview.snapshot);
+
   const promptDisplay: PromptDisplayResult | null = !requiresPromptView
     ? null
     : promptReview.status === "ready"
@@ -477,15 +526,23 @@ export function AcknowledgementCard({
       : placeholderDisplay(
           promptReview.status === "loading" ? "Loading the reviewed prompt…" : "The reviewed prompt is unavailable.",
         );
-  // Slot STATUS only: the live interpretation events say whether each slot's
-  // own review is pending or accepted. The slot's text never comes from here.
+  // Each slot from the snapshot's frozen skeleton: a slot naming an event
+  // shows that event's approved definition (checked against the snapshot's
+  // rendered prompt); a slot with no event shows its own review's live
+  // status and no definition. A slot that cannot be shown leaves the card
+  // with no Approve (`slotViews.failure` says why).
   const pendingEvents = useInterpretationEventsStore((s) => s.pendingBySession[sessionId]);
   const resolvedEvents = useInterpretationEventsStore((s) => s.resolvedBySession[sessionId]);
-  const slotStatuses: PromptSlotStatus[] = (promptDisplay?.segments ?? []).flatMap((segment) =>
-    segment.kind === "slot" ? [promptSlotStatus(segment, event.affected_node_id, pendingEvents, resolvedEvents)] : [],
-  );
-  const promptHasSlot = slotStatuses.length > 0;
-  const promptReviewAvailable = promptDisplay?.reviewAvailable === true;
+  const slotViews: PromptSlotViews =
+    promptReview.status === "ready"
+      ? promptSlotViews(promptReview.display, promptReview.snapshot, event.affected_node_id, pendingEvents, resolvedEvents)
+      : NO_SLOT_VIEWS;
+  const legendKeys = new Set(slotViews.slots.map(slotViewLegendKey));
+  const promptHasSlot = slotViews.slots.length > 0;
+  const promptHasDefinition = slotViews.slots.some((view) => view.kind === "definition");
+  const promptHasOwnCardSlot = slotViews.slots.some((view) => view.kind === "own_card");
+  const promptSlotsAllOwnCard = promptHasSlot && slotViews.slots.every((view) => view.kind === "own_card");
+  const promptReviewAvailable = promptDisplay?.reviewAvailable === true && slotViews.failure === null;
   const valueIsLong =
     llmDraft.length > 140 || llmDraft.split("\n").length > 4;
   // invented_source shows pretty-printed JSON; short values inline, long
@@ -523,6 +580,13 @@ export function AcknowledgementCard({
     stepLabel,
     stepTitle ?? defaultStepTitle(stepLabel),
   );
+  const cardLine = !requiresPromptView
+    ? presentation.line
+    : promptReview.status !== "ready"
+      ? "This step's instruction is waiting for your approval."
+      : promptIsUserSuppliedFiles
+        ? "The instruction for this step comes from a file supplied by a user."
+        : presentation.line;
   const chooseMode = mode === "choose" || !showAmend;
 
   // Data-contract body: the demanded columns with per-field sample warnings,
@@ -605,7 +669,9 @@ export function AcknowledgementCard({
   const promptGateReason =
     promptReview.status === "error"
       ? promptReview.reason
-      : "The complete prompt is not available yet. Reload the session if it does not load; the preview cannot be approved.";
+      : slotViews.failure !== null
+        ? slotViews.failure
+        : "The complete prompt is not available yet. Reload the session if it does not load; the preview cannot be approved.";
 
   const spinner = (
     <>
@@ -669,28 +735,34 @@ export function AcknowledgementCard({
                 in that state is present. */}
             {promptHasSlot && (
               <ul className="ack-card-prompt-legend">
-                {(["accepted", "pending", "unknown"] as const)
-                  .filter((status) => slotStatuses.includes(status))
-                  .map((status) => (
-                    <li key={status}>
-                      <span
-                        className={`ack-card-prompt-legend-swatch ack-card-prompt-slot--${status}`}
-                        aria-hidden="true"
-                      />
-                      {LEGEND_TEXT[status]}
-                    </li>
-                  ))}
+                {LEGEND_KEYS.filter((key) => legendKeys.has(key)).map((key) => (
+                  <li key={key}>
+                    <span
+                      className={`ack-card-prompt-legend-swatch ack-card-prompt-slot--${key === "not_shown" ? "unknown" : key}`}
+                      aria-hidden="true"
+                    />
+                    {LEGEND_KEY_TEXT[key]}
+                  </li>
+                ))}
               </ul>
             )}
+            {/* Each prompt's heading, then the file it is read from (display
+                only: Approve sends the snapshot's anchor, never this text). */}
             {promptDisplay.systemPrompt !== undefined && (
               <>
                 {promptDisplay.systemPrompt !== null && (
                   <>
                     <p className="ack-card-prompt-role">System prompt</p>
+                    {promptDisplay.systemPromptFile !== undefined && (
+                      <p className="ack-card-prompt-file">File: {promptDisplay.systemPromptFile}</p>
+                    )}
                     <pre className="ack-card-prompt-pre">{promptDisplay.systemPrompt}</pre>
                   </>
                 )}
                 <p className="ack-card-prompt-role">User prompt</p>
+                {promptDisplay.promptTemplateFile !== undefined && (
+                  <p className="ack-card-prompt-file">File: {promptDisplay.promptTemplateFile}</p>
+                )}
               </>
             )}
             <pre className="ack-card-prompt-pre">
@@ -698,24 +770,51 @@ export function AcknowledgementCard({
                 let slotIndex = 0;
                 return promptDisplay.segments.map((segment, index) => {
                   if (segment.kind === "text") return <span key={index}>{segment.text}</span>;
-                  const status = slotStatuses[slotIndex++];
+                  const view = slotViews.slots[slotIndex++];
+                  const status = slotViewStatus(view);
                   return (
                     <mark key={index} className={`ack-card-prompt-slot ack-card-prompt-slot--${status}`}>
                       {/* The tint is CSS-only, so the status is also in the
                           span's text (forced colors strip the tint) and in
                           an sr-only prefix (WCAG 1.3.1). Same words as the
-                          legend, so the encodings agree. */}
+                          legend, so the encodings agree. A definition is
+                          shown whole, as text, after the term's name. */}
                       <span className="visually-hidden">{`interpretation slot, ${SLOT_STATUS_WORDS[status]}: `}</span>
-                      {`[${promptSlotLabel(segment.userTerm)}: ${SLOT_STATUS_WORDS[status]}]`}
+                      {slotViewLabel(view)}
                     </mark>
                   );
                 });
               })()}
             </pre>
-            {promptHasSlot && (
+            {promptReview.status === "ready" && (() => {
+              const surface = promptReview.snapshot.authored_surface;
+              const queries = promptQueryEntries(surface.queries).filter((query) => typeof query.entry.template === "string");
+              if (typeof surface.system_prompt !== "string" && typeof surface.prompt_template !== "string" && queries.length === 0) return null;
+              // One wrapping row under the text, so several copy controls
+              // line up instead of running on as inline buttons.
+              return <div className="ack-card-copy-actions">
+                {typeof surface.system_prompt === "string" && (
+                  <PromptCopyButton value={surface.system_prompt} label="system prompt" showLabel />
+                )}
+                {typeof surface.prompt_template === "string" && (
+                  <PromptCopyButton value={surface.prompt_template} label="user prompt template" showLabel />
+                )}
+                {queries.map((query) => (
+                  <PromptCopyButton key={query.selector} value={String(query.entry.template)} label={`prompt template for query ${promptQueryCopyName(query)}`} showLabel />
+                ))}
+              </div>;
+            })()}
+            {promptHasDefinition && (
               <p className="ack-card-prompt-pending-note">
-                A marked term is reviewed in its own card, which approves its
-                value; this card approves the prompt around it.
+                Terms shown with a definition keep their approved definitions,
+                shown in place; this card approves the wording around them.
+              </p>
+            )}
+            {promptHasOwnCardSlot && (
+              <p className="ack-card-prompt-pending-note">
+                {promptSlotsAllOwnCard
+                  ? "A marked term is reviewed in its own card, which approves its value; this card approves the prompt around it."
+                  : "A term marked “reviewed in its own card” has its value approved in that card."}
               </p>
             )}
             {promptDisplay.hasPendingSlot === true && (
@@ -758,7 +857,7 @@ export function AcknowledgementCard({
       </h3>
 
       <div className="ack-card-main">
-        <p className="ack-card-line">{presentation.line}</p>
+        <p className="ack-card-line">{cardLine}</p>
         {/* Always mounted for a prompt card so a changed-snapshot notice is
             announced when it appears (a live region inserted with its text
             already inside is not reliably read). The replacement text is
@@ -778,9 +877,9 @@ export function AcknowledgementCard({
               promptGateReason
             ) : (
               <>
-            <strong>{ACKNOWLEDGEMENT_VIEW_PROMPT_LABEL}</strong> shows the
-            LLM's instruction; {ACKNOWLEDGEMENT_APPROVE_LABEL} unlocks once
-            you have viewed it.
+            <strong>{ACKNOWLEDGEMENT_VIEW_PROMPT_LABEL}</strong> shows the{" "}
+            {promptIsUserSuppliedFiles ? "file's text" : "LLM's instruction"};{" "}
+            {ACKNOWLEDGEMENT_APPROVE_LABEL} unlocks once you have viewed it.
               </>
             )}
           </p>

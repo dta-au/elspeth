@@ -48,3 +48,41 @@ def test_canonical_hash_is_32_hex_chars():
     digest = canonical_hash({"a": 1})
     assert len(digest) == 32
     int(digest, 16)  # raises ValueError if not valid hex
+
+
+def test_the_allowlist_is_exactly_the_reviewed_set():
+    allowed = set(SAFE_FIELDS)
+    assert allowed == {
+        "request_id",
+        "request_hash",
+        "response_hash",
+        "contract_major",
+        "adapter_name",
+        "adapter_version",
+        "adapter_api_major",
+        "adapter_fingerprint",
+        "model_alias",
+        "mapping_generation",
+        "status",
+        "latency_ms",
+        "response_bytes",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "upstream_status_class",
+        "upstream_status_code",
+        "validation_stage",
+        "exception_category",
+        "stop_reason_category",
+        "content_block_count",
+        "text_block_count",
+        "tool_block_count",
+        "other_block_count",
+        "empty_text_block_count",
+        "malformed_tool_block_count",
+        "oauth_cache_hit",
+        "oauth_refresh",
+        "oauth_refresh_outcome",
+        "error_code",
+        "event",
+    }

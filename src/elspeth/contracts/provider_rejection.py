@@ -13,7 +13,9 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 RequestRejectionReason = Literal["invalid_request", "context_length_exceeded", "unsupported_parameter"]
 ReasonDisposition = Literal["retained", "absent", "unrecognized", "unavailable"]
-ReasonSource = Literal["sdk_body", "http_response", "unavailable"]
+# ``sdk_class`` and ``message_pattern`` admit only ``context_length_exceeded``: the SDK's own
+# context-window exception class, or a fixed wording of that rejection on an HTTP 400.
+ReasonSource = Literal["sdk_body", "http_response", "sdk_class", "message_pattern", "unavailable"]
 
 
 class SafeRequestRejectionData(TypedDict):

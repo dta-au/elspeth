@@ -596,7 +596,7 @@
   container-type: inline-size;
 }
 
-/* The chat-input notice slot (elspeth-b3f4ecefee). Three states share one
+/* The chat-input notice slot (elspeth-b3f4ecefee). Four states share one
    position above the input row, so they share ONE chrome — a bordered notice
    card — and vary only the tone tokens. Previously each state invented its
    own species: a bordered card for the upload error, and loose unframed text
@@ -604,6 +604,7 @@
    in the same error register read as unrelated kinds of event and neither
    loose variant aligned with anything. */
 .chat-input-upload-alert,
+.chat-input-upload-status,
 .chat-input-bootstrapping,
 .chat-input-composer-unavailable {
   padding: var(--space-1-5) var(--space-2-5);
@@ -624,6 +625,9 @@
   background-color: var(--color-error-bg);
   color: var(--color-error);
 }
+
+/* .chat-input-upload-status — "Uploading <file>…" while a chat upload is in
+   flight; shown only then, in the same muted neutral register. */
 
 /* .chat-input-bootstrapping — the compose-timeout bootstrap notice, a soft,
    transient "connecting" status shown while the backend wall clock is still
@@ -2587,6 +2591,9 @@
   flex-direction: column;
   align-items: flex-start;
   gap: var(--space-xs);
+  /* A flex item may shrink below its longest unbreakable line; without this
+     the prompt box ran past the card's edge in a 390px column. */
+  min-width: 0;
 }
 
 .ack-card-view-toggle {
@@ -2608,6 +2615,7 @@
   background: none;
   border: 1px solid var(--color-border-strong);
   border-radius: var(--radius-sm);
+  font-family: var(--font-sans);
   font-size: var(--font-size-xs);
   color: var(--color-text-secondary);
   cursor: pointer;
@@ -2658,6 +2666,14 @@
   font-weight: var(--font-weight-semibold);
 }
 
+/* The file a prompt is read from, under that prompt's heading. */
+.ack-card-prompt-file {
+  margin: 0 0 var(--space-xs);
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-xs);
+  overflow-wrap: anywhere;
+}
+
 .ack-card-prompt-role:first-child {
   margin-top: 0;
 }
@@ -2686,14 +2702,19 @@
 }
 
 /* Interpretation slots in the displayed prompt (elspeth-990f5ea562, then
-   PFR #1-resolve): each span says the term is reviewed in its own card and
-   is tinted by that review's live status. It never shows the slot's value.
-   <mark> keeps the UA's forced-colors treatment for free, and the status is
-   in the span's text too, so no forced-colors block belongs here. */
+   PFR #1-resolve, then the carry card): a slot naming a term accepted
+   earlier shows that term's approved definition in place, whole; a slot not
+   accepted when the card was made says the term is reviewed in its own card.
+   The tint follows the status. <mark> keeps the UA's forced-colors treatment
+   for free, and the status is in the span's text too, so no forced-colors
+   block belongs here. A long definition wraps across lines; `clone` repeats
+   the padding, radius and border on every line so each line reads as part
+   of the slot. */
 .ack-card-prompt-slot {
   padding: 0 var(--space-2xs);
   border-radius: var(--radius-sm);
   color: var(--color-text);
+  box-decoration-break: clone;
 }
 
 .ack-card-prompt-slot--accepted {
@@ -2780,6 +2801,20 @@
 
 /* Secondary disclosure for the frozen staging-time template, shown only
    when it differs from the resolved render. */
+.ack-card-copy-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-xs);
+  margin-top: var(--space-xs);
+}
+
+/* A long query label wraps inside its button rather than widening the card. */
+.ack-card-copy-actions .btn-compact {
+  max-width: 100%;
+  white-space: normal;
+  text-align: start;
+}
+
 .ack-card-original-template {
   margin-top: var(--space-2xs);
 }

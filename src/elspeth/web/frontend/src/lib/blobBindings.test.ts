@@ -82,10 +82,47 @@ describe("prompt file editability display mirror", () => {
     ["prompt_file_mixed_use", { state: stateFor({ prompt_template: marker, queries: { one: { reference_blob_id: "file" } } }) }],
     ["prompt_file_shared_binding", { state: stateFor({ prompt_template: marker }, [{ id: "llm-2", plugin: "llm", options: { prompt_template: marker } }]) }],
     ["prompt_file_shared_binding", { state: stateFor({ prompt_template: marker, system_prompt: marker }) }],
-    ["prompt_file_node_multi_binding", { state: stateFor({ prompt_template: marker, system_prompt: { ...marker, blob_ref: "other" } }) }],
     ["prompt_file_encoding_unsupported", { state: stateFor({ prompt_template: { ...marker, encoding: "latin-1" } }) }],
     ["prompt_file_review_pending_inline", { state: stateFor({ prompt_template: marker, system_prompt: "You are helpful." }), pendingEvents: [{ choice: "pending", kind: "llm_prompt_template", affected_node_id: "llm" } as InterpretationEvent] }],
   ])("returns %s for a pre-checkable refusal", (code, overrides) => {
     expect(check(overrides)).toMatchObject({ editable: false, code });
+  });
+
+  const pendingCard = { choice: "pending", kind: "llm_prompt_template", affected_node_id: "llm" } as InterpretationEvent;
+  const otherFile = { ...marker, blob_ref: "other" };
+
+  it.each([
+    ["the system prompt", { prompt_template: marker, system_prompt: otherFile }],
+    ["a mapping-form query", { prompt_template: marker, queries: { one: { template: otherFile } } }],
+    ["a list-form query", { prompt_template: marker, queries: [{ name: "one", template: otherFile }] }],
+  ])("allows a file on a step whose other prompt file backs %s", (_slot, options) => {
+    expect(check({ state: stateFor(options) })).toEqual({ editable: true });
+  });
+
+  it.each([
+    ["prompt_file_review_pending", { prompt_template: marker, system_prompt: otherFile }],
+    ["prompt_file_review_pending", { prompt_template: marker, queries: [{ name: "one", template: otherFile }] }],
+    // Inline text beside another file: the other-file refusal is reported, as the server reports it.
+    ["prompt_file_review_pending", { prompt_template: marker, system_prompt: "You are helpful.", queries: { one: { template: otherFile } } }],
+    ["prompt_file_review_pending_inline", { prompt_template: marker, system_prompt: "You are helpful." }],
+  ])("returns %s while the step's card is pending over content this editor does not show", (code, options) => {
+    expect(check({ state: stateFor(options), pendingEvents: [pendingCard] })).toMatchObject({ editable: false, code, opens: true });
+    // The same step with no card pending is editable.
+    expect(check({ state: stateFor(options) })).toEqual({ editable: true });
+  });
+
+  it("does not count an unset prompt slot as content the pending card covers", () => {
+    expect(check({ state: stateFor({ prompt_template: marker, system_prompt: null }), pendingEvents: [pendingCard] })).toEqual({ editable: true });
+  });
+
+  it.each([
+    ["prompt_file_not_found", false, { blobs: [] }],
+    ["prompt_file_not_ready", false, { blobs: [{ ...blob, status: "pending" as const }] }],
+    ["prompt_file_not_text", false, { blobs: [{ ...blob, mime_type: "application/pdf" }] }],
+    ["prompt_file_mixed_use", true, { state: stateFor({ prompt_template: marker, queries: { one: { reference_blob_id: "file" } } }) }],
+    ["prompt_file_shared_binding", true, { state: stateFor({ prompt_template: marker, system_prompt: marker }) }],
+    ["prompt_file_encoding_unsupported", true, { state: stateFor({ prompt_template: { ...marker, encoding: "latin-1" } }) }],
+  ])("%s opens the editor read-only: %s", (code, opens, overrides) => {
+    expect(check(overrides)).toMatchObject({ editable: false, code, opens });
   });
 });

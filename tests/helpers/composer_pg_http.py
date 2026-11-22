@@ -146,9 +146,15 @@ async def _serve(
         assert request.headers["Ocp-Apim-Subscription-Key"] == "synthetic-pg-guard-key"
         payload = json.loads(request.content)
         assert set(payload) == {"userPrompt", "documents"}
-        assert payload["userPrompt"] == "Explain this request without changing the pipeline."
         assert type(payload["documents"]) is list
         assert all(type(document) is str for document in payload["documents"])
+        # The guard inspects the user prompt in its own call with no documents,
+        # and documents in calls with an empty user prompt (session reuse).
+        if payload["userPrompt"]:
+            assert payload["userPrompt"] == "Explain this request without changing the pipeline."
+            assert payload["documents"] == []
+        else:
+            assert payload["documents"], "a guard call with no user prompt carries documents"
         guard_requests.append(request)
         return httpx.Response(
             200,

@@ -8,6 +8,9 @@ import { usePreferencesStore } from "./preferencesStore";
 import { usePluginCatalogStore } from "./pluginCatalogStore";
 
 const TOKEN_KEY = "auth_token";
+/** Shown on the sign-in page when the server rejected the credential in use.
+ *  A message only: no draft or prompt text is kept for after sign-in. */
+export const SESSION_EXPIRED_MESSAGE = "Your sign-in has expired. Sign in again to continue.";
 let pendingLogoutCleanup: Promise<void> | null = null;
 
 interface AuthState {
@@ -18,7 +21,8 @@ interface AuthState {
 
   login: (username: string, password: string) => Promise<boolean>;
   loginWithToken: (token: string) => Promise<void>;
-  logout: (options?: { revoke?: boolean }) => Promise<void>;
+  /** `expired`: the server rejected the credential; the sign-in page says so. */
+  logout: (options?: { revoke?: boolean; expired?: boolean }) => Promise<void>;
   loadFromStorage: () => Promise<void>;
 }
 
@@ -133,7 +137,8 @@ export const useAuthStore = create<AuthState>((set) => ({
     const generation = advanceAuthGeneration();
     const revocation = options?.revoke !== false && token !== null
       ? Promise.resolve().then(() => api.logoutSession(token)).catch(() => {
-          if (isCurrentAuthGeneration(generation)) set({ loginError: "Signed out locally. Server session revocation could not be confirmed." });
+          // A rejected credential has nothing left to revoke; keep the expiry reason.
+          if (isCurrentAuthGeneration(generation) && options?.expired !== true) set({ loginError: "Signed out locally. Server session revocation could not be confirmed." });
         })
       : Promise.resolve();
     usePreferencesStore.getState().reset();
@@ -148,6 +153,7 @@ export const useAuthStore = create<AuthState>((set) => ({
       import("./secretsStore"),
       import("./shareableReviewStore"),
       import("./interpretationEventsStore"),
+      import("./promptDraftStore"),
     ]).then(([
       { useSessionStore },
       { useExecutionStore },
@@ -155,6 +161,7 @@ export const useAuthStore = create<AuthState>((set) => ({
       { useSecretsStore },
       { useShareableReviewStore },
       { useInterpretationEventsStore },
+      { usePromptDraftStore },
     ]) => {
       useSessionStore.getState().reset?.();
       useExecutionStore.getState().reset?.();
@@ -162,13 +169,15 @@ export const useAuthStore = create<AuthState>((set) => ({
       useSecretsStore.getState().reset();
       useShareableReviewStore.getState().reset();
       useInterpretationEventsStore.setState(useInterpretationEventsStore.getInitialState(), true);
+      // Unsaved prompt text belongs to the signed-out principal.
+      usePromptDraftStore.getState().reset();
       usePreferencesStore.getState().reset();
     });
     const cleanup = Promise.all([storeCleanup, revocation]).then(() => undefined);
     pendingLogoutCleanup = cleanup;
     localStorage.removeItem(TOKEN_KEY);
     usePluginCatalogStore.getState().clear();
-    set({ token: null, user: null, loginError: null, isLoading: false });
+    set({ token: null, user: null, loginError: options?.expired === true ? SESSION_EXPIRED_MESSAGE : null, isLoading: false });
     await cleanup;
     if (pendingLogoutCleanup === cleanup) pendingLogoutCleanup = null;
   },
@@ -208,12 +217,14 @@ export const useAuthStore = create<AuthState>((set) => ({
       const activeSessionId = useSessionStore.getState().activeSessionId;
       if (activeSessionId !== null) void useSessionStore.getState().resumeComposerOperation(activeSessionId);
       void useSessionStore.getState().reconcileInactiveComposerCustody();
-    } catch {
+    } catch (err) {
       if (!isCurrentAuthGeneration(generation)) return;
       // Token invalid or expired -- clear it
       localStorage.removeItem(TOKEN_KEY);
       usePreferencesStore.getState().reset();
-      set({ token: null, user: null, isLoading: false });
+      // Only a server rejection says the stored sign-in expired.
+      const expired = (err as Partial<ApiError> | null)?.status === 401;
+      set({ token: null, user: null, isLoading: false, ...(expired ? { loginError: SESSION_EXPIRED_MESSAGE } : {}) });
     }
   },
 }));

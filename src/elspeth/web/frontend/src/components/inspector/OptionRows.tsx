@@ -19,14 +19,15 @@
 //      "Raw options (JSON)" block, which itself renders only with show_advanced.
 // ============================================================================
 
-import { type JSX, useEffect } from "react";
+import { type ComponentType, type JSX, useEffect, useId } from "react";
 
 import { CodeBlock } from "@/components/chat/CodeBlock";
-import { BlobFileName } from "@/components/blobs/BlobFileName";
-import { useBlobFilename } from "@/components/blobs/BlobFileName";
+import { BlobFileName, useBlobFilename, useSessionFileList } from "@/components/blobs/BlobFileName";
 import { Button } from "@/components/ui";
-import { promptFileEditability, promptQueryEntries, promptQueryTemplatePath } from "@/lib/blobBindings";
+import { REDACTED_BLOB_SOURCE_PATH } from "@/lib/redactionPlaceholders";
+import { promptFileEditability, promptFileSlots, promptQueryCopyName, promptQueryEntries, promptQueryTemplatePath } from "@/lib/blobBindings";
 import { useBlobStore } from "@/stores/blobStore";
+import { usePromptDraftHiddenUnsaved } from "@/stores/promptDraftStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import { titleCaseLabel } from "@/components/catalog/pluginDisplayName";
@@ -34,6 +35,7 @@ import { useShowAdvanced } from "@/stores/preferencesStore";
 import { usePluginCatalogStore } from "@/stores/pluginCatalogStore";
 
 import { ConfigValue, STRUCTURAL_OPTION_CONTAINER_KEYS } from "./ConfigRows";
+import { PromptCopyButton } from "./PromptCopyButton";
 
 // Wire sentinel for a blob-backed source's `path` knob. The authoring
 // surface commits `blob:<blob_ref>` in place of the absolute storage_path,
@@ -71,6 +73,11 @@ export const OPTION_LABELS: Readonly<Record<string, string>> = {
 
 export function optionLabel(key: string): string {
   return OPTION_LABELS[key] ?? titleCaseLabel(key);
+}
+
+/** Reader-facing name of one prompt slot from `promptFileSlots`: its role, or its query's name. */
+export function promptSlotLabel(fieldPath: string, queryName?: string): string {
+  return queryName === undefined ? optionLabel(fieldPath) : `${optionLabel("prompt_template")}, query ${queryName}`;
 }
 
 // Fallback partition when the plugin's catalog schema is not cached (catalog
@@ -113,24 +120,62 @@ function pick(options: Record<string, unknown>, keys: readonly string[]): Record
 // `value` to `string` for the `title` attribute directly from the `typeof`
 // check, with no cast. Shared by BOTH partitions (visible and advanced) so
 // masking is a property of the value, never of which disclosure it lands in.
-function OptionValue({ label, value }: { label: string; value: unknown }): JSX.Element {
-  if (
-    label === optionLabel("path") &&
-    typeof value === "string" &&
-    value.startsWith(BLOB_REF_PATH_PREFIX)
-  ) {
-    return <BlobFileName blobId={value.slice(BLOB_REF_PATH_PREFIX.length)} fallback={BLOB_REF_FRIENDLY_LABEL} />;
+//
+// A source or sink step's file row (`path`, or `file`, which shares its
+// label) names the file, not where it is stored: the session file's name when
+// the step has a `blob_ref`, else the path's last segment with the whole path
+// one disclosure away (two folders can hold files of the same name). The
+// server's placeholder for a masked blob path is never shown as text.
+interface FileStep {
+  /** The step's `blob_ref`, when it reads or writes a session file. */
+  blobId: string | undefined;
+}
+
+function OptionValue({ label, value, fileStep }: { label: string; value: unknown; fileStep: FileStep | null }): JSX.Element {
+  if (label === optionLabel("path") && typeof value === "string") {
+    if (value.startsWith(BLOB_REF_PATH_PREFIX)) {
+      return <BlobFileName blobId={value.slice(BLOB_REF_PATH_PREFIX.length)} fallback={BLOB_REF_FRIENDLY_LABEL} />;
+    }
+    if (fileStep?.blobId !== undefined) return <StepFileName blobId={fileStep.blobId} />;
+    if (value === REDACTED_BLOB_SOURCE_PATH) {
+      return <span className="graph-config-empty-value">File reference unavailable</span>;
+    }
+    if (fileStep !== null) return <PathFileName path={value} />;
   }
   return <ConfigValue value={value} humaniseKeys={STRUCTURAL_OPTION_CONTAINER_LABELS.has(label)} />;
 }
 
-function OptionDl({ rows }: { rows: Record<string, unknown> }): JSX.Element {
+/** The session file a source or sink step names by `blob_ref`. */
+function StepFileName({ blobId }: { blobId: string }): JSX.Element {
+  const sessionId = useSessionStore((state) => state.activeSessionId);
+  // A failed (or cut-short) list read is not evidence the file is gone.
+  const listFailed = useBlobStore((state) => state.activeSessionId === sessionId && !state.isLoading && state.error !== null);
+  return <BlobFileName blobId={blobId} fallback={listFailed ? "File name unavailable" : undefined} />;
+}
+
+/** A stored path's last segment, with the whole path behind a disclosure. */
+function PathFileName({ path }: { path: string }): JSX.Element {
+  const segments = path.split(/[\\/]/);
+  const name = segments[segments.length - 1];
+  if (name === "" || name === path) return <ConfigValue value={path} />;
+  return (
+    <span className="option-file-path">
+      <span title={path}>{name}</span>
+      <details className="option-file-path-full">
+        <summary>Full path</summary>
+        <code>{path}</code>
+      </details>
+    </span>
+  );
+}
+
+function OptionDl({ rows, fileStep }: { rows: Record<string, unknown>; fileStep: FileStep | null }): JSX.Element {
   return (
     <dl className="graph-config-rows">
       {Object.entries(rows).map(([label, value]) => (
         <div key={label}>
           <dt>{label}</dt>
-          <dd><OptionValue label={label} value={value} /></dd>
+          <dd><OptionValue label={label} value={value} fileStep={fileStep} /></dd>
         </div>
       ))}
     </dl>
@@ -155,9 +200,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function PromptRoleValue({ label, value, notSet }: { label: string; value: unknown; notSet: string }): JSX.Element {
+function PromptRoleValue({ label, value, notSet, copyLabel }: { label: string; value: unknown; notSet: string; copyLabel: string }): JSX.Element {
   if (isUnsuppliedPrompt(value)) return <span className="option-rows-prompt-missing">{notSet}</span>;
-  return <OptionValue label={label} value={value} />;
+  return <><OptionValue label={label} value={value} fileStep={null} />{typeof value === "string" && <PromptCopyButton value={value} label={copyLabel} />}</>;
 }
 
 function PromptSlotActions({ value, nodeId, fieldPath, label, showInFiles }: {
@@ -190,30 +235,52 @@ function BoundPromptActions({ blobId, nodeId, fieldPath, label, sessionId, state
   const filename = useBlobFilename(blobId) ?? (loading ? "Loading file name…" : "File not in this session");
   const present = blobs.some((blob) => blob.id.toLowerCase() === blobId.toLowerCase());
   const editability = promptFileEditability({ state, blobs, pendingEvents, nodeId, fieldPath, blobId });
-  const editReason = loading && !present ? "Checking files in this session." : editability.editable ? null : editability.reason;
-  const reasonId = `prompt-slot-${nodeId}-${fieldPath}-reason`;
-  const missingReasonId = `prompt-slot-${nodeId}-${fieldPath}-missing`;
+  const checking = loading && !present;
+  const editReason = checking ? "Checking files in this session." : editability.editable ? null : editability.reason;
+  // Edit is a no-op only when there is no prompt text to show (file missing,
+  // still processing, not text). Every other refusal opens the editor
+  // read-only: Save is disabled there and the same reason is shown.
+  const editBlocked = checking || (!editability.editable && !editability.opens);
+  // useId, not the slot path: two query rows that fall back to the node-level
+  // prompt share one slot path and would otherwise share one DOM id.
+  const rowId = useId();
+  const reasonId = `${rowId}-reason`;
+  const missingReasonId = `${rowId}-missing`;
+  const unsaved = usePromptDraftHiddenUnsaved({ sessionId, nodeId, fieldPath });
   return <span className="prompt-slot-actions">
+    {unsaved && <span className="prompt-editor-tag">Unsaved changes</span>}
     {showInFiles && <>
       {/* The accessible name STARTS with the visible label (WCAG 2.5.3), so
           "click Show in files" matches for voice-control users. */}
-      <Button type="button" variant="bare" aria-label={`Show in files: ${filename} (${label})`}
+      <Button type="button" variant="ghost" compact aria-label={`Show in files: ${filename} (${label})`}
         aria-disabled={!present} aria-describedby={!present ? missingReasonId : undefined}
         onClick={(event) => { if (present) useBlobStore.getState().revealBlob(sessionId, blobId, filename, event.currentTarget); }}>
         Show in files
       </Button>
-      {!present && <span id={missingReasonId}>{loading ? "Checking files in this session." : "This file is not in this session."}</span>}
+      {!present && <span id={missingReasonId} className="prompt-slot-reason">{loading ? "Checking files in this session." : "This file is not in this session."}</span>}
     </>}
-    <Button type="button" variant="bare" aria-label={`Edit ${filename} (${label})`}
-      aria-disabled={editReason !== null} aria-describedby={editReason !== null ? reasonId : undefined}
-      onClick={() => { if (editReason === null) useBlobStore.getState().requestPromptEdit(nodeId, fieldPath); }}>
+    {/* data-prompt-edit-slot: the editor returns focus here when it closes. */}
+    <Button type="button" variant="ghost" compact aria-label={`Edit ${filename} (${label})`}
+      data-prompt-edit-slot={`${nodeId}:${fieldPath}`}
+      aria-disabled={editBlocked} aria-describedby={editReason !== null ? reasonId : undefined}
+      onClick={() => { if (!editBlocked) useBlobStore.getState().requestPromptEdit(nodeId, fieldPath); }}>
       Edit
     </Button>
-    {editReason !== null && <span id={reasonId}>{editReason}</span>}
+    {editReason !== null && <span id={reasonId} className="prompt-slot-reason">{editReason}</span>}
   </span>;
 }
 
-function LlmPromptRoles({ options, slotActions }: { options: Record<string, unknown>; slotActions?: { nodeId: string; showInFiles?: boolean } }): JSX.Element {
+/** The prompt file editor, as OptionRows mounts it inside a prompt's row. */
+export type PromptSlotEditor = ComponentType<{ nodeId: string; blobId: string; fieldPath: string; queryName?: string }>;
+
+export interface PromptSlotActionsConfig {
+  nodeId: string;
+  showInFiles?: boolean;
+  /** Passed in by the host (not imported here: the editor imports this module). */
+  Editor?: PromptSlotEditor;
+}
+
+function LlmPromptRoles({ options, slotActions }: { options: Record<string, unknown>; slotActions?: PromptSlotActionsConfig }): JSX.Element {
   const systemLabel = optionLabel("system_prompt");
   const userLabel = optionLabel("prompt_template");
   // A multi-query step has ONE system prompt and one user prompt PER QUERY.
@@ -223,43 +290,75 @@ function LlmPromptRoles({ options, slotActions }: { options: Record<string, unkn
   // list form, as the server keys it), `name` is only ever a label. A
   // malformed entry is skipped here and reported by validation.
   const queries = promptQueryEntries(options.queries);
-  return (
+  // The user prompt a query actually sends: its own template, else the
+  // node-level fallback — the same resolution the runtime applies.
+  // copyName carries the list position, so copy labels stay unique when names repeat.
+  const queryRows = queries.map((query) => {
+    const { selector, name, entry } = query;
+    const copyName = promptQueryCopyName(query);
+    return isUnsuppliedPrompt(entry.template)
+      ? { selector, name, copyName, value: options.prompt_template, fieldPath: "prompt_template" }
+      : { selector, name, copyName, value: entry.template, fieldPath: promptQueryTemplatePath(selector) };
+  });
+  // One editor per file-backed slot (promptFileSlots, the editor's and the
+  // server's slot authority), mounted in the row that shows that prompt.
+  const Editor = slotActions?.Editor;
+  const fileSlots = Editor === undefined ? [] : promptFileSlots(options).flatMap(({ fieldPath, value, queryName }) =>
+    isRecord(value) && value.mode === "inline_content" && typeof value.blob_ref === "string"
+      ? [{ fieldPath, blobId: value.blob_ref, queryName }] : []);
+  const editorFor = (slot: (typeof fileSlots)[number] | undefined): JSX.Element | null => Editor !== undefined && slotActions !== undefined && slot !== undefined
+    ? <Editor key={`${slotActions.nodeId}:${slot.fieldPath}:${slot.blobId}`} nodeId={slotActions.nodeId} {...slot} />
+    : null;
+  const editorAt = (fieldPath: string): JSX.Element | null => editorFor(fileSlots.find((slot) => slot.fieldPath === fieldPath));
+  // Query rows that fall back to the step-level prompt share ONE slot, so one
+  // editor: it sits under the first such row and the others say so.
+  const sharedHost = queryRows.find((row) => row.fieldPath === "prompt_template");
+  const sharedIsFile = fileSlots.some((slot) => slot.fieldPath === "prompt_template");
+  // A file-backed slot no row shows (a step-level prompt file every query
+  // overrides) can still be opened from the file list; its editor goes last.
+  const rowPaths = new Set(["system_prompt", ...(queries.length === 0 ? ["prompt_template"] : queryRows.map((row) => row.fieldPath))]);
+  const unshown = fileSlots.filter((slot) => !rowPaths.has(slot.fieldPath));
+  return (<>
     <dl className="graph-config-rows option-rows-prompt-roles">
       <div>
         <dt>{systemLabel}</dt>
-        <dd><PromptRoleValue label={systemLabel} value={options.system_prompt} notSet={SYSTEM_PROMPT_NOT_SET} />
-          {slotActions && <PromptSlotActions value={options.system_prompt} nodeId={slotActions.nodeId} fieldPath="system_prompt" label={systemLabel} showInFiles={slotActions.showInFiles ?? true} />}</dd>
+        <dd><PromptRoleValue label={systemLabel} value={options.system_prompt} notSet={SYSTEM_PROMPT_NOT_SET} copyLabel="system prompt" />
+          {slotActions && <PromptSlotActions value={options.system_prompt} nodeId={slotActions.nodeId} fieldPath="system_prompt" label={systemLabel} showInFiles={slotActions.showInFiles ?? true} />}
+          {editorAt("system_prompt")}</dd>
       </div>
       {queries.length === 0 ? (
         <div>
           <dt>{userLabel}</dt>
-          <dd><PromptRoleValue label={userLabel} value={options.prompt_template} notSet={USER_PROMPT_NOT_SET} />
-            {slotActions && <PromptSlotActions value={options.prompt_template} nodeId={slotActions.nodeId} fieldPath="prompt_template" label={userLabel} showInFiles={slotActions.showInFiles ?? true} />}</dd>
+          <dd><PromptRoleValue label={userLabel} value={options.prompt_template} notSet={USER_PROMPT_NOT_SET} copyLabel="user prompt template" />
+            {slotActions && <PromptSlotActions value={options.prompt_template} nodeId={slotActions.nodeId} fieldPath="prompt_template" label={userLabel} showInFiles={slotActions.showInFiles ?? true} />}
+            {editorAt("prompt_template")}</dd>
         </div>
       ) : (
-        // The user prompt a query actually sends: its own template, else the
-        // node-level fallback — the same resolution the runtime applies. The
-        // query name is the reader's own identifier, so it is shown verbatim
-        // in the value cell, never humanised into the label.
-        queries.map(({ selector, name, entry }) => (
-          <div key={selector}>
+        // The query name is the reader's own identifier, so it is shown
+        // verbatim in the value cell, never humanised into the label.
+        queryRows.map((row) => (
+          <div key={row.selector}>
             <dt>{userLabel}</dt>
             <dd>
-              <span className="option-rows-query-name">{name}</span>
-              <PromptRoleValue
-                label={userLabel}
-                value={isUnsuppliedPrompt(entry.template) ? options.prompt_template : entry.template}
-                notSet={USER_PROMPT_NOT_SET}
-              />
-              {slotActions && <PromptSlotActions value={isUnsuppliedPrompt(entry.template) ? options.prompt_template : entry.template}
-                nodeId={slotActions.nodeId} fieldPath={isUnsuppliedPrompt(entry.template) ? "prompt_template" : promptQueryTemplatePath(selector)}
-                label={`${userLabel}, query ${name}`} showInFiles={slotActions.showInFiles ?? true} />}
+              <span className="option-rows-query-name">{row.name}</span>
+              <PromptRoleValue label={userLabel} value={row.value} notSet={USER_PROMPT_NOT_SET}
+                copyLabel={`prompt template for query ${row.copyName}`} />
+              {slotActions && <PromptSlotActions value={row.value} nodeId={slotActions.nodeId} fieldPath={row.fieldPath}
+                label={`${userLabel}, query ${row.name}`} showInFiles={slotActions.showInFiles ?? true} />}
+              {row.fieldPath !== "prompt_template" || row === sharedHost
+                ? editorAt(row.fieldPath)
+                : sharedIsFile && sharedHost !== undefined && (
+                  <span className="prompt-slot-shared">
+                    This query uses the step&apos;s shared prompt file. Its editor opens under query {sharedHost.name}.
+                  </span>
+                )}
             </dd>
           </div>
         ))
       )}
     </dl>
-  );
+    {unshown.map(editorFor)}
+  </>);
 }
 
 export function OptionRows({
@@ -271,7 +370,7 @@ export function OptionRows({
   options: Record<string, unknown>;
   ariaLabel: string;
   plugin?: { kind: "source" | "transform" | "sink"; name: string } | null;
-  slotActions?: { nodeId: string; showInFiles?: boolean };
+  slotActions?: PromptSlotActionsConfig;
 }): JSX.Element {
   const showAdvanced = useShowAdvanced();
   const catalogKey = usePluginCatalogStore((s) => s.key);
@@ -293,6 +392,10 @@ export function OptionRows({
   }, [pluginKind, pluginName, catalogKey, loadSchema]);
 
   const isLlmStep = plugin !== null && plugin.kind === "transform" && plugin.name === "llm";
+  const fileStep: FileStep | null = plugin?.kind === "source" || plugin?.kind === "sink"
+    ? { blobId: typeof options.blob_ref === "string" ? options.blob_ref : undefined }
+    : null;
+  useSessionFileList(fileStep?.blobId !== undefined);
   const candidateKeys = Object.keys(options).filter(
     (key) => !INTERNAL_OPTION_KEYS.has(key) && !(isLlmStep && LLM_PROMPT_ROLE_KEYS.includes(key)),
   );
@@ -337,11 +440,11 @@ export function OptionRows({
       ) : (
         <>
           {isLlmStep && <LlmPromptRoles options={options} slotActions={slotActions} />}
-          {Object.keys(visible).length > 0 && <OptionDl rows={visible} />}
+          {Object.keys(visible).length > 0 && <OptionDl rows={visible} fileStep={fileStep} />}
           {advancedKeys.length > 0 && (
             <details className="option-rows-advanced" open={showAdvanced}>
               <summary>Advanced settings ({advancedKeys.length})</summary>
-              <OptionDl rows={advanced} />
+              <OptionDl rows={advanced} fileStep={fileStep} />
             </details>
           )}
         </>

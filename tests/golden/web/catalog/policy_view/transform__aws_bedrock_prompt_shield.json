@@ -204,5 +204,6 @@
     }
   ],
   "secret_requirements": [],
+  "usage_when_not_to_use": "Not for post-LLM harmful content moderation. Use aws_bedrock_content_safety with source: OUTPUT for that output-control role.",
   "web_config_authority": "operator_profiled"
 }

@@ -5,17 +5,19 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import contextlib
+import functools
 import os
 import stat
 import tempfile
 import threading
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Final, Literal
 
 import structlog
-from sqlalchemy import Engine, create_engine, text
+from sqlalchemy import Connection, Engine, create_engine, text
 
 from elspeth.web.auth.providers import PROFILE_REGISTRY, registered_provider_names
 from elspeth.web.config import WebSettings, configured_auth_settings
@@ -30,6 +32,26 @@ from elspeth.web.schema_probe import (
 from elspeth.web.sessions.engine import create_session_engine
 
 ReadinessProbeLabel = Literal["session", "landscape", "data_dir", "payload_store", "blob_dir"]
+SchemaKind = Literal["session", "landscape"]
+_SCHEMA_KINDS: tuple[SchemaKind, ...] = ("session", "landscape")
+# How long a CURRENT schema-shape verdict is served before readiness reflects
+# the schema again. Startup already refuses a non-current schema (validate-only
+# for external PostgreSQL, initialize-or-refuse for local SQLite), so after
+# startup the shape changes only if someone alters the database under a
+# running server. Reflecting both schemas costs ~160 ms of CPU per probe on
+# SQLite and more on PostgreSQL, where it is the dominant readiness cost. Sixty
+# seconds sits inside the window in which the shipped orchestrators act on a
+# failing probe (Azure Container Apps 10 s x 3, ALB target group 30 s x 3), so
+# drift is still reported within about one more failure window, while the
+# reflection runs about once a minute instead of on every uncached probe.
+# Connectivity is still proven on every probe, and any failed probe discards
+# the verdict (see SchemaShapeVerdicts).
+SCHEMA_SHAPE_REFRESH_SECONDS: Final[float] = 60.0
+# Per-probe deadline inside one readiness request, and the bound on the whole
+# request. A probe past its deadline reports "probe timed out"; its worker keeps
+# its single-flight registration until it returns.
+PROBE_DEADLINE_SECONDS: Final[float] = 2.0
+READINESS_REQUEST_TIMEOUT_SECONDS: Final[float] = 5.0
 READINESS_CHECK_NAMES: tuple[str, ...] = (
     "auth_mode",
     "session_db",
@@ -132,6 +154,54 @@ def _cancel_wrapped_on_loop(
         loop.call_soon_threadsafe(cancel_and_drain)
 
 
+class SchemaShapeVerdicts:
+    """Serve a recent CURRENT schema-shape verdict instead of reflecting on every probe.
+
+    Only CURRENT is ever cached: a MISSING, PARTIAL or STALE answer, or a
+    probe that raised, leaves nothing behind, so the next probe reflects again
+    and a repaired schema reports ready at once. A CURRENT verdict is served
+    for ``SCHEMA_SHAPE_REFRESH_SECONDS`` measured from when its reflection
+    STARTED, and ``invalidate`` discards it at once; readiness invalidates
+    after any probe whose connectivity check did not pass.
+
+    Probes run on worker threads and can overlap. One reflection per database
+    runs at a time; a probe that arrives during it waits and then takes the
+    verdict that reflection produced. A reflection that was running when
+    ``invalidate`` was called does not store its answer (generation check), so
+    a probe that timed out cannot have its late success cached.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._refresh_locks: dict[SchemaKind, threading.Lock] = {kind: threading.Lock() for kind in _SCHEMA_KINDS}
+        self._current_since: dict[SchemaKind, float | None] = dict.fromkeys(_SCHEMA_KINDS)
+        self._generation: dict[SchemaKind, int] = dict.fromkeys(_SCHEMA_KINDS, 0)
+
+    def _now(self) -> float:
+        return time.monotonic()
+
+    def state(self, kind: SchemaKind, conn: Connection) -> SchemaState:
+        with self._refresh_locks[kind]:
+            started = self._now()
+            with self._lock:
+                since = self._current_since[kind]
+                if since is not None and started - since < SCHEMA_SHAPE_REFRESH_SECONDS:
+                    return SchemaState.CURRENT
+                generation = self._generation[kind]
+            # A reflection that raises stores nothing; the expired verdict
+            # stays expired, so the next probe reflects again.
+            state = probe_session_schema(conn) if kind == "session" else probe_landscape_schema(conn)
+            with self._lock:
+                if state is SchemaState.CURRENT and self._generation[kind] == generation:
+                    self._current_since[kind] = started
+            return state
+
+    def invalidate(self, kind: SchemaKind) -> None:
+        with self._lock:
+            self._generation[kind] += 1
+            self._current_since[kind] = None
+
+
 def _schema_checks(kind: Literal["session", "landscape"], state: SchemaState) -> _ProbeResult:
     return (
         ReadinessCheck(f"{kind}_db", True, "connected"),
@@ -143,12 +213,13 @@ def _probe_database_engine(
     engine: Engine,
     *,
     kind: Literal["session", "landscape"],
+    schema_verdicts: SchemaShapeVerdicts,
 ) -> _ProbeResult:
     with engine.connect() as conn:
         if engine.dialect.name == "postgresql":
             conn.execute(text("SET LOCAL statement_timeout = '1000ms'"))
         conn.execute(text("SELECT 1"))
-        state = probe_session_schema(conn) if kind == "session" else probe_landscape_schema(conn)
+        state = schema_verdicts.state(kind, conn)
     return _schema_checks(kind, state)
 
 
@@ -169,12 +240,18 @@ def _owned_database_check(
     url: str,
     *,
     kind: Literal["session", "landscape"],
+    schema_verdicts: SchemaShapeVerdicts,
 ) -> _ProbeResult:
+    # A fresh engine per probe is deliberate: it proves a NEW connection can
+    # be opened (credentials, network policy, connection limits) within the
+    # bounded connect/pool timeouts above, which a pooled connection from the
+    # application's engine would not. Construction is cheap; the schema
+    # reflection it used to carry is what SchemaShapeVerdicts amortises.
     engine: Engine | None = None
     try:
         kwargs = _readiness_engine_kwargs(url)
         engine = create_session_engine(url, **kwargs) if kind == "session" else create_engine(url, **kwargs)
-        return _probe_database_engine(engine, kind=kind)
+        return _probe_database_engine(engine, kind=kind, schema_verdicts=schema_verdicts)
     finally:
         if engine is not None:
             engine.dispose()
@@ -191,11 +268,13 @@ def _check_session_database(
     settings: WebSettings,
     session_engine: Engine,
     deployment_state_mode: Literal["sqlite-single", "external-postgresql"] | None = None,
+    *,
+    schema_verdicts: SchemaShapeVerdicts,
 ) -> _ProbeResult:
     state_mode = deployment_state_mode or resolve_deployment_state_mode(settings)
     if state_mode == "external-postgresql":
         assert settings.session_db_url is not None
-        return _owned_database_check(settings.session_db_url, kind="session")
+        return _owned_database_check(settings.session_db_url, kind="session", schema_verdicts=schema_verdicts)
     if _is_in_memory_sqlite(session_engine):
         remedy = "in-memory SQLite is not readiness-probeable; use a file-backed session database"
         return (
@@ -203,13 +282,15 @@ def _check_session_database(
             ReadinessCheck("session_schema", False, remedy),
         )
     if session_engine.dialect.name == "sqlite":
-        return _probe_database_engine(session_engine, kind="session")
-    return _owned_database_check(settings.get_session_db_url(), kind="session")
+        return _probe_database_engine(session_engine, kind="session", schema_verdicts=schema_verdicts)
+    return _owned_database_check(settings.get_session_db_url(), kind="session", schema_verdicts=schema_verdicts)
 
 
 def _check_landscape_database(
     settings: WebSettings,
     deployment_state_mode: Literal["sqlite-single", "external-postgresql"] | None = None,
+    *,
+    schema_verdicts: SchemaShapeVerdicts,
 ) -> _ProbeResult:
     state_mode = deployment_state_mode or resolve_deployment_state_mode(settings)
     if state_mode == "external-postgresql":
@@ -217,7 +298,7 @@ def _check_landscape_database(
         url = settings.landscape_url
     else:
         url = settings.get_landscape_url()
-    return _owned_database_check(url, kind="landscape")
+    return _owned_database_check(url, kind="landscape", schema_verdicts=schema_verdicts)
 
 
 def _probe_directory(name: str, directory: Path) -> _ProbeResult:
@@ -391,15 +472,16 @@ async def readiness_report(
     instance_draining: threading.Event,
 ) -> ReadinessReport:
     state_mode = deployment_state_mode or resolve_deployment_state_mode(settings)
+    schema_verdicts = runner.schema_verdicts
     tasks: list[asyncio.Task[_ProbeResult]] = []
     try:
-        async with asyncio.timeout(5.0):
+        async with asyncio.timeout(READINESS_REQUEST_TIMEOUT_SECONDS):
             tasks = [
                 asyncio.create_task(
                     runner.run(
                         "session",
                         ("session_db", "session_schema"),
-                        _check_session_database,
+                        functools.partial(_check_session_database, schema_verdicts=schema_verdicts),
                         settings,
                         session_engine,
                         state_mode,
@@ -409,7 +491,7 @@ async def readiness_report(
                     runner.run(
                         "landscape",
                         ("landscape_db", "landscape_schema"),
-                        _check_landscape_database,
+                        functools.partial(_check_landscape_database, schema_verdicts=schema_verdicts),
                         settings,
                         state_mode,
                     )
@@ -437,20 +519,29 @@ async def readiness_report(
         # "readiness evaluation failed (KeyError)" report instead of a
         # fabricated synthetic check.
         checks = tuple(by_name[name] for name in READINESS_CHECK_NAMES)
+        # A probe whose connectivity check did not pass (error, timeout,
+        # still in flight) discards that database's cached shape verdict, so
+        # the next probe that connects reflects the schema again.
+        for kind in _SCHEMA_KINDS:
+            if not by_name[f"{kind}_db"].ok:
+                schema_verdicts.invalidate(kind)
         return _finalize(checks)
     except asyncio.CancelledError:
+        _invalidate_all(schema_verdicts)
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         raise
     except TimeoutError:
+        _invalidate_all(schema_verdicts)
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         return overall_timeout_report()
     except BaseException as exc:
+        _invalidate_all(schema_verdicts)
         for task in tasks:
             task.cancel()
         if tasks:
@@ -458,10 +549,20 @@ async def readiness_report(
         return _finalize(_static_failures(READINESS_CHECK_NAMES, f"readiness evaluation failed ({type(exc).__name__})"))
 
 
+def _invalidate_all(schema_verdicts: SchemaShapeVerdicts) -> None:
+    for kind in _SCHEMA_KINDS:
+        schema_verdicts.invalidate(kind)
+
+
 class ReadinessProbeRunner:
-    """Admit at most one unresolved worker future for each closed label."""
+    """Admit at most one unresolved worker future for each closed label.
+
+    It also owns the schema-shape verdicts its database workers share, so the
+    verdicts live exactly as long as the application's readiness runner.
+    """
 
     def __init__(self) -> None:
+        self.schema_verdicts = SchemaShapeVerdicts()
         self._executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=5,
             thread_name_prefix="readiness-worker",
@@ -514,7 +615,7 @@ class ReadinessProbeRunner:
         # Registration therefore must remain outside the registry lock.
         source.add_done_callback(source_done)
         wrapped.add_done_callback(wrapped_done)
-        deadline = loop.time() + 2.0
+        deadline = loop.time() + PROBE_DEADLINE_SECONDS
         try:
             while not wrapped.done():
                 remaining = deadline - loop.time()

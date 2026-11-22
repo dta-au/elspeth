@@ -504,6 +504,24 @@
       },
       "proposal_summary": "Apply composer tool upsert_node."
     },
+    "upsert_node_routing_only": {
+      "tool": "upsert_node",
+      "arguments": {
+        "id": "extract",
+        "node_type": "transform",
+        "input": "rows",
+        "on_error": "results",
+        "routing_only": true
+      },
+      "redacted": {
+        "id": "extract",
+        "node_type": "transform",
+        "input": "rows",
+        "on_error": "results",
+        "routing_only": true
+      },
+      "proposal_summary": "Rewire node \"extract\": input \"rows\", on_error \"results\"."
+    },
     "set_output_with_options": {
       "tool": "set_output",
       "arguments": {

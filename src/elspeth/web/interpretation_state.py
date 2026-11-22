@@ -16,11 +16,12 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from difflib import get_close_matches
 from hashlib import sha256
-from typing import Any, Final, Literal, NotRequired, TypedDict
+from typing import Any, Final, Literal, NotRequired, TypedDict, final
 
 from elspeth.contracts.blobs_inline import is_widened_blob_ref
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.enums import CreationModality
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.plugin_capabilities import ControlRole, PluginCapability
@@ -111,6 +112,18 @@ GATE_CONDITION_AUTHORED_USER_TERM: Final[str] = "gate_condition_authored"
 COMPOSER_AUTHORED_PIPELINE_DECISION_USER_TERMS: Final[frozenset[str]] = REGISTERED_PIPELINE_DECISION_USER_TERMS - {
     REQUIRED_CONTROL_AUTO_WIRED_USER_TERM
 }
+SERVER_STAGED_PIPELINE_DECISION_USER_TERMS: Final[frozenset[str]] = (
+    REGISTERED_PIPELINE_DECISION_USER_TERMS - COMPOSER_AUTHORED_PIPELINE_DECISION_USER_TERMS
+)
+
+
+def is_server_staged_review(kind: object, user_term: object) -> bool:
+    """Identify only the exact persisted kind and term owned by the server."""
+    return (
+        kind == InterpretationKind.PIPELINE_DECISION.value
+        and isinstance(user_term, str)
+        and user_term in SERVER_STAGED_PIPELINE_DECISION_USER_TERMS
+    )
 
 
 class ServerStagedRequiredControlUserTerm(str):
@@ -694,6 +707,106 @@ def unwired_vague_term_error(state: CompositionState) -> str | None:
     return None
 
 
+def _authored_options_hash(node: NodeSpec) -> str:
+    return stable_hash({key: deep_thaw(value) for key, value in node.options.items() if key != INTERPRETATION_REQUIREMENTS_KEY})
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class _RetainedReviewRowsNotRows:
+    """A retained node keeps a stored server-staged review, but its proposed requirements are not rows."""
+
+    node_id: str
+
+
+def server_staged_review_preservation_error(previous: CompositionState, proposed: CompositionState) -> str | None:
+    """Describe the first server-staged review that a proposed state would not keep.
+
+    Only a node that keeps a stored server-staged review needs its proposed
+    rows. If that value is not rows, the server cannot tell whether the review
+    was kept, which is an integrity failure. The observation of the stored
+    rows reports it and never raises; this wrapper raises it.
+
+    A non-row value on any other node is not this check's concern. Not every
+    caller has passed canonical admission first: the dispatcher admits only
+    tools with graph effects, and untouched nodes come from storage or a YAML
+    import.
+    """
+    outcome = _stored_review_preservation_outcome(previous, proposed)
+    if type(outcome) is _RetainedReviewRowsNotRows:
+        raise AuditIntegrityError(f"Proposed interpretation requirements for node {outcome.node_id!r} are not rows")
+    return outcome
+
+
+@observation_boundary(
+    tier=3,
+    source="untyped interpretation_requirements rows in stored and proposed composer node options",
+    source_param="previous",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "a stored value that is not rows, and stored rows that are not server-staged reviews, are skipped; "
+        "a matching review is required on a retained node; never raises"
+    ),
+)
+def _stored_review_preservation_outcome(previous: CompositionState, proposed: CompositionState) -> str | _RetainedReviewRowsNotRows | None:
+    """Observe the stored server-staged rows of ``previous`` against the rows of ``proposed``."""
+    proposed_nodes = {node.id: node for node in proposed.nodes}
+    for old_node in previous.nodes:
+        old_rows = old_node.options[INTERPRETATION_REQUIREMENTS_KEY] if INTERPRETATION_REQUIREMENTS_KEY in old_node.options else ()
+        if not isinstance(old_rows, (list, tuple)):
+            continue
+        owned_rows = []
+        for row in old_rows:
+            if not isinstance(row, Mapping):
+                continue
+            term = row["user_term"] if "user_term" in row else None
+            if "kind" in row and is_server_staged_review(row["kind"], term) and "id" in row and "status" in row:
+                owned_rows.append(row)
+        if not owned_rows:
+            continue
+        new_node = proposed_nodes[old_node.id] if old_node.id in proposed_nodes else None
+        for old_row in owned_rows:
+            term = old_row["user_term"]
+            prefix = f"Node '{old_node.id}' carries a server-staged review ({term}) that only the user can resolve, on its card. "
+            suffix = " Nothing was changed. To edit the node, re-send it without interpretation_requirements; the review is kept."
+            if new_node is None:
+                if old_row["status"] == "pending":
+                    return prefix + "It is still pending, so the node cannot be removed." + suffix
+                continue
+            if (new_node.node_type, new_node.plugin) != (old_node.node_type, old_node.plugin):
+                return prefix + "Its node type and plugin cannot be changed." + suffix
+            new_rows = new_node.options[INTERPRETATION_REQUIREMENTS_KEY] if INTERPRETATION_REQUIREMENTS_KEY in new_node.options else ()
+            if not isinstance(new_rows, (list, tuple)):
+                return _RetainedReviewRowsNotRows(old_node.id)
+            identity = (old_row["id"], old_row["kind"], term)
+            matching = next(
+                (
+                    row
+                    for row in new_rows
+                    if isinstance(row, Mapping)
+                    and "id" in row
+                    and "kind" in row
+                    and "user_term" in row
+                    and is_server_staged_review(row["kind"], row["user_term"])
+                    and (row["id"], row["kind"], row["user_term"]) == identity
+                ),
+                None,
+            )
+            matching_status = matching["status"] if matching is not None and "status" in matching else None
+            if matching is None or (old_row["status"] == "pending" and matching_status != "pending"):
+                return prefix + "This change would have removed or altered that review." + suffix
+            if (
+                old_row["status"] == "resolved"
+                and matching_status == "resolved"
+                and (
+                    stable_hash(deep_thaw(old_row)) != stable_hash(deep_thaw(matching))
+                    or _authored_options_hash(old_node) != _authored_options_hash(new_node)
+                )
+            ):
+                return prefix + "This change would have removed or altered that review." + suffix
+    return None
+
+
 def prompt_shield_recommendation_warning_pairs(
     state: CompositionState,
     *,
@@ -717,8 +830,64 @@ def prompt_shield_recommendation_warning_pairs(
     ``warnings`` list and they are excluded from the blocking contract.
     """
 
+    return tuple(
+        (f"node:{finding.node_id}", _prompt_shield_warning_message((finding.node_id,), finding.producer_names, finding.draft))
+        for finding in _prompt_shield_findings(state, shield_available=shield_available)
+    )
+
+
+def prompt_shield_recommendation_warning_groups(
+    state: CompositionState,
+    *,
+    shield_available: bool | None = None,
+) -> tuple[tuple[str, str], ...]:
+    """Return the prompt-shield advisory once per distinct text, naming every node.
+
+    :func:`prompt_shield_recommendation_warning_pairs` yields one near-identical
+    entry per unshielded LLM node, so a 25-LLM graph carried 13 KB of repeats
+    on every tool result and turn-start message. Here findings sharing the same
+    producer set and draft collapse into one entry:
+
+    - a group of ONE node keeps the per-node entry exactly (``node:<id>`` and
+      the same message bytes);
+    - a group of two or more is ``("pipeline", message)`` whose message names
+      EVERY node id in the group. There is deliberately no cap: a truncated
+      list would leave nodes named nowhere — not in the tool result, not in
+      ``preview_pipeline``, not in the stored row.
+
+    Ids are sorted within a group and groups ordered by their first id, so the
+    same graph yields the same bytes whatever order its nodes were inserted in.
+    """
+
+    grouped: dict[tuple[tuple[str, ...], str], list[str]] = {}
+    for finding in _prompt_shield_findings(state, shield_available=shield_available):
+        grouped.setdefault((finding.producer_names, finding.draft), []).append(finding.node_id)
+    groups = sorted(((tuple(sorted(node_ids)), key) for key, node_ids in grouped.items()), key=lambda group: group[0])
+    return tuple(
+        (
+            f"node:{node_ids[0]}" if len(node_ids) == 1 else "pipeline",
+            _prompt_shield_warning_message(node_ids, producer_names, draft),
+        )
+        for node_ids, (producer_names, draft) in groups
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _PromptShieldFinding:
+    """One unshielded LLM node: its id, the untrusted producers found (sorted), and the draft."""
+
+    node_id: str
+    producer_names: tuple[str, ...]
+    draft: str
+
+
+def _prompt_shield_findings(
+    state: CompositionState,
+    *,
+    shield_available: bool | None,
+) -> tuple[_PromptShieldFinding, ...]:
     graph = _output_stream_graph(state.nodes)
-    warnings: list[tuple[str, str]] = []
+    findings: list[_PromptShieldFinding] = []
     for node in state.nodes:
         if not node_has_capability(node, PluginCapability.LLM):
             continue
@@ -726,25 +895,38 @@ def prompt_shield_recommendation_warning_pairs(
             continue  # State A — already shielded, silent
         if _llm_has_shield_recommendation(node):
             continue  # review already staged on this node
-        untrusted_producers = _llm_untrusted_content_producers(node, graph)
-        if untrusted_producers:
-            # Name the producer actually found. Hardcoding "web_scrape" made the
-            # sentence assert a plugin that need not be in the pipeline at all.
-            named = " and ".join(sorted(untrusted_producers))
-            lead = (
-                f"LLM node {node.id!r} consumes untrusted or externally controlled upstream content "
-                f"produced by {named} without an authorized prompt-injection shield between them. "
-            )
+        # Name the producer actually found. Hardcoding "web_scrape" made the
+        # sentence assert a plugin that need not be in the pipeline at all.
+        producer_names = tuple(sorted(_llm_untrusted_content_producers(node, graph)))
+        if producer_names:
             draft = PROMPT_SHIELD_AVAILABLE_DRAFT if shield_available is True else PROMPT_SHIELD_WARNING_DRAFT
         else:
             # Provenance-honest draft: no declared untrusted producer exists in
             # this graph, so the producer-specific constants would be false —
             # and the staged review card carries the DRAFT alone, discarding
-            # this computed lead, so the draft itself must tell the truth.
-            lead = f"LLM node {node.id!r} has no authorized prompt-injection shield in front of it. "
+            # the computed lead, so the draft itself must tell the truth.
             draft = PROMPT_SHIELD_LOCAL_CONTENT_AVAILABLE_DRAFT if shield_available is True else PROMPT_SHIELD_LOCAL_CONTENT_WARNING_DRAFT
-        warnings.append((f"node:{node.id}", f"{lead}{draft}"))
-    return tuple(warnings)
+        findings.append(_PromptShieldFinding(node_id=node.id, producer_names=producer_names, draft=draft))
+    return tuple(findings)
+
+
+def _prompt_shield_warning_message(node_ids: Sequence[str], producer_names: tuple[str, ...], draft: str) -> str:
+    """Lead naming every node in ``node_ids``, then the draft; one id keeps the per-node wording."""
+
+    if len(node_ids) == 1:
+        subject = f"LLM node {node_ids[0]!r}"
+        consumes, has, it = "consumes", "has", "it"
+    else:
+        subject = "LLM nodes " + ", ".join(repr(node_id) for node_id in node_ids)
+        consumes, has, it = "consume", "have", "them"
+    if producer_names:
+        lead = (
+            f"{subject} {consumes} untrusted or externally controlled upstream content "
+            f"produced by {' and '.join(producer_names)} without an authorized prompt-injection shield between them. "
+        )
+    else:
+        lead = f"{subject} {has} no authorized prompt-injection shield in front of {it}. "
+    return f"{lead}{draft}"
 
 
 def _llm_untrusted_content_producers(
@@ -2810,8 +2992,10 @@ def multi_query_prompt_surface_from_options(options: Mapping[str, Any]) -> Multi
     a node-level-template user, because plugin schema validation rejects the
     node. That matches the binding guard
     (``state._validate_multi_query_template_variable_bindings``), which skips
-    such a query whole without counting it as a node-level-template user, and
-    the advisor evidence walk (``service._advisor_query_option_values``).
+    such a query whole without counting it as a node-level-template user. The
+    advisor evidence walk (``advisor_context._advisor_query_option_values``)
+    differs on one shape: a valid ``inline_content`` file marker is a file-held
+    prompt there, stated with its file facts, not an invalid template.
     A node-level ``prompt_template`` that is an ``inline_content`` file marker
     is not text: the surface carries ``node_prompt_template=None`` and, when
     any query falls back to it, its marker identity as
@@ -3386,6 +3570,28 @@ def _vague_review_is_unchanged(
     return prompt_structure_hash(previous_parts) == prompt_structure_hash(proposed_parts)
 
 
+def _wording_edit_reopens_its_prompt_review(candidate: NodeSpec) -> bool:
+    """Whether a wording edit around carried terms is put to the user by a reopened prompt review.
+
+    ``candidate`` is the proposed node with its carried rows in place. A
+    resolved vague term keeps its accepted value across a wording edit only
+    when the node has an ``llm_prompt_template`` review: that review is the
+    review of the change. A term is carried only when the parts skeleton
+    changed, and every prompt review anchor contains the skeleton hash
+    (``prompt_review_anchor_hash_from_options``), so a review that exists has
+    been reopened by the same edit; only its absence needs checking here. The
+    length of the prompt plays no part; the prompt card has to show each
+    carried term's accepted definition at its slot, whatever it shortens.
+
+    A node where a query supplies its own template is never carried: that
+    query bypasses the node-level slots, and reopening the terms is what lets
+    ``unwired_vague_term_error`` refuse the edit as it did before.
+    """
+    if _prompt_template_review_requirement(candidate.options) is None:
+        return False
+    return "queries" not in candidate.options or vague_term_query_override_error(candidate.options["queries"]) is None
+
+
 def _reconcile_node_options(
     previous: NodeSpec | None,
     proposed: NodeSpec,
@@ -3396,11 +3602,17 @@ def _reconcile_node_options(
 ) -> Mapping[str, Any]:
     proposed_index = _validated_review_index(proposed.options)
     previous_index = _validated_review_index(previous.options) if previous is not None and previous.plugin == proposed.plugin else {}
+    for identity, stored_row in previous_index.items():
+        if is_server_staged_review(stored_row["kind"], stored_row["user_term"]) and identity not in proposed_index:
+            proposed_index[identity] = stored_row
     options = dict(proposed.options)
     if "approved_prompt_artifact_hash" in options:
         del options["approved_prompt_artifact_hash"]
     reconciled: list[Mapping[str, Any]] = []
     carried_prompt_review = False
+    # Position in ``reconciled`` -> the pending shell to fall back to, for each
+    # vague term carried although the wording around its slot changed.
+    carried_across_wording_edit: dict[int, InterpretationRequirement] = {}
 
     for identity, proposed_requirement in proposed_index.items():
         requirement_id, kind, user_term = identity
@@ -3420,6 +3632,15 @@ def _reconcile_node_options(
         _require_resolved_review_coherence(previous_requirement)
         if kind is InterpretationKind.VAGUE_TERM:
             unchanged = _vague_review_is_unchanged(previous, proposed, previous_requirement)
+            if not unchanged and proposed_requirement["draft"] == previous_requirement["draft"]:
+                # Carry unless the term itself changed. The checks above hold:
+                # the slot is still referenced, the stored evidence is intact,
+                # and the row attests its accepted value alone, so wording
+                # edited elsewhere in the prompt leaves the acceptance standing.
+                # Whether a reopened prompt review puts the edit to the user
+                # is decided below, once every row is reconciled.
+                carried_across_wording_edit[len(reconciled)] = shell
+                unchanged = True
         elif kind is InterpretationKind.INVENTED_SOURCE:
             raise ValueError("invented_source review cannot target a transform node")
         else:
@@ -3446,6 +3667,8 @@ def _reconcile_node_options(
                 )
             proposed_artifact = _node_review_artifact(proposed, proposed_nodes, kind=kind, user_term=user_term)
             unchanged = proposed_artifact == previous_artifact
+            if unchanged and is_server_staged_review(proposed_requirement["kind"], proposed_requirement["user_term"]):
+                unchanged = _authored_options_hash(previous) == _authored_options_hash(proposed)
         if unchanged:
             reconciled.append(dict(previous_requirement))
             carried_prompt_review = carried_prompt_review or kind in (
@@ -3454,6 +3677,17 @@ def _reconcile_node_options(
             )
         else:
             reconciled.append(shell)
+
+    if carried_across_wording_edit and not _wording_edit_reopens_its_prompt_review(
+        replace(proposed, options={**options, INTERPRETATION_REQUIREMENTS_KEY: reconciled})
+    ):
+        for position, pending_shell in carried_across_wording_edit.items():
+            reconciled[position] = pending_shell
+        carried_prompt_review = any(
+            row["status"] == "resolved"
+            and InterpretationKind(row["kind"]) in (InterpretationKind.VAGUE_TERM, InterpretationKind.LLM_PROMPT_TEMPLATE)
+            for row in reconciled
+        )
 
     if reconciled:
         options[INTERPRETATION_REQUIREMENTS_KEY] = reconciled

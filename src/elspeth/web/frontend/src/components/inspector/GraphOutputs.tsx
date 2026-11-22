@@ -15,7 +15,7 @@ interface PolicyRow {
   action: ReactNode;
 }
 
-const NODE_LABELS: Record<NodeType, string> = {
+export const NODE_LABELS: Record<NodeType, string> = {
   transform: "Transform",
   gate: "Gate",
   aggregation: "Aggregation",

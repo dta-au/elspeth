@@ -72,6 +72,21 @@ class _Client(PromptGuardClient):
         return self.decision
 
 
+def _check_requests(requests: list[PromptGuardRequest]) -> list[list[PromptGuardRequest]]:
+    """Group the separate prompt/document inspections of each logical check."""
+    grouped: list[list[PromptGuardRequest]] = []
+    for request in requests:
+        if grouped and grouped[-1][0].request_hash == request.request_hash:
+            grouped[-1].append(request)
+        else:
+            grouped.append([request])
+    return grouped
+
+
+def _inspected_documents(requests: list[PromptGuardRequest]) -> str:
+    return "\n".join(document for request in requests for document in request.documents)
+
+
 @pytest.fixture
 def invocation(tmp_path):
     engine, authority, service = _quota_service(tmp_path)
@@ -202,8 +217,8 @@ async def test_recovery_fixed_instruction_does_not_hide_variable_context_from_gu
             required_work=owner.required_work,
             provider_owner=owner,
         )
-    assert len(client.requests) == 1
-    documents = "\n".join(client.requests[0].documents)
+    assert len(_check_requests(client.requests)) == 1
+    documents = _inspected_documents(client.requests)
     assert "malformed_head" in documents
     assert "Choose exactly one terminal recovery control" not in documents
     coordinator.assert_completed()
@@ -302,7 +317,8 @@ async def test_real_advisor_format_retry_gets_its_own_guard_and_preserves_prior_
     class RetryClient(_Client):
         async def inspect(self, request):
             self.requests.append(request)
-            return PromptGuardDecision("allow", "clean") if len(self.requests) == 1 else PromptGuardDecision("blocked", "policy_blocked")
+            first_check = request.request_hash == self.requests[0].request_hash
+            return PromptGuardDecision("allow", "clean") if first_check else PromptGuardDecision("blocked", "policy_blocked")
 
     client = RetryClient(PromptGuardDecision("allow", "clean"))
     service = _guarded_service(invocation, monkeypatch, advisor_client=client)
@@ -328,9 +344,12 @@ async def test_real_advisor_format_retry_gets_its_own_guard_and_preserves_prior_
             session_operation_context=owner.required_work.coordinator.authority.context,
             user_message="Compare columns.",
         )
-    assert len(client.requests) == 2 and len(sdk_calls) == 1
-    assert client.requests[0].role == client.requests[1].role == "advisor"
-    assert client.requests[0].request_hash != client.requests[1].request_hash
+    checks = _check_requests(client.requests)
+    assert len(checks) == 2 and len(sdk_calls) == 1
+    assert {request.role for request in client.requests} == {"advisor"}
+    assert checks[0][0].request_hash != checks[1][0].request_hash
+    # The retry's user prompt was allowed by the first check: only new documents go.
+    assert [request.user_prompt for request in checks[1]] == [""]
     assert len(caught.value.llm_calls) == len(recorder.llm_calls) == 1
     with engine.connect() as connection:
         assert len(connection.execute(select(quota_provider_attempts_table)).all()) == 1
@@ -376,7 +395,7 @@ async def test_real_title_uses_composer_guard_before_model_and_title_mutation(in
         with pytest.raises(PromptGuardRefused):
             await title()
     assert len(sdk_calls) == int(allowed)
-    assert len(client.requests) == 1 and client.requests[0].role == "composer"
+    assert len(_check_requests(client.requests)) == 1 and {request.role for request in client.requests} == {"composer"}
     assert "Compare columns." in client.requests[0].user_prompt
     session = await sessions.get_session(UUID(context.fence.session_id))
     assert session.title == ("Neutral Column Comparison" if allowed else "Wiring")
@@ -712,7 +731,7 @@ async def test_owned_trust_is_stripped_but_unmarked_system_text_remains_guard_ev
                 {"role": "user", "content": "Compare columns."},
             ],
         )
-    documents = "\n".join(client.requests[0].documents)
+    documents = _inspected_documents(client.requests)
     assert "UNTRUSTED_SYSTEM_EVIDENCE" in documents
     assert "OPERATOR_SKILL" not in documents and "CATALOG_REFERENCE" not in documents
     assert PROMPT_GUARD_TRUST_KEY not in documents
@@ -782,7 +801,7 @@ async def test_real_planner_selects_independent_mount_even_with_identical_model_
             },
         )
     assert len(completion.requests) == (2 if hatch else 0)
-    assert len(advisor.requests) == int(hatch)
+    assert len(_check_requests(advisor.requests)) == int(hatch)
     assert all(request.role == "composer" for request in composer.requests)
     assert all(request.role == "advisor" for request in advisor.requests)
     assert caught.value.disposition == "blocked"
@@ -833,12 +852,12 @@ async def test_captured_planner_catalog_reference_preserves_complete_untrusted_g
         policy_override=(policy, snapshot),
         model_overrides={"prompt_guard_mount": PromptGuardMount(client), "prompt_guard_mode": "required"},
     )
-    assert len(client.requests) == len(completion.requests) == 1
+    assert len(_check_requests(client.requests)) == len(completion.requests) == 1
     wire = completion.requests[0]
     parsed = [json.loads(message["content"]) for message in wire["messages"] if message["role"] == "user"]
     categories = [sorted(payload) for payload in parsed]
     record_property("wire_user_message_chars", [len(message["content"]) for message in wire["messages"] if message["role"] == "user"])
-    record_property("guard_document_chars", [len(document) for document in client.requests[0].documents])
+    record_property("guard_document_chars", [len(document) for request in client.requests for document in request.documents])
     record_property("wire_user_field_categories", categories)
     references = [payload for payload in parsed if "authoring_aids" in payload and "intent" not in payload]
     assert len(references) == 1
@@ -846,9 +865,9 @@ async def test_captured_planner_catalog_reference_preserves_complete_untrusted_g
     evidence = next(payload for payload in parsed if "intent" in payload)
     assert {**reference["schema_contract_evidence"], **evidence["schema_contract_evidence"]} == expected_schema
     assert reference["schema_contract_evidence"]["schemas"][0]["plugin_id"] == "transform/passthrough"
-    assert "authoring_aids" not in "\n".join(client.requests[0].documents)
-    assert graph_plugin in "\n".join(client.requests[0].documents)
-    assert max(map(len, client.requests[0].documents)) < 10_000
+    assert "authoring_aids" not in _inspected_documents(client.requests)
+    assert graph_plugin in _inspected_documents(client.requests)
+    assert max(len(document) for request in client.requests for document in request.documents) < 10_000
     assert all(PROMPT_GUARD_TRUST_KEY not in message for message in wire["messages"])
     hashed = {
         "role": "composer",

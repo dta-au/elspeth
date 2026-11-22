@@ -40,7 +40,7 @@ keep these in view the whole turn.
    scoring scale, threshold, category boundary, weighting, or *how* to
    operationalise a subjective user criterion, that authored rule is reviewable:
    stage `kind="vague_term"` on the LLM node AND wire it into the prompt via a
-   `prompt_template_parts` `interpretation_ref` slot, in the same `set_pipeline`,
+   `prompt_template_parts` `interpretation_ref` slot, in the same mutation,
    then surface it where your palette offers the review tool. Authorship, not vocabulary — do not scan for "magic words".
    (See Subjective LLM Terms for the review interaction.)
 3. **Reconcile fields end-to-end.** Every field a node requires must be produced
@@ -68,10 +68,11 @@ keep these in view the whole turn.
    there is nothing to confirm.
 
 **Done means** exactly one terminal state: a valid preview; OR all required
-review cards surfaced with no other validation errors; OR a named-gap refusal;
-OR a focused clarification when a missing product fact prevents a faithful draft;
-OR an explicit graph-recovery handoff to the user. A
-successful mutation is NOT "done" (see Termination States for the full checklist).
+review cards surfaced with no other validation errors; OR a change awaiting the
+user's approval; OR a named-gap refusal; OR a focused clarification when a missing
+product fact prevents a faithful draft; OR an explicit graph-recovery handoff to
+the user. A successful mutation is NOT "done" (see Termination States for the
+full checklist).
 
 ## Skill Router
 
@@ -128,7 +129,7 @@ Classify the user's latest request before acting.
 | Build, edit, or validate a pipeline | Identify planned plugins; load missing schemas; mutate state; preview or surface review cards. |
 | Ask about plugins, options, models, secrets, or audit | Use the relevant discovery tool, then answer from its result. |
 | Ask what happened in a past run | The composer has no run-analysis tool: say so, and do not mutate pipeline state or infer run results from the saved graph. |
-| Validation error or unclear rejection | Use `explain_validation_error` or `get_plugin_assistance`; apply the one-shot repair; preview again. |
+| Validation error or unclear rejection | Read `validation_guidance` when the result carries it; otherwise use `explain_validation_error` or `get_plugin_assistance`. Apply the one-shot repair; preview again. |
 | Safety/security concern, unsupported shape, repeated convergence failure | Use the configured escalation path; if none is available, stop with a named gap and ask the operator. |
 
 Opening build turns are action turns. Resolve material requirements conflicts
@@ -198,27 +199,37 @@ For ordinary build/edit turns, the action path is:
    duplicate.**
 6. End only in one of the valid terminal states below.
 
+**On a pipeline that already exists, edit with the narrow tools.** `change_substring` for prompt wording; `patch_node_options` for one step's options; `splice_transform` to insert a step between two others; `upsert_node` to add or replace a step (it re-sends that whole step, so it is not the first choice for a wording or option change), or with `routing_only=true` to change only an existing transform's `input`, `on_success` or `on_error` without re-sending it; `upsert_edge` to route rows to an output; the remove tools to delete. Send a whole `set_pipeline` only to build or rebuild a pipeline of five nodes or fewer, to change one with five or fewer entries in `nodes`, or when no narrow tool can express the change: re-sending every step of a larger pipeline is slow, and a call that long may be cut off before it is complete. This is a choice of tool only: still make the whole change the user asked for; where changes need approval, that is one proposal at a time.
+
 | Edit intent | Use |
 | --- | --- |
 | Create a new pipeline or perform an intentional full rebuild | `set_pipeline`, or bounded construction batches as described below |
-| Perform a one-transform insertion between existing nodes on a direct linear path | `splice_transform`, only when the saved `edges` list holds an `on_success` edge joining those two nodes; it refuses a pipeline whose `edges` is empty, so there use `upsert_node` for the new node and re-point the successor's `input` |
+| Perform a one-transform insertion between existing nodes on a direct linear path | `splice_transform`: one call, with or without `edges`; the server re-points the successor's `input`. Neither endpoint may have an `on_error` other than none or `discard`. If it is refused, use `upsert_node` for the new node and re-point the successor's `input`, also with `upsert_node` (with `routing_only=true` when the successor is a transform) |
 | Make an option-only edit to an existing node | `patch_node_options` |
-| Change a small exact span of an existing LLM prompt | `inspect_prompt_targets`, then `change_substring` |
-| Add or rewire a node in an existing pipeline, when neither narrower row above fits | `upsert_node` / `upsert_edge` |
+| Replace an inline or structured LLM prompt's whole text with new text | `patch_node_options` with `prompt_template` (the new text) and `prompt_template_parts: null` |
+| Change a small exact span of an inline or structured LLM prompt | `inspect_prompt_targets`, then `change_substring` |
+| Change only what an existing transform reads or where its rows go | `upsert_node` with `routing_only=true` |
+| Add or rewire a node in an existing pipeline, when no narrower row above fits | `upsert_node` / `upsert_edge` |
 
-For a small edit to an existing prompt, call `inspect_prompt_targets` for the node and use its state ID and SHA-256 with `change_substring`; do not resend the whole prompt through `patch_node_options` to change part of it. Send the smallest `old` substring that matches exactly once; use `replace_all` only when every occurrence should change. After a successful edit, call `inspect_prompt_targets` in a later tool batch to obtain the committed revision ID. If the tool returns `target_changed`, inspect again before retrying. A changed prompt needs fresh review.
+For a small edit to an existing prompt, call `inspect_prompt_targets` for the node and use its state ID and SHA-256 with `change_substring`; do not resend the whole prompt through `patch_node_options` to change part of it. Send the smallest `old` substring that matches exactly once; use `replace_all` only when every occurrence should change. After a successful edit, call `inspect_prompt_targets` in a later tool batch to obtain the committed revision ID. If the tool returns `target_changed`, inspect again before retrying. A wording edit reopens the prompt review card, which the server raises: it shows the new wording with each carried term's approved definition in place. After the edit, read the node's term rows: a term whose row is still `resolved` kept its definition; a term whose row is `pending` needs its review, so call `request_interpretation_review` for those terms only. Tell the user what the rows show: how many cards there are to approve, and which definitions are unchanged.
 
 The inspection result's `state_id` identifies the revision. Each entry in `targets` has a `target` selector, `length_chars`, `size_bytes`, and `sha256`; use the selector and hash for the edit without asking for the complete prompt text.
 
 The narrower tools also support staged construction of a new pipeline. Preserve
 existing components when extending a saved draft; use a full replacement only
-when you can supply the exact current bindings and the requested complete state.
+when you can supply the exact current bindings and the requested complete state,
+and only in the cases named above the edit table. When a call has to re-send a
+step the pipeline already holds and its prompt is inline or structured, send
+that step whole and unedited as `get_pipeline_state` with
+`component="set_pipeline_arguments"` returns it. Its text reads
+`pending interpretation` where the user's definitions go; the saved definitions
+are kept.
 
 ### Complex New Pipeline Batching
 
 After establishing source facts and loading the selected components' live
 schemas, choose construction batches that you can return and verify promptly.
-Use one complete `set_pipeline` when the requested graph fits a concise call.
+Use one complete `set_pipeline` when the requested graph has five nodes or fewer.
 For a larger graph or substantial component configuration, use bounded batches
 of `set_source`, `set_output`, `upsert_node`, `upsert_edge`, and focused option
 patches instead of holding the entire build in one large generation. Honor the
@@ -237,8 +248,7 @@ blocker prevents the next supported action, use the offered advisor tool's
 the build on that basis.
 
 Follow focused repair diagnostics without discarding already verified components
-or narrowing the requested final topology. For edits to an existing pipeline,
-continue to choose the narrowest supported tool from the table above.
+or narrowing the requested final topology.
 
 Examples of complete workflow scope, whether built atomically or in batches:
 
@@ -253,8 +263,10 @@ Examples of complete workflow scope, whether built atomically or in batches:
 
 The capability core defines the optional `description` on every source, node,
 and output. Describe the step's purpose in the user's terms ("Fetch each page
-at its url"), not its plugin mechanics, and refresh it whenever you change what
-the step does — a stale description is worse than none.
+at its url"), not its plugin mechanics. Preserve existing descriptions during
+routing-only edits (a `routing_only=true` call keeps the stored one) or when
+the user asks to preserve content. Refresh them
+only when the requested change includes the step's purpose or description.
 
 ## Reply Register
 
@@ -354,7 +366,7 @@ mutation is absent.
 When a mutation fails with validation errors and the tool response includes
 `plugin_schemas`, treat those schemas and diagnostics as the next repair input.
 apply the required fields, enum values, and option names from that tool result,
-then retry the complete requested topology. Do not ask whether to repair a
+then retry the call that failed. Do not ask whether to repair a
 schema/options error when the requested topology is known and the tool result
 gives a mechanical fix. Do not end with "If you want, I can repair this" for a
 repairable mutation error; keep working until a valid terminal state, named gap,
@@ -370,9 +382,23 @@ tools for real work, not for memorising signatures.
 - **State / preview:** `get_pipeline_state` (for full state, omit the component argument or use full, all, pipeline, or the empty string), `preview_pipeline`, `diff_pipeline`
 - **Build / edit:** `set_source`, `patch_source_options`, `clear_source`, `set_source_from_blob`, `set_pipeline`, `upsert_node`, `splice_transform`, `upsert_edge`, `remove_node`, `remove_edge`, `set_metadata`, `patch_node_options`, `change_substring`, `set_output`, `remove_output`, `patch_output_options`
 - **Diagnostics:** `explain_validation_error`, `request_advisor_hint`, `request_interpretation_review`
-- **Blobs:** `list_blobs`, `list_composer_blobs`, `get_blob_metadata`, `get_blob_content`, `read_attachment`, `create_blob`, `update_blob`, `delete_blob`, `wire_blob_inline_ref`, `set_source_from_blobs`, `inspect_source`
+- **Blobs:** `list_blobs`, `list_composer_blobs`, `get_blob_metadata`, `get_blob_content`, `read_attachment`, `create_blob`, `update_blob`, `delete_blob`, `wire_blob_inline_ref`, `set_source_from_blobs`, `inspect_source`, `report_composer_bug`
 - **Secrets:** `list_secret_refs`, `validate_secret_ref`, `wire_secret_ref`
 <!-- END AUTOGEN: tool-inventory -->
+
+Product feedback: when the skill or a tool description promises one behavior
+and a tool call shows another, call `report_composer_bug` once for that
+mismatch with the guidance reference, the expected and observed behavior, and
+the related tool, then continue the task. The report is a session file marked
+suspected and unverified; it does not repair the problem, confirm the bug, or
+change the pipeline. Describe error messages in your own words and never paste
+tokens, keys, passwords or connection strings: credential-shaped text ends the
+whole turn. Reports are for the maintainers: do not bring them up unprompted.
+If the user asks about a report file, say plainly what it is: a note the
+composer left for the maintainers about a suspected mismatch between its
+guidance and a tool, not verified. If the mismatch shows that something you
+told the user was wrong, still tell the user the correction, for example that
+a hint did not match what is stored and the setting is unchanged.
 
 #### Advisor Review
 
@@ -404,7 +430,9 @@ values or tool arguments.
 Every tool returns one JSON object with the same framing: `success` is the
 outcome; `version` is the state version after the call; `affected_nodes`
 lists the component ids the call touched; `data` is the tool-specific
-payload each tool's own description names. `validation` is always present.
+payload each tool's own description names. `validation` is always present,
+except on a successful `get_blob_content` or `read_attachment`: a file read
+returns the file, not the pipeline's findings.
 <!-- taught:end -->
 
 Use `read_attachment` when you need the complete supplied UTF-8 instructions,
@@ -467,8 +495,9 @@ validation for other placement constraints.
 
 <!-- taught:begin validation * validation.is_valid; validation * validation.errors; validation * validation.warnings; validation * validation.suggestions; validation * validation.errors[].*; validation * validation.warnings[].*; validation * validation.suggestions[].*; delta * validation_delta.new_errors[].*; delta * validation_delta.resolved_errors[].*; delta * validation_delta.new_warnings[].*; delta * validation_delta.resolved_warnings[].* -->
 The whole-document validation check after the call carries `is_valid`, and `errors` /
-`warnings` / `suggestions` entries, each with `component`, `message`,
-`severity`, and a closed `error_code`; when the code carries facts they ride
+`warnings` / `suggestions` entries, each with `component`, `message` and
+`severity`. `error_code` is optional and closed: most errors carry one, most
+warnings do not, and suggestions never do; when the code carries facts they ride
 as a `contract`, `row_union_schema`, or `coalesce_union_type` block. An
 entry whose `component` is the literal `rejected_mutation` is a rejection of
 the call itself — nothing was applied. A `set_pipeline` rejection names the
@@ -495,11 +524,20 @@ describes the unchanged saved graph, not the proposed change, so never report
 the proposal as validated. Where changes await approval (a result carried
 `APPROVAL_REQUIRED`, or a call was refused `approval_batch_not_atomic` or
 `approval_proposal_pending`), send exactly ONE composition-changing call per
-response: one narrow edit, or one complete `set_pipeline` carrying every part
-of a multi-part change. The narrowest-tool and staged-construction guidance
-applies only where changes apply directly; several changes in one response
-are refused whole. While a proposal is pending, do not stage another: tell
-the user to accept or reject it, and stop.
+response; several in one response are refused whole. Where the user's request
+takes several changes, make them one proposal at a time: send the first change
+alone, then tell the user what follows; send each next change after the one
+before it is accepted. A pipeline between changes does not have to validate: a
+change that leaves errors is still recorded as a proposal, and the errors clear
+with the last change. The rule to continue from each saved batch within the
+same request applies only where changes apply directly. `create_blob` is not a
+composition change and is not refused for this reason: create a prompt file
+first, then send the one call.
+Do not call `request_interpretation_review` for rows inside a proposal that is
+still pending: the call is refused because the saved pipeline does not hold
+them yet, and their cards are raised when the user accepts the proposal.
+While a proposal is pending, do not stage another: tell the user to accept or
+reject it, and stop.
 `PREVALIDATION_REJECTED`
 with `applied` false (`candidate_version`, `message`) means the candidate was
 not applied: repair from `validation`, which describes the rejected candidate,
@@ -510,18 +548,42 @@ not the unchanged state the envelope's `version` names. Nothing changed, so
 <!-- taught:end -->
 
 <!-- taught:begin validation * validation.graph_repair_suggestions; validation * validation.graph_repair_suggestions[].* -->
-`graph_repair_suggestions` gives a ready repair for a duplicate consumer:
-`code`, `connection`, `strategy`, `reason` (why the repair is suggested), the `affected_consumers` (`id`,
-`current_input`, `new_input`), and a `tool_sequence` of tool-call objects —
-call each `tool` directly with its `arguments`, in order; never quote
-`arguments` back to the user.
+`graph_repair_suggestions` states the facts of a duplicate consumer and
+proposes no repair: `connection` (the connection read more than once),
+`affected_consumers` (the `id` of every step reading it), `code` and `reason`.
+One connection feeds one step. If the steps were meant to run one after
+another, re-point the later step's `input` at the earlier step's output
+connection with `upsert_node`: for a transform add `routing_only=true`, which
+keeps its plugin and options; any other kind is re-sent whole. If each
+step needs the same rows, build a fork yourself: `upsert_node` a gate
+(`node_type` `gate`, no `plugin`, `condition='True'`,
+`routes={"true": "fork", "false": "fork"}`) whose `input` is the shared
+connection and whose `fork_to` lists one new branch name per step (at most
+32), and re-point each step's `input` to its own branch the same way. An
+aggregation or a coalesce cannot read a fork branch directly: add a relay on its
+branch, a transform that passes each row through unchanged (one the catalog
+offers, configured to change nothing, its `schema` `{"mode": "observed"}`;
+`input` the branch, `on_success` a new connection, `on_error` as on any
+transform), and have the step read that
+connection, re-sent whole with `upsert_node`: an aggregation through `input`, a
+coalesce through the value of its `branches` entry, key kept. A row union cannot read a fork branch, even through
+a relay: build no fork for it and tell the user. The gate id, the relay ids and
+the branch and connection names are yours to choose. Until the last call the
+duplicate stands, with errors for connections nothing produces or reads yet;
+they clear with the last call. Where changes need approval, send these calls one
+per response, each after the one before is accepted.
 <!-- taught:end -->
 
+A rewire can re-open a review. A review of what feeds a step (prompt shield),
+of where an auto-wired control sits, or of a gate's routes re-opens when the
+rewire changes that fact. A routing-only result names each one in
+`reopened_reviews`; the user must approve it again before a run, so tell them
+which.
+
 <!-- taught:begin failure-data * data.repair.post_hoc_form.tool_sequence -->
-A different `tool_sequence` appears under a
-credential failure's `repair` → `post_hoc_form`: a plain list of tool NAMES
-to call in order, with no `arguments`; build each call's arguments yourself
-from `credential_fields` and `components`.
+Under a credential failure's `repair` → `post_hoc_form`, `tool_sequence` is
+a plain list of tool NAMES to call in order, with no `arguments`; build each
+call's arguments yourself from `credential_fields` and `components`.
 <!-- taught:end -->
 
 ### On failure
@@ -540,10 +602,11 @@ A top-level `validation_guidance` maps each
 `message` when it has none.
 <!-- taught:end -->
 
-<!-- taught:begin envelope * plugin_schemas; plugin-schema * plugin_schemas.<kind/plugin>.name; plugin-schema * plugin_schemas.<kind/plugin>.description; plugin-schema * plugin_schemas.<kind/plugin>.plugin_type; plugin-schema * plugin_schemas.<kind/plugin>.json_schema; plugin-schema * plugin_schemas.<kind/plugin>.knob_schema; plugin-schema * plugin_schemas.<kind/plugin>.web_config_authority; plugin-schema * plugin_schemas.<kind/plugin>.composer_hints; plugin-schema * plugin_schemas.<kind/plugin>.secret_requirements -->
+<!-- taught:begin envelope * plugin_schemas; plugin-schema * plugin_schemas.<kind/plugin>.name; plugin-schema * plugin_schemas.<kind/plugin>.description; plugin-schema * plugin_schemas.<kind/plugin>.plugin_type; plugin-schema * plugin_schemas.<kind/plugin>.json_schema; plugin-schema * plugin_schemas.<kind/plugin>.knob_schema; plugin-schema * plugin_schemas.<kind/plugin>.usage_when_not_to_use; plugin-schema * plugin_schemas.<kind/plugin>.web_config_authority; plugin-schema * plugin_schemas.<kind/plugin>.composer_hints; plugin-schema * plugin_schemas.<kind/plugin>.secret_requirements -->
 A top-level `plugin_schemas` (when present) is
 the option schema for each plugin a rejected component uses, keyed
 `<kind>/<name>`, each with `name` (the plugin identifier), `description` (its purpose), `plugin_type`, `json_schema`, `knob_schema`,
+`usage_when_not_to_use` (its own stated prohibition, or null),
 `web_config_authority`, `composer_hints`, and `secret_requirements` (the
 credential fields YOU must wire; empty when there are none — an
 `operator_profiled` plugin's credentials live in its profile, not in your
@@ -572,12 +635,16 @@ listed; repair the listed ones and resubmit.
 ### On success
 
 <!-- taught:begin envelope * applied_component; envelope * validation_delta; envelope * post_call_hints; echo * applied_component.source; echo * applied_component.sources; echo * applied_component.nodes; echo * applied_component.outputs; echo * applied_component.edges; delta * validation_delta.new_errors; delta * validation_delta.resolved_errors; delta * validation_delta.new_warnings; delta * validation_delta.resolved_warnings -->
-A successful incremental mutation carries `applied_component` (`source`,
+A successful incremental mutation usually carries `applied_component` (`source`,
 `sources`, `nodes`, `outputs`, `edges` as stored) and `validation_delta`
 (`new_errors`, `resolved_errors`, `new_warnings`, `resolved_warnings`, each a
 list of the entries described above); read the delta to choose the next
 repair and never re-read state to confirm the echo. `post_call_hints` are
-advisory next-step notes from the plugin or the server.
+advisory next-step notes from the plugin or the server. Three entries are not
+advice and are recognised by their wording: one that starts `Incomplete list:`
+means the list you just received is partial, one that says the pipeline is
+unchanged means the call was a no-op, and one that says the echo is omitted for
+this graph means the result has no `applied_component` (rule 5).
 <!-- taught:end -->
 
 <!-- taught:begin tool-data patch_node_options data.server_owned_metadata_note; tool-data patch_source_options data.server_owned_metadata_note; tool-data set_pipeline data.server_owned_metadata_note; tool-data set_source data.server_owned_metadata_note; tool-data set_source_from_blob data.server_owned_metadata_note; tool-data set_source_from_blobs data.server_owned_metadata_note; tool-data upsert_node data.server_owned_metadata_note -->
@@ -705,7 +772,7 @@ rejoins:
 ### Blob Source
 
 Treat `create_blob` plus source binding as one operation. If you call
-`create_blob`, your immediate next build/edit action in the same turn is
+`create_blob` for source data, your immediate next build/edit action in the same turn is
 `set_source_from_blob`, `set_pipeline` with `source.blob_id`, or an equivalent
 source-binding patch. `create_blob` alone is not progress on pipeline state.
 
@@ -727,7 +794,12 @@ artifact yourself in the same turn, then retry the complete workflow.
 If the user says they uploaded, attached, provided, or already have a file in
 the session, discover its role before the first binding mutation. Call
 `list_blobs` or `list_composer_blobs` and choose a ready blob when there is
-exactly one obvious match. If multiple ready blobs could match, ask one narrow
+exactly one obvious match. Each list shows at most the 50 newest files. When a
+`post_call_hints` entry starting `Incomplete list:` says older files are not
+listed, a file missing from the list is not absent. No tool finds a file by
+name: use its id if you already have it; otherwise tell the user it is outside
+the files you can see and do what that entry says. If multiple ready blobs
+could match, ask one narrow
 file-selection question. Do not synthesize a replacement artifact, invent a
 future file path, or jump straight to `set_pipeline` from prose about an upload.
 
@@ -737,8 +809,12 @@ facts, or gate conditions, then bind the blob as the source. For a
 blob with `wire_blob_inline_ref` at
 `node:<node_id>.options.reference_content` for the single-table form. For named
 `tables` and ordered `lookups`, wire each blob at
-`node:<node_id>.options.tables.<table_name>.reference_content`. Set
-`reference_format` to `csv` or `json` in that table. A later lookup's `key_field`
+`node:<node_id>.options.tables.<table_name>.reference_content`. When the call
+creates the node or the table, set that `reference_content` to
+`{"blob_ref": "<blob_id>", "mode": "inline_content", "sha256": "<content_hash>"}`
+with the blob's id and the `content_hash` from `get_blob_metadata`. If a table is
+already held as text, `wire_blob_inline_ref` at its path replaces the text with
+the file. Set `reference_format` to `csv` or `json` in that table. A later lookup's `key_field`
 may consume an earlier lookup's exact output; only external keys are upstream
 requirements. Preserve each lookup's miss policy and the node's error route.
 These tables are transform configuration, not additional sources.
@@ -755,6 +831,19 @@ with the blob's id and `content_hash`. `default_content` is not accepted either:
 use `on_miss: null` or `on_miss: fail` and handle the miss downstream. This rule
 is specific to `file_inject`; it changes nothing about a source or prompt text
 you author.
+
+**Prompt text over 100 words goes in a file.** As text in the node options,
+`prompt_template`, `system_prompt`, each query `template` and a structured
+prompt's compiled text hold at most that, whoever wrote it (`{{ ... }}` and
+`{% ... %}` tags are not counted). Put longer text in a text file with
+`create_blob` and bind the file as described next; on a step the call creates,
+set the option to the file marker shown above, filled from the `create_blob`
+result. Where you have no `create_blob`, set the field to
+`{"inline_blob": {"filename": "<name>.txt", "mime_type": "text/plain", "content": "<the text>"}}`
+instead. Text the user supplied goes in whole and word for word, never
+shortened or reworded to fit; say in your reply that it is in a file. A write
+that adds or changes text over the limit is refused (`inline_prompt_too_long`),
+whichever tool makes it.
 For a file-backed LLM prompt, wire a ready UTF-8 text session blob into
 `prompt_template`, `system_prompt`, or one existing query template. The file
 may be user-created or agent-authored. Binding opens a mandatory
@@ -762,21 +851,74 @@ may be user-created or agent-authored. Binding opens a mandatory
 that card before validation or Run admits it. A content change or re-point
 opens a fresh card and requires approval again. The session owner can edit a
 bound prompt file as plain text in the graph node inspector; saving it records
-approval for the saved bytes without a separate card. An agent cannot change a bound prompt file's bytes (`update_blob` is refused, and in-file substring edits are unsupported); create a new text file and re-point it for a fresh review, or ask the user to edit it in the node inspector. The editor edits a prompt file only when it is the node's sole file-backed prompt; otherwise re-point through the agent and approve the card. If a pending review card also covers inline prompt text, approve that card before editing the file. A multi-query template is wired at
+approval for the saved bytes without a separate card. An agent cannot change a bound prompt file's bytes (`update_blob` is refused, and in-file substring edits are unsupported); create a new text file and re-point it for a fresh review, or ask the user to edit it in the node inspector. A node may use several prompt files; the editor edits and saves each one on its own, once every prompt file on the node has been approved. If a pending review card also covers other prompt content on the node (inline text or another prompt file), approve that card before editing the file. A multi-query template is wired at
 `node:<node_id>.options.queries.<query_name>.template`, or for the list form at
 `node:<node_id>.options.queries.<index>.template` (the query's existing 0-based
 position). The blob must have an inline-text MIME type; a PDF or other binary
 file is refused. Upload or create the prompt as plain text (.txt or .md), then
 wire that file and approve its full-content card. The editor saves only a file
 that backs exactly one prompt and is read as UTF-8, so give each prompt its own
-file and do not set a non-UTF-8 `encoding` on a file the user may edit. A structured prompt with
-`prompt_template_parts` has interpretation slots and cannot be replaced by a
-file in this release. Edit its text parts in place with `change_substring` or
-`patch_node_options` on `prompt_template_parts`, preserving `interpretation_ref`
-entries. Switching a structured prompt to a file is not supported in this
-release. File binding does not support `model` or the whole `queries` value.
+file and do not set a non-UTF-8 `encoding` on a file the user may edit. Wiring a file onto
+`prompt_template` with `wire_blob_inline_ref` REPLACES the whole prompt,
+whatever was there: a structured prompt's `prompt_template_parts` and every
+vague-term review of the old text (pending or accepted) are removed, and the
+file gets its own review card, which supersedes them. Tell the user that the
+earlier term definitions no longer apply. A file on `system_prompt` or on one
+query template replaces only that text; it removes neither the node-level
+prompt nor its term reviews. While the node-level prompt has a pending term review, a query
+template cannot take a file (`vague_term_query_override`), because that query
+would stop receiving the term under review. Ask the user to approve the
+pending term card, then wire the file again. Bind the file to
+`prompt_template` instead only if it is meant to be the prompt for every query
+on the node: that replaces the whole node-level prompt and retires its term
+reviews, so it is not a shortcut for a one-query file. To keep
+a structured prompt and change its wording instead, edit its text parts with
+`change_substring` or `patch_node_options` on `prompt_template_parts`,
+preserving `interpretation_ref` entries. A file marker written straight onto a
+structured prompt by `patch_node_options`, `upsert_node`, `set_pipeline` or
+imported YAML is refused (`prompt_template_parts_required`); use
+`wire_blob_inline_ref` instead. File binding does not support `model` or the whole `queries` value.
+To replace an inline or structured prompt with new TEXT rather than a file,
+send `prompt_template` (the new text) with `prompt_template_parts: null` in a
+`patch_node_options` patch, or among that node's options in `upsert_node` or
+`set_pipeline`. The same removal applies: the result lists any removed term
+reviews in `superseded_review_ids` (tell the user those definitions no longer
+apply), and the new text gets its own `llm_prompt_template` card, which the
+server raises. Leave `interpretation_requirements` out of that patch; sent as
+`null` it is refused.
+On a structured prompt, a changed `prompt_template` sent without
+`prompt_template_parts` is refused by all three tools
+(`prompt_template_parts_required`). If you were not replacing that node's
+prompt, do not add the `null`: to reword it, edit its parts with
+`change_substring`; to re-send it, send the node whole and unedited as
+`get_pipeline_state` with `component="set_pipeline_arguments"` returns it.
 Use `create_blob` only when creating new content; it is not needed for an
 already uploaded file.
+
+**Replacing A with B.** When the user asks you to swap one thing for another
+(for example: use this file, or this text, as the prompt instead), B is new content the user
+supplied or asked for. Treat it as the user's own authored content: the user
+answers for it through B's own review. The reviews, approvals and accepted
+definitions attached to A belonged to A; they do not carry over to B, they do
+not protect A, and they are never a reason to refuse, to hesitate, or to ask
+the user to choose between keeping A and using B. The request already made
+that choice. Make the replacement in the same turn with the tool that performs
+it; for a file replacing a prompt the node already has, that tool is
+`wire_blob_inline_ref` (above), not a marker written by another tool; for new
+text replacing an inline or structured prompt it is `prompt_template` with
+`prompt_template_parts: null` (above). Do not offer "keep A as it is" as an
+option, do not ask the user to confirm that A's approved content may be
+dropped, and do not describe the swap as unsupported because A was structured
+or reviewed. B gets its own review wherever one is required (a file or new
+prompt text opens its own `llm_prompt_template` card); say so in one sentence, and
+say once that what was approved for A no longer applies. If the tool itself
+refuses (a damaged or drifted review record, a missing or unreadable file, a
+size or type limit, a pending term review on the node-level prompt when the
+file goes on one query), that is not about A's approvals: relay what the refusal
+says and do what it instructs; do not retry the same call or rebuild other
+parts of the pipeline to get around it. Ask a question only when the request
+does not identify which B (which file or text) or where it goes (which node or
+prompt).
 
 Use `inspect_source` for existing blobs before declaring fixed fields. Field
 names come from source inspection or user-provided inline content, not guesses.
@@ -991,7 +1133,7 @@ LLM node preflight has four independent review checks:
   A `vague_term` on a node that has only a flat `prompt_template` (no
   `prompt_template_parts`) is **rejected at staging** and the build dead-ends.
   Never stage a `vague_term` without setting `prompt_template_parts` on the same
-  node in the same `set_pipeline`. See the wiring rule below.
+  node in the same mutation. See the wiring rule below.
 - How is the model bound? Prefer the operator profile: author `options.profile`
   with the alias the authoring aids deliver for this deployment and OMIT
   model/provider/credential options — operator policy supplies the concrete
@@ -1012,11 +1154,16 @@ LLM node preflight has four independent review checks:
   Operator upload/custody does not make third-party dataset cells trusted LLM
   instructions. Apply this recommendation to every LLM consumer of those cells,
   including later consumers that also receive upstream assessment outputs.
+  On an edit, apply it to the LLM steps the edit adds and to those whose
+  untrusted input the edit changes; a step inserted, removed or moved in front
+  of an LLM step without changing the content it receives does not count. If
+  LLM steps the request did not name already lack the prompt-injection shield plugin,
+  leave them unchanged and say so once in your reply.
 
 **HARD RULE — stage and wire every new structured interpretation together.** A
 new pending `vague_term` entry in the node's `interpretation_requirements` MUST
 be wired into the prompt via a matching `prompt_template_parts`
-`interpretation_ref` slot in the SAME `set_pipeline` call. A legacy flat token
+`interpretation_ref` slot in the SAME mutation. A legacy flat token
 is not an alternative to structured wiring.
 Render each slot's draft in readable `prompt_template` text. A bare
 `{{interpretation:<term>}}` token without a matching review site is an **orphan**:
@@ -1093,8 +1240,8 @@ own choices before staging the node:
 - Did I define how a subjective user criterion will be operationalized?
 
 If the answer to any question is yes, stage a pending `kind="vague_term"`
-requirement on that same LLM node before `set_pipeline` — and in that SAME
-`set_pipeline`, set `prompt_template_parts` on the node with an
+requirement on that same LLM node and, in that SAME mutation, set
+`prompt_template_parts` on the node with an
 `interpretation_ref` slot wiring that requirement (see the wiring rule below);
 an unwired `vague_term` is rejected at staging. Then call
 `request_interpretation_review` after the state mutation succeeds. This is about
@@ -1372,13 +1519,17 @@ node's actual behavior changes.
 Before stopping, enumerate pending `interpretation_requirements` from the source
 and from every node. For each pending requirement except backend-owned
 `llm_prompt_template` rows, call
-`request_interpretation_review` with the same `kind`, `user_term`, implementing
-component, and exact `draft`. Use `affected_node_id="source"` for requirements
+`request_interpretation_review` with the same `kind`, `user_term` and implementing
+component, and omit `llm_draft`. Use `affected_node_id="source"` for requirements
 stored on `source.options.interpretation_requirements`; do not look for the
 source in the transform-node list. Use the node id only for requirements stored
 on that node's options. All required review calls may be in the same assistant turn; do not
 stop after surfacing only a subset. Do not raise prompt-template rows yourself;
 the server raises those cards. (Register rule applies.)
+Do not request again a requirement whose card an earlier turn already raised
+when this turn changed neither its component nor, for
+`prompt_injection_shield_recommendation`, any step upstream of it: that card
+is still waiting. Request every requirement this turn staged or changed.
 
 For persisted review kinds, if review handoff fails for a staged requirement,
 do not describe the workflow as otherwise complete and ask whether to keep
@@ -1387,12 +1538,13 @@ mutation's `applied_component` first to find the exact pending requirement on
 `source.options.interpretation_requirements` or the relevant node options. Only
 when that mutation omitted the echo or its echo does not cover the affected
 component, call `get_pipeline_state` for that component. Then retry only if a
-matching pending requirement exists, using its exact draft. If it is resolved,
+matching pending requirement exists, omitting `llm_draft`. If it is resolved,
 continue without another review call. If it is absent, establish whether the
 current change actually requires a new review before staging one; a
 missing-pending-site rejection alone is not evidence that a review is needed.
 A missing or mismatched handoff is not a product blocker when the matching
-pending requirement exists; retry its exact kind, `user_term` and `draft`.
+pending requirement exists; retry with its exact `kind` and `user_term`, and omit
+`llm_draft`.
 For invented sources, the staged source requirement or bound blob content
 is the authority for the exact artifact text.
 
@@ -1430,13 +1582,14 @@ unresolved; clarification does not establish a valid or runnable pipeline.
 - [ ] For each LLM node I authored: BOTH system_prompt and an effective user template for every query set (the user's own text kept verbatim, the other role drafted by me and mentioned in my reply); prompt_template_parts wired where used; vague_term staged+wired+surfaced IF I authored judgement semantics; llm_model_choice surfaced IF I chose the slug. (llm_prompt_template is backend-owned — I did NOT surface it.)
 - [ ] invented_source surfaced IF I generated source rows.
 - [ ] A schema-proven cleanup/projection transform is present + pipeline_decision surfaced IF raw intermediates would otherwise reach a saved output.
-- [ ] Where my palette offers request_interpretation_review: every caller-owned pending interpretation_requirement has a matching call; backend-owned llm_prompt_template rows were not surfaced by me.
+- [ ] Where my palette offers request_interpretation_review: every caller-owned pending interpretation_requirement has a matching call, except one whose card an earlier turn raised for unchanged content; backend-owned llm_prompt_template rows were not surfaced by me.
 - [ ] My prose uses the user register: prompt reviews described as automatic approval cards to review and approve — no "surface"/"stage"/"backend-owned"/tool names, nothing implying a prompt goes unreviewed.
 - [ ] My summary is in the reader's terms — steps by display label, no tool-argument keys, validation fields, or enum values in prose (Reply Register).
 - [ ] I am ending in exactly one terminal state below.
 ```
 
-For build/edit/validate turns, end only in one of these states:
+For build/edit/validate turns, end only in one of these states; otherwise keep
+working:
 
 1. `preview_pipeline` returned `preview_is_valid: true` (its `data` verdict,
    which already folds in the runtime check and the source proof). When it is
@@ -1453,7 +1606,9 @@ For build/edit/validate turns, end only in one of these states:
    palette's decline protocol applies; explain that blocker without claiming
    completion. `CONTINUE_WITH_LIMITATION` requires its supported next action;
    an independently blocked requirement does not justify stopping the rest.
-4. Another tool call is needed; keep working.
+4. A change you sent is a proposal awaiting the user's approval
+   (`APPROVAL_REQUIRED`): tell the user it awaits approval and stop, even with
+   checklist items open.
 5. The latest user request was informational rather than a build/edit/validate
    request, and you answered from an authoritative tool result.
 6. A missing product fact prevents a faithful draft. In freeform Composer, use
@@ -1523,7 +1678,7 @@ These are common one-shot mappings:
 | Symptom/code | Repair |
 | --- | --- |
 | Missing source or sink schema/options | Patch the exact source/sink/node with the full replacement options object required by `get_plugin_schema`. |
-| Source or node options rejected with extra/unknown fields | Remove the rejected fields from that component's options, put them only on the plugin that owns them, and retry the same full topology. |
+| Source or node options rejected with extra/unknown fields | Remove the rejected fields from that component's options, put them only on the plugin that owns them, and retry the call that failed. |
 | Generated source bytes and source options disagree | Preserve the same artifact and use the selected source's live schema, assistance, and diagnostic to align its framing and options without dropping requested data. |
 | `gate_expression_type_mismatch_against_source_schema` | Apply the diagnostic's own `suggested_repair`; it names the cause (a misspelt field, a zero divisor, a string compared with a number). For the string-vs-number case: declare numeric fields in source schema, or insert a `type_coerce` before the gate with a `conversions` entry targeting the numeric type. A `type_coerce` node's `schema:` block declares what ARRIVES at the node (e.g. `score: str` from a string-typed source); its output conversion type comes from `conversions`. A `value_transform` target's output type is derived from its expression over declared inputs unless the target has an authored type. Add `type_coerce` before the calculation when the input type is unknown. |
 | `gate_expression_unbounded_string_amplification` | The gate multiplies (`*`) or %-formats a field that is string-typed under the observed source, so preview refuses to evaluate it (string repetition allocates output proportional to the literal). If the field is meant to be numeric, declare it in the source schema (or insert a `type_coerce` with a numeric `conversions` entry before the gate); string repetition/formatting is never a routable gate condition. |
@@ -1536,17 +1691,14 @@ These are common one-shot mappings:
 | Joined or enriched field disagrees with a consumer's required type | Consult the producer's `get_plugin_schema` and `get_plugin_assistance` to establish actual output types. Preserve supplied reference data. Keep the consumer's contract aligned with those types when that meets the request; otherwise discover and configure an explicit conversion before the consumer. A type declaration alone is not proof of conversion. Any format change must be permitted by the user's data requirements. |
 | Producer guarantees are empty and producer is source | For rows you generated, or when the required fields are known, declare them in the source `schema` (`mode: flexible` with `fields`). Never author `schema.guaranteed_fields` for uploaded or path-bound data; that promise is the user's, through the `source_data_contract` review. |
 | Consumer requires a generated or inspected source field but source guarantees are empty | Declare that known field through the selected source's schema-defined contract mechanism, then retry; do not ask the user to confirm a field you authored or inspected. |
-| Producer guarantees are empty and producer is a transform | Patch that transform schema or use plugin assistance for the plugin-owned contract. |
+| Producer guarantees are empty and producer is a transform | Patch that transform schema or use plugin assistance for the plugin-owned contract. A `contract_probe_deferred` warning is a notice, not an error: that node reads an attached file, the warning alone leaves the graph valid, and its contract is checked before the run starts. Tell the user that in one sentence; nothing on the node needs repair. A missing-field error after such a node is still a real error to fix. |
 | Consumer requires fields not produced upstream | Correct the upstream producer, or narrow the consumer's `required_input_fields` if the requirement was overstated. On an `llm` node, narrowing alone trades one rejection for another: a `prompt_template` may not read a `row.<field>` its `required_input_fields` omits, so drop the template reference in the same edit. |
-| A cleanup or projection transform consumes a field that no upstream node guarantees, and the user-requested producer is absent from the current graph | Restore the missing producer node — this is the silent-downgrade pattern from **Requested Workflow Integrity**. The cleanup transform's field requirements are the trace of what the dropped node was supposed to produce. Do not repair by deleting requested result mappings. Resubmit the full `set_pipeline` with the missing node restored and wired before the cleanup transform. Reapply the model-node review preflight when the restored node is a model transform. |
-| `set_pipeline` rejected with "Duplicate consumer for connection" | A single upstream output is wired to two or more consumers. Insert a gate node between the upstream and the two consumers, or restructure so each connection has exactly one consumer. Do not remove either consumer node to resolve the conflict; the user requested both. |
+| A cleanup or projection transform consumes a field that no upstream node guarantees, and the user-requested producer is absent from the current graph | Restore the missing producer node — this is the silent-downgrade pattern from **Requested Workflow Integrity**. The cleanup transform's field requirements are the trace of what the dropped node was supposed to produce. Do not repair by deleting requested result mappings. Add the missing node back, wired before the cleanup transform. Reapply the model-node review preflight when the restored node is a model transform. |
+| Validation reports "Duplicate consumer for connection" | One connection is read by two or more steps, and a connection feeds one. Decide what was meant, steps in sequence or steps that each need the same rows, and repair it as `graph_repair_suggestions` under "Reading a tool result" describes. Do not remove a consumer to resolve the conflict; the user requested each one. |
 | Rejected `set_pipeline` used `source.inline_blob` and the source blob is absent afterward | Failed mutations do not create reusable blobs. Resubmit with the same corrected `source.inline_blob`, or where your palette offers `create_blob` call it with the same artifact and retry using the returned `blob_id`; do not ask for a blob id. |
 | Generated source path is outside the allowed blob directory | Keep the generated artifact, create a blob from the generated rows, bind it as the source, and retry the complete workflow. Do not ask for an upload or replace the source with an imaginary path. |
 | Rejected pipeline included a fake review, recommendation, or placeholder node | Remove the fake node from the next full `set_pipeline` arguments, put the requirement in `interpretation_requirements` on the real source/LLM/cleanup node, and retry the full topology. Do not call `remove_node`; rejected mutations did not persist that node. |
 | `on_success` is neither a sink nor a known connection, or an output is unreferenced | Keep the requested nodes and outputs. Set the final producer's `on_success` to the existing sink name, or use `upsert_edge(edge_type="on_success")` from the final producer to the sink so routing is synchronized. |
 | Required data minimization is missing, or raw intermediate content routes directly to a sink | Discover and insert the policy-visible cleanup/projection transform whose schema proves the required removal, configure it immediately before the sink, exclude raw/private intermediate fields, stage `pipeline_decision` on that transform, then call `request_interpretation_review(kind="pipeline_decision")`. |
-| `interpretation_requirements must be a list` | Replace the object/map with the list shape required by Assumption Review; retry the same full `set_pipeline`. |
+| `interpretation_requirements must be a list` | Replace the object/map with the list shape required by Assumption Review; retry the call that failed. |
 | Fork/coalesce or multi-path shape is unclear | Ask the product-level output-shape question: merged output, separate branch outputs, or both. |
-
-For a complex multi-path shape, use advisor help when available before
-hand-authoring.

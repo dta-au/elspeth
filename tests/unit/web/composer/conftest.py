@@ -102,13 +102,18 @@ from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.redaction import (
     MANIFEST,
+    REPORT_BEHAVIOR_MAX_CHARS,
+    REPORT_GUIDANCE_REFERENCE_MAX_CHARS,
+    REPORT_SUMMARY_MAX_CHARS,
     CreateBlobArgumentsModel,
     GetBlobContentArgumentsModel,
     GetBlobContentDataModel,
     GetBlobContentResponseModel,
+    GetBlobContentValidationModel,
     ReadAttachmentArgumentsModel,
     ReadAttachmentDataModel,
     ReadAttachmentResponseModel,
+    ReportComposerBugArgumentsModel,
     SetPipelineArgumentsModel,
     SetSourceFromBlobArgumentsModel,
     SetSourceFromBlobsArgumentsModel,
@@ -119,7 +124,6 @@ from elspeth.web.composer.redaction import (
     _PipelineMetadataModel,
     _PipelineNodeModel,
     _PipelineOutputModel,
-    _RepairToolCallShadowModel,
     _SetPipelineNamedSourceModel,
     _SetPipelineSourceModel,
     _SpliceTransformNodeModel,
@@ -223,13 +227,34 @@ def _create_blob_strategy() -> st.SearchStrategy[CreateBlobArgumentsModel]:
     ).map(CreateBlobArgumentsModel.model_validate)
 
 
+def _report_composer_bug_strategy() -> st.SearchStrategy[ReportComposerBugArgumentsModel]:
+    # The optional fields refuse a supplied null, so they are omitted rather
+    # than generated as None; prose needs at least one visible character.
+    def prose(cap: int) -> st.SearchStrategy[str]:
+        return st.text(min_size=1, max_size=cap).filter(lambda text: bool(text.strip()))
+
+    return st.fixed_dictionaries(
+        {
+            "summary": prose(REPORT_SUMMARY_MAX_CHARS),
+            "expected_behavior": prose(REPORT_BEHAVIOR_MAX_CHARS),
+            "observed_behavior": prose(REPORT_BEHAVIOR_MAX_CHARS),
+        },
+        optional={
+            "guidance_reference": prose(REPORT_GUIDANCE_REFERENCE_MAX_CHARS),
+            "related_tool": st.from_regex(r"[a-z][a-z0-9_]{0,40}", fullmatch=True),
+        },
+    ).map(ReportComposerBugArgumentsModel.model_validate)
+
+
 def _get_blob_content_response_strategy() -> st.SearchStrategy[GetBlobContentResponseModel]:
     # Success requires data; failure can omit it. Other envelope fields retain
     # their inferred strategies, including nested sensitive repair arguments.
     data = st.from_type(GetBlobContentDataModel)
+    # A success may go out without validation; a refusal always carries it.
+    validation = st.from_type(GetBlobContentValidationModel)
     return st.one_of(
-        st.builds(GetBlobContentResponseModel, success=st.just(True), data=data),
-        st.builds(GetBlobContentResponseModel, success=st.just(False), data=st.one_of(st.none(), data)),
+        st.builds(GetBlobContentResponseModel, success=st.just(True), data=data, validation=st.one_of(st.none(), validation)),
+        st.builds(GetBlobContentResponseModel, success=st.just(False), data=st.one_of(st.none(), data), validation=validation),
     )
 
 
@@ -301,9 +326,10 @@ def _read_attachment_data_strategy(draw: st.DrawFn) -> ReadAttachmentDataModel:
 
 def _read_attachment_response_strategy() -> st.SearchStrategy[ReadAttachmentResponseModel]:
     data = st.from_type(ReadAttachmentDataModel)
+    validation = st.from_type(GetBlobContentValidationModel)
     return st.one_of(
-        st.builds(ReadAttachmentResponseModel, success=st.just(True), data=data),
-        st.builds(ReadAttachmentResponseModel, success=st.just(False), data=st.one_of(st.none(), data)),
+        st.builds(ReadAttachmentResponseModel, success=st.just(True), data=data, validation=st.one_of(st.none(), validation)),
+        st.builds(ReadAttachmentResponseModel, success=st.just(False), data=st.one_of(st.none(), data), validation=validation),
     )
 
 
@@ -412,34 +438,6 @@ def _splice_transform_node_strategy() -> st.SearchStrategy[_SpliceTransformNodeM
     )
 
 
-def _repair_tool_call_strategy() -> st.SearchStrategy[_RepairToolCallShadowModel]:
-    """Resolve ``_RepairToolCallShadowModel`` for the property test.
-
-    The shadow model's ``arguments`` field is typed ``Mapping[str, object]`` to
-    mirror ``_RepairToolCall`` (tools/_common.py) faithfully. ``st.from_type``
-    would fill ``object`` with arbitrary, sometimes non-JSON, non-deepcopy-able
-    instances (e.g. ``super(NoneType)``), which crashes the redactor's
-    ``copy.deepcopy(model_dump())`` step — a pure strategy artifact, since at
-    runtime the value always originates from a parsed JSON response dict.
-
-    We constrain ``arguments`` to a string-keyed dict of JSON scalars so the
-    generated examples are deepcopy-safe and faithful to the real wire shape.
-    The ``arguments`` leaf carries a Sensitive summarizer
-    (:func:`_summarize_repair_arguments`); the property test asserts only that
-    the redacted value differs from the raw value at that Sensitive path, so the
-    scalar value-space is sufficient — it does not assert on the contents.
-    """
-    return st.builds(
-        _RepairToolCallShadowModel,
-        tool=st.text(),
-        arguments=st.dictionaries(
-            st.text(min_size=1, max_size=8),
-            st.one_of(st.text(max_size=16), st.integers(), st.booleans(), st.none()),
-            max_size=3,
-        ),
-    )
-
-
 st.register_type_strategy(SetSourceFromBlobArgumentsModel, _set_source_from_blob_strategy())
 st.register_type_strategy(SetSourceFromBlobsArgumentsModel, _set_source_from_blobs_strategy())
 st.register_type_strategy(CreateBlobArgumentsModel, _create_blob_strategy())
@@ -449,12 +447,12 @@ st.register_type_strategy(GetBlobContentResponseModel, _get_blob_content_respons
 st.register_type_strategy(ReadAttachmentArgumentsModel, _read_attachment_arguments_strategy())
 st.register_type_strategy(ReadAttachmentDataModel, _read_attachment_data_strategy())
 st.register_type_strategy(ReadAttachmentResponseModel, _read_attachment_response_strategy())
+st.register_type_strategy(ReportComposerBugArgumentsModel, _report_composer_bug_strategy())
 st.register_type_strategy(_SetPipelineSourceModel, _set_pipeline_source_strategy())
 st.register_type_strategy(_SetPipelineNamedSourceModel, _set_pipeline_named_source_strategy())
 st.register_type_strategy(_PipelineNodeModel, _pipeline_node_strategy())
 st.register_type_strategy(_PipelineOutputModel, _pipeline_output_strategy())
 st.register_type_strategy(_SpliceTransformNodeModel, _splice_transform_node_strategy())
-st.register_type_strategy(_RepairToolCallShadowModel, _repair_tool_call_strategy())
 st.register_type_strategy(SetPipelineArgumentsModel, _set_pipeline_arguments_strategy())
 
 

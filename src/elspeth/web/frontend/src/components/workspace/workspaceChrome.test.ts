@@ -86,7 +86,6 @@ describe("workspace action bar rhythm (elspeth-fca731fb28)", () => {
   // "Share inspect link" at exactly the viewport where the bar is most crowded.
   const gapBearingSelectors = [
     ".workspace-action-bar-slot",
-    ".workspace-pane-controls",
     ".workspace-action-bar",
     ".workspace-action-bar .completion-bar",
   ];
@@ -111,40 +110,48 @@ describe("workspace action bar rhythm (elspeth-fca731fb28)", () => {
     expect(densityBlock![1]).not.toContain(".workspace-collapse-control");
   });
 
-  it("gives both pane toggles the shared icon chrome at the 44px register", () => {
-    // Recut 2026-08-15: the toggles render variant="bare", so
-    // .workspace-pane-toggle is their ONLY chrome. It must carry the full
-    // --size-control register on BOTH axes (the collapse control's
-    // registration contract needs the height; icon-only needs the width for
-    // the 44px target the geometry e2e hit-tests), and it must NOT recreate
-    // the .btn surface fill that made the old control read as a sixth
-    // action-bar button — transparent ground, hover-only wash.
+  it("gives the hide/show toggle the title bars' 36px icon chrome", () => {
+    // By design, the toggle opens a pane title bar, so
+    // it takes the bars' compact register (the tab pills and Plugin catalog
+    // are 36px in the 46px band) on BOTH axes. variant="bare" makes
+    // .workspace-pane-toggle its ONLY chrome: transparent ground, hover-only
+    // wash, no .btn surface fill.
     const toggle = ".workspace-pane-toggle";
-    expect(declaration(toggle, "min-width")).toBe("var(--size-control)");
-    expect(declaration(toggle, "min-height")).toBe("var(--size-control)");
+    expect(declaration(toggle, "min-width")).toBe("var(--size-control-compact)");
+    expect(declaration(toggle, "min-height")).toBe("var(--size-control-compact)");
     expect(declaration(toggle, "background-color")).toBe("transparent");
     // The border is the toggle's ONLY resting boundary (transparent fill), so
-    // WCAG 1.4.11 applies to it directly: --color-border-strong is ~1.7:1 on
-    // --color-surface in both themes (2026-08-15 a11y audit), which is why
-    // the toggles borrow --color-input-border — the token M04 created for
-    // exactly this defect on form inputs. colorContrast.test.ts proves the
-    // token clears 3:1; this pin proves the toggles actually use it.
+    // WCAG 1.4.11 applies to it directly, on the title bar fill.
+    // colorContrast.test.ts proves the token clears 3:1 there in both
+    // themes; this pin proves the toggle actually uses it.
     expect(declaration(toggle, "border")).toBe(
-      "1px solid var(--color-input-border)",
+      "1px solid var(--color-pane-toggle-border)",
     );
     expect(
       declaration(`${toggle}:hover:where(:not(:disabled))`, "background-color"),
     ).toBe("var(--color-surface-hover)");
   });
 
-  it("takes the bar's padding and the stable toggle's standoff from one inset", () => {
-    // Task A: toggle and actions share the pipeline-column flex row; their
-    // block standoffs still move together in the short-screen regime.
+  it("takes the bar's padding from the shared inset", () => {
     expect(declaration(".workspace-action-bar", "padding")).toBe(
       "var(--workspace-bar-inset) 0",
     );
-    expect(declaration(".workspace-pane-controls", "margin")).toBe(
-      "var(--workspace-bar-inset) 0",
+  });
+
+  it("puts the toggle the same distance from the title in both title bars", () => {
+    // The Hide control opens the conversation's bar and the Show control
+    // the pipeline's; equal inline padding and gap keep the control on one
+    // spot and its title one gap away, in the density regime too.
+    expect(declaration(".workspace-pane-header", "gap")).toBe("var(--space-sm)");
+    expect(declaration(".artifact-workspace-toolbar", "gap")).toBe("var(--space-sm)");
+    expect(declaration(".workspace-pane-header", "padding")).toBe(
+      declaration(".artifact-workspace-toolbar", "padding"),
+    );
+    const densityBlock = /@media \(min-width: 961px\) and \(max-height: 800px\) \{([\s\S]*)\n\}/.exec(
+      cssWithoutComments,
+    );
+    expect(densityBlock![1]).toMatch(
+      /\.artifact-workspace-toolbar,\s*\.workspace-pane-header\s*\{\s*gap: var\(--space-xs\);/,
     );
   });
 });
@@ -337,9 +344,8 @@ describe("workspace bottom edge (elspeth-215c989bed, elspeth-9c94a58500)", () =>
     ).toBe("3");
   });
 
-  it("centres the stable toggle and actions in the same pipeline-column row", () => {
+  it("centres the workflow actions in the pipeline-column row", () => {
     expect(declaration(slot, "align-items")).toBe("center");
-    expect(declaration(".workspace-pane-controls", "align-items")).toBe("center");
     expect(declaration(".workspace-action-bar", "align-items")).toBe("center");
     expect(declaration(".workspace-action-bar-main", "flex")).toBe("1");
     expect(declaration(".workspace-action-bar-main", "min-width")).toBe("0");

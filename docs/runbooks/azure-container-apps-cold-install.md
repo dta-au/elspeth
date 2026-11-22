@@ -14,7 +14,7 @@ the web app and its Jobs.
 > `elspeth-5ec3befc1a` closed on 2026-09-10 by operator ruling. No live cloud
 > acceptance is claimed. This is an executable operator procedure; steps marked
 > **LIVE** require measurements during execution. A future acceptance receipt at
-> `docs/operator/evidence/azure-container-apps/0.8.15.json` is no longer a tracker
+> `docs/operator/evidence/azure-container-apps/0.8.16.json` is no longer a tracker
 > closure or documentation-promotion condition.
 
 > **Temporary deployment policy:** only fresh/new stores are supported until
@@ -104,7 +104,7 @@ The bundle is a **disposable-by-default** package for a dedicated resource
 group. It is not a multi-region design and it does not manage the registry
 (the existing registry that CI publishes to is referenced by resource id).
 
-## Offline rehearsal before entering the enclave
+## Offline rehearsal before working in the restricted environment
 
 With the checkout's existing Python environment and `bash`/`jq` available, run
 the instruction rehearsal before executing any Azure commands:
@@ -133,7 +133,7 @@ settings loader and local pricing calculation. Negative controls cover missing
 exports, unknown deployment pricing and failed Jobs. They do not compile Bicep,
 build an image, contact a provider or verify cloud permissions. Run the compiled
 bundle tests separately when the approved Bicep compiler is available. Supply
-the enclave's real registry route, Azure identities, model/catalog mappings,
+the restricted environment's real registry route, Azure identities, model/catalog mappings,
 network access and SSO registration at the operator-input steps below.
 
 ## Prerequisites

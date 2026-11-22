@@ -162,10 +162,10 @@ a target.
 | `ELSPETH_WEB__SECRET_KEY` | Required session-token signing secret. Generate at least 32 random bytes and keep the value stable across restarts. |
 | `ELSPETH_WEB__SHAREABLE_LINK_SIGNING_KEY` | Required base64-encoded shareable-link signing key. Generate with `openssl rand -base64 32` and keep the value stable across restarts. |
 | `ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS` | Required positive maximum for Composer build/revision turns. The standalone Docker example uses `15`. |
-| `ELSPETH_WEB__COMPOSER_CONTEXT_MAX_PROMPT_TOKENS` | Required positive prompt-token limit of the model gateway in front of the Composer. There is no default; the server will not start without it. The Composer sheds old history to keep its conservative estimate under it; protected content can still cause refusal. The standalone Docker example uses `200000` as a placeholder; set your gateway's actual limit. |
-| `ELSPETH_WEB__COMPOSER_CONTEXT_SHED_ABOVE` | Optional fraction of the token cap above which history is shed. Default `0.85`; must be above 0 and at most 1. |
-| `ELSPETH_WEB__COMPOSER_CONTEXT_SHED_TO` | Optional target fraction of the token cap; when protected content exceeds this target, shedding targets the high mark. Default `0.60`; must be above 0, below 1 and below `COMPOSER_CONTEXT_SHED_ABOVE`. |
-| `ELSPETH_WEB__COMPOSER_PLANNER_MAX_REQUEST_BYTES` | Optional positive maximum bytes per compose-loop or planner provider request, measured as sent (the JSON of its messages and tools). Default `983040` (960 KiB; it was 2 MiB before the context budget and now also applies to the compose loop). Advisor and review calls are not bounded by it. |
+| `ELSPETH_WEB__COMPOSER_CONTEXT_MAX_PROMPT_TOKENS` | Required positive prompt-token limit of the model gateway in front of the Composer. There is no default; the server will not start without it. To keep its conservative token estimate under this limit, the Composer leaves out history: earlier turns of the conversation only, never the turn in progress. This applies to compose-loop, planner and advisor requests. A request still over the estimate once no history is left to leave out is sent and recorded as over the estimate (`over_estimate`); the estimate never stops a request. For compose-loop and planner requests only `COMPOSER_PLANNER_MAX_REQUEST_BYTES` refuses one. The advisor leaves out earlier turns by age (see "Advisor input allowance" below for its other bounds) and does not use the shed marks or the byte maximum. When the provider or gateway rejects a compose-loop request as over the model's context limit, the request is sent once more with every earlier turn left out; if that is rejected too, or there was no earlier turn, the turn is refused as too large for the model. The standalone Docker example uses `200000` as a placeholder; set your gateway's actual limit. |
+| `ELSPETH_WEB__COMPOSER_CONTEXT_SHED_ABOVE` | Optional fraction of the token cap above which history (earlier turns) is shed from compose-loop and planner requests. Default `0.85`; must be above 0 and at most 1. |
+| `ELSPETH_WEB__COMPOSER_CONTEXT_SHED_TO` | Optional target fraction of the token cap; when protected content (everything but earlier turns) exceeds this target, shedding targets the high mark. History left out stays out until the whole request is back under this mark. Default `0.60`; must be above 0, below 1 and below `COMPOSER_CONTEXT_SHED_ABOVE`. |
+| `ELSPETH_WEB__COMPOSER_PLANNER_MAX_REQUEST_BYTES` | Optional positive maximum bytes per compose-loop or planner provider request, measured as sent (the JSON of its messages and tools). Default `983040` (960 KiB; it was 2 MiB before the context budget and now also applies to the compose loop). It is the only limit that refuses one of these requests: a request still over it once every earlier turn is left out is refused, and the turn in progress is never cut to fit. Advisor and review calls are not bounded by it. |
 | `ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS` | Required positive maximum for Composer discovery turns. The standalone Docker example uses `10`. |
 | `ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS` | Required positive Composer timeout in seconds. The standalone Docker example uses `180.0`. |
 | `ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE` | Required positive per-user Composer request limit. The standalone Docker example uses `60`. |
@@ -363,6 +363,75 @@ remain in force. Daily quotas compare recorded usage; they do not reserve the
 next call's input/output tokens or guarantee context fit. The operator remains
 responsible for the selected model and gateway's actual capacity. Restart the
 service after changing the setting.
+
+### Advisor reply cap and timeout
+
+`ELSPETH_WEB__COMPOSER_ADVISOR_MAX_COMPLETION_TOKENS` (default `16384`) is the
+completion-token cap sent with every advisor request. A checkpoint reviews a
+whole build, and the model's reasoning tokens are drawn from the same cap as
+its verdict. A reply that reaches the cap before it states a verdict is
+recorded with finish reason `length`, and every advisor call record carries
+the cap it sent (`max_completion_tokens_requested`). The completion check then
+says the reply ran out of room, names this setting and gives the cap that was
+sent.
+
+`ELSPETH_WEB__COMPOSER_ADVISOR_TIMEOUT_SECONDS` (default `180`) bounds each
+advisor provider call. A call never waits longer than the time left in the
+turn (`ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS`), whichever is smaller.
+
+The defaults were `8192` and `60` before 0.8.16. An explicit setting is used
+as given. A cap above the model's own output limit may be rejected by the
+provider, and startup cannot detect it; a rejected advisor request blocks
+completion as a rejected request. Restart the service after changing either
+setting.
+
+### Validation reuse within a compose call (`ELSPETH_WEB__COMPOSER_VALIDATION_REUSE_ENABLED`)
+
+Default `true`. Within one compose call, the Composer can hand back a
+validation verdict it has already computed for the same state object instead
+of computing it again. This covers two validations:
+
+- The runtime preflight of a state that references an uploaded or
+  composer-created file (a `blob_ref`). Before every reuse ELSPETH reads again
+  each referenced file's metadata record, the stored file's size, modification
+  time, change time and inode, the user's secret inventory (names and
+  availability, not values), and every source, sink and `provider_config`
+  path as the path allowlist resolves it, symbolic links included. Every
+  value must equal what was read immediately before and after the verdict was
+  computed, and the file rows the computation itself read must match too.
+  Otherwise the preflight runs again. A state whose own options wire a
+  secret reference is never reused, because its verdict depends on the
+  secret's value. A state that gets a credential from an operator profile can
+  be reused: its preflight resolves that credential, and the reuse checks it
+  only through the secret inventory (names and availability, never values),
+  so a value replaced under the same name is seen at the next compute. A
+  failed preflight is never reused. A reuse is not made after the caller's deadline;
+  the call fails with the same timeout a fresh preflight would.
+- The policy view's authoring validation of the same state object.
+
+Any composer tool call that can change the pipeline, a secret or a file ends
+every reuse in that compose call, whether the call succeeded or not. Nothing
+is reused across compose calls.
+
+What was compared before this shipped, on synthetic graphs: every verdict
+field of each validation with reuse on and off across scripted rounds,
+including rounds that change secrets, stored file bytes and sink paths, and
+rounds with an expired deadline. That comparison is evidence for those
+scripts, not for every state.
+
+Reuse is visible in telemetry. `composer.runtime_preflight.reused` counts
+verdicts handed back (attribute `layer`: `runtime_preflight` or
+`policy_view`); `composer.runtime_preflight.total` still counts only
+preflights actually computed. `composer.runtime_preflight.reuse_declined`
+counts runtime-preflight verdicts computed with reuse on that were not kept
+for reuse, by `reason` (for example `evidence_read_failed`,
+`secret_ref_sites` or `evidence_changed`); a steady stream of
+`evidence_read_failed` means reuse has stopped working and every preflight is
+being computed.
+
+Set `ELSPETH_WEB__COMPOSER_VALIDATION_REUSE_ENABLED=false` to compute every
+validation every time, as before this setting existed. The value is read once
+when the Composer service is built; restart the service after changing it.
 
 ### Strict tool contracts (`ELSPETH_WEB__COMPOSER_STRICT_TOOLS`)
 

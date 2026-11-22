@@ -13,6 +13,7 @@ unmocked end-to-end.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -510,7 +511,7 @@ class TestWalkerInValidatePipeline:
             raise injected_error
 
         with (
-            patch("elspeth.web.execution.validation.load_settings_from_yaml_string", new=_load_settings_from_yaml_string),
+            patch("elspeth.web.execution.validation.load_settings_from_config_dict", new=_load_settings_from_config_dict),
             patch(
                 "elspeth.web.execution.validation.instantiate_runtime_plugins",
                 new=raise_value_source_error,
@@ -563,7 +564,7 @@ class TestWalkerInValidatePipeline:
         settings = _make_settings()
 
         with (
-            patch("elspeth.web.execution.validation.load_settings_from_yaml_string", new=_load_settings_from_yaml_string),
+            patch("elspeth.web.execution.validation.load_settings_from_config_dict", new=_load_settings_from_config_dict),
             patch("elspeth.web.execution.validation.instantiate_runtime_plugins", new=_runtime_plugins_returning(bundle)),
             patch("elspeth.web.execution.validation.build_runtime_graph", new=_build_runtime_graph),
             patch("elspeth.web.execution.validation.assemble_and_validate_pipeline_config", new=_assemble_and_validate_pipeline_config),
@@ -592,7 +593,7 @@ class TestWalkerInValidatePipeline:
             raise injected_error
 
         with (
-            patch("elspeth.web.execution.validation.load_settings_from_yaml_string", new=_load_settings_from_yaml_string),
+            patch("elspeth.web.execution.validation.load_settings_from_config_dict", new=_load_settings_from_config_dict),
             patch("elspeth.web.execution.validation.instantiate_runtime_plugins", new=raise_value_source_error),
         ):
             result = validate_pipeline_for_trained_operator(
@@ -700,7 +701,7 @@ class _RuntimePluginBundleStub:
     aggregations: dict[str, object] = field(default_factory=dict)
 
 
-def _load_settings_from_yaml_string(_yaml_content: str, *, expand_env_vars: bool = True) -> object:
+def _load_settings_from_config_dict(_config_dict: Mapping[str, object], *, expand_env_vars: bool = True) -> object:
     return SimpleNamespace(expand_env_vars=expand_env_vars)
 
 

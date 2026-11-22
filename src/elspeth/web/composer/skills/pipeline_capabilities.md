@@ -10,11 +10,12 @@ these exact bytes before their interaction rules.
 
 [capability:discovery-order]
 
-Author pipelines as one complete canonical pipeline document — the
-`set_pipeline` object shape. Each authoring surface accepts that document
-through its own terminal authoring tool; your tool palette and any
-per-request instruction identify yours. Use the read-only discovery tools
-before authoring:
+A pipeline is one canonical pipeline document — the `set_pipeline` object
+shape. To build or rebuild a pipeline, send that complete document through
+your surface's terminal authoring tool; your tool palette and any per-request
+instruction identify yours. Where your palette has narrow edit tools, change an
+existing pipeline with them; without them every change is the complete
+document. Use the read-only discovery tools before authoring:
 
 1. Read the request's information manifest first. Its current pipeline
    projection and policy snapshot are already supplied facts; do not repeat a
@@ -38,8 +39,9 @@ before authoring:
    expression grammar is already supplied. Use blob and secret-reference
    discovery when the request needs them; secret values are never part of
    authoring discovery.
-5. Author through your surface's terminal authoring tool with the complete
-   canonical document. Preserve the requested topology during every repair.
+5. Build or rebuild through your surface's terminal authoring tool with the
+   complete canonical document; change an existing pipeline as stated above.
+   Preserve the requested topology during every repair.
 
 Batch independent missing facts. Pages of one blob depend on its
 returned continuation offset and content hash; read them sequentially, without
@@ -59,7 +61,28 @@ that field is the authoritative post-change state of everything it names; do
 not call `get_pipeline_state` to confirm those components. Use
 `get_pipeline_state` only for an untouched component, a whole-document
 question, or a successful mutation that omits the echo. A successful result
-whose hint reports the pipeline unchanged needs no confirming read.
+whose hint reports the pipeline unchanged needs no confirming read. A
+routing-only `upsert_node` returns `routing_update` instead of the echo; it is
+authoritative for the routes it names.
+
+For an existing transform's routing edit, send `upsert_node` with
+`routing_only=true`, `id`, `node_type`, `input` (the current one when it does
+not change) and only the routes that change; its plugin, options, description
+and every route you leave out stay as stored, and a null route is refused. A
+review of what feeds the step (prompt shield), of where an auto-wired control
+sits, or of a gate's routes re-opens when the rewire changes that fact; the
+result names each in `reopened_reviews`, and each must be approved again
+before a run. Any other change to a step re-sends it whole. `upsert_node`
+replaces the whole node: an omitted `description` is dropped and the supplied
+`options` replace the old ones, so resupply both; an omitted `on_error` keeps
+the existing choice.
+
+Use `get_pipeline_state(since_start=true)` for the net changes since this turn
+began: exact values, components keyed by identity, their order reported
+separately. A whole-graph read too large to return becomes a structural `view`
+without option values or descriptions. Read an exact value with `field_path`;
+continue a page from `next_offset_chars`, passing the returned `sha256` as
+`expected_sha256`. A structural view or a partial page is not the whole graph.
 
 An absent policy-visible plugin is different from an unsupported pipeline
 shape. Say that a plugin is unavailable or policy-denied only when live
@@ -271,9 +294,11 @@ runtime connection contract. Do not invent fields outside the terminal schema.
 
 Every source, node, and output accepts an optional `description`: one short
 sentence of plain prose saying what that step does, shown to human reviewers
-beside the raw config. Supply it when authoring a step and refresh it when the
-step's behavior changes. It is informational only — never routing, validation,
-or a substitute for review.
+beside the raw config. Supply it when authoring a step; refresh it only when
+the requested change includes the step's purpose or description. Preserve it
+for routing-only edits or explicit content-preservation requests; a
+`routing_only=true` call keeps the stored one, so leave it out there. It is
+informational only — never routing, validation, or a substitute for review.
 
 ## Field contracts and structured plugin output
 
@@ -517,6 +542,6 @@ the schema does not contain; use those when correcting a prior conclusion.
 
 Validation failures are structured repair input. Preserve the complete
 requested shape, apply required fields/enums/options from the returned schema or
-assistance, correct routing and field guarantees, then resubmit the complete
-proposal. Never delete a requested source, node,
+assistance, correct routing and field guarantees, then retry what failed: the
+same narrow edit, or the complete proposal. Never delete a requested source, node,
 branch, output, cleanup, LLM, or failure path merely to make validation pass.

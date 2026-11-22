@@ -1,0 +1,1 @@
+Invented note C: this file is test data for the file-binding battery.

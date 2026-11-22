@@ -272,7 +272,7 @@ def test_materialization_uses_only_interpretation_state_and_preserves_exact_yaml
     assert isinstance(result, PhaseReport)
     assert result.artifact.materialized_state is materialized_state
     assert result.artifact.authored.policy.state is policy_state
-    assert result.artifact.pipeline_yaml == "sinks: {}\nsources: {}\n"
+    assert result.artifact.pipeline.text == "sinks: {}\nsources: {}\n"
     assert generator.seen_state is materialized_state
     assert [(check.name, check.detail) for check in result.checks] == [("blob_inline_refs", "No inline-content blob references found")]
 
@@ -298,7 +298,7 @@ def test_materialization_validates_blob_metadata_and_substitutes_exact_yaml() ->
     assert isinstance(result, PhaseReport)
     expected_config = _blob_config()
     expected_config["transforms"][0]["options"]["prompt_template"] = "prompt text"  # type: ignore[index]
-    assert result.artifact.pipeline_yaml == yaml.dump(expected_config, default_flow_style=False)
+    assert result.artifact.pipeline.text == yaml.dump(expected_config, default_flow_style=False)
     assert result.checks[0].detail == "All inline-content blob references and bytes are valid"
     assert requested == [_BLOB_ID]
 
@@ -336,7 +336,7 @@ def test_materialization_without_discovered_refs_needs_no_blob_readers(
     )
 
     assert isinstance(result, PhaseReport)
-    assert result.artifact.pipeline_yaml == pipeline_yaml
+    assert result.artifact.pipeline.text == pipeline_yaml
     assert result.artifact.authored.semantic_contracts == (_contract(),)
     assert [(check.name, check.passed, check.detail) for check in result.checks] == [
         ("blob_inline_refs", True, "No inline-content blob references found")
@@ -568,7 +568,7 @@ def test_provider_policy_successes_detach_materialized_semantic_evidence(phase_n
     assert result.artifact is not artifact
     assert result.artifact.authored.policy is artifact.authored.policy
     assert result.artifact.materialized_state is artifact.materialized_state
-    assert result.artifact.pipeline_yaml == artifact.pipeline_yaml
+    assert result.artifact.pipeline is artifact.pipeline
     assert result.artifact.authored.semantic_contracts[0].outcome == "satisfied"
     assert [(check.name, check.passed) for check in result.checks] == [(check_name, True)]
 

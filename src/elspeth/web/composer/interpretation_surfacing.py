@@ -12,6 +12,8 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID, uuid4
 
+import structlog
+
 from elspeth.contracts.blobs_inline import is_widened_blob_ref
 from elspeth.contracts.composer_interpretation import InterpretationKind, InterpretationSource, InterpretationSurfaceOrigin
 from elspeth.contracts.errors import AuditIntegrityError
@@ -41,7 +43,9 @@ from elspeth.web.interpretation_state import (
 )
 
 if TYPE_CHECKING:
-    from elspeth.web.sessions.protocol import PreparedInterpretationEventDraft, SessionServiceProtocol
+    from elspeth.web.sessions.protocol import InterpretationResolveError, PreparedInterpretationEventDraft, SessionServiceProtocol
+
+slog = structlog.get_logger()
 
 
 def _has_pending_prompt_template_requirement(options: Mapping[str, Any], *, user_term: str) -> bool:
@@ -148,6 +152,42 @@ def _resolvable_vague_term_count(
     return 0
 
 
+def _log_surface_skipped(
+    *,
+    session_id: str,
+    current_state_id: str,
+    affected_node_id: str,
+    kind: InterpretationKind,
+    repair_mode: bool,
+    exc: InterpretationResolveError,
+) -> None:
+    """One warning line for a review card the writer refused and the surfacer skipped.
+
+    Diagnostic of a skipped write, not an audit record. The skip writes no
+    interpretation event and no Landscape row; the durable record of the
+    outcome is the state itself (its review debt stays owed) and the run-time
+    gate, which still refuses the site. Neither says WHY the card is missing,
+    and nothing else does: without this line a refused create (for example a
+    runtime-preflight refusal after a data directory moved) leaves a pending
+    review with no card and no trace. It has no probative value for any run
+    (no run exists at this seam), so under the primacy test it is not audit;
+    there is no telemetry stream for surfacing, so logging is the last resort.
+
+    Fields are identifiers and the exception class only. The exception
+    message is deliberately omitted: writer refusals embed the user term
+    (for example "... requirement for 'cheap'"), which must not reach a log.
+    """
+    slog.warning(
+        "composer_interpretation.surface_skipped",
+        session_id=session_id,
+        composition_state_id=current_state_id,
+        affected_node_id=affected_node_id,
+        kind=kind.value,
+        repair_mode=repair_mode,
+        error_class=type(exc).__name__,
+    )
+
+
 async def _surfaced_evidence_keys(
     sessions_service: SessionServiceProtocol,
     *,
@@ -251,6 +291,14 @@ async def _auto_surface_prompt_template_reviews_for_state(
             # whether the debt still exists, and it has just said no. Skipping
             # keeps the already-verified stored response intact; raising would
             # turn a valid replay into a 500 over debt that no longer exists.
+            _log_surface_skipped(
+                session_id=session_id,
+                current_state_id=current_state_id,
+                affected_node_id=affected_node_id,
+                kind=InterpretationKind.LLM_PROMPT_TEMPLATE,
+                repair_mode=repair_mode,
+                exc=exc,
+            )
             continue
 
 
@@ -407,6 +455,7 @@ def prepare_pending_interpretation_event_drafts_for_state(
     model_version: str | None,
     provider: str | None,
     composer_skill_hash: str | None,
+    skip_unsurfaceable: bool = False,
 ) -> tuple[PreparedInterpretationEventDraft, ...]:
     """Prepare the generic surfacer's event cohort for atomic settlement.
 
@@ -414,7 +463,10 @@ def prepare_pending_interpretation_event_drafts_for_state(
     kind still delegates to ``_backend_surface_args_for_site``, the one pure
     site-to-writer projection shared with asynchronous repair surfacing.
     Callers must reject ``unsurfaceable_pending_interpretation_review_sites``
-    before invoking this function.
+    before invoking this function, unless they pass ``skip_unsurfaceable``:
+    that leaves out exactly the sites the post-commit surfacer skips (the
+    same projection returning ``None``), which stay fail-closed at the
+    run-time gate.
     """
     from elspeth.web.sessions.protocol import PreparedInterpretationEventDraft
 
@@ -427,6 +479,8 @@ def prepare_pending_interpretation_event_drafts_for_state(
     for site in ordered_sites:
         surfaced = _backend_surface_args_for_site(state, site)
         if surfaced is None:
+            if skip_unsurfaceable:
+                continue
             raise InvariantError("atomic interpretation cohort contains an unsurfaceable pending site")
         affected_node_id, user_term, llm_draft = surfaced
         drafts.append(
@@ -629,9 +683,9 @@ async def _surface_pending_interpretation_reviews_under_writer(
         # save_composition_state at a persist seam with NO outer except — so
         # an unguarded raise would 500 and wedge the session. Skip the site
         # instead; it stays fail-closed at the run-time gate (advisory
-        # polarity). Deliberately not slog'd: a skipped advisory surface is
-        # not a telemetry/audit event, matching the existing surfacer's
-        # silent precondition skips.
+        # polarity). Not an audit or telemetry event, but the refusal is
+        # logged once (see _log_surface_skipped): a silent skip left review
+        # debt with no card and no trace of why.
         try:
             await sessions_service.create_pending_interpretation_event(
                 session_id=UUID(session_id),
@@ -648,7 +702,15 @@ async def _surface_pending_interpretation_reviews_under_writer(
                 provider=provider,
                 composer_skill_hash=composer_skill_hash,
             )
-        except InterpretationResolveError:
+        except InterpretationResolveError as exc:
+            _log_surface_skipped(
+                session_id=session_id,
+                current_state_id=current_state_id,
+                affected_node_id=affected_node_id,
+                kind=site.kind,
+                repair_mode=only_missing_evidence,
+                exc=exc,
+            )
             continue
 
 
@@ -819,6 +881,26 @@ class InterpretationSurfacing:
             model_version=self._model_identifier,
             provider=self._provider,
             composer_skill_hash=self._composer_skill_hash,
+        )
+
+    def prepare_surfaceable_pending_interpretation_reviews(self, state: CompositionState) -> tuple[PreparedInterpretationEventDraft, ...]:
+        """Freeze the review cohort an accepted ordinary proposal commits with its head.
+
+        The cohort is what :meth:`surface_pending_interpretation_reviews` would
+        write for this state after an auto-commit: one draft per site the
+        backend can eventize, with the same provenance. A site it cannot
+        eventize is left out rather than refused, as that surfacer leaves it
+        out. The accepted state may carry such a site from before the
+        proposal, and refusing here would make every later accept fail on it.
+        """
+        return prepare_pending_interpretation_event_drafts_for_state(
+            state,
+            surface_origin=InterpretationSurfaceOrigin.COMPOSER_LLM,
+            model_identifier=self._model_identifier,
+            model_version=self._model_identifier,
+            provider=self._provider,
+            composer_skill_hash=self._composer_skill_hash,
+            skip_unsurfaceable=True,
         )
 
     async def surface_pending_interpretation_reviews(

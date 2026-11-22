@@ -183,15 +183,25 @@ def test_actual_list_producers_preserve_legacy_roots_and_order(empty: bool) -> N
     context = _trained_context(
         data_dir=Path("/tmp/blob-response"), session_id="response", session_engine=create_session_engine("sqlite://")
     )
-    inventory = [] if empty else [_INVENTORY, {**_INVENTORY, "id": "00000000-0000-4000-8000-000000000002", "created_by": "user"}]
-    descriptors = [] if empty else [_INLINE]
-    with patch.object(blobs, "_sync_list_blobs", autospec=True, return_value=inventory):
+    second = "00000000-0000-4000-8000-000000000002"
+    records = () if empty else (dict(_RECORD), {**_RECORD, "id": second, "created_by": "user"})
+    inventory = [] if empty else [_INVENTORY, {**_INVENTORY, "id": second, "created_by": "user"}]
+    descriptors = [] if empty else [_INLINE, {**_INLINE, "blob_id": second}]
+
+    def listing(*, ready_only: bool) -> Any:
+        return blobs._BlobListRead(records=records, matching_total=len(records), ready_only=ready_only)
+
+    with patch.object(blobs, "_sync_read_blob_list", autospec=True, return_value=listing(ready_only=False)) as read:
         result = blobs._handle_list_blobs({}, _empty_state(), context)
+        assert read.call_args.kwargs == {"ready_only": False}
     contract = blobs._LIST_BLOBS_DECLARATION.response_contract
     assert contract is blobs._BLOB_INVENTORY_RESPONSE
     assert json.dumps(contract.admit(result.data).to_wire()) == json.dumps(inventory)
-    with patch.object(blobs, "_sync_list_ready_blob_inline_descriptors", autospec=True, return_value=descriptors):
+    assert result.post_call_hints == ()
+    with patch.object(blobs, "_sync_read_blob_list", autospec=True, return_value=listing(ready_only=True)) as read:
         result = blobs._handle_list_composer_blobs({}, _empty_state(), context)
+        assert read.call_args.kwargs == {"ready_only": True}
+    assert result.post_call_hints == ()
     contract = blobs._LIST_COMPOSER_BLOBS_DECLARATION.response_contract
     assert contract is blobs._COMPOSER_BLOBS_RESPONSE
     assert json.dumps(contract.admit(result.data).to_wire()) == json.dumps({"blobs": descriptors})
@@ -247,18 +257,8 @@ def test_actual_metadata_producer_preserves_explicit_null(pending: bool) -> None
 
 
 def test_ready_null_hash_producer_retains_integrity_exception() -> None:
-    from unittest.mock import MagicMock
-
-    from sqlalchemy import Engine
-
-    engine = MagicMock(spec=Engine)
-    connection = engine.connect.return_value.__enter__.return_value
-    connection.execute.return_value.fetchall.return_value = [object()]
-    with (
-        patch.object(blobs, "_blob_row_to_tool_dict", autospec=True, return_value={**_RECORD, "content_hash": None}),
-        pytest.raises(AuditIntegrityError, match="null content_hash"),
-    ):
-        blobs._sync_list_ready_blob_inline_descriptors(engine, "response")
+    with pytest.raises(AuditIntegrityError, match="null content_hash"):
+        blobs._blob_inline_descriptors([{**_RECORD, "content_hash": None}])
 
 
 @pytest.mark.parametrize("filename_chars", [0, 100, 1_000, 6_000])

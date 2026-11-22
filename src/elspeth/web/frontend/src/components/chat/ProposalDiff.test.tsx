@@ -168,6 +168,34 @@ describe("buildProposalDiff", () => {
     ]);
   });
 
+  it("projects a routing-only upsert_node as the stored node with only its routes changed", () => {
+    const state = makeState();
+    const stored = state.nodes[0];
+    // The producer's redacted payload (scripts/cicd/bootstrap_proposal_diff_fixture.py).
+    const entries = projectEntries("upsert_node", redactedArguments("upsert_node_routing_only"), state);
+    expect(entries).toEqual([
+      {
+        kind: "changed",
+        section: "node",
+        identity: "extract",
+        before: stored,
+        after: { ...stored, on_error: "results" },
+        beforeSummary: "transform field_mapper",
+        afterSummary: "transform field_mapper",
+      },
+    ]);
+    // Control: the same arguments without the flag read as a replacement that drops the plugin.
+    const replacing = projectEntries(
+      "upsert_node",
+      { id: "extract", node_type: "transform", input: "rows", on_error: "results" },
+      state,
+    );
+    expect(replacing?.[0].afterSummary).not.toBe("transform field_mapper");
+    expect(
+      projectEntries("upsert_node", { id: "ghost", node_type: "transform", input: "rows", routing_only: true }, state),
+    ).toBeNull();
+  });
+
   it("projects upsert_node on a new id as an added node", () => {
     const entries = projectEntries(
       "upsert_node",

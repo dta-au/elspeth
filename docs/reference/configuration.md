@@ -1867,7 +1867,7 @@ Limits:
 | Parsed values of one node, all entries plus `default_content` | 64 MiB |
 | JSON nesting, in `json`, each `jsonl` line, and `default_content` | 100 levels |
 | One CSV cell | 131,072 characters (Python's per-cell limit). Put longer text in a `text` or `json` file. |
-| Composer attachment | 256 KiB per file and 1 MiB across all inline attachments in the pipeline |
+| Composer attachment | 256 KiB per file and 4 MiB across all inline attachments in the pipeline, counting a file once for each place it is bound |
 
 The per-node limit counts every entry in both modes. In `all` that total is
 added to every row, so keep bound files small.

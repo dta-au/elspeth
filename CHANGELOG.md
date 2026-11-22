@@ -1,8 +1,636 @@
 # Changelog
 
-All notable changes to ELSPETH are documented here.
+All notable changes to ELSPETH are documented here. The current release is
+recorded in full. Older entries are summarised: each keeps what the release
+was and what an upgrader still needs (upgrade actions, breaking changes,
+schema-epoch cutovers, required or renamed settings and removed features).
+The full history is in the repository's releases and commit history.
 
 ---
+
+## 0.8.16 - 2026-11-22
+
+Web Composer fixes for large pipelines, long sessions and prompts held in
+files, bounded advisor and prompt-guard requests, less redundant per-row engine
+work, and LLM gateway logging. The session epoch stays at 79 and the Landscape
+epoch at 51, so existing 0.8.15 session and Landscape stores open unchanged.
+The dated entry does not establish qualification, a published tag or an image.
+
+### Upgrade notes
+
+Schema and stored data:
+
+- No schema epoch changed and no stored data is migrated, reset or rewritten.
+  Session epoch 79 and Landscape epoch 51 are unchanged from the previous
+  release; this release adds no schema-epoch cutover, and no table is added or
+  altered. Existing 0.8.15 session and Landscape stores need no action, and
+  the 0.8.15 cutover guidance continues to apply to older stores. This
+  authorizes no migration, reset, restamping or downgrade.
+- **Upgrading from 0.8.14 or earlier: apply the 0.8.15 upgrade notes first.**
+- Context-budget records written from this release carry a different
+  `policy_hash` (the policy's schema string changed), and compose-loop records
+  may carry `over_estimate` and `max_prompt_tokens`. The record of a compose
+  call retried after a provider context-length rejection carries
+  `retry_after_provider_rejection: true`, and `stubbed_tool_call_ids` is
+  always empty in new records. Records written by 0.8.15 still load.
+- Advisor call records now fill `max_completion_tokens_requested` with the
+  completion cap that was sent (it was null on advisor rows). No field is
+  added to the advisor call record.
+- Prompt-guard audit records are written at `schema_version` 2, with
+  `units_scanned` and `units_reused`. Version 1 records still load.
+- Composer guidance and tool text grew by about 21 KB over 0.8.15 (skill
+  +12,786 bytes, tool definitions about +8,500 bytes), about 7,000 estimated
+  tokens on every composer request, so on very large turns history shedding
+  starts correspondingly earlier. `composer_skill_hash` changes with the
+  skill text; it is a provenance field on review rows and gates nothing.
+
+Behaviour you will see:
+
+- **Web runs admitted under 0.8.15 do not resume.** The `reference_join`
+  plugin changed, and every web deployment authorizes it, so the compiled
+  plugin policy hash changes. A web run admitted under 0.8.15 is refused on
+  resume as `POLICY_CHANGED` (`admitted_policy_changed`): finish interrupted
+  web runs before upgrading, or run them again afterwards. A run approval is
+  bound to the policy hash, so one recorded under 0.8.15 must be given again.
+  The stores themselves open unchanged.
+
+- **Long inline prompts belong in files.** A Composer edit that adds or changes
+  an inline LLM prompt (`system_prompt`, `prompt_template` or a query
+  `template`) holding more than 100 words or 1,000 characters of prose
+  (template tags are not counted) is refused with `inline_prompt_too_long`,
+  and the composer puts the text in a file instead. Existing long inline
+  prompts still validate and run, but the composer cannot change them in
+  place: copy the text (see the new Copy button) into a file and bind it.
+- **An inline prompt the template check refuses is now an error.** An inline
+  prompt over the size limit for one template, nested too deeply or holding a
+  number literal too long to read makes the pipeline invalid at authoring, with
+  an error on that step. It used to be valid with a warning that named only an
+  exception class.
+- **Size limits changed.** One prompt template may now be up to 64 KiB (was
+  16 KiB). A pipeline may hold up to 4 MiB of text in attached files (was
+  1 MiB), counting a file once for each place it is bound; each file is still
+  limited to 256 KiB. A file attached at a template position must fit the
+  64 KiB template limit. The resolved configuration of a run may hold up to
+  16 MiB of text, counted as text rather than as escaped YAML
+  (`resolved_pipeline_config_oversized`).
+- **YAML import refusals.** Importing YAML whose attached text is over a size
+  limit is refused with HTTP 413 `prompt_file_too_large` and nothing is
+  imported. An incomplete file marker is refused with 400
+  `malformed_inline_blob_content`, and a prompt file that cannot be verified
+  with 409 `import_prompt_file_unverified`. These cases used to fail with a
+  server error.
+- **Run start.** A run whose source, sink or retrieval step holds a file
+  reference where a local path belongs is refused with the usual 422
+  `pipeline_validation_failure` naming the step, instead of a 500.
+- **File list API.** `GET /api/sessions/{id}/blobs` now returns 100 files by
+  default (was 50); the maximum is still 500.
+- **Composer tools.** The composer offers 48 tools by default (was 47; adds
+  `report_composer_bug`). `list_transforms` is now a five-key selection index;
+  a plugin's configuration comes from `get_plugin_schema`, which gains
+  `usage_when_not_to_use`. `get_pipeline_state` gains four optional arguments
+  and bounds large reads. `patch_node_options` refuses a `queries` value that
+  leaves out an existing query. The duplicate-consumer repair suggestion
+  carries facts only. `upsert_node` gains `routing_only`, which rewires an
+  existing transform without re-sending it and returns a `routing_update`
+  receipt instead of the component. Clients or tests that pin these tool
+  results must follow; see Web Composer below.
+- **Requests that fit are sent.** A composer or planner request under the
+  configured request byte maximum is now always sent, even when its token
+  estimate is over `composer_context_max_prompt_tokens`. Only earlier turns of
+  the conversation are left out to stay under the estimate; nothing of the
+  turn in progress is left out or replaced by a stub, so a turn whose own
+  content is over the byte maximum is refused rather than cut. A compose
+  request the gateway or model rejects as too long is sent once more with
+  every earlier turn left out. If that is rejected too, or there was no
+  earlier turn to leave out, the turn reaches the user as the size refusal
+  `context_budget_exceeded`, not as a provider outage; a planner request
+  rejected as too long is refused that way at once. This replaces the 0.8.13
+  behaviour: tool results of the turn in progress are no longer shed, a
+  request over the token estimate is no longer refused, advisor requests are
+  now bounded, and a provider context-length rejection is retried once.
+- **Advisor requests are bounded by age, not stopped by size.** The advisor
+  now sees earlier turns by age within a fixed budget; when a review's size
+  estimate is over `composer_context_max_prompt_tokens`, older turns are left
+  out first. A review still over the estimate is sent, as composer and planner
+  requests are, and the provider judges its own limit; see Advisor below.
+- **Advisor reply cap and timeout defaults changed.**
+  `ELSPETH_WEB__COMPOSER_ADVISOR_MAX_COMPLETION_TOKENS`
+  (`composer_advisor_max_completion_tokens`) now defaults to 16384 (was 8192)
+  and `ELSPETH_WEB__COMPOSER_ADVISOR_TIMEOUT_SECONDS`
+  (`composer_advisor_timeout_seconds`) to 180 seconds (was 60). Each advisor
+  call still waits at most the time left in the turn. An explicit setting is
+  used as given. A cap above the advisor model's output limit may be rejected
+  by the provider, and startup cannot detect it.
+- **Small edits are reviewed on what they changed.** The advisor judges a
+  small edit by the steps the edit added and those whose untrusted input it
+  changed. A condition already present on steps the request did not name (for
+  example an LLM step without a prompt-injection shield plugin) no longer
+  blocks the edit or leads the composer to change those steps; the reply
+  mentions it instead. Review cards already waiting from an earlier turn are
+  not requested again when the edit did not change what they review.
+- **Undoing a rewire does not restore an approval.** A review that a rewire
+  re-opened must be approved again before a run, even after the route is put
+  back.
+- **A busy server no longer reports that it stopped.** A compose request that
+  loses its hold on the session while the server keeps running now ends with
+  HTTP 503 "This request stopped because the server was too busy to keep its
+  hold on the session." and a diagnostic id. Any other request that ends
+  without a result while the server is running gets the generic failure with a
+  diagnostic id. "The server stopped while composing this request" is now
+  reported only when the server restarted or the request belonged to another
+  web process.
+- **New warning log lines:** `session_operation.renewal_slow`,
+  `composer_operation.event_loop_lag`,
+  `composer_interpretation.surface_skipped_runtime_findings` and
+  `composer_interpretation.surface_skipped`; see Operations below.
+- **Prompt guard calls change shape.** The user prompt is inspected in its own
+  call, and text the guard service already allowed in the session is not sent
+  again, so the number of guard calls no longer grows with the conversation.
+- **New setting.** `ELSPETH_WEB__COMPOSER_VALIDATION_REUSE_ENABLED` (default
+  `true`) lets the composer reuse validation results within one compose call.
+  Set it to `false` and restart to turn reuse off.
+- **Readiness.** `/api/ready` still checks every database connection on every
+  probe, but runs the schema check at most once every 60 seconds.
+- **LLM gateway logs.** The gateway container now writes its log events to
+  stderr unless the `elspeth_llm_gateway` logger is already configured, and the
+  `completion` event carries token counts.
+- **LLM audit view.** `GET /api/sessions/{id}/messages?include_llm_audit=true`
+  now also returns end-of-turn advisor review rows; see Advisor below.
+
+### Web Composer: prompts and files
+
+- Binding a file to a step's `prompt_template` with `wire_blob_inline_ref`
+  now replaces whatever prompt was there, including a structured prompt with
+  defined terms. The old prompt's term reviews are superseded and the file gets
+  its own review. This replaces the 0.8.15 statement that a structured prompt
+  could not be switched to a file. Writing a file marker directly onto a
+  structured prompt by any other route is still refused, and the refusal now
+  names `wire_blob_inline_ref` as the call that does it. When asked to replace
+  A with B, the composer no longer asks whether to keep A's approvals.
+- A structured prompt can be replaced with new plain text: send
+  `prompt_template` with `prompt_template_parts: null` through
+  `patch_node_options`, `upsert_node` or `set_pipeline`. The old parts and term
+  reviews are removed and listed in `superseded_review_ids`, and the new text
+  gets its own review card. A step re-sent with its own prompt text keeps its
+  structure, term definitions and approvals, and the result names it in
+  `prompt_unchanged_node_ids`.
+- A `patch_node_options` change whose `queries` value leaves out a query the
+  node already has is refused with `queries_patch_omits_existing`, naming every
+  omitted query, instead of silently deleting them. Send every query to change
+  one, or send the whole node with `upsert_node` to remove one;
+  `queries: null` still removes every query. A patch that also replaces the
+  prompt is refused whole.
+- A step that reads an attached file keeps its authoring guarantees. A
+  file-backed LLM prompt (before and after its review is approved), a
+  `file_inject` entry held in a file, and steps that take their settings from
+  an operator profile no longer cause every later step to be refused with
+  "Producer guarantees: (none)". Such a step is reported with a
+  `contract_probe_deferred` notice naming it and the fields it adds, and its
+  contract is checked on the file's bytes before the run starts. A field that
+  an attached file could add is left to that check; a field nothing in the
+  pipeline could supply is still an error, and the source data-contract review
+  is offered for it. An output that needs such a field is refused at authoring
+  as its inline twin is, instead of being shown as valid and then refused by
+  the run.
+- An attached file placed where a local file path belongs (a source or sink
+  path, or a retrieval step's persist directory) is refused when the pipeline
+  is edited, with a message naming the step and option.
+- Opening a saved pipeline in which a batch step declares input fields reports
+  the problem instead of failing.
+- Template refusals are typed and name their position. A prompt over the
+  template limit, nested too deeply or holding a number literal too long to
+  read is refused with a message naming the step and option (and, for size,
+  the size and the limit), never quoting the text. This applies to inline
+  prompts, prompt files, query templates and the LLM source. Attaching a file
+  over the template limit at a template position is refused at once. Saving a
+  prompt file, or making a substring edit, that would take a template over the
+  limit is refused with the size and the limit. A saved pipeline holding
+  template text the engine refuses now opens and reports the step; it used to
+  fail to open, and a turn on it failed with an unexplained error.
+- A pipeline refused for the total size of its file-held text says the total,
+  the limit and the number of file bindings, and the composer is told which
+  limit applied and to shorten the named files, not that session storage ran
+  out.
+- Web validation judges a pipeline's size by its text, so prompt files in any
+  language validate up to the file-text limit. Preflight no longer re-reads
+  file-held prompt text through YAML.
+- YAML import: re-importing your own export, or importing YAML whose source is
+  bound without a `mode`, no longer hides the session's prompt files or fails
+  with a server error. Import refusals name the whole field path (at most five,
+  then a count of the rest) and, for a file that cannot be verified, the
+  step's file-backed prompt fields.
+- `set_pipeline` accepts an `inline_blob` at a prompt field and stores it as a
+  prompt file; an exact retry reuses the stored file.
+- Under explicit approval, a response carrying several pipeline changes is
+  refused with guidance to send the first change alone and each next one after
+  the user accepts the one before, instead of rebuilding the whole pipeline in
+  one `set_pipeline` call. A pipeline between approved changes does not have to
+  validate; expect one approval per change, with intermediate versions that may
+  show errors. Creating a prompt file with `create_blob` comes first, in an
+  earlier response.
+- The composer edits an existing pipeline with the narrow tools and sends a
+  whole `set_pipeline` only for a pipeline of five nodes or fewer, or when no
+  narrow tool can express the change. A failed call is retried as the same
+  call. Tool descriptions list every review term the model can author, and a
+  validation entry's `error_code` is documented as optional.
+- The composer can now clear a pipeline's description: `set_metadata` takes
+  `description: null` or an empty string, and a field left out is unchanged.
+  Its result lists the fields that actually changed (`changed_fields`). When
+  nothing changed it says so instead of reporting a successful edit, so the
+  composer no longer tells you it removed something it did not. A pipeline
+  name can be replaced but not cleared: `null`, an empty name or a
+  whitespace-only name is refused.
+- Editing an LLM prompt's wording no longer resets the vague terms you already
+  approved. A term whose wording slot, definition and evidence are unchanged
+  keeps its approved definition. The prompt review card reopens instead,
+  showing each kept definition in place, and the pipeline does not run until
+  you approve it. A term that was removed, renamed or re-drafted is reviewed
+  again, as before.
+- Wiring a file onto one query's template while the node's main prompt has a
+  term review still pending is now refused, with the steps to fix it (approve
+  the pending term, then wire the file again). Binding a file to the node's
+  main prompt is still the way to replace the prompt for every query.
+- A pipeline whose bound file's stored content no longer matches its record
+  (changed or missing on disk) is now reported as a validation problem on that
+  file, instead of failing with a server error when you validate or run it.
+  Upload the file again and rebind it to recover.
+- In sessions where changes need approval, accepting a proposed prompt, model,
+  prompt-file or rewire edit now shows its review card at once, instead of
+  leaving the pipeline blocked with nothing to approve. The card is saved in
+  the same step as the accepted change. A card left out (a prompt file over
+  the inline size limit, or a review the writer refuses) is logged once, as it
+  is for automatic saves.
+- On an LLM step whose prompt has parts, the exact `set_pipeline` arguments
+  read and the applied-component echo no longer carry the prompt review's
+  stored draft, which keeps the wording from before a term was amended.
+  Writing that read back through `set_pipeline`, `upsert_node` or
+  `patch_node_options` keeps the approved prompt review and the stored order
+  of review rows.
+- The prompt-injection shield advisory is now given once per distinct advisory
+  instead of once per unshielded LLM node. It still names every affected node.
+  On a 25-LLM chain the advisory shrinks from 13,337 bytes to 1,419 on every
+  tool result and state message. A graph with one unshielded LLM node sees the
+  same entry as before.
+- After a reply stage (the review-card handoff), the advisor no longer
+  receives every tool call and tool result of the turn twice. The second copy
+  was quoted text, where the redactor could rewrite call identifiers so they
+  no longer matched their originals. The request sent to the model is
+  unchanged.
+- Changing a JSON output's options no longer tells the composer that the
+  output's write-failure choice is missing when one is already saved.
+- After changing one option of a source or an output, the composer is no
+  longer given advice about options the change did not touch, such as a
+  reminder about a fixed schema it set earlier.
+- When you ask the composer to empty the pipeline (for example, to remove its
+  source and output), the reply no longer says the composer failed to build
+  and asks you to retry. It says the pipeline is empty and needs a source and
+  an output.
+- Moving a pipeline source onto another uploaded file no longer erases the
+  source's description. The composer is told the description was kept, so it
+  no longer reports the source as otherwise unchanged when that description
+  may name the earlier file.
+- When the composer sends a malformed content hash to a file-reading tool, for
+  example the text "null" instead of an empty value, the refusal says what to
+  send instead of only "Validation failed".
+- A reference-table lookup step with a required option left out (such as its
+  table or key field) reports the option as required instead of as the wrong
+  type.
+- The composer's guidance says how to create a reference-table lookup step
+  with its uploaded table in one call, and how to replace a table that was
+  written in as text.
+- When an edit's result cannot show the stored component (for example, on a
+  pipeline whose uploaded-file source has its own name), the result says so in
+  one line and names how to read it, instead of leaving it out silently. The
+  composer is also told when the exact pipeline-authoring document cannot be
+  produced for the current graph.
+- The composer's output tool states that an output may be fed by any route
+  that sends rows to it, including a step's error route.
+- The composer's guidance states when a step cannot be inserted between two
+  others in one call (either neighbour has its own error route), and the
+  refusal says how to make the same insertion in two steps.
+- The composer no longer brings up the suspected-bug reports it files for the
+  maintainers. If you ask about a report file it says plainly what it is, and
+  it still tells you when something it said earlier turns out to be wrong.
+- `upsert_node` accepts `routing_only=true` to rewire a step without re-sending
+  it. It changes only an existing transform's `input`, `on_success` and
+  `on_error` and keeps its plugin, options (file-held prompts included) and
+  description as stored. Any other field, an explicit `null` route or a step
+  that is not a transform is refused with `routing_only_edit_invalid`. The
+  result carries a small `routing_update` receipt instead of the component and
+  names each review the rewire re-opened (`reopened_reviews`, up to 32, with
+  the full `reopened_review_count`). A prompt-shield review, or the disclosure
+  of an auto-wired control, re-opens when the rewire changes what it binds and
+  must be approved again before a run; putting the route back does not restore
+  it. The proposal card and its diff show the rewire, not a replacement. See
+  `docs/reference/composer-tools.md`.
+- The composer no longer requests a review card again when an earlier turn
+  already raised it and this turn changed neither its step nor, for a
+  prompt-shield recommendation, any step upstream of it. That card is still
+  waiting. Every requirement the turn staged or changed is still requested.
+- After a refused edit, the next successful edit reports only the errors and
+  warnings that edit added or fixed. It no longer lists the refusal as
+  resolved, or every standing finding as new after a refused full replacement.
+- The duplicate-consumer validation error names every step reading the
+  connection, not only the first two. Its repair suggestion now states only the
+  connection and the ids of the steps reading it, with no ready tool calls or
+  whole nodes, and says to change only the input bindings and keep each step's
+  options; the composer builds the fork itself.
+- `list_transforms` returns, per transform, only `name`, `description`,
+  `capability_tags`, `web_config_authority` and `policy_capabilities`, plus the
+  prohibited list and `details_tool`. `get_plugin_schema` returns a plugin's
+  options and now its `usage_when_not_to_use` text.
+- `get_pipeline_state` gains `field_path`, `offset_chars`, `expected_sha256`
+  and `since_start`. It can return the net changes since the turn began, and a
+  large read becomes a structural overview: single values are read by
+  `field_path`, and long values come in pages tied to a content hash. A stale
+  or missing hash is refused. A read is bounded at 32,768 bytes.
+- `list_blobs` and `list_composer_blobs` still show the 50 newest files, and
+  now say when more exist (a `post_call_hints` entry starting
+  `Incomplete list:`) so the model does not treat an unlisted file as missing.
+- A successful `get_blob_content` or `read_attachment` result no longer
+  carries the pipeline's validation block, so standing validation findings no
+  longer stop a prompt file from being read.
+- New tool `report_composer_bug` records a suspected mismatch between the
+  composer's guidance and a tool's behaviour. Each report is one session JSON
+  file (UTF-8, at most 16,384 bytes; at most 20 per session, freed by deleting
+  one) marked suspected and unverified, and the call changes nothing else. It
+  runs immediately in approval mode, like `create_blob`.
+- A question or other message that changes nothing no longer fails with "could
+  not verify this session's audit trail" when the pipeline has a prompt held
+  in a file with an open review card and the previous message also changed
+  nothing. Once it started, it failed on every following message until the
+  pipeline changed or every card was resolved.
+
+### Web UI
+
+- A Copy button beside each inline prompt (system prompt, prompt template and
+  each query template) in the node inspector, the specification view and the
+  prompt review card copies the exact stored text, so a long inline prompt can
+  be moved into a file.
+- The prompt editor opens, edits and saves each file on a step with several
+  prompt files. Saving one keeps the step's other prompt files approved. It
+  opens inside the row of the prompt it edits, follows a file that changes
+  while open, and keeps unsaved text when you select another step or the
+  editor closes ("Your unsaved text is kept").
+- The prompt review card names each prompt's file under its own heading, and
+  no longer says the LLM wrote the instruction when the whole prompt is a file
+  a user supplied.
+- The file list loads every file in the session (up to 10,000), not only the
+  newest 50, so older prompt files no longer read as "not in this session".
+- The Workflow panel gains a Files section listing each file the pipeline
+  uses, with the step and fields that use it (one row per step), Show node and
+  Edit file actions, and a "Filter by file or step" box. Files no step uses are
+  listed only in the file manager. The file manager gains a wiring pad that sends
+  your chosen prompt connections to the composer as an ordinary chat request,
+  and can filter files.
+- The inspector names a source or sink step's file.
+- Hide or show the conversation from the left end of the title bars, or with
+  Ctrl+\.
+- Refusals and failures now say what happened where you are looking:
+  - A YAML import refused because the paste contains a credential says so and
+    tells you to use a secret reference, instead of claiming the paste is empty
+    or too large.
+  - A refused chat upload says why (quota, size or file type) next to the
+    upload button, instead of sending you to the file manager.
+  - Archiving or renaming a session that the server refuses shows the server's
+    reason, for example "Cancel the run first.", instead of "Please try again."
+  - If starting a run loses its connection, the message says the start could
+    not be confirmed and asks you to check Run history, instead of pointing at
+    results that may belong to an earlier run.
+  - When your sign-in expires, the sign-in page says it expired and asks you to
+    sign in again. Unsent chat and unsaved prompt text is not kept.
+- Recovery in place:
+  - If creating a new session fails while Composer is working, the current
+    session keeps receiving that turn's updates instead of staying busy.
+  - A prompt file that fails to load in the editor can be retried in place,
+    and the disabled Save says why.
+  - If the tutorial's audit summary fails to load, a Retry button loads it
+    again.
+- The session picker and its search include all your sessions, not only the 50
+  most recently updated.
+- Pressing Enter to confirm an input-method candidate (for example Japanese,
+  Chinese or Korean) no longer sends a half-typed chat message.
+- Uploads show that they are in progress: chat says "Uploading <file>…" and
+  the Upload buttons are unavailable until the upload finishes.
+- The Composer guide and user manual now say that approval mode cannot be set
+  or seen in the web UI and is switched only through the session preferences
+  API.
+
+### Large pipelines and performance
+
+- The composer's size estimate prices every byte at the shipped rate
+  (3 bytes per token, or the provider's measured density when that is
+  denser), so a large pipeline keeps its conversation history when it fits.
+  Content already left out of a request can be left out again in the same
+  call, so a request that fits without it is no longer refused or stopped with
+  an internal error.
+- Only earlier turns of the conversation are left out to fit the context
+  budget. Every round of the turn in progress (its tool calls and tool
+  results, on the compose loop and its reply stage, the planner and the
+  planner's escape-hatch transcript) is sent whole, and a tool result is no
+  longer replaced by an omission stub. A request still over
+  `composer_context_max_prompt_tokens` once every earlier turn is left out is
+  sent and recorded as over the estimate. Only a request over the request byte
+  maximum is refused, so a turn whose own content is over that maximum is now
+  refused rather than cut. The context estimate follows the latest call of the
+  turn. `stubbed_tool_call_ids` in new LLM-call records is always empty;
+  records written by earlier releases keep their values and still load.
+- A provider "input is too long" rejection is recognised even when the gateway
+  reports it under a generic or unfamiliar error code. The provider's own
+  reason is still shown only when `composer_expose_provider_errors` is on, and
+  the call record keeps the closed reason `context_length_exceeded` without
+  provider text.
+- When the provider or gateway rejects a compose request as over the model's
+  context limit while earlier turns are still in it, the request is sent once
+  more with every earlier turn left out, instead of the turn being refused,
+  and the user sees the usual notice, once per turn, "Earlier conversation is
+  no longer visible to the composer." Those turns stay out for the rest of the
+  turn. Only if the retry is rejected too, or there was no earlier turn to
+  leave out, is the turn refused as too large for the model. Such a turn makes
+  two provider calls; both are recorded, and the retry's context-budget record
+  carries `retry_after_provider_rejection: true`. The planner, the advisor,
+  the reply stage and the last-chance composition call do not retry; a planner
+  rejection reaches the user as a size refusal.
+- Long sessions no longer fail edits with "The server stopped while composing
+  this request" while the server is running. Building the advisor's
+  prompt-guard request took time that grew with the square of the session's
+  length and ran on the event loop, so on a long session it could hold the
+  loop long enough for the session's hold to lapse. That work is now linear,
+  and the request is built once per advisor call, after the transcript is
+  shaped, in the worker pool; the stored history's redaction is reused while
+  it is unchanged. What is redacted, scanned and sent is unchanged. A request
+  that does lose its hold now says so; see Upgrade notes.
+- Approving a prompt review card for a step with many file-held prompts checks
+  the step once for all of them and reads each file once, instead of once for
+  every file on the step. Such approvals no longer slow down sharply as files
+  are added or fail with a server error on a slow host. The approval rows
+  written and the refusals given are unchanged.
+- Within one compose call, validation of an unchanged pipeline is not repeated:
+  the runtime preflight and the policy view's authoring check are reused until
+  the pipeline, a referenced file, the secret inventory or a resolved path
+  changes. A state whose own options wire a secret reference is never reused.
+  Run admission always validates afresh. The reuse reads all attached files'
+  records in one database transaction.
+- Preflight parses the rendered pipeline YAML once instead of three times.
+- Template checks cache their results across a whole validation walk, and the
+  caches are bounded at 128 MiB in total per process, so long-running servers
+  no longer grow memory without bound.
+
+### Advisor
+
+- Advisor requests no longer grow with the session. The advisor sees this
+  turn whole, the previous three turns as the request and the reply shown, and
+  older turns as the request only, newest first, within 8,000 tokens; an older
+  request over 2,000 characters is shortened to its first 1,500 and last 500.
+  The request states exactly what it leaves out. When a review's size
+  estimate, based on a real earlier call, is over
+  `composer_context_max_prompt_tokens`, the oldest earlier turns are left out
+  until it fits; if it is still over with none left, it is sent anyway and the
+  request records the estimate, the limit and `over_estimate`. A provider
+  rejection of it is reported like any other request rejection.
+- The advisor's completion cap now defaults to 16,384 tokens (was 8,192) and
+  its per-call timeout to 180 seconds (was 60); a call still waits at most the
+  time left in the turn. When a review runs out of its completion cap before it
+  gives a verdict, the completion check now says so ("the advisor's reply ran
+  out of room before a verdict"), names
+  `composer_advisor_max_completion_tokens` and the cap that was sent, and
+  advises raising it, instead of reporting a malformed response. Every advisor
+  call record carries that cap in `max_completion_tokens_requested` beside its
+  finish reason.
+- On a small edit the advisor judges what the turn changed: the steps it added
+  and the LLM steps whose untrusted input it changed. Inserting, removing or
+  moving a step in front of an LLM step without changing the content it
+  receives does not count. A condition only on steps the turn did not change
+  is pre-existing: it does not block the edit or withhold the reply, the
+  composer is told not to change those steps for it, and the reply reports it
+  once. Violations the turn introduced are still flagged.
+- The advisor is told plainly when a prompt is held in a file: the file's name,
+  size and who wrote it. A file you wrote is not sent to the advisor; a file
+  written by the composer, produced by a pipeline, imported from a shared link
+  or copied by a session fork is sent and reviewed like an inline prompt. A
+  valid file-held prompt is no longer described as invalid.
+- The advisor reviews against the user's request and binding contracts, not
+  against earlier assistant choices, but counts a proposal the user explicitly
+  accepted as a requirement. A finding that does not apply can be answered with
+  evidence, written for the user, instead of an edit.
+- A newly flagged pipeline keeps its remaining review. The extra review round
+  runs only when the turn changed the pipeline; if that round fails or its
+  reply is withheld, the reply the first pass admitted is published, provided
+  the pipeline and the session's files are unchanged since then.
+- `GET /api/sessions/{id}/messages?include_llm_audit=true` also returns
+  end-of-turn advisor review rows with `phase`, `pass_index`, `verdict`,
+  `source`, `provider_attempts` and `publication_verdict`. The response header
+  `X-Elspeth-End-Review-Rows-Omitted` gives the number of stored rows left out
+  because they did not parse.
+
+### Prompt guard
+
+- Within a session, text the guard service has already allowed is not sent to
+  it again; only new text is inspected, and the user prompt in its own call.
+  Guard calls per turn no longer grow with the conversation. Reuse is keyed on
+  the session, policy, mode, role, slot and the exact text; only a complete
+  allow is reused, and a refusal, timeout or error never is. The record of
+  allowed text holds digests only, lives in the web process that made the
+  check (at most 20,000 units per guard), and is lost on restart. With several
+  web workers, a unit of text is scanned once per process. Each guard audit
+  record states how many units it scanned and how many it reused
+  (`schema_version` 2). One deadline still covers the whole check.
+
+### Engine
+
+- Less redundant per-row work on the sink and gate paths, with no change to
+  stored audit records, outputs or refusals. The sink executor no longer
+  computes a sink-effect identity that the reservation recomputes;
+  finalization members are copied only when recovery rebinds their ordinal and
+  their output data is frozen once; gates hand their input token on instead of
+  copying it.
+
+### Operations and LLM gateway
+
+- LLM gateway: its metadata-only log events reach the container's stderr, one
+  JSON line each, unless the operator configured the `elspeth_llm_gateway`
+  logger. Two new events: `upstream_result` (status class and code) and
+  `response_validation_rejected` (stage and a closed category; exception text
+  is never logged). The `completion` event logs `prompt_tokens`,
+  `completion_tokens` and `total_tokens` when the response reports them as
+  non-negative integers, never content; this is a recorded exception to the
+  logging policy because the gateway has no audit store of its own.
+- LLM gateway: adapters may also log `stop_reason_category` and six response
+  block counts (`content_block_count`, `text_block_count`, `tool_block_count`,
+  `other_block_count`, `empty_text_block_count`, `malformed_tool_block_count`).
+  These are categories and counts, never content; the built-in adapter does
+  not emit them.
+- `/api/ready` checks database connectivity on every probe and the schema
+  against the current models on the first probe and then at most once every
+  60 seconds, reporting the last `CURRENT` result between checks. A result
+  that is not `CURRENT` is never reused, and a probe that cannot connect makes
+  the next probe check the schema again.
+- The `composer_operation.settled` log line carries the session id, operation
+  id and the support diagnostic id. An audit-integrity failure adds one error
+  line, `composer_operation.audit_integrity_failure`, with the error's class
+  and a credential-filtered message of at most 512 bytes. Both point to the
+  private failure record kept with the operation.
+- `composer_operation.owner_unsettled` (error), written when a compose request
+  ends without recording a result, now carries the session id, operation id,
+  diagnostic id, the number of underlying failures and up to eight of them,
+  each with its class, its cause's class and its message, credential-filtered
+  and only when it is at most 512 bytes. No row data or prompt text is
+  logged.
+- Two new warnings show a held event loop before it costs a request its hold
+  on the session. `session_operation.renewal_slow` is logged when a session
+  hold renewal starts 2 seconds or more after it was due or takes 2 seconds or
+  more; it carries the session, operation, epoch and kind, the hold and renewal
+  interval, `start_late_seconds`, `attempt_seconds`, the worker pool's
+  outstanding admissions and the outcome, never the hold's token.
+  `composer_operation.event_loop_lag` (with `lag_seconds`) is logged when a
+  probe that sleeps for half a second wakes more than one second late.
+- The composer logs one warning when it skips creating review cards:
+  `composer_interpretation.surface_skipped_runtime_findings` when the
+  pipeline's runtime check reports problems (for example a stored file path
+  outside the allowed directories after a data directory was moved), and
+  `composer_interpretation.surface_skipped` when a single card could not be
+  created. Each line names the session, state and, for a single card, the
+  step and review kind, with the error codes or exception class but not their
+  text. Before this, a review could stay pending with no card and nothing in
+  the log to say why.
+
+### Tooling
+
+- New operator tools for acceptance runs against a deployment: a Composer
+  edit battery (a planned run of small edits, each judged on its own, with
+  50-edit plans and a structural add/swap/remove cycle around an LLM step), a
+  generator for a wired-up large-graph fixture and its setup through the real
+  routes, a real-graph battery, a copied-session prompt-review repair tool, a
+  direct Bedrock streaming canary and a recovery-set capture. Each records
+  sanitised per-call usage and timing. See
+  `docs/runbooks/composer-edit-battery.md`.
+- The edit battery gains a 35-edit file-binding plan
+  (`composer_file_bindings.json`). Starting from an empty session, it uploads
+  each file before the message that names it, has the composer connect and
+  reconnect sources, reference joins, LLM prompts, system prompts, query
+  templates and file-inject entries to uploaded and composer-written files,
+  checks which file each binding points at and which kind of review card
+  opens, and ends empty. Plans can now upload files, start from an empty
+  session and use a pass rule for plans shorter than 50 edits.
+- The battery's judge no longer counts an unchanged finding as new when the
+  server spells it differently: a component named with or without its kind
+  prefix (`node:`, `output:`, `sink:`, `source:`) and a pending review stored
+  as a sentence or as its bare kind compare equal. A step whose query
+  templates are held in files is judged as file-held, as the server does.
+- The edit battery gains a prompt-wording plan
+  (`composer_prompt_edits_50.json`): 54 chat edits to the file-held prompts of
+  a 30-step graph, each judged byte for byte on the stored file, with file
+  sizes, byte-exactness and output tokens recorded per edit.
+- The battery's judge accepts an edit that keeps the edited component's own
+  description true, reporting the rewrite as `own_description_corrected`
+  instead of failing the edit.
+
+### Publication and acceptance
+
+Automatic image publication from main remains held. The 0.8.16 tag and
+container publication follow successful required checks and the protected
+merge. Operator signing, live-provider acceptance and deployment remain
+separate steps.
 
 ## 0.8.15 - 2026-11-17
 
@@ -49,100 +677,15 @@ Schema and stored data:
 
 ### Engine and runtime
 
-- `SchemaContract.version_hash()` is computed once per contract instance.
-  Constructing a `SchemaContract` with `fields` that is not a plain tuple now
-  raises `TypeError`.
-- Gates reuse the input hash recorded for the node state instead of hashing
-  each row a second time. A row that cannot be canonically hashed (for example
-  one containing NaN) still fails with the same `ValueError` and writes no
-  Landscape row, but now emits one error gate telemetry span where it emitted
-  none before.
+- Executor hot-path fixes: `SchemaContract.version_hash()` is computed once
+  per contract instance, and gates reuse the input hash recorded for the node
+  state instead of hashing each row a second time. Constructing a
+  `SchemaContract` with `fields` that is not a plain tuple now raises
+  `TypeError`.
 
 ### Web Composer
 
-- The pipeline graph no longer blanks and redraws its connectors when the view
-  loads, a node is selected or failure routes are toggled. React Flow had been
-  re-measuring every node on each rebuild; measured sizes are now carried
-  forward, and nodes re-read their handles when their parallel routes change.
-- The composer's context budget now estimates a request's size from the
-  provider's own token count for an earlier call in the same exchange (same
-  model and dialect), plus every byte added since. With no usable count, text
-  ELSPETH ships (the composer skill, tool definitions and labelled plugin
-  schemas) is priced at 3 bytes per token, and everything else at one token
-  per byte; the lower of the two estimates is used. If the provider's count
-  for that earlier call shows the 3-bytes-per-token assumption undercounted
-  it, or the earlier call's authored size is unknown, the provider-anchored
-  estimate is used alone. Requests carrying several large plugin schemas that
-  were refused as over budget are now admitted. Once older history is dropped
-  to fit, it stays dropped until the raw request is back under the configured
-  low mark, so long sessions keep a stable prompt prefix. Composer LLM audit
-  records gain optional anchor and pricing fields; records written by earlier
-  versions still load.
-- `wire_blob_inline_ref` can bind a session file to a list entry by position,
-  such as `options.queries.0.template`. A numeric path segment always means a
-  list position. An option key that is not a plain name (for example `v1.2`
-  or `2024`) holding a file marker is refused as malformed rather than
-  misread as a nested path.
-- A prompt backed by a session file is validated when the file's content is
-  resolved, not refused at authoring time for not being literal text.
-- Exporting a pipeline as YAML no longer fails with a 409 when an option is
-  backed by a session file.
-- Composer provider requests now scan text values up to 2 MiB for credential
-  material (was 256 KiB), so real file-backed prompts and a maximum-size YAML
-  import fit; larger values are still refused unscanned, never passed
-  through. The limit applies to each text value, not to a whole request.
-- The composer runtime preflight timeout
-  (`composer_runtime_preflight_timeout_seconds`) now defaults to 60 s (was
-  5 s), so preflight that reads and verifies real file-backed prompts can
-  finish.
-- Runtime YAML import, including the browser Import YAML dialog, accepts
-  documents up to 524,288 characters (was 262,144), so pipelines carrying real
-  file-backed prompts fit. This supersedes the 0.8.14 decision to leave the
-  limit unchanged (composer remediation checklist item 05.21).
-- The composer can change part of an existing LLM prompt without resending
-  it: `inspect_prompt_targets` reports a prompt's length and SHA-256 (never
-  its text), and `change_substring` applies up to 32 exact, all-or-none
-  substring edits to that prompt (or one text part of a structured prompt)
-  against that hash, under the same checks as `patch_node_options`. A match
-  must be unique unless `replace_all` is set; edit text is redacted to its
-  length in tool results, proposal cards and audit records, and is checked
-  for credentials. Changing a prompt reopens its prompt review. A one-line
-  edit now sends a few hundred bytes of tool arguments instead of the whole
-  prompt. The composer cannot yet edit text inside a session file; use the
-  prompt editor below. The composer now offers 47 tools by default (was 45).
-- An LLM prompt can be backed by a session file. Pointing the prompt at a
-  different file, or a change to the file's content, reopens the prompt review
-  ("Re-approve first"), and the run is blocked until the new text is approved.
-  Each run uses exactly the approved bytes and records their hash.
-- The inspector's new prompt editor edits a prompt file in place. Saving is
-  your approval of the new text, so no new review card appears. A save is
-  refused when the file backs more than one prompt
-  (`prompt_file_shared_binding`), is not UTF-8
-  (`prompt_file_encoding_unsupported`), changed since you opened it or its
-  binding moved (`prompt_file_stale`, `prompt_file_binding_changed`; the
-  request must carry `expected_sha256`), or while the node's review card is
-  still waiting (`prompt_file_review_pending_inline`, 409: approve the card
-  first, then edit). Approvals are kept append-only, whether from the card or
-  an editor save.
-- The inspector shows a prompt file by name, with a "changed since attached"
-  hint, instead of its blob ID and hash, and each prompt slot has Edit and
-  "Show in files" buttons. The editor starts collapsed, and Edit and Save are
-  disabled with the reason shown when the server would refuse. With the file
-  manager open, the selected node's files are highlighted and labelled "Used
-  by <node>". Uploaded source files show their filename in the pipeline view.
-- Selecting a source or sink in the graph no longer clears on every composer
-  turn.
-- A prompt that points at a session file now gets a clear, typed refusal
-  instead of an internal error or a silent change when the file is not
-  plain text (`inline_blob_not_text`) or the prompt is a structured prompt
-  (`prompt_template_parts_required`). This applies when the file is wired,
-  when the pipeline is validated, exported, approved or run (including the
-  tutorial run), and when pipeline YAML is imported. Each refusal says how to
-  fix it; switching a structured prompt to a file is not supported in this
-  release.
-- The prompt review card shows exactly the reviewed snapshot; each
-  interpretation slot shows whether its own review is pending or accepted.
-- Approving a prompt review card is now bound to the text the card showed.
+- **Approving a prompt review card is bound to the text the card showed.**
   Every LLM prompt review card stores a review snapshot (inline prompts
   included), and `POST /api/sessions/{id}/interpretations/{event_id}/resolve`
   requires `reviewed_anchor` for prompt cards: the snapshot's `anchor` from
@@ -150,36 +693,54 @@ Schema and stored data:
   is refused with 422 `prompt_review_anchor_required`; an anchor that is not
   the card's stored snapshot is refused with 409 `prompt_review_stale`, and
   nothing is written. Other review kinds must omit it (422
-  `interpretation_review_anchor_unexpected`). A second tab or a stale view can
-  no longer approve text the user did not see. API clients that resolve prompt
+  `interpretation_review_anchor_unexpected`). API clients that resolve prompt
   cards must send the anchor.
-- A pending prompt review card whose displayed text changes (for example after
-  a vague-term answer, or an agent change to one query of a multi-query node
-  beside a file-backed prompt) is replaced by a fresh card, and an editor save
-  cannot approve a card that is still waiting on other text. Answering a
-  vague-term review on a node whose prompt uses a session file reopens that
-  prompt's review with the final text.
-- File-backed prompt reviews are always shown, including in a session that has
-  opted out of interpretation reviews, and a forked session's file-backed
-  prompts are reviewed again in the new session.
-- LLM call audit records for a file-backed prompt carry the approved prompt
-  hash, as they do for literal prompts. Governed approval of an earlier
-  revision checks that revision's prompt files.
-- A review whose file has since changed or become unreadable is refused with a
-  typed 409; a prompt file larger than the 256 KiB inline limit is refused with
-  a clear message when its review is raised. A recorded prompt field path is
-  limited only by PostgreSQL's index row size (about 2.6 KB).
-- A resume is refused if the run's prompt files were re-approved with different
-  content after it started. A prompt file whose stored bytes no longer match
-  their recorded hash raises the inline-blob integrity alert.
+- **An LLM prompt can be backed by a session file.** Pointing the prompt at a
+  different file, or a change to the file's content, reopens the prompt review,
+  and the run is blocked until the new text is approved. Each run uses exactly
+  the approved bytes and records their hash. File-backed prompt reviews are
+  always shown, including in a session that has opted out of interpretation
+  reviews, and a forked session's file-backed prompts are reviewed again in
+  the new session. A resume is refused if the run's prompt files were
+  re-approved with different content after it started.
+- **The inspector's prompt editor edits a prompt file in place.** Saving is
+  your approval of the new text. A save is refused when the file backs more
+  than one prompt (`prompt_file_shared_binding`), is not UTF-8
+  (`prompt_file_encoding_unsupported`), changed since you opened it or its
+  binding moved (`prompt_file_stale`, `prompt_file_binding_changed`; the
+  request must carry `expected_sha256`), or while the node's review card is
+  still waiting (`prompt_file_review_pending_inline`, 409).
+- **Typed refusals for file-backed prompts.** A prompt that points at a
+  session file is refused when the file is not plain text
+  (`inline_blob_not_text`) or the prompt is a structured prompt
+  (`prompt_template_parts_required`); switching a structured prompt to a file
+  is not supported in this release.
+- **New composer tools.** `inspect_prompt_targets` reports a prompt's length
+  and SHA-256 (never its text), and `change_substring` applies exact,
+  all-or-none substring edits to that prompt against that hash. Changing a
+  prompt reopens its prompt review. The composer now offers 47 tools by
+  default (was 45). `wire_blob_inline_ref` can bind a session file to a list
+  entry by position, such as `options.queries.0.template`.
+- **Limits and defaults changed.** Composer provider requests scan text values
+  up to 2 MiB for credential material (was 256 KiB); larger values are still
+  refused unscanned. `composer_runtime_preflight_timeout_seconds` defaults to
+  60 s (was 5 s). Runtime YAML import, including the browser Import YAML
+  dialog, accepts documents up to 524,288 characters (was 262,144).
+- **Context budget estimate.** The composer's context budget estimates a
+  request's size from the provider's own token count for an earlier call in
+  the same exchange, plus every byte added since; requests carrying several
+  large plugin schemas that were refused as over budget are now admitted.
+  Composer LLM audit records gain optional anchor and pricing fields; records
+  written by earlier versions still load.
+- Fixes: the pipeline graph no longer blanks and redraws its connectors,
+  exporting a pipeline as YAML no longer fails with a 409 when an option is
+  backed by a session file, and selecting a source or sink no longer clears on
+  every composer turn.
 
 ### Release pipeline
 
-- The image smoke test runs on CI runners with a `0077` umask. The image's
-  non-root user (uid 1654) could not read the checked-out example, and the
-  runner could not read the `0600` sink outputs, so the 0.8.14 tag build
-  stopped before release. Only the mounted example directories are opened to
-  the container, and the image user makes its own outputs readable afterwards.
+- The image smoke test runs on CI runners with a `0077` umask, which is what
+  stopped the 0.8.14 tag build before release.
 - The release image scan accepts the four chromadb 1.5.5 advisories that
   `pip-audit` already accepts (CVE-2026-45829, -45830, -45831, -45833) as
   version-scoped, expiring exceptions in `.trivyignore.yaml`. They affect the
@@ -504,690 +1065,93 @@ Schema and stored data:
 
 ### Engine and runtime
 
-Each of these keeps the behaviour ELSPETH had under Python 3.13.
-
-- **Strict JSON parsing bounds nesting explicitly** at the interpreter
-  recursion limit. Python 3.14's C decoder no longer stops there.
-- **The runtime-validation manifest again records helper dependencies reached
-  through local loads**, for which 3.14 emits new instructions. It also
-  ignores docstring-only edits, which 3.14 marks with a new `CO_HAS_DOCSTRING`
-  flag.
-- **Runtime preflight keeps reporting an abandoned task failure by class
-  only.** Python 3.14's `asyncio.shield` began logging the message and
-  traceback.
+- **Behaviour under Python 3.14 matches 3.13.** Strict JSON parsing bounds
+  nesting explicitly, the runtime-validation manifest again records helper
+  dependencies, and runtime preflight keeps reporting an abandoned task
+  failure by class only. asyncio diagnostics that carry an exception are
+  logged as `asyncio_unhandled_exception` with the exception class and code
+  location only.
 
 ### Plugins
 
-- **A timed-out batch attempt's late lease loss no longer ends the run.** When
-  a row's wait timed out, the row was recorded and its worker kept running; if
-  that worker later lost its own scheduler lease, the
-  `SchedulerLeaseLostError` was treated as an orphaned worker failure and
-  failed the whole run. A lease loss from an already-evicted attempt is now
-  discarded. Every other late failure, including `RunWorkerEvictedError` and
-  audit-integrity errors, still ends the run, and errors for live rows are
-  delivered as before.
-- **The LLM transform waits at least an hour for a row's result.** Its wait
-  was sized from the capacity-retry budget plus one request per query, but the
-  query pool runs one row's batch at a time, so a pooled multi-query row also
-  queues behind earlier rows. With a short `max_capacity_retry_seconds` (for
-  example 30), an ordinary row could time out while still queued. The wait now
-  keeps the one-hour batch-wait default as a floor, like the other batch
-  transforms, and still grows with a larger budget. Provider request timeouts
-  and capacity retries are unchanged.
-- **New `azure_content_understanding` transform.** It runs an Azure AI
-  Content Understanding analyzer (GA api-version `2025-11-01`) over one
-  document, image, audio or video reference per row. The reference is a URL or
-  a base64 string. Like `azure_document_intelligence`, it submits an
-  asynchronous analyze operation, polls it to completion and writes the
-  configured outputs onto the row: `content_field` (markdown), `fields_field`
-  (the analyzer's fields as plain values), `page_count_field`,
-  `metadata_field`, `result_field`, and `extract` facets that are
-  concatenated across the result's contents. Options also cover
-  `content_range`, `mime_type`, `processing_location`, `string_encoding` and
-  per-request `model_deployments`. Its key is `AZURE_CONTENT_UNDERSTANDING_KEY`.
-- **`azure_document_intelligence` no longer records a SAS signature in its
-  HTTP request record.** A `urlSource` that carried a SAS `sig` was recorded
-  verbatim in the Landscape request record and its telemetry. The recorded
-  request now fingerprints the credential-shaped query values and userinfo,
-  while Azure still receives the URL unchanged. The fingerprint key
-  requirement is the same one the api-key header already had. The row's own
-  `source_field` value is unchanged, so the URL is still stored wherever row
-  data is stored.
-- **`azure_document_intelligence` reports `canceled` and `skipped` operations
-  as `analysis_failed`.** They were reported as `malformed_response`. The
-  error reason now carries `error_type` (`failed` or `canceled`) alongside the
-  bounded `cause`.
-- **Rejected Document Intelligence calls name Azure's error code.** An
-  `api_error` now carries `code` (Azure's `error.code`) and `cause` (its
-  `innererror.code`), both bounded tokens from Azure's error envelope; the
-  error message is still never placed in the error reason.
-- **Document Intelligence retry timing follows Azure's `Retry-After`.**
-  Capacity retries (429/503) wait as long as Azure asks. A request for longer
-  than the remaining budget fails the row at once. `max_capacity_retry_seconds`
-  now bounds each call's retrying (clamped to `poll_timeout_seconds`) instead
-  of being measured from the row start, so a 429 on a late poll is retried. A
-  poll `Retry-After` is honoured up to 60 seconds.
-- **Two Document Intelligence failures no longer end the run.** A document
-  URL with a malformed bracketed host fails the row as
-  `invalid_input/invalid_document_url`, and a response with a refused
-  `Content-Encoding` fails it as
-  `malformed_response/response_encoding_refused`.
-- **Invalid base64 is rejected before it is sent.** A base64 source that is
-  not padded standard-alphabet base64 fails the row with
-  `invalid_input/invalid_base64` instead of costing a billed Azure call. This
-  includes a `data:` URI, the URL-safe alphabet, and line-wrapped or
-  whitespace-containing output, which was previously forwarded to Azure;
-  strip line breaks upstream.
-- **The Document Intelligence batch wait now covers a full request
-  timeout.** A large `request_timeout_seconds` could previously let a row
-  outlive the batch wait.
-- **New `azure_document_intelligence` outputs.** `fields_field` writes the
-  first document's typed fields as plain values (for example `InvoiceTotal`).
-  `metadata_field` writes bounded analysis metadata: model id, operation id,
-  page and document counts, and warning codes.
-- **Smaller `azure_document_intelligence` changes.** A `malformed_response`
-  message now names the facet without the `analyzeResult.` prefix. The
-  success metadata's `operation_id` is omitted when Azure's id is not a plain
-  token. The catalogue lists the shared source, polling and timeout options
-  before `endpoint` and `model_id`. Option names and defaults are unchanged.
-- **Generic HTTP JSON responses are admitted only if the audit can record
-  them.** A body nested deeper than 64 levels, a number that overflows to
-  infinity or an integer outside the canonical range is now recorded as a
-  JSON parse failure. Previously the call raised with no audit record.
-- **`web_scrape` refuses a row URL that contains a control character**, such
-  as a trailing newline, as a `validation_failed` row error. It previously
-  crashed the run. The shared SSRF and origin checks now refuse ASCII control
-  characters and DEL as `malformed_url` for every caller, including
-  discovered, paginated and redirected `web_scrape` URLs, `blob_fetch`, and
-  Dataverse requests and `nextLink` URLs. `blob_fetch` used to crash on such
-  a URL and Dataverse admitted it.
-- **Every audited HTTP request is cut off at its configured timeout.** The
-  timeout is now one deadline covering DNS, connect, TLS, sending, headers,
-  the full body and every redirect hop, where it used to bound each socket
-  operation, so an upstream that trickled bytes could hold a worker without
-  limit. This applies to `web_scrape`, `blob_fetch`, the OpenRouter and
-  gateway LLM transforms and sources, the Azure content safety, prompt
-  shield, AI Search, Document Intelligence and Content Understanding
-  transforms, Power Automate and the Dataverse client (30 s per request).
-  Rate-limiter waits are bounded separately by the same number of seconds,
-  and `web_scrape`'s pagination `max_elapsed_seconds` also bounds the page in
-  flight. Timeout option descriptions state the total bound.
-- **Chroma search records and classifies HTTP-layer failures.** Transport
-  errors and HTTP 408, 429 and 5xx are retryable; other 4xx responses and
-  non-JSON bodies are permanent. These calls were previously unrecorded and
-  not retried.
-- **Dataverse FetchXML paging works past the first page.** The request now
-  asks for the paging annotations, a page without `morerecords` ends the
-  results, and the paging cookie sent back is the annotation's inner
-  `pagingcookie` value. If the server ignores the annotations and a second
-  page exists, the source fails instead of truncating.
-- **The `database` sink publishes batches larger than about 64 KiB.** The
-  effect plan no longer embeds every row; it binds them by hash and member
-  count, and commit re-derives them from the durable member payloads. Such
-  batches previously failed at prepare. Not run for this change: the
-  PostgreSQL testcontainer suite.
-- **The `database` sink writes object and list values as RFC 8785 canonical
-  JSON text** (`{"k":1}`), where it previously wrote `json.dumps` output
-  (`{"k": 1}`). Consumers that compare the stored text byte-for-byte will see
-  the difference.
-
-Sources:
-
-- **External JSON is bounded at 64 levels of nesting before it is decoded**
-  in the JSON source (JSON arrays and each JSONL line), the Azure blob
-  source, `blob_json_expand`, the schema value walker and LLM response
-  validation. Over-deep input is quarantined (for JSONL, that line only)
-  instead of exhausting recursion and crashing the run.
-- **JSON source:** `data_key` and non-array quarantines record the same row
-  they route, so the validation-error link is kept, and resume snapshots no
-  longer crash.
-- **CSV source:** the file is decoded strictly in binary, so a decode error
-  names the physical line and row holding the bad byte. A bad byte on the
-  header line still quarantines the whole file without a line number.
-- **S3 source:** an object that fails partway gives its error row the next
-  unused index and says rows were already emitted. A JSONL object resyncs
-  past an oversized line, quarantining it, and a CSV or JSONL read that stops
-  records that it stopped. JSONL line numbers no longer shift by one when an
-  oversized line is split between its CR and LF. `max_record_chars` counts a
-  CSV record's content without its line terminator, so a record exactly at
-  the limit is now accepted; the S3 sink measures each record as it writes
-  it, so the sink and source agree at the limit.
-- **Azure blob source:** CSV is decoded per record, so an undecodable row is
-  quarantined on its own with its raw bytes, line and row number. An
-  undecodable header still quarantines the whole file.
-- **S3 CSV** skips blank records before header discovery; a blank-only
-  object raises the existing empty-file error.
-- **Undecodable UTF-16 and UTF-32 records are quarantined one at a time.**
-  The JSON source (JSONL), text source, Azure blob source (CSV and JSONL) and
-  S3 source (JSONL) quarantine only the bad line or record, with its true
-  line number and raw bytes, instead of the whole file or object. The
-  recorded bytes are the line as the file holds it: in the byte order the
-  file's BOM declares, with the BOM only on line 1. One shared decoder does
-  this for every source, and registers a namespaced codec error handler,
-  `elspeth.source_byte_escape`, process-wide on import. Every reader of
-  `utf-8` input consumes a leading byte-order mark; a mid-file U+FEFF is
-  still data.
-- **Text source:** undecodable lines are quarantined one at a time.
-- **Dataverse source:** formatted values are requested with a `Prefer`
-  header and their annotations stripped. `top` must be at least 1, and
-  FetchXML must have exactly one named entity; both are checked at config
-  time rather than at load.
-
-Transforms:
-
-- **`web_scrape`:**
-  - Pagination cycle detection compares canonical URLs, so a self-link that
-    canonicalisation rewrites is caught instead of fetched again.
-  - In replay and verify, a malformed URL fails the row with a scheme/shape
-    refusal instead of crashing; live behaviour is unchanged.
-  - An invalid `next_link_selector` is a config error.
-  - A discovered link is used exactly as validated, without re-encoding its
-    query. Links found in `href`s refuse the same cursor and session query
-    keys that Link-header links already did (`cursor`, `continuation`,
-    `next_token`, `page_token`, `session`, `state`), and the
-    sensitive-parameter check also splits on `;`.
-  - `fingerprint_mode: full` hashes what it claims: the exact extracted
-    content plus each fetched page's HTTP status, final URL (as recorded in
-    `fetch_url_final`), raw Content-Type and decoded-body SHA-256. It used to
-    hash the extracted content only. `content` mode is unchanged (#5).
-  - Null elements inside a selected JSON records array are treated as
-    absent, like a top-level null, instead of failing the page (#153).
-  - `compute_fingerprint` refuses an unknown fingerprint mode instead of
-    silently hashing as `full` (#157).
-  - API-key header names exclude hop-by-hop and proxy headers, and basic
-    credentials must be `user:password` (#164).
-- **Power Automate:** an archived SAS VERIFY run with no fingerprint key
-  reports `fingerprint_key_required` instead of a misleading
-  `authentication_failed` (#130).
-- **`reference_join`** refuses non-canonical reference values at config load
-  (see Upgrade notes); the first matching row previously crashed the run or
-  was misrouted as a contract violation.
-- **`truncate`** declares its `fields` keys as string-typed inputs, as
-  `keyword_filter` and the guardrails declare theirs, so the build refuses a
-  producer that types one non-string and the field-name spelling rule
-  applies. A missing field fails the row; `strict` is removed (#146).
-  Transforms that read other configured row fields as strings declare them
-  the same way (see Upgrade notes).
-- **`field_mapper`** runs its dotted-source collision check, so an existing
-  field is no longer silently overwritten when the executor collision gate is
-  off.
-- **`batch_replicate`** joins the output contract across all buffered rows;
-  the first row's contract previously won, so copies could carry a contract
-  that misdescribed their own values.
-- **Batch statistics transforms:**
-  - `batch_stats` records integer sums beyond 2^53-1 and overflowing or
-    non-finite float sums as a `float_overflow` error.
-  - `batch_classifier_metrics` fails the batch on a `positive_label` type
-    mismatch instead of reporting tp = fn = 0.
-  - Baseline labels in `batch_paired_preference`, `batch_effect_size` and
-    `batch_experiment_compare` are type-strict; blank and non-finite labels
-    are refused, and `batch_experiment_compare` baselines are no longer
-    string-only.
-  - The `batch_paired_preference` interval uses Student's t.
-  - `batch_data_quality_report` counts distinct values in linear time.
-  - The outlier, rank, paired-preference and drift-compare transforms
-    declare their 4096-row flush cap, and an aggregation whose
-    `trigger.count` exceeds it is refused at pipeline build and by the
-    composer, instead of failing every full batch at flush. Their composer
-    hints state the cap (#20).
-  - `batch_drift_compare` success rows list skipped missing and non-finite
-    rows by batch index per cohort, as `batch_stats` does, in four new fields
-    (`baseline_`/`cohort_missing_indices`,
-    `baseline_`/`cohort_non_finite_indices`) (#101).
-  - `batch_drift_compare` `chi_square_statistic` is Pearson's chi-square test
-    of homogeneity over every category seen in either cohort. Categories
-    absent from the baseline used to be left out; they now count toward the
-    statistic (#102).
-  - `batch_distribution_profile` percentiles of extreme opposite-sign finite
-    values no longer fail with `float_overflow` (#121).
-  - `batch_threshold_summary` requires a numeric threshold `value` (#135).
-  - `batch_top_k` counts datetime and Decimal values, as `group_by` already
-    admits; non-finite Decimals are skipped and reported (#136).
-- **Batch transform engine:** a timed-out row's late failure is no longer
-  charged to the next row, and a dead release thread fails pending rows at
-  once instead of leaving them blocked until timeout. A refused eviction no
-  longer replaces a completed row's result with a `KeyError` (#120).
-- **`blob_json_expand`, `blob_text`, `blob_csv`:** `max_blob_bytes` is enforced
-  while the blob is read, not after it is loaded. `blob_csv_expand` validates
-  its delimiter the same way the CSV sink does. `blob_json_expand` splits
-  JSONL only on `\n` (one trailing `\r` stripped), so records containing
-  U+2028, U+2029 or U+0085 stay whole, and it rejects NaN and Infinity.
-  `blob_csv_expand` parse-phase error reasons name their source (`field`,
-  `blob_ref`), like `empty_csv` and load errors, and every routed error
-  reason has a focused unit test (#53, #54).
-- **`json_explode`** has a new `index_field` option (default `item_index`), so
-  nested explodes do not collide (#111).
-- **JSON sink:** the unreachable JSON-array append path is removed;
-  `format: json` never appends (#105).
-- **`pdf_rasterize`:**
-  - The parent re-checks every page the worker reports and refuses bad
-    geometry, pages over `max_page_pixels`, text when `extract_text` is off,
-    and text over `max_page_text_bytes`.
-  - A memory error on one page refuses only that page.
-  - The temporary output directory is removed on every failure path.
-  - Multi-page replay works, and duplicate page rows are refused.
-  - The renderer identity check also accepts the macOS and Windows pdfium
-    library names.
-  - The audited render request records `max_total_bytes`, and its format is
-    `pdf_rasterize/v2` (#59).
-- **Textract:** FORMS entries carry `value_selection_status` (`SELECTED`,
-  `NOT_SELECTED` or none), and a malformed selection fails closed. Inline
-  analysis reads its input with a size bound. Closing a Textract transform no
-  longer sets the engine's shutdown event. When a bucket-region lookup fails,
-  rows waiting on the same lookup get the shared failure, marked with
-  `cache_status: shared_failure`.
-  From the AWS review:
-  - Throttled and transient failures raise `PluginRetryableError`, so the
-    engine retry policy applies; a `retryable=True` row result used to be
-    silently ignored. Transient poll errors retry in place until the poll
-    deadline (#1).
-  - `aws_textract_document_analysis` replay no longer sleeps or races the
-    wall clock and ends polling from the archive; verify substitutes the
-    source job id and `next_token` fingerprint, and HeadBucket single-flight
-    leadership in replay follows the source run (#2, #3).
-  - Textract and S3 HeadBucket audit records carry the observed HTTP attempt
-    count for every botocore transport error, and SSL, proxy and streaming
-    failures are classified as retryable, as botocore does (#6).
-  - Inline analysis limits are capped (#7).
-  - Page projection is linear in the block count instead of quadratic (#9).
-  - Per-row bucket mode bounds S3 keys in UTF-8 bytes (1024), as
-    static-bucket mode does (#10).
-  - `too_many_blocks` and `result_too_large` are recorded from a structured
-    error category, so provider text in a malformed response can no longer
-    pick the audited failure reason (#38).
-  - Query text and alias validation rejects non-ASCII whitespace such as
-    U+00A0 at config load, matching the provider pattern (#158).
-- **AWS guardrails** count botocore attempts as they are sent, so a transport
-  error reports the attempts actually made. They stop scanning at a row
-  deadline, set by the new `row_deadline_seconds` option (positive integer,
-  default 300; not exposed on the web operator profile), honour shutdown
-  between fields, and hand retryable failures to the engine retry policy
-  (AWS review #4). The response parser records a wrong-typed `confidence`,
-  `action` or `filterStrength` as a malformed response instead of crashing
-  with an unaudited `TypeError` (#5), and the guardrail ARN is cross-checked
-  against `region` (#8). Every configured field is validated before the
-  first ApplyGuardrail call, so a later invalid field no longer lets earlier
-  fields be sent and billed (#145), and profile aliases are limited to 64
-  characters at config load, matching the live check (#159).
-- **`azure_content_safety`** composer hint no longer claims a default
-  threshold of 4: every category threshold is required, and lower values are
-  stricter (#127).
-- **Azure analyze transforms** (Document Intelligence, Content Understanding)
-  retry network errors while polling until the poll deadline.
-- **LLM transforms:**
-  - Replaying a recorded content-policy refusal raises the same error as the
-    live run, so the row is handled the same way.
-  - The Azure and Bedrock batch wait covers the whole batch: the budget plus
-    queries × request timeout plus 30 seconds.
-  - Tracing imports its instrumentor before configuring, refuses a second,
-    conflicting tracing policy in one process, and type-checks its boolean
-    flags and credentials.
-  - An empty or whitespace-only completion is classified by why it is empty:
-    a content filter or explicit refusal raises a content-policy error,
-    `length` a token-budget error, tool calls an unsupported-response error,
-    and anything else a non-retryable error. The audited LLM client does this
-    once for every provider, and records the call as an ERROR with that
-    classification instead of SUCCESS; replay raises the same error (#123).
-    Bedrock's readiness check validates content and finish reason the same
-    way.
-  - OpenRouter network errors use fixed text, so the URL no longer reaches
-    the audit trail or Langfuse.
-  - The LLM gateway rejects malformed usage when the `usage` capability is
-    required, and rejects a malformed readiness response.
-  - The OpenRouter and gateway source configs no longer show the API key in
-    their repr. Plugin configs now hide credential, endpoint and tracing
-    fields from repr across the LLM, Azure, AWS, Chroma, database and
-    `web_scrape` plugins, and a plugin config validation error no longer
-    echoes the authored input values (#128).
-  - Single-query `fields_added` declares the `<response_field>_usage` and
-    `<response_field>_model` fields the transform already wrote.
-  - The Langfuse tracer refuses a cached client whose base URL or secret key
-    differs from the one requested, and a conflicting `LANGFUSE_BASE_URL`.
-  - A required image field holding an empty list is an `invalid_input` row
-    error (`empty_image_list`).
-  - Config refusals for row-object misuse or dynamic row access name the
-    query template at fault instead of always blaming `prompt_template`
-    (#33).
-  - Ordered-mode config validation compiles the ordered query plan once per
-    validation pass instead of once per query (#34).
-  - Single-query transforms no longer record an empty system message in
-    Langfuse when `system_prompt` is `""` (#46).
-  - `_parts_hash` is registered as an LLM audit-only field, so the row/audit
-    separation guards cover it (#87).
-  - `populate_llm_operational_fields` requires a `TokenUsage` and a model
-    string, matching the non-nullable output schema (#88).
-  - The unused `validate_json_object_response` parser is removed; response
-    property tests exercise the production parser `extract_structured_fields`
-    (#143).
-  - `too_many_images` reasons report "more than N" instead of a misleading
-    max+1 count (#154).
-- **`keyword_filter`:** the ReDoS guard treats `{,n}` and `{,}` as
-  quantifiers (`{}` stays literal), and a single-string `fields` declares
-  that one field rather than all fields.
-- **Unscanned fields are reported.** `keyword_filter` and the Azure content
-  safety and prompt shield transforms list fields they skipped because the
-  value was not a string in `success_reason.validation_warnings`. They do not
-  recurse into containers, by design.
-- **RAG:** the registry hides only a missing `chromadb` module, and its error
-  names the `elspeth[rag]` extra.
-
-Sinks and retrieval:
-
-- **Chroma sink:**
-  - An empty, whitespace-only or duplicate document id in an effect group is
-    diverted per row at prepare; the whole effect previously failed, an empty
-    id was recommitted forever, and a whitespace-only id was published.
-  - `on_duplicate` accepts only `overwrite`, the one policy the sink
-    performs; `skip` and `error` fail config validation.
-  - A row is diverted only when chromadb rejects it before sending
-    (validation, embedding, metadata preparation). A failure after the write
-    is sent, such as an unreadable HTTP response, is reconciled by reading the
-    write back; it used to be recorded as a diversion of a row that had been
-    written. This uses chromadb's private upsert path, so `chromadb` is pinned
-    to 1.5.5.
-  - Startup refuses an existing collection whose `hnsw:space` differs from
-    `distance_function`.
-- **HTTP replay** re-raises a recorded transport failure and records the
-  replay call as an error; other recorded failure types still raise
-  `AuditIntegrityError`.
-- **Azure Search** result metadata excludes the vector field and
-  `@search.*` keys.
-- **Chroma retrieval** records a failure in runtime preflight or deferred
-  initialisation as a failed call.
-- **Dataverse sink:**
-  - Reconciliation no longer treats a server echo of the same value as a
-    mismatch.
-  - Apostrophes in upsert alternate-key values are OData-escaped.
-  - A lookup whose key is not mapped is a config error.
-- **Dataverse client:** errors carry a typed `retry_after` parsed from
-  `Retry-After`. The Dataverse source and sink honour it on 429 and 503
-  throttling: the client waits at least `Retry-After` (with an exponential
-  backoff floor and a 300 s throttle-wait budget per request, cancellable on
-  shutdown) and re-sends instead of failing the run. Each waited-out
-  throttled call is recorded with its `retry_wait_ms`, and sink commit
-  evidence names the waits as `throttle_wait_ms` (#76).
-- **S3 sink:** a closed sink refuses further requests, the CSV probe checks
-  the header it will actually write, and an unencodable header raises a
-  `ValueError`.
-- **Azure blob sink:** JSON and JSONL bodies are streamed in 64 KiB chunks.
-  The Azure blob sink and source close the service client and credential.
-- **CSV sink:** the delimiter is validated by building a real CSV writer, and
-  non-text encodings are refused. A new opt-in `neutralize_formulas` setting
-  (off by default, so output is byte-identical unless enabled) neutralises
-  spreadsheet formulas.
-- **Local file effects** admit storage per 64 KiB accumulated rather than per
-  chunk, with exact cumulative reservations.
-- **Audit-export bundles:** a bundle being built is held under an exclusive
-  lock, and the stale-scratch sweep skips locked trees, so it can no longer
-  delete a live bundle.
-- **`database` sink** composer guidance now matches what it supports:
-  SQLite or PostgreSQL, an existing table, no DDL, a required effect ledger,
-  and append only. `if_exists` accepts only `append`, so `replace` fails
-  config validation.
-- **Plugin infrastructure:**
-  - `PluginManager.create_*` builds the plugin class from its own registry
-    and validates config against that same class (#126).
-  - Plugin discovery raises on a missing core dependency (#129).
-  - The Chroma readiness probe reports a persistent path that is not an
-    existing directory as unreachable, without creating a client (#149).
-  - An unknown landscape export sink is refused for every run purpose,
-    `landscape.export` values are expanded before eligibility checks, and a
-    deferred Key Vault reference defers the raw-settings gate, in the CLI
-    preflight as well (#104).
-  - A template render timeout is classified by worker CPU time: a template
-    that used its 2 s CPU budget is a row `TemplateError`, anything else a
-    retryable worker-lost error (#6).
-  - Parallel LLM multi-query records the pool execution context in
-    `context_after` (#100). The context is captured under the batch lock, so
-    with concurrent rows each row records its own batch's retries, throttling
-    and concurrency rather than another row's.
-  - Control credit no longer reads a `detect_only` option that no plugin
-    config admits (#1).
-  - A template render whose context carries a row reports failures by
-    exception class only, so row values cannot reach error text. Value-free
-    reporting is also the default for every sandboxed template environment;
-    only the Azure Blob sink's blob path, whose context never carries row
-    data, opts in to the detailed message. The output-size limit message is
-    kept in value-free renders (#7).
-  - Every plugin `encoding` option refuses non-text codecs, and every CSV
-    `delimiter` option refuses `"`, newline and carriage return, at config
-    load, through one shared check.
-  - Sink pre-validation resolves the config model from the config, as the
-    runtime factory does, and reports a provider dispatch rejection as a
-    `provider` validation error, matching sources and transforms (#8).
-- **S3, audit export and Dataverse:**
-  - The `aws_s3` source admits the SDK `GetObject` body by parsing its
-    `read`/`close` members rather than a runtime-checkable protocol; a body
-    whose `read` is not callable is closed and reported as `InvalidS3Body`
-    instead of a mid-download `TypeError` (#12).
-  - The `aws_s3` sink records a multipart composite `ChecksumSHA256`
-    (`<base64>-<parts>`) as having no full-object checksum instead of
-    rejecting it as malformed; malformed composites are still refused (#31).
-  - Audit export bundle preflight reports a scratch probe it could not
-    remove (#15), the same-device guard compares the staging parent rather
-    than the target parent with itself (#16), and reconcile evidence records
-    the measured staging state, using `divergent` only for a tree actually
-    compared against the plan (#17).
-  - Dataverse member-effect validation computes batch plan material once per
-    batch rather than per member; the plan-vs-material integrity check still
-    runs for every member (#89).
+- This release carries a broad round of plugin fixes across sources,
+  transforms, sinks and retrieval; the ones that change behaviour are listed
+  in the upgrade notes above. New: the `azure_content_understanding`
+  transform, the `azure_document_intelligence` outputs `fields_field` and
+  `metadata_field`, and the `json_explode` option `index_field` (default
+  `item_index`). The CSV source decodes the file strictly in binary. The LLM
+  transform keeps the one-hour batch-wait default as a floor for a row's
+  result, and the Azure and Bedrock batch wait covers the whole batch: the
+  budget plus queries × request timeout plus 30 seconds.
+- Examples: the `multi_worker`, `multi_worker_showcase` and `join_refused`
+  launchers require the `sqlite3` command-line tool and exit 2 with a clear
+  message when it is missing.
 
 ### Web Composer
 
-- **Multi-query prompt reviews can be approved without a shared template.**
-  When every query supplies its own template and the optional node-level
-  `prompt_template` is omitted or null, the review card now shows the system
-  prompt and every query template in full from the live composition, and
-  Approve unlocks after View prompt. Before, the card fell back to the bounded
-  staging preview and approval stayed unavailable. A query that relies on a
-  missing shared template still keeps approval unavailable.
-- **A reply the completion review withholds is shown as a system notice.** The
-  assistant message is empty and the notice says why (review unavailable,
-  malformed, rejected, out of budget, or not admitted). The withheld text never
-  re-enters the conversation history sent to the model, so it is never treated
-  as the model's own words. The saved-scope facts appear once, in the
-  checkpoint receipt.
-- **Credential-shaped model reasoning no longer fails the turn.** It is dropped
-  and recorded as a value-free withhold, and the turn continues. Where the
-  provider forbids editing or omitting thinking blocks (a tool-call
-  completion), the call is refused with a typed cause instead.
-- **Credential refusals on model output no longer blame the user.** When the
-  guard blocks content the model produced, the message says the model's output
-  was blocked and to retry, and keeps the secret-service remedy for the case
-  where the user supplied the value.
-- **Stored provider-error text is scrubbed with the shared credential
-  patterns.** The scrubber kept its own list, which missed database-URL
-  passwords and over-redacted ordinary request paths. Hyphenated provider keys
-  are never stored in an audit row's `error_message`. New rows may carry the
-  shared marker labels `ssn_like` and `github_token`; existing rows are not
-  rewritten. Redis, AMQP and raw-slash URL passwords are not recognised by the
-  shared detector and remain a gap.
-- **The version menu shows the newest 50 versions and marks validated
-  milestones.** It used to request the oldest 50, so in a long session the
-  baseline `diff_pipeline` names could not be found. Strictly validated
-  versions are labelled without relying on colour and are never hidden by the
-  identical-snapshot filter. If the head keeps moving while the history loads,
-  the menu says so and offers Retry.
-- **A forked session's first version no longer claims a validation that never
-  ran on its bytes.** Fork rewrites blob and sink paths; when that changes the
-  structure, the marker is now `authoring_only` (`is_valid` is kept). An
-  unchanged fork keeps its marker.
-- **`diff_pipeline` compares against the last validated state.** The baseline
-  is the newest strictly validated state other than the working state, reported
-  as `baseline_kind: last_validated`; with none, it is the request-start state
-  (`request_start`). A state checked only by the mid-turn authoring check does
-  not count. The tool description and the composer skill now tell the model to
-  name both version numbers and to say plainly when nothing has changed. The
-  skill text change moves `composer_skill_hash`.
-- **A reviewed interpretation slot that a per-query template bypasses is
-  refused at staging.** A multi-query node whose query supplies its own template
-  never rendered the node-level slot, so the approved value did not reach that
-  prompt. `set_pipeline`, `upsert_node`, `splice_transform` and `patch_node_options`
-  now refuse the shape with the validation code `vague_term_query_override`
-  and a repair message that names the real cause.
-- **Ordinary prose no longer blocks resolving an accepted interpretation.**
-  The guard that refused any template whose text before the placeholder ended
-  in `system:`, `role:` or `instructions:` is removed (for example "Describe
-  the user's role:"). Braces and control characters are still refused.
-- **The end-of-turn advisor review gets the plugin capability record** bound to
-  the same snapshot as the candidate, and a rubric that separates a prose
-  objection (the reply is withheld) from a graph finding. Repair copy says the
-  user has not seen the draft.
-- **The three batch plugins are available on every install.** `batch_stats`,
-  `batch_replicate` and `batch_experiment_compare` no longer depend on an
-  operator allowlist; both AWS terraform mirrors and the docs lists follow. The
-  schema-contract repair text now says `copy_index` is an output field of
-  `batch_replicate` when `include_copy_index` is enabled. The planner request
-  grows by a measured 1,335 bytes.
-- **`report_assemble` declares the text framing it produces**, so the Web
-  Composer rejects a direct link to a `text` sink at validation (see Upgrade
-  notes). The `document` sink example admits the eight report metadata fields as
-  optional, and the `text` and `document` sink guidance states what each
-  writes.
-- **The tutorial's Build step is script-only.** After the brief is sent, the
-  learner can take only the card decisions the script needs: no chat input,
-  upload, suggestion Apply, repair, inline-source edit or use-as-input. The
-  interpretation card has no "Change..." control. Cancel and the
-  interrupted-request retry stay, and a resend control re-sends the scripted
-  brief. The launch check's 409 detail names what differs. The ordinary chat is
-  unchanged.
-- **The escape-hatch boot probe sends the real request.** It used to send three
-  tools; it now sends the full planner palette a production hatch turn sends,
-  so the probe now exercises the request production sends.
-- **A reply that fits is no longer refused by the context budget.** Savings
-  from shed history and stubbed tool results are now counted in wire bytes (and
-  on the quoted records the reply stage sends), where they were counted in
-  content bytes, and a reply-stage refusal's audit components are sized on the
-  request that was measured.
-- **A forked session's copy of a model-written file stays model-written**
-  (#365). Forking used to record the copy as VERBATIM, which let a session
-  fork turn LLM-generated text into a file the composer would accept as
-  prompt text. The copy now keeps its source's creation modality and the
-  `creating_*` provenance fields, anchored to the child session's own
-  `session_fork` audit row, so the prompt-surface guard, blob admission and
-  share checks treat it as model-written through forks of forks as well.
+- A reply the completion review withholds is shown as a system notice, and the
+  withheld text never re-enters the conversation history sent to the model.
+- Credential-shaped model reasoning is dropped and recorded as a value-free
+  withhold instead of failing the turn. Stored provider-error text is scrubbed
+  with the shared credential patterns; existing rows are not rewritten. Redis,
+  AMQP and raw-slash URL passwords are not recognised by the shared detector
+  and remain a gap.
+- The version menu shows the newest 50 versions and marks validated
+  milestones. `diff_pipeline` compares against the last validated state
+  (`baseline_kind: last_validated`, or `request_start` when there is none).
+- A reviewed interpretation slot that a per-query template bypasses is refused
+  at staging with the validation code `vague_term_query_override`.
+- `batch_stats`, `batch_replicate` and `batch_experiment_compare` are
+  available on every install and no longer depend on an operator allowlist.
+- The tutorial's Build step is script-only: after the brief is sent, the
+  learner can take only the card decisions the script needs.
+- A forked session's copy of a model-written file stays model-written (#365).
+  Fork copies made before this fix stay VERBATIM; they are not rewritten.
+- The skill text change moves `composer_skill_hash`.
 
 ### Sharing
 
-- **Cancelling a shared-pipeline import or a library fork no longer leaves an
-  empty session.** A client disconnect during creation used to commit a live,
-  empty "Copy of ..." or "Fork of ..." session that nothing archived. The
-  session is now archived on cancellation.
-- **Share tokens are decoded strictly.** A token containing characters outside
-  the URL-safe base64 alphabet is refused; it used to verify with the junk
-  discarded. Every token issued before this release still verifies. The unused
-  `requesting_user_id` parameter of `ShareableReviewService.resolve_token` is
-  removed; the route keeps its authentication and rate limit.
-- **`elspeth purge` can no longer delete a live share's data.** Share snapshots
-  and frozen import files shared the content-addressed payload store with run
-  payloads, so a share whose bytes matched a run's canonical row JSON was
-  deleted with the run and its link returned 404. Shares now have their own
-  store at `<payload base>/shares`, on the same mounted volume with no new
-  setting. Links created before this release keep working (reads fall back to
-  the parent store), but their data stays where it is and remains
+- Cancelling a shared-pipeline import or a library fork no longer leaves an
+  empty session; the session is archived on cancellation.
+- Share tokens are decoded strictly. Every token issued before this release
+  still verifies.
+- **`elspeth purge` can no longer delete a live share's data.** Shares now
+  have their own store at `<payload base>/shares`, on the same mounted volume
+  with no new setting. Links created before this release keep working (reads
+  fall back to the parent store), but their data stays where it is and remains
   purge-exposed; there is no migration. Never point `purge --payload-dir` at
   `shares/`.
-- **Copying a share link again keeps its original expiry.** A re-minted link
-  is signed with the expiry recorded when the pipeline was shared for review,
-  shortened if the deployment maximum has since been lowered. It used to start
-  a fresh lifetime. Once that expiry has passed, the request returns 409
-  `share_link_expired`; share for review again to create a new link.
-- **Library payloads have their own store**, at `<payload base>/library`, so
-  `elspeth purge` cannot delete a published entry's pipeline. A missing payload
-  is reported as `library_payload_unavailable` (republish); a corrupt one is
-  still an integrity error. See the upgrade note above.
-
-### Logging
-
-- **asyncio diagnostics that carry an exception are reduced to class and code
-  location.** A task exception that was never retrieved, a failed loop
-  callback and 3.14's shielded-future report are logged as
-  `asyncio_unhandled_exception exc_class=… frames=file:line:function,…`, on
-  every event loop in the process. Records without an exception are
-  unchanged.
-
-### Examples
-
-- **The `multi_worker`, `multi_worker_showcase` and `join_refused` launchers
-  require the `sqlite3` command-line tool** and exit 2 with a clear message
-  when it is missing. Without it they used to fail as a misleading "leader
-  never reached RUNNING" timeout. `examples/AGENTS.md` lists `sqlite3` as a
-  prerequisite and documents `reference_join_chain`, which ends PARTIAL with
-  exit 1 by design.
+- Copying a share link again keeps its original expiry, shortened if the
+  deployment maximum has since been lowered. Once that expiry has passed, the
+  request returns 409 `share_link_expired`; share for review again to create a
+  new link.
+- Library payloads have their own store at `<payload base>/library`. A missing
+  payload is reported as `library_payload_unavailable` (republish); see the
+  upgrade note above.
 
 ### Known limits
 
-- Ruff still targets `py313`, so that the formatter does not rewrite 169 files
-  to the PEP 758 `except A, B:` form. That is separate work.
-- One `elspeth-lints` masquerade test, of definition-time annotation order,
-  stays skipped on 3.14: the model it checks predates PEP 649.
-- Four signed tier-model allowlist entries for
-  `contracts/runtime_val_manifest.py` drift and await operator re-signing.
-  Keyless scans report them. The plugin fixes leave more awaiting re-signing:
-  one for the batch transform mixin, four for the S3 sink, and the signed
-  `http.py` entries after the client changes.
 - In pooled LLM mode, time a row spends queueing is still unbounded.
 - `chromadb` 1.5.5 carries four advisories with no fixed release
   (CVE-2026-45829, CVE-2026-45830, CVE-2026-45831, CVE-2026-45833). All four
-  are in the Chroma server, which the image never runs, so the image scan
-  takes them as version-scoped, expiring exceptions (`.trivyignore.yaml`), as
-  the dependency audit already did. A separate limitation: in Chroma
-  `mode: client`, ELSPETH does not pass its own embedding function, so
-  `chromadb` builds the one named in the remote collection's stored
+  are in the Chroma server, which the image never runs. A separate limitation:
+  in Chroma `mode: client`, ELSPETH does not pass its own embedding function,
+  so `chromadb` builds the one named in the remote collection's stored
   configuration. Point client mode only at Chroma servers you trust.
-- The plugin source-hash lint now checks the AWS transforms, which it had
-  skipped: it did not scan `plugins/transforms/aws` or recognise the Bedrock
-  guardrail base. The stale `aws_bedrock_prompt_shield` hash it then found is
-  re-pinned, and a test now requires the rule to cover every registered
-  plugin.
 - Bedrock's readiness check still requests 32 tokens, so reasoning models may
   fail it.
 - Azure OpenAI and Bedrock LLM requests go through provider SDKs and still
   bound each network operation separately rather than the whole request.
-- Seven allowlist entries for audit-export bundle effects also await
-  re-signing.
-- `azure-ai-inference` is not a declared dependency of LLM tracing, and if
-  `instrument()` fails the exporter is left running.
-- Dataverse sink errors are not yet diverted per row: which error codes are
-  attributable to a row needs a maintainer decision. Reconciliation does not
-  normalise decimal or datetime values.
-- The PostgreSQL testcontainer suite has not been run for the `database` sink
-  change or the fork provenance fix (#365).
-- Textract verify mode still compares responses and indexes `IN_PROGRESS`
-  polls per live run, so provider-generated `JobId` and `NextToken` values
-  are not yet normalised; replay residuals, a HeadBucket verify race, and
-  whether follower evidence should name the leader's state await
-  maintainer decisions.
-- The Dataverse 300 s throttle-wait budget is not configurable, and the
-  client retries only 429 and 503; 500, 502, 504 and timeouts are not
-  retried in the client.
-- The batch transform mixin's `evict_submission` allowlist entry is stale
-  and awaits re-signing.
-- Power Automate still acquires an OAuth token per POST; reusing it (#131)
-  awaits a maintainer decision.
+- Dataverse sink errors are not yet diverted per row, and reconciliation does
+  not normalise decimal or datetime values. The Dataverse 300 s throttle-wait
+  budget is not configurable, and the client retries only 429 and 503.
+- Textract verify mode does not yet normalise provider-generated `JobId` and
+  `NextToken` values.
 - An engine retry of a guardrail row re-scans, and re-bills, fields that
   already passed.
-  The guardrails client also awaits operator re-signing of three tier-model
-  allowlist entries for `BedrockGuardrailsClient.apply_guardrail`.
-- `diff_pipeline` moves its baseline to the request-start state as soon as the
-  turn edits, and after a revert it compares with the validated state before
-  the revert.
-- The vague-term bypass refusal does not tell the planner which query bypasses
-  the slot; a slot resolved before an override is added is still accepted; and
-  a stored session with a pending card on such a node is treated as orphaned on
-  the next compose turn.
-- The advisor does not yet receive blocker detail. The handoff override before
-  the pre-scan still drops the masked-red diagnostic.
-- The tutorial's script-only Build step has not had its browser walk: no
-  Chromium was available.
-- Fork copies made before the #365 fix stay VERBATIM; they are not rewritten.
-  A fork interrupted mid-copy across the upgrade fails closed on retry with a
+- A fork interrupted mid-copy across the upgrade fails closed on retry with a
   modality mismatch. Pipeline `llm`-node output is still recorded VERBATIM
   and has not been checked as a route to model-written prompt text.
-- Two masquerade baseline entries added for the `aws_s3` source body parse
-  and a test double await maintainer review, and tier-model allowlist
-  entries for audit export preflight and the `aws_s3` source download await
-  operator re-signing.
 
 ### Publication and acceptance
 
@@ -1244,67 +1208,28 @@ Other things an operator or client will notice:
   continues to apply to older stores. This authorizes no migration, reset,
   restamping or downgrade.
 
-### Composer
+### Composer and audit records
 
 - **The Composer sheds context to fit an operator-set budget.** Before each
-  compose-loop and planner provider call (the escape hatch and the reply
-  after staged review cards included; advisor and review calls are not, see
-  Known limits), the server removes context in a fixed order until the
-  request fits the prompt-token cap and the request-byte ceiling: earlier
-  tool results in the current turn (each body replaced by a fixed stub; the
-  call and result message stay), then earlier assistant prose, then
-  escape-hatch transcript events, then the oldest earlier user requests,
-  oldest first within each. The system skill, catalog, tool definitions,
-  current request, pipeline state and latest tool round trip are never
-  removed. The budgeter makes no provider call and adds no text of its own
-  beyond the stub and counts of omitted messages.
-- **Shedding has a high and a low mark.** It starts when the request is above
-  `SHED_ABOVE` of the token cap, or over the byte ceiling, and continues to
-  `SHED_TO`. What was shed stays shed. Whether more must go is judged on the
-  already-reduced request, so nothing more is shed until that crosses
-  `SHED_ABOVE` again; shed history is restored only when the whole request is
-  back at or under `SHED_TO`. A tool result stubbed during a turn stays
-  stubbed for the rest of that turn.
-- **Both ceilings are judged on the request as sent.** The measure is the
-  wire bytes of the request: the JSON of its messages and tools, escaping
-  included. That is what a gateway's body cap sees, and everything the model
-  reads (content, tool-call arguments, thinking blocks and tool definitions).
-  The token estimate divides that size by a bytes-per-token ratio measured on
-  the same basis.
-- **A request that cannot fit is refused with a named cause.** When the
-  protected content alone exceeds either ceiling, the server refuses before
-  any provider call with `context_budget_exceeded`: "This conversation is too
-  large for the composer to continue. Start a new session, or shorten your
-  request." It offers no Retry. The refusal names the ceiling and the largest
-  component of the request as sent.
-- **A reply that cannot fit does not fail a finished turn.** If the optional
-  reply after review cards are staged cannot be fitted, no provider call is
-  made and the turn completes with its staged work intact. The user sees:
-  "This turn's work was completed, but the model's final reply could not be
-  produced because this conversation is too large for the composer. Start a
-  new session, or shorten your request."
-- **Users are told when history is shed.** A turn whose model call leaves
-  earlier conversation out shows the progress notice "Earlier conversation is
-  no longer visible to the composer."
-- **The escape-hatch transcript header no longer says "Complete"**, because
-  the transcript can now be reduced to fit the budget.
-
-### Audit records
-
-- **What was shed is recorded on each budgeted call.** The call record and
-  its public envelope gain a `context_budget` field: the policy hash, the
-  `bytes_per_token` ratio the estimate used, the estimated tokens before and
-  after shedding (the figure after is an upper bound), `request_wire_bytes`
-  (the size of the request sent), and what was removed or stubbed. A call
-  that shed nothing says so explicitly. Advisor and auto-title calls are not
-  budgeted and store a null `context_budget`.
-- **A refused reply is recorded on the turn's audit trail.** It is an audit
-  row (`composer_reply_stage_refusal`, reason `context_budget_exceeded`) with
-  the ceiling, the estimated tokens and request bytes, the configured
-  ceilings and the largest component. It holds sizes and fixed names only. No
-  call record is written, because no call was made.
-- **The stored `request_byte_split` keeps its meaning** (the content split).
-  It is not what the budget is judged on.
+  compose-loop and planner provider call, the server removes context in a
+  fixed order until the request fits the prompt-token cap and the request-byte
+  ceiling: earlier tool results in the current turn, then earlier assistant
+  prose, then escape-hatch transcript events, then the oldest earlier user
+  requests. The system skill, catalog, tool definitions, current request,
+  pipeline state and latest tool round trip are never removed. Shedding starts
+  above `SHED_ABOVE` of the token cap, or over the byte ceiling, and continues
+  to `SHED_TO`. Both ceilings are judged on the wire bytes of the request as
+  sent.
+- **A request that cannot fit is refused with a named cause**
+  (`context_budget_exceeded`) before any provider call. If only the optional
+  reply after staged review cards cannot fit, the turn completes with its
+  staged work intact. Users are told when earlier conversation is no longer
+  visible to the composer.
+- **What was shed is recorded on each budgeted call** in the call record's
+  `context_budget` field. A refused reply is recorded as a
+  `composer_reply_stage_refusal` audit row holding sizes and fixed names only.
+  Advisor and auto-title calls are not budgeted and store a null
+  `context_budget`.
 
 ### Known limits
 
@@ -1338,142 +1263,44 @@ Composer tool remediation. Verification status is recorded in the pull
 request. The dated entry and package version do not establish qualification, a
 published tag or an image.
 
-### Dependencies
+### What changed
 
-- **The remaining Python dependency advisories are fixed.** OpenTelemetry
-  moves to 1.45.2 with the Prometheus exporter at 0.66b1, and soupsieve
-  moves to 4.0. These SDK and
-  exporter versions are exact pins because operator telemetry custody verifies
-  their implementation at startup. Langfuse moves from SDK 3 to 5.2, allowing
-  packaging 26.3 and patched virtualenv 21.15.6. Azure Monitor moves with the
-  compatible OpenTelemetry stack to 1.8.12 / b59. Existing tracing
-  configuration remains supported; installs must use the updated lock rather
-  than upgrading the telemetry SDK independently.
-
-### Composer
-
-- **Refusals and no-ops go back to the model, not to an approval card.** A
-  mutation now passes validation-only admission before a proposal is staged.
-  A change the server already knows it will refuse, or one that would change
-  nothing, is returned to the model as tool feedback so it can repair its
-  request. Approval cards are created only for changes that pass admission.
-- **Blob and secret changes are checked before a proposal is published.**
-  Blob update and delete prerequisites, quota and custody checks run at
-  admission, and malformed blob references are refused there
-  (`proposal_blob_reference_malformed`). No blob-store effect is executed as a
-  preview. A pending option change keeps the blobs it depends on. When the
-  blob or graph a staged proposal depends on changes before publication, the
-  tool reports the race instead of reporting that the proposal was staged.
-- **Under explicit approval, one composition proposal is pending at a time.**
-  A response carrying more than one mutation is refused whole
+- **Composer.** Refusals and no-ops go back to the model as tool feedback, not
+  to an approval card; approval cards are created only for changes that pass
+  admission. Under explicit approval, one composition proposal is pending at a
+  time: a response carrying more than one mutation is refused whole
   (`approval_batch_not_atomic`), and a mutation is refused while a composition
-  proposal is pending (`approval_proposal_pending`); both refusals tell the
-  model what to do next. Proposals staged together from one response were
-  previewed against the same state, so accepting them in turn produced stale
-  or contradictory pipelines. This contains the defect and does not redesign
-  it: auto-commit sessions and blob-only proposals are not covered.
-- **Blob and parked-graph selectors accept any spelling of a UUID.** Blob
-  lookups, bindings, retention, planner facts, proposal custody and duplicate
-  detection treat a UUID in upper case, with braces or as a URN as the same
-  blob, and restoring a parked graph canonicalises its selector the same way.
-  The model's arguments, and the hashes recorded over them, are preserved
-  unchanged.
-- **`diff_pipeline` answers in freeform sessions.** It compares the current
-  state with the state at the start of the request, and says so when held
-  proposals are not included. Asked one turn after an edit it reports no
-  change; the intended baseline is still to be decided.
-- **Graph edits.** Transforms can be spliced into planner-built pipelines,
-  which do not carry the visual edges splicing used to require, and removing
-  an output removes its edges.
-- **An oversized blob read is reported as a size refusal**
-  (`blob_content_size_limit`), not as a credential problem.
-- **The gate-preview mismatch diagnostic names the actual failure** (a
-  misspelt field, a short row, a zero divisor or a bad function argument)
-  instead of always advising a numeric source-schema type, and the preview no
-  longer samples a CSV row cut short by its 8 KiB byte limit. Known and
-  deferred: the preview keys sampled rows by the raw CSV header where the
-  runtime uses normalised names; the repair text says so and tells the model
-  not to rename the field.
-- **Composer skill text corrected.** Contradictory and stale instructions were
-  removed or rewritten in place; the skill now says the server raises every
-  prompt review card, in place of wording that read as though prompts go
-  unreviewed. The text was not restructured; about a third of what the
-  proposal planner receives still describes tools it does not have.
-- **Smaller fixes.** A pending proposal's tool result states the next action.
-  The audit record for a cached discovery result matches the admitted
-  envelope delivered to the model. Three queue scope fields that were dropped
-  before `NodeSpec` admission are now carried through. JSON preview warnings
-  and record-count evidence are admitted by the preview response contract
-  instead of failing it. A Chroma client-mode configuration with a null
-  persistence directory is admitted without bypassing path confinement.
-  Recovery tools are recognised in persisted planner receipts.
-
-### Web interface
-
-- **The ARGOnite skin.** The web interface takes the ARGOnite look in light
-  and dark themes, with a high-contrast palette built on the same hues. Header
-  pills, the model chips included, share one height. The conversation runs the
-  full height of the window, with its hide/show control beside "Share inspect
-  link". A selected node and a selected edge are gold, distinct from the
-  keyboard focus colour. Known and deferred: between workspace widths of 960
-  and 1041 px the pipeline card is narrower than its 640 px target.
-- **The share dialog follows the active session and states what a link
-  grants.** It now closes when the active session changes. It stayed bound to
-  the session it was opened for, so after back/forward or a session switch it
-  could make a link for a pipeline the owner was no longer looking at. Its
-  success text no longer says read-only access when the recipient can import
-  an editable copy with copies of the listed files.
-- **A pipeline that uses two files with the same content under different
-  names or file types is no longer shared for import.** An import keeps one
-  copy per content, so both uses would have taken one file's name and type,
-  and a `blob_rows` source would have emitted the wrong filename or MIME type
-  as row data. The share dialog names the two files; give them the same name
-  and type, or use one file in both places.
-- **The tutorial's audit step explains its LLM call count**, which includes
-  one reachability check made before the run starts.
-
-### LLM gateway
-
-- **Thinking from an adapter that does not declare `REASONING` is refused**
-  as upstream-invalid on the first turn. The gateway returned it with a 200,
-  then refused the caller's next turn when that thinking was sent back. The
-  reference adapter declares
-  `REASONING` and is unaffected; an operator adapter with this defect will now
-  fail earlier.
-
-### Plugins
-
-- **`file_inject` transform.** Writes the content of whole files, bound as
-  configuration, into row fields. The content is part of node identity, so
-  editing a bound file between a run and its resume refuses the resume. It is
-  in the default web plugin set. In the Composer its content must be a file the
-  user uploaded: content written by the planner is refused. A shipped example
-  is in `examples/file_inject/`.
-- **A file the agent rewrites is recorded as the agent's file.** `update_blob`
-  kept the uploader as creator, so a rewritten upload could pass as a user
-  upload after a session fork, or when the new text came from the user's
-  message. It now records the assistant as creator, as for a file the agent
-  creates. Files rewritten before this release keep their old record. Known
-  and deferred: the `llm` prompt guard reads modality only, and a fork copy of
-  a model-written file still passes it; prompt review cards cover that route.
-
-### MCP server
-
-- **File paths authored over MCP are resolved against the configured data
-  directory**, and a path outside it is refused at admission, including the
-  explicit-null case that previously bypassed the check.
-- **The standalone MCP server owns its process lifecycle.** The installed CLI
-  runs the server under a private supervisor, so shutdown, a failed start,
-  loss of the control channel and the death of the parent all settle the
-  child process instead of leaving it running. The supervisor uses the same
-  portable path on every platform; it has been exercised on Linux only.
-
-### Landscape
-
-- **Creating Landscape tables on PostgreSQL no longer breaks a later SQLite
-  initialization in the same process**, which lost its inline foreign keys.
-  Table creation is now serialized and restores the original constraint rules
-  on the shared schema metadata, including when the DDL fails.
+  proposal is pending (`approval_proposal_pending`). This contains the defect
+  and does not redesign it: auto-commit sessions and blob-only proposals are
+  not covered. `diff_pipeline` answers in freeform sessions, transforms can be
+  spliced into planner-built pipelines, and an oversized blob read is reported
+  as a size refusal (`blob_content_size_limit`). Contradictory and stale
+  Composer skill text was corrected in place without restructuring it.
+- **Web interface.** The web interface takes the ARGOnite look in light and
+  dark themes. The share dialog closes when the active session changes and
+  states what a link grants. A pipeline that uses two files with the same
+  content under different names or file types is no longer shared for import.
+- **Plugins.** New `file_inject` transform: it writes the content of whole
+  files, bound as configuration, into row fields. Editing a bound file between
+  a run and its resume refuses the resume. In the Composer its content must be
+  a file the user uploaded. A file the agent rewrites with `update_blob` is
+  now recorded as the agent's file; files rewritten before this release keep
+  their old record.
+- **MCP server.** File paths authored over MCP are resolved against the
+  configured data directory, and a path outside it is refused at admission.
+  The installed CLI runs the standalone MCP server under a private supervisor
+  that settles the child process on shutdown, failed start and parent death.
+- **Landscape.** Creating Landscape tables on PostgreSQL no longer breaks a
+  later SQLite initialization in the same process.
+- **LLM gateway.** Thinking from an adapter that does not declare `REASONING`
+  is refused as upstream-invalid on the first turn; an operator adapter with
+  this defect will now fail earlier.
+- **Dependencies.** The remaining Python dependency advisories are fixed:
+  OpenTelemetry moves to 1.45.2 with the Prometheus exporter at 0.66b1,
+  soupsieve to 4.0, Langfuse from SDK 3 to 5.2 and Azure Monitor to
+  1.8.12 / b59. The OpenTelemetry SDK and exporter versions are exact pins;
+  installs must use the updated lock rather than upgrading the telemetry SDK
+  independently.
 
 ### Upgrade notes
 
@@ -1514,103 +1341,33 @@ separate steps.
 This section records changes on the 0.8.11 candidate. It does not establish
 qualification, a published tag or an image.
 
-### Composer
-
-- **Shared, published and exported graphs no longer keep half of a
-  transform's uploaded-file reference.** A transform that reads an uploaded
-  file (a `reference_join` lookup table, a file-backed prompt) previously
-  lost only the file's identifier in share snapshots, library publications,
-  the MCP `generate_yaml` tool and YAML export, leaving a fragment that named
-  no file but still carried its digest. The whole reference is now removed,
-  the export's redaction account names each affected node and option
-  (`stripped_node_options`, `# redacted-node:` header lines), and YAML import
-  refuses a leftover fragment with guidance to re-attach the file. Re-importing
-  such an export reports the missing option unless the request re-attaches the
-  file (see YAML import below).
-- **Shared, published and exported graphs no longer carry a `blob_rows`
-  source's file entries.** Only each entry's `blob_id` was dropped, silently
-  leaving the file's digest (`payload_ref`), filename, MIME type and size. The
-  whole `blobs` list is now removed and named in the redaction account
-  (`blobs`, labelled `blob-linkage` in the export header); such sources also
-  count as reading uploaded files.
-- **The YAML export header no longer says sink paths are re-authored on
-  import**, which was untrue for a pasted-YAML import. The rebind guidance
-  (also returned as `redaction.rebind_guidance`) says sink paths are not
-  exported and must be set after import, or passed as `sink_path_bindings`.
 - **A shared link can let recipients import a copy, files included.** The
-  "Share inspect link" dialog has a configure step: "Let recipients import a
-  copy" (off by default), which lists the files that would travel, and "Link
-  expires after" 1 day, 7 days or 30 days; nothing is minted until "Create
-  link". The deployment's `shareable_link_lifetime_seconds` is now the maximum:
-  the dialog offers only lifespans at or below it, defaulting to the longest;
-  when none fits it offers no choice, says so, and the link lasts the maximum.
-  A longer lifespan sent to the server is refused with 422, and "copy link
-  again" keeps the chosen lifespan, clamped to the current maximum. Import
-  consent is tied to the listed files: the share carries the list's
-  fingerprint, and if the files changed after the owner saw them the server
-  refuses (409, `share_files_changed`) and the dialog shows the current list
-  for the owner to confirm again. When import is allowed, every uploaded file
-  the graph is attached to (source `blob_ref`, `blob_rows` entries, transform
-  inline-content markers) is frozen into the share at creation, so later
-  edits or deletion on the sharer's side do not break the link.
-- **Importing a shared copy.** An import link shows "Import a copy into my
-  workspace" and the file list; importing creates a new session, "Copy of
-  ‹name›", with its own copy of each file and every attachment pointing at the
-  copy, and records the share's digest and sharer as `shared_import`
-  provenance in the new state. Links minted before this release, and links
-  without the opt-in, stay view-only (403 on import). Secrets never travel. A
-  sink output path (`path`, `file` or `persist_directory`) inside the sharer's
-  session `outputs/` or `blobs/` folder is re-based to the same place in the
-  new session, so the copy validates without setting it; any other sink path
-  does not travel and must be set in the copy, as must one longer than 1024
-  characters, one holding a control character (C0, DEL or C1) or a Unicode
-  line or paragraph separator, or one shaped like a credential. Sinks that do
-  not write a local file are unaffected. The ordinary YAML import
-  accepts the same re-basing as `sink_path_bindings`, which can only name a
-  path inside the caller's own session folders and refuses those same paths.
-  A graph using a plugin the recipient's policy disallows is refused with 422
-  and the new session is archived. The import page has its own message for an
-  account without the pipeline-user role, a view-only link, a disallowed
-  plugin (named, with why), a graph over the YAML size cap, too many attempts
-  (429), an unavailable import (503), and the server's detail for any other
-  refusal.
-- **Only files the user uploaded can be shared for import.** If the graph is
-  attached to a file the assistant created or a pipeline run produced,
-  creating an import link is refused with 409 naming the file, and the dialog
-  says so beforehand, judging each file from its stored record; creating the
-  link reads and checks every file's bytes. View-only links to the same graph
-  are unaffected.
-- **Known cost: share snapshots and frozen files are not reclaimed.** Nothing
-  in the web app deletes payload-store content, so every share, and every file
-  frozen into an import link, stays on disk after the link expires. Identical
-  bytes are stored once. Reclamation is tracked in
+  "Share inspect link" dialog offers "Let recipients import a copy" (off by
+  default) and a link lifespan. The deployment's
+  `shareable_link_lifetime_seconds` is now the maximum: a longer lifespan sent
+  to the server is refused with 422. Links minted before this release, and
+  links without the opt-in, stay view-only (403 on import). Secrets never
+  travel. Only files the user uploaded can be shared for import.
+- **Shared, published and exported graphs drop the whole uploaded-file
+  reference.** A transform's uploaded-file reference and a `blob_rows`
+  source's file entries are removed whole and named in the export's redaction
+  account; YAML import refuses a leftover fragment with guidance to re-attach
+  the file. `POST /api/sessions/{id}/state/yaml` accepts
+  `inline_blob_bindings` and `source_blob_rows` to re-attach files, and
+  `sink_path_bindings` to re-base sink paths; sink paths are not exported and
+  must be set after import.
+- **Known cost: share snapshots and frozen files are not reclaimed.** Every
+  share, and every file frozen into an import link, stays on disk after the
+  link expires. Reclamation is tracked in
   [#356](https://github.com/dta-au/elspeth/issues/356).
-- **Accepted gaps in import.** There is no staged session and no server-side
-  idempotency (neither is possible without a sessions-schema change), so a
-  process that dies mid-import can leave a half-built "Copy of …" session for
-  the recipient to delete, and a deliberate retry after a network failure can
-  create a second copy. The Import button is disabled while its request is in
-  flight and after a refusal a retry cannot change (400, 403, 422).
-- **YAML import can re-attach files to transforms and multi-file sources.**
-  `POST /api/sessions/{id}/state/yaml` accepts `inline_blob_bindings`, keyed by
-  component and option path, which rebuilds an inline-content file marker from
-  a ready blob of the session (its `sha256` is that blob's content hash), and
-  `source_blob_rows`, which re-binds a `blob_rows` source's file entries and,
-  like the composer's own multi-file source tool, refuses a file the assistant
-  wrote. The Import YAML dialog does not offer these fields yet.
-
-### LLM gateway
-
-- **The gateway carries thinking blocks through tool loops.** Assistant
-  messages accept `thinking_blocks` (`thinking` with a signature, or
-  `redacted_thinking` with opaque data); adapters receive them in order and
-  unmodified, and thinking an adapter reports is returned on the response
-  message in the same shape, so ELSPETH replays it on the next turn. Without
-  this, a model that requires its signed thinking back (Claude with thinking
-  enabled) rejects the second turn of every Composer tool loop. Replayed
-  thinking to an adapter without the `reasoning` capability is refused with
-  `capability_unsupported`. The reference adapter and mock upstream implement
-  the round trip, and the reference image's `adapter-fingerprint` label
+- **Accepted gaps in import.** A process that dies mid-import can leave a
+  half-built "Copy of …" session for the recipient to delete, and a deliberate
+  retry after a network failure can create a second copy.
+- **The LLM gateway carries thinking blocks through tool loops.** Assistant
+  messages accept `thinking_blocks`, and thinking an adapter reports is
+  returned on the response message in the same shape. Replayed thinking to an
+  adapter without the `reasoning` capability is refused with
+  `capability_unsupported`. The reference image's `adapter-fingerprint` label
   changes accordingly.
 
 ## 0.8.10 - 2026-11-09
@@ -1618,124 +1375,6 @@ qualification, a published tag or an image.
 This entry records the Composer performance remediation and the fixes landed
 with it on the 0.8.10 candidate. The dated entry and package version do not
 establish qualification, a published tag or an image.
-
-### Engine and runtime
-
-- **Approval binding shares the cached runtime VAL manifest with `begin_run`.**
-  The approval hash and the run header are now derived from the same frozen
-  manifest text, keyed on the registry fingerprint, instead of rebuilding the
-  manifest on every approval binding. The resume drift check stays uncached.
-  Warm approval binding drops from about half a second to under a millisecond.
-  Closes [#346](https://github.com/dta-au/elspeth/issues/346).
-- **The transform executor reads the recorded input hash.** The executor
-  hashed every row's input on every attempt while the Landscape repository
-  hashed the same row again inside `begin_node_state`. The executor now reads
-  the hash the repository derived and recorded. Its output hash is kept because
-  it routes NaN and Infinity output as a Tier-2 violation. Recorded hashes and
-  sink output are byte-identical on the shipped examples. Closes
-  [#347](https://github.com/dta-au/elspeth/issues/347).
-- **`.env` discovery follows the working directory.** The CLI searched upward
-  from the installed package, so an editable checkout loaded the checkout's
-  `.env` from any directory and a wheel install ignored the operator's `.env`.
-  Discovery now starts from the current working directory, as documented.
-  `--env-file` and `--no-dotenv` are unchanged. Tests that assert `--no-dotenv`
-  no longer inherit the variables pytest preloaded from the checkout's `.env`.
-  Closes [#353](https://github.com/dta-au/elspeth/issues/353).
-
-### Composer
-
-- **Composer and advisor must be reasoning models.** Every composer-plane
-  request (compose loop, planner, escape hatch and advisor) now carries a
-  reasoning-effort hint. Previously the hint was silently dropped for bare and
-  `openai/` model names, which covers every OpenAI-compatible gateway alias,
-  including AWS Scenario C's, so those deployments ran unhinted while the boot
-  advisory implied otherwise. A model, provider or gateway that cannot honour
-  the hint now refuses the request instead of running it unhinted.
-- **The `none` reasoning-effort opt-out is removed.**
-  `ELSPETH_WEB__COMPOSER_DISCOVERY_REASONING_EFFORT`,
-  `ELSPETH_WEB__COMPOSER_CANDIDATE_REASONING_EFFORT` and
-  `ELSPETH_WEB__COMPOSER_ADVISOR_REASONING_EFFORT` accept `low`, `medium` or
-  `high`; `none` is refused at startup, and the planner configuration refuses
-  an unhinted or unknown effort before any provider turn.
-- **Every LLM call row records request byte sizes per component.** Each
-  composer call record carries the UTF-8 size of every message sent, in send
-  order, the size of the tool-definition array and their sum, derived from the
-  same canonical serialization the message and tool hashes already perform.
-  The contract refuses a split that does not sum or that disagrees with the
-  tool hash about whether tools were sent. The sidecar exposes sizes, never
-  content.
-- **Proposals, schemas and tool definitions are verified once.**
-  `PipelineProposal.create` freezes and hashes its tree once instead of four
-  and two times; hand-built, replaced and decoded proposals still run full
-  verification. The canonical `set_pipeline` schema and its compiled validator
-  are built once per process and served as fresh decoded copies. Passing
-  credential-scan verdicts for the fixed tool definitions are memoized by
-  content hash; a refused list is never remembered and messages are still
-  scanned on every call. Draft hashes and canonical pipelines are byte-identical.
-- **Candidate builds and review projections preserve state identity.** The
-  `set_pipeline` candidate envelope is built from the request-scoped authority,
-  removing a provisional whole-graph walk that nothing read. Restored states
-  are threaded through review projection, graph-review reads, reconciliation,
-  proposal restoration and commit binding instead of being rebuilt, so the
-  content-hash memo survives; reconciliation returns its input when every
-  component reproduces the original exactly. All outputs are byte-identical.
-- **Plugin summaries, proposal lists and review cards read once.** The catalog
-  builds plugin summaries at construction instead of regenerating about sixty
-  schemas per composer request. Dispatch custody verification reads the
-  session's `tool_calls` history once per proposal list. Publishing the review
-  cards for one candidate prepares the shared context once and locks the head
-  state per card instead of re-reading it, with per-card provenance and
-  authorization checks unchanged.
-- **Advisory validation is memoized briefly; durable records validate fresh.**
-  `POST /validate` and `GET /audit-readiness` for the same composition version
-  share a bounded ten-second single-flight memo keyed on user, session, content
-  hash, version, plugin snapshot and secret inventory. States wiring a
-  user-authored secret bypass it, failures are never stored, and execute and
-  approval binding never read it. `validate_state` and `compute_snapshot` take
-  a keyword-only `fresh` parameter, and marking a state ready for review passes
-  `fresh=True`, so nothing in the durable review record derives from the memo.
-- **Operation streams authorize on one connection.** The database clock is
-  read as a column of the operation row, and identity, session family, role
-  grants and the session columns the stream judges are read on one connection
-  with one clock sample. No revocation, expiry, cancellation or fencing
-  decision changed; SQLite's write lock is no longer taken per frame.
-- **The frontend validates once per edit and holds Run while work settles.**
-  Validation after an interpretation resolve or a YAML import goes through the
-  auto-validation queue instead of a second direct `POST /validate`; with no
-  queue registered the store still validates directly. Run and Retry are held,
-  with a short status line, while a compose turn, a proposal decision, a resolve
-  or opt-out for the session, or validation is still in flight, so the run route
-  no longer answers a bare 409. No backend change; the tutorial runs the same
-  backend as every session. Closes
-  [#352](https://github.com/dta-au/elspeth/issues/352).
-
-### LLM gateway
-
-- **The gateway carries the reasoning hint.** The inbound Chat Completions
-  subset accepts `reasoning_effort` (`low`, `medium` or `high`) and passes it to
-  adapters on the canonical request. The OpenRouter-style `reasoning` object is
-  still rejected.
-- **New `reasoning` adapter capability.** An adapter declares it only when its
-  upstream can honour the hint. A request carrying the hint to an adapter that
-  does not declare it is refused with `capability_unsupported` before any
-  upstream call, never forwarded with the hint dropped. The reference adapter
-  declares it and forwards the hint as `generation.deliberation`, and the
-  conformance capability sweep covers it. The reference image's
-  `adapter-fingerprint` label changes accordingly.
-
-### Dependencies
-
-- **Security updates.** The application lock moves filelock to 4.2.1, litellm
-  to 1.102.2, oauthlib to 4.0.1 and virtualenv to 21.14.5. The gateway lock
-  moves filelock to 4.2.1 and opentelemetry-api to 1.45.2, and the gateway
-  image rebuilds on the current `python:3.12-alpine` digest, which carries
-  musl 1.2.6-r3 and zlib 1.3.2-r1. The frontend and test-tooling npm locks
-  take the patched dompurify, zod, undici, fast-uri, vitest and minimatch
-  releases.
-- **Still open.** The application's OpenTelemetry 1.40 pin (CVE-2026-114603)
-  and eight virtualenv advisories remain. OpenTelemetry 1.45 breaks web start-up
-  and operator telemetry custody, and virtualenv 21.14.7 or later needs
-  packaging 26, which langfuse 3 forbids. These are resolved together in 0.8.12.
 
 ### Upgrade notes
 
@@ -1769,12 +1408,43 @@ cannot share session stores or replicas.
 - `deploy/compose` and `deploy/linux-systemd` boot on the `gpt-5.5` default,
   which is now hinted at the code defaults (`low` discovery, `high` candidate,
   `medium` advisor). No latency measurements exist for those surfaces yet.
-- The tier-model allowlist entry for `warn_if_not_reasoning_capable` changed
-  and needs operator re-judging and signing before release; CI does not make
-  that claim.
 - Operators who relied on an editable checkout's `.env` being loaded from
   another working directory must now start from that directory or pass
   `--env-file`.
+
+### What changed
+
+- **Composer and advisor must be reasoning models.** Every composer-plane
+  request (compose loop, planner, escape hatch and advisor) carries a
+  reasoning-effort hint, and a model, provider or gateway that cannot honour
+  the hint refuses the request instead of running it unhinted.
+  `ELSPETH_WEB__COMPOSER_DISCOVERY_REASONING_EFFORT`,
+  `ELSPETH_WEB__COMPOSER_CANDIDATE_REASONING_EFFORT` and
+  `ELSPETH_WEB__COMPOSER_ADVISOR_REASONING_EFFORT` accept `low`, `medium` or
+  `high`; `none` is refused at startup.
+- **LLM gateway.** The inbound Chat Completions subset accepts
+  `reasoning_effort` (`low`, `medium` or `high`). A request carrying the hint
+  to an adapter that does not declare the new `reasoning` capability is
+  refused with `capability_unsupported` before any upstream call. The
+  reference image's `adapter-fingerprint` label changes accordingly.
+- **Composer performance remediation.** Proposals, the `set_pipeline` schema
+  and fixed tool definitions are verified once; plugin summaries, proposal
+  lists and review cards read once per request; advisory validation shares a
+  brief memo that durable review records never read; and operation streams
+  authorize on one connection. Every composer LLM call record carries request
+  byte sizes per component. Approval binding shares the cached runtime
+  manifest with run start, and the transform executor reads the recorded
+  input hash. Draft hashes, canonical pipelines and recorded hashes are
+  byte-identical.
+- **The frontend holds Run while work settles.** Run and Retry are held, with
+  a short status line, while a compose turn, a proposal decision, a resolve or
+  validation is still in flight.
+- **`.env` discovery follows the working directory.** Discovery now starts
+  from the current working directory, as documented. `--env-file` and
+  `--no-dotenv` are unchanged.
+- **Dependencies.** Security updates move filelock to 4.2.1, litellm to
+  1.102.2, oauthlib to 4.0.1 and virtualenv to 21.14.5; the remaining
+  OpenTelemetry and virtualenv advisories are resolved in 0.8.12.
 
 ### Publication and acceptance
 
@@ -1783,86 +1453,12 @@ merge remain required; this entry does not establish a published tag or image.
 Automatic image publication from main remains held. The 0.8.10 tag and container
 publication follow successful required checks and the protected merge.
 Operator signing, live-provider acceptance and deployment remain separate steps.
-The PostgreSQL testcontainer suites for the statement-count changes are owed on
-a Docker host before merge.
 
 ## 0.8.9 - 2026-10-21
 
 This release combines the Composer work developed under 0.8.7, Azure Container
 Apps work developed under 0.8.8, and engine and runtime improvements developed
-under 0.8.9. The sections below retain those development groupings.
-
-### Engine and runtime
-
-- **CSV sinks can require retention and include verified audit context.** The
-  opt-in `require_all_rows` stops a rejected member before publishing that
-  effect. With `include_audit_context`, a retention envelope carries owned row
-  and token identity, recorded outcomes, audit reason references and the complete
-  canonical carried row. Unprovable predecessor context refuses publication.
-  Defaults remain ordinary CSV, and earlier published effects are not rolled
-  back. These options require a supporting runtime beginning with 0.8.9; see
-  [CSV required-row retention](docs/runbooks/csv-required-row-retention.md) for
-  configuration constraints and recovery limits.
-- **Required CSV retention can include a readable recorded cause.** Opt-in
-  `include_error_reason` appends a bounded cause to the audit envelope, backed by
-  the exact durable source or transform failure handoff and verified on recovery.
-  Missing, ambiguous or redacted evidence and unsupported linked sink diversions
-  stop explicitly. Existing envelope defaults and earlier publications are
-  preserved; this option requires a supporting 0.8.9 runtime.
-- **CSV audit envelopes can retain a verified disposition reason.** Opt-in
-  `include_disposition_reason` records a source or transform failure, or one
-  direct completed Boolean gate-to-sink decision. Gate decisions remain
-  successful outcomes. This option requires `include_audit_context` and is
-  mutually exclusive with `include_error_reason`; missing or ambiguous evidence
-  refuses publication rather than inventing a cause.
-- **LLM output fields can explicitly admit null.** The opt-in `nullable: true`
-  descriptor supports unavailable values in single-query and multi-query
-  transforms and LLM sources while retaining required keys and typed nullable
-  row contracts. Defaults preserve non-null extraction. The new option requires
-  a supporting 0.8.9 runtime; existing plugin implementation compatibility checks
-  still govern resume and replay.
-- **LLM transforms can check inputs and completed results.** Named `input_checks`
-  run before per-row model requests; `result_checks` run before releasing
-  completed output. Failed, non-Boolean or invalid row-data evaluations follow
-  `on_error` without retry. `allow_blank_input_fields` permits empty strings only
-  for explicitly named required inputs; presence and type checks still apply.
-- **Multi-query structured outputs can use explicit field prefixes.** Per-query
-  `structured_output_prefix` can retain the query-name default, choose another
-  identifier, or use an empty prefix for bare suffixes. Explicit prefix overrides
-  require unique generated names and refuse arriving-field collisions. Response
-  JSON keys and raw response, usage and model fields retain their existing names.
-- **Complete-source batches can annotate exact duplicate cells.** The new
-  `batch_duplicate_annotator` compares selected string cells within and across
-  rows, retains every member in order, and emits validity and static cause
-  fields for downstream admission. It requires a finite, bounded, EOF-only
-  source window. Incomplete windows, capacity failures and output collisions
-  refuse the batch; it does not select survivors or compare across runs.
-- **Expressions support typed text and decimal comparisons.** `starts_with`
-  checks a string prefix, `word_count` counts whitespace-separated tokens, and
-  `decimal_within` compares finite numeric decimal spellings with an inclusive,
-  nonnegative tolerance. The helpers reject invalid types without coercion;
-  decimal comparison does not undo earlier floating-point arithmetic.
-- **Landscape retains provider-attempt and returned-model evidence.** Durable
-  attempt bindings support Web quota recovery without an in-memory association.
-  Returned model identity survives response-payload retention choices. Exported
-  row-call and operation-call records add nullable `returned_model`; consumers
-  enforcing a closed export shape must admit this field.
-- **Container builds and CLI dependencies avoid known installation failures.**
-  The Docker builder supplies the compiler, headers and `make` required by the
-  SQL parser extension. Dependency resolution constrains `typer-slim` to prevent
-  older wheels overwriting the full Typer package used by the CLI.
-- **Compose keeps the backend behind its host proxy.** The host-nginx bundle
-  binds port 8451 to loopback and explicitly trusts its configured bridge
-  gateway. Existing networks need recreation to change their IPAM settings;
-  named data volumes must be preserved.
-- **CI preserves failed proof evidence and rejects broken mutation runs.**
-  Collection failures retain diagnostic evidence even when coverage never starts.
-  Mutation tooling errors and missing, empty or malformed result inventories
-  fail the job; mutation-score thresholds remain advisory.
-- **Dependency updates address Python and JavaScript advisories.** Both Python
-  projects require `certifi>=2026.10.19`; the frontend uses Vite 6.4.5 and root
-  tooling uses `follow-redirects` 1.16.1. Existing audit thresholds and exceptions
-  are unchanged.
+under 0.8.9.
 
 ### Upgrade notes
 
@@ -1877,6 +1473,67 @@ blockers or cannot admit the new quota shape. This authorizes no migration,
 reset, restamping or downgrade. Drain and isolate old/new deployments; they
 cannot share session stores or replicas.
 
+### Changes that need action
+
+- **Quota API quantities are decimal strings** over the positive
+  signed-64-bit range; request bodies still accept exact JSON integers through
+  `2**53-1`, while larger values require strings. API consumers must adapt
+  response parsing.
+- **Forwarded client addresses are trusted only from explicit numeric
+  `trusted_proxy_hosts`;** the default trusts no forwarding headers. Proxy
+  deployments must configure their actual connecting peers. The Compose
+  host-nginx bundle binds port 8451 to loopback and supplies its bridge
+  gateway explicitly; existing networks need recreation to change their IPAM
+  settings, and named data volumes must be preserved.
+- **Shared request limits bind their durable policy.** A replica with a
+  different configured cap refuses admission while the shared bucket remains
+  active; configuration changes take effect after its expiry.
+- **Web execution refuses local SQLite database sinks and persistent Chroma
+  sinks, retrieval and collection probes,** because their library-owned files
+  cannot obey byte reservations. Existing graphs using those modes must
+  change; standalone CLI plugin behavior is unchanged.
+- **Azure Container Apps enforces authenticated PostgreSQL TLS settings.**
+  Startup and deployment doctor require one explicit `sslmode=verify-full` and
+  one `sslrootcert`, either `system` or an absolute CA-file path. Existing
+  insecure ACA configurations must be corrected before using this version.
+- **Composer and advisor protection uses Azure Prompt Shields.** Each role has
+  an independent Azure AI Content Safety configuration. Missing configuration,
+  blocked input or unavailable inspection refuses dispatch. Unsupported
+  authoring input returns `prompt_guard_unsupported_input` with status 422;
+  guard service failures retain status 503.
+- **Exported row-call and operation-call records add nullable
+  `returned_model`;** consumers enforcing a closed export shape must admit
+  this field.
+- **Advisor checkpoint budgeting relaxes the previous input cost bound;**
+  calls may cost more or take longer.
+- **`_sync_list_blobs` is no longer re-exported** by
+  `elspeth.web.composer.tools`; code using the private facade path must update
+  its import.
+
+### What else changed
+
+- **CSV sink retention.** Opt-in `require_all_rows`, `include_audit_context`,
+  `include_error_reason` and `include_disposition_reason` let a CSV sink
+  require retention and carry verified audit context; these options require a
+  supporting runtime beginning with 0.8.9. See
+  [CSV required-row retention](docs/runbooks/csv-required-row-retention.md).
+- **LLM transforms.** Output fields can explicitly admit null
+  (`nullable: true`), named `input_checks` and `result_checks` run before and
+  after model requests, and multi-query structured outputs can use an explicit
+  `structured_output_prefix`.
+- **New `batch_duplicate_annotator`** and the expression helpers
+  `starts_with`, `word_count` and `decimal_within`.
+- **Landscape retains provider-attempt and returned-model evidence,** and
+  configured container quotas are provisioned before serving.
+- **Composer correctness and recovery.** Provider request rejections retain
+  safe, actionable reasons; the planner can read a complete authorized
+  attachment with `read_attachment`; native thinking survives tool
+  continuations intact; and advisor reviews receive the complete available
+  visible conversation evidence.
+- **Azure Container Apps.** First-install instructions can be rehearsed
+  offline. Offline rehearsal does not establish cloud deployment, guard health
+  or provider access.
+
 ### Publication and acceptance
 
 These notes describe the 0.8.9 source package. Final-head CI and the protected
@@ -1885,260 +1542,18 @@ Automatic image publication from main remains held. The 0.8.9 tag and container
 publication follow successful required checks and the protected merge.
 Operator signing, live-provider acceptance and deployment remain separate steps.
 
-### Azure Container Apps (0.8.8 development)
-
-- **First-install instructions can be rehearsed offline.** The instructions
-  select an explicit GHCR account, export the transport ceiling required by
-  configuration resolution and distinguish model routing aliases from pricing
-  identities. The application example supplies primary and advisor pricing
-  settings and versioned secret references for both required authoring guards.
-- **ACA enforces authenticated PostgreSQL TLS settings.** Startup and deployment
-  doctor require one explicit `sslmode=verify-full` and one `sslrootcert`, either
-  `system` or an absolute CA-file path. Duplicate TLS parameters, legacy
-  `requiressl` and GSS settings other than a single optional `gssencmode=disable`
-  are refused. Correctly URL-escaped credentials remain supported. Existing
-  insecure ACA configurations must be corrected before using this version.
-- **ACA doctor reports TLS before schema initialization.** Sessions and Landscape
-  checks measure each initial preflight connection used for schema inspection.
-  Failed prerequisites or TLS checks prevent schema initialization. Separate
-  initialization/final-verification connections and later web connections remain
-  outside this measurement.
-
-Offline rehearsal does not establish cloud deployment, guard health or provider
-access. First installation requires explicitly new compatible stores;
-existing-service redeploy, transition and rollback holds remain in place.
-
-### Composer correctness and recovery (0.8.7 development)
-
-- **Provider request rejections retain safe, actionable reasons.** Tool
-  feedback, Advisor audit records and readiness responses carry a closed
-  rejection descriptor with recognized reason codes and a diagnostic reference
-  when available. Upstream prose and request values are excluded. Rejections
-  remain nonretryable and continue to block publication; malformed stored
-  descriptors refuse replay.
-- **Explicit debug authoring accepts complete input without an unconfigured
-  guard's Azure limits.** With `debug-when-unconfigured` selected and no guard
-  configured, the Azure inspection limits no longer reject otherwise supported
-  authoring input. Configured and required inspection retain their limits and
-  refusal behavior.
-- **Exact no-op source patches preserve graph state.** A patch whose reconciled
-  source configuration is unchanged returns the existing graph and version.
-  Actual value, type and ordering changes retain normal mutation behavior.
-- **Shared-inspect links distinguish authentication from link failures.**
-  Bearer authentication failures request fresh credentials; invalid shared
-  links retain their link-specific failure without discarding a valid login.
-
-- **Empty-session conversations reach the planner without wording heuristics.**
-  Graph and session prerequisites select the authoring surface. The model can
-  build, explain, clarify or decline using ordinary bounded prose; it no longer
-  needs a special decline marker or completed discovery before replying.
-  Prior assistant messages retain clarification context separately from
-  authenticated user requirements.
-- **Cleanup review follows structured decisions and actual source fields.**
-  Registered decision identity and declared web-scrape fields determine cleanup
-  obligations. Draft wording, node names and HTML-like field names no longer
-  decide admission; review provenance and artifact binding remain required.
-- **Advisor input reviews assess the requested task.** Constant prompts,
-  URL-only inputs and absent named field references alone no longer establish
-  a defect. Review guidance requires a concrete mismatch between the task and
-  available inputs, including whole-row and dynamic references.
-- **Public tool evidence excludes private inline custody data.** New pipeline
-  evidence removes private inline values before public retention. Unsafe or
-  unparseable historical inline custody evidence refuses public replay while
-  preserving the original audit record.
-- **Composer and advisor protection uses Azure Prompt Shields.** Each role has
-  an independent Azure AI Content Safety configuration. Required guard checks
-  precede protected model dispatch and record sanitized decisions; missing
-  configuration, blocked input or unavailable inspection refuses dispatch.
-  Historical advisor prescan audits remain readable. Runtime graph transforms
-  remain separately configured.
-- **Composer repair guidance distinguishes replies from graph changes.** A
-  publication-only review can request a prose correction without demanding graph
-  mutations; graph-blocking reviews retain their tool-call requirement. Plugin
-  option repair guidance tells the planner to preserve explicit user requirements
-  and report unsupported capabilities. Discovery follows actual continuation
-  offsets, and blocked or time-limited work can return truthful saved progress
-  for continuation. Advisor repairs use current schema evidence and distinguish
-  strict CSV retention from audit references and readable failure reasons.
-- **Native thinking survives tool continuations intact.** Complete signed and
-  redacted thinking blocks retain their native fields after shape admission and
-  credential checks. Guard inspection does not truncate or rewrite replay data.
-  Invalid blocks refuse replay; native thinking remains separate from visible
-  replies and Advisor evidence.
-- **Advisor reviews receive complete available visible conversation evidence.**
-  Historical authenticated turns, visible tool requests and results, and current
-  discovery retain their chronology and request binding. Missing original tool
-  results are explicit gaps. Reviews retain configured prompts, query bindings,
-  schemas and output values with secret redaction. Native thinking, private
-  diagnostics and static authoring prompts remain excluded.
-- **Planner context preserves prior requirements and discovery access.** Prior
-  authenticated user requests, including amendments, remain chronological;
-  oversized request packets refuse dispatch instead of dropping middle requests.
-  Read-only discovery remains available within existing budgets, and schema
-  evidence is marked delivered only after successful delivery.
-- **The planner can read a complete authorized attachment.** `read_attachment`
-  returns guarded UTF-8 content with its hash and origin, or explicitly refuses
-  when the complete serialized response cannot fit. Identity-bound paged reads
-  remain available through `get_blob_content`.
-- **Advisor limitations survive continued useful work.**
-  `CONTINUE_WITH_LIMITATION` retains the unresolved requirement through later
-  publication review while allowing independent authorized work to proceed.
-  Failed batch prerequisites block dependent mutations without blocking unrelated
-  calls. Reviewed prompt parts and authored score scales remain reviewable through
-  planner edits; old reduced draft echoes require reinspection.
-- **Settled replies report committed checkpoints.** Saved-change receipts remain
-  available when ordinary prose is withheld. They describe committed effects
-  separately from delivered inspection evidence and do not imply that every
-  requested edit was completed.
-- **Source inspection accepts an explicit CSV encoding.** A bounded read can
-  resolve BOM-bearing CSV/TSV headers using the runtime name resolver and report
-  the selected interpretation. This read-only option does not configure a source
-  or claim full-file coverage; omitted encoding retains the previous behavior.
-- **Refusals retain the correct graph context.** Full-replacement candidate
-  refusals exclude errors from the old saved graph; incremental output refusals
-  retain standing validation and the original version. Producer-owned codes,
-  output subjects, admitted plugin schemas and credential repair payloads remain
-  distinct. Candidate and output path-policy refusals use safe static messages.
-  Bounded inline CSV inspection distinguishes failed inspection, incomplete
-  comparison and a larger upload with matching headers without claiming verified
-  data rows. No other incremental producer family is claimed migrated.
-- **Shared-link failures preserve the requested link.** Malformed fragments and
-  unavailable private sender links remain link failures rather than falling
-  through to the recipient's workspace. Ordinary root-URL SSO resume is retained.
-- **The private blob-helper import boundary is narrower.** `_sync_list_blobs`
-  is no longer re-exported by `elspeth.web.composer.tools`. Its implementation
-  and internal callers remain in `elspeth.web.composer.tools.blobs`; code using
-  the private facade path must update its import.
-- **Configured container quotas are provisioned before serving.** Token and
-  storage ceilings are independent. Container storage admission measures aggregate
-  retained and reserved bytes across identities, including run-output reservations.
-  Identity allowances remain mandatory. A cross-actor singleton prevents duplicate
-  active container policies, and startup joins provisioning through cancellation
-  before finalizing database owners.
-- **Quota accounting survives durable run-call recovery.** Landscape calls retain
-  their provider-attempt binding so recovery can settle completed calls without
-  an in-memory association. Quota chronology uses database time, and returned
-  model identity is retained independently of response payload retention. Closed
-  receipt failures preserve storage accounting outages as 503 responses on both
-  first response and replay.
-- **Web storage admission covers retained run artifacts and stage reservations.**
-  Archiving a session preserves those artifacts and does not reclaim quota.
-  The file manager can delete uploads; generic run artifacts have no user-facing
-  purge action. Web execution refuses local SQLite database sinks and persistent
-  Chroma sinks, retrieval and collection probes because their library-owned files
-  cannot obey byte reservations. Existing graphs using those modes must change;
-  standalone CLI plugin behavior is unchanged. Remote service modes remain subject
-  to the existing plugin policy and security restrictions.
-- **Quota administration shows enforced policy state and exact quantities.**
-  Revoked allowances show suspension, durable policies remain editable after
-  defaults are removed, and shared ceilings include shared usage. Quota API
-  quantities are decimal strings over the positive signed-64-bit range; request
-  bodies still accept exact JSON integers through `2**53-1`, while larger values
-  require strings. API consumers must adapt response parsing. Application-owned
-  Composer 429 refusals surface immediately with retry guidance instead of silently
-  resubmitting the action; uncertain gateway responses retain reconciliation.
-- **Shared request limits bind their durable policy.** A replica with a different
-  configured cap refuses admission while the shared bucket remains active;
-  configuration changes take effect after its expiry. Forwarded client addresses
-  are trusted only from explicit numeric `trusted_proxy_hosts`; the default trusts
-  no forwarding headers. Proxy deployments must configure their actual connecting
-  peers. The Compose host-nginx bundle supplies its bridge gateway explicitly.
-- **Automatic titles disable adapter and SDK retries.** Both existing title
-  custody modes supply zero retry settings. This does not claim universal
-  physical-dispatch accounting under arbitrary dependency fallback settings.
-- **Composer prompt inspection accommodates its supported content limits.**
-  The aggregate byte limit now derives from the existing user-text,
-  document-size and document-count limits, so supported whole content is no
-  longer refused by a smaller aggregate allowance. Azure per-call limits and
-  required fail-closed inspection remain enforced. Policy fingerprints include
-  the numeric limits even when no guard is configured.
-- **Advisor checkpoint budgeting preserves complete review evidence.** The
-  configured checkpoint input allowance now limits the optional summary,
-  retaining the full request, candidate, guidance and available visible transcript
-  with their review binding. Both default and explicit settings relax the previous
-  input cost bound; calls may cost more or take longer. The summary allowance does
-  not cap required review evidence or reserve model context tokens or account
-  credit. Guard and provider constraints still apply. Inspection retains separate
-  option, query and field units without changing the published summary or guard limits.
-  Unicode prompt text is inspected decoded while provider text remains unchanged.
-  Reviews receive bounded source-inspection facts only after successful delivery;
-  these facts do not imply complete file-content coverage.
-- **Prompt guard input refusals report their local cause.** Unsupported
-  authoring input returns `prompt_guard_unsupported_input` with status 422;
-  guard service failures retain status 503. Audit decisions and previously
-  stored operation replies remain unchanged.
-- **Planner routing semantics stay with the model.** Quoted comparisons no
-  longer trigger the prose-based threshold rejection. Removing that heuristic
-  also removes its automatic second authoring opportunity for an incorrect
-  constant gate, including under auto-commit; no replacement semantic review
-  is added. Structural checks and artifact-bound approval retain their
-  existing behavior.
-
-Graph visibility toggles now redraw filtered routes correctly without changing
-the authored graph or execution behavior. The upgrade and publication limits
-above apply to the complete 0.8.9 package.
-
 ## 0.8.6 - Candidate (Composer correctness and recovery)
 
 - **Dependent queries can run in one LLM node.** `query_input_mode: ordered`
   lets explicitly bound later queries read earlier validated outputs. It
-  requires uniquely named list-form queries and `pool_size: 1`; each query
-  still makes a provider call. Recovery remains at the node boundary and can
-  repeat earlier calls. See [ordered LLM queries](docs/guides/ordered-llm-queries.md).
-- **Failure-route visibility is local presentation.** The graph's quarantine
-  and discard toggle filters the displayed routes after layout without changing
-  the authored graph, execution behavior or persisted pipeline.
-- **Final replies use the existing bounded review.** Ordinary explanations,
-  edit-completion replies, planner declines and proof-exhausted replies require
-  current candidate/evidence-bound publication admission. Unadmitted prose is
+  requires uniquely named list-form queries and `pool_size: 1`. See
+  [ordered LLM queries](docs/guides/ordered-llm-queries.md).
+- **Final replies use the existing bounded review.** Unadmitted prose is
   retained privately while trusted saved-progress and blocker text is shown.
   Reply admission does not clear graph, pending-review or execution blockers.
-- **Saved changes and inspection evidence remain distinct.** Final review uses
-  committed-row witnesses and net authored changes, separately from the content
-  actually delivered to the reviewing provider. A saved revision count does not
-  establish that requested edits were completed; complete inspection does not
-  establish semantic equivalence.
-- **Advisor redaction preserves evidence identities.** Sensitive text is scrubbed
-  separately from server-owned graph hashes and state IDs, so phone-shaped digit
-  sequences cannot corrupt the structured review evidence.
-- **Operation outcomes survive refreshes.** Authenticated retained outcomes
-  expose bounded saved progress and safe diagnostics. Known terminal outcomes
-  appear before optional refreshes finish, including attachment to another
-  active operation, without replaying the losing submission.
-- **Blob inspection supports bounded continuation.** Pages bind to the original
-  content hash and actual returned character ranges. Response byte limits can
-  produce smaller pages; stale content identities cannot be combined into one
-  inspection. Stream completion remains bounded when the transport is writable.
-- **Diagnostics and guidance follow existing contracts.** Invalid schema-name
-  examples are checked against the actual field grammar without renaming input.
-  Fork guidance describes ordinary downstream consumers without requiring
-  coalescing. Failed-operation diagnostics retain bounded private original
-  causes atomically with the failed terminal under the existing live fence.
-- **Provider failures retain their actual disposition.** Failed advisor requests
-  report review unavailability; malformed-response wording is reserved for an
-  observed unusable response. Nonretryable failures stop automatic re-review
-  within that operation without consuming unused passes. A later user request
-  can retry after configuration changes.
-- **Planner repairs retain safe diagnostic facts.** Argument failures include
-  bounded schema categories, canonical locations and missing required fields,
-  without echoing rejected values. Repeated coarse error codes no longer stop
-  successive repairs to different authored candidates; an unchanged candidate
-  with the same failure remains subject to the repeat guard and existing budgets.
-- **FieldMapper labels remain data through Composer admission.** Valid mapping
-  labels such as `customer_key` survive tool-wire, state, YAML import, preflight
-  and execution-envelope checks. Known-node patches use the owned current plugin
-  identity; batches that may replace it remain conservative. Actual credential
-  strings and all authoring metadata remain scanned. Private identity-bearing
-  diagnostics preserve valid mappings; context-free patch diagnostics retain
-  their existing filtering.
-- **YAML authoring and internal query chains are documented.** The
-  [YAML guide](docs/guides/yaml-authoring.md) covers control nodes, plugin families,
-  validation, execution and audit commands. The
-  [reference lookup](examples/reference_join_chain/) and
-  [ordered LLM](examples/llm_ordered_chain/) examples each demonstrate a later
-  lookup or query consuming the previous output within one node. Advisor
-  evidence labels identify redacted text, and the redaction-policy guide now
-  describes the existing label checker accurately.
+- Also in this candidate: a local failure-route visibility toggle on the
+  graph, bounded blob inspection with continuation, operation outcomes that
+  survive refreshes, and the [YAML guide](docs/guides/yaml-authoring.md).
 
 Session epoch advances from 75 to 76; Landscape remains at epoch 49. Committed
 graph-review facts now govern effective completion status without rewriting
@@ -2163,61 +1578,23 @@ successful required checks and the protected merge.
   `temperature: 0.0` explicitly to retain that request where supported.
   Explicit numeric settings remain unchanged; unsupported settings are
   refused without silently stripping them or retrying with different sampling.
-- **Tutorial execution uses ordinary application ownership.** The tutorial
-  acquires the same execution obligation and lease as the normal execute
-  route and uses its transfer-aware cleanup. The ownership guard remains.
-- **Document review accepts legitimate long lines.** The arbitrary 1,024
-  character per-line caps are removed from interpretation and source-artifact
-  review content. Aggregate inline limits and template, control-character and
-  credential safeguards remain. Fixed safe diagnostics identify the actual
-  rejected rule, missing or stale draft, and concrete recovery. Oversized
-  inline drafts can use the exact staged draft; repaired reviews bind afresh.
-- **Recovery advice follows the failed rule.** Repeated content failures no
-  longer prescribe topology restructuring. Advisor calls honor the existing
-  nonretryable classification instead of repeating deterministic refusals.
-- **Shared-sink routes are easier to inspect.** Separate visual arrivals,
-  pointer and keyboard selection, endpoint emphasis and persistent route detail
-  retain the logical graph, conditions and handles.
+- Also in this release: tutorial execution uses the same execution obligation
+  and lease as the normal execute route, the 1,024 character per-line caps are
+  removed from interpretation and source-artifact review content, and
+  shared-sink routes are easier to inspect.
 
 Session epoch 75 and Landscape epoch 49 are unchanged. Existing unsupported
 stores remain preserved and refused; this release does not authorize migration,
 reset or downgrade. Ordered dependent LLM queries and the quarantine/discard
 visibility toggle are separate 0.8.6 work and are not included.
 
-This entry describes the source changes in 0.8.5. Focused synthetic checks and
-independent source reviews are separate from final exact-head qualification,
-live model or tutorial acceptance, release tagging, signed image publication
-and deployment. Verify the evidence for the exact source head and image digest
-before upgrading.
-
 ## 0.8.4 - Unreleased (Restricted SQL and credential lifecycle hardening)
 
-- **Live PostgreSQL analysis has a restricted language and database profile.**
-  Query APIs admit a bounded PostgreSQL 16 scalar SELECT/CTE subset and check
-  the executing connection's role, catalog and executable dependencies.
-  Caller-directed state, control and notification effects are refused. The
-  direct Python facade applies the same semantic restrictions. This is an
-  API/profile contract, not a guarantee for arbitrary database-password use;
-  bounded read contention remains possible. Raw MCP queries use a disposable
-  worker with finite input, output, memory and time budgets, owned cancellation
-  and joined cleanup. See the [analysis guide](docs/guides/landscape-mcp-analysis.md).
-- **Derived credentials follow durable session authority.** Logout revokes the
-  bearer family, password changes advance its credential generation, and
-  websocket tickets and established progress streams recheck the binding.
-- **External request and provider evidence are bounded.** Received request
-  bytes are checked before downstream dispatch. Provider HTTP responses have
-  transport limits, and submitted image echoes are refused before audit/replay
-  retention across the reviewed raw, base64, hex and byte-array representations.
-  This does not claim universal detection of arbitrary transformed encodings.
-- **Provider sampling preserves omission and explicit zero.** Azure's omitted
-  sampling values remain omitted; explicit values retain their authored meaning.
-- **Compose separates runtime and schema ownership.** Bootstrap refuses unsafe
-  runtime ownership before reopening login. Existing stores are not reset or
-  converted by this release candidate.
-- **Test and tooling maintenance is bounded.** Completed module extractions,
-  focused CI regression repairs and the lint CLI parser extraction retain the
-  current runtime and authority controls. The session-authority scanner
-  extraction remains deferred.
+An unreleased source candidate. Live PostgreSQL analysis has a restricted
+language and database profile (see the
+[analysis guide](docs/guides/landscape-mcp-analysis.md)); logout revokes the
+bearer family and password changes advance its credential generation; and
+Compose separates runtime and schema ownership.
 
 **Store compatibility.** Session epoch 75 combines authentication families and
 bound tickets with graph recovery. Session epoch 72 adds durable Composer jobs
@@ -2226,145 +1603,39 @@ A Landscape database already at epoch 49 remains usable if its complete schema
 matches current admission. Qualification uses explicitly new compatible stores.
 Unsupported session, Landscape and local-auth stores are preserved and refused
 before incompatible writes. Do not migrate, recreate, delete or restamp them.
-The temporary no-backwards-compatibility window has no fixed expiry.
-
-This is an unreleased source candidate. Final exact-head CI remains required;
-no operator signature clearance, tag, image publication, deployment or live
-cloud qualification is claimed. Automatic image and Pages publication remain held.
-The preceding Composer progress and recovery qualifications remain separate
-from a published release claim.
 
 ## 0.8.3 - Unreleased (Archive recovery and Composer HTTPS progress candidate)
 
-- **Session archive and cleanup recover on filesystems without no-replace rename.**
-  The merged EFS repair supports an in-place, identity-bound archive path and
-  recovery after interrupted cleanup. It retains collision checks and durable
-  database custody rather than assuming the filesystem has atomic no-replace
-  rename. This is merged source from PR #276.
-- **The tracked LLM gateway accepts a 64,000-token completion allowance.**
-  Its default request bound now matches an operator-configured 64,000-token
-  planner call for either `max_tokens` spelling. Values above the bound are
-  refused, a lower explicit gateway bound still applies, and an admitted
-  value reaches the reference adapter unchanged. This includes reasoning
-  tokens within the requested completion allowance; it does not raise the
-  Web Composer's 16,384-token default or its independent job, transport,
-  cost and repair limits. Standalone mock-upstream and conformance tests
-  passed locally; no deployed gateway image or genuine-model replay is
-  established by this source candidate.
-- **The proposed Web Composer transport delivers live progress over authenticated
-  HTTPS.** An operation-scoped server-sent event subscription follows the same
-  durable operation and progress authority as the authenticated status GET.
-  The browser receives bounded, redacted status and progress, then retrieves
-  the completed answer through GET; it reconciles interrupted subscriptions
-  against that operation. Live role, identity, ownership and token checks,
-  disconnect cleanup and bounded readers protect the stream. The provider and
-  gateway still return complete answers: generated answer-token streaming and
-  interim answer text are outside this release candidate. These changes are
-  held on the streaming branch and remain subject to final integration and
-  acceptance, so this entry does not claim a landed release.
-- **Durable Composer failure paths retain the original outcome and required-work
-  custody.** The held candidate reconciles cancellation, worker failure,
-  pending review, terminal publication and physical cleanup against their
-  committed authorities. These changes are likewise awaiting final frozen
-  default, serial PostgreSQL, TLS and browser acceptance gates.
-- **The first-run tutorial keeps its Build and Run chrome out of the Composer
-  workspace.** Each step's title, one instruction that says what to do next,
-  and its actions (Continue to Run; Run, Retry or Continue) sit in a header
-  above both panes. The tutorial no longer removes the workspace's height
-  floor, so the conversation stays readable on short and narrow screens
-  (measured at 1280×560: 49 px before, 110 px after). The chat header lines up
-  with the pipeline toolbar again, and nothing in the authoring pane sits flush
-  against the window edge. A disabled Continue to Run is described by the
-  instruction naming what it waits for, and stays visible in the narrow Compose
-  view. Run results wrap inside the pane instead of cutting off the summary
-  column.
-- **The Composer chat no longer offers to turn a message into source data,
-  and drops its authority chip.** The "This looks like source data — Create
-  source" offer resent the whole message, instructions included, whenever it
-  contained a URL; the composer creates sources from the conversation itself.
-  The "Auto-apply on" chip and the header row it sat in are gone: nothing in
-  the interface changes the composer's authority, so the chip always said the
-  same thing, and the transcript already labels each change the composer
-  applies. The conversation now starts at the top of the chat pane.
-- **Container and dependency maintenance advances.** Merged main updates the
-  distroless runtime base for patched OpenSSL, the gateway FastAPI and
-  Hatchling locks, root Playwright tooling, and pinned GitHub Actions. The
-  Chroma advisory identifies the registered `rag_retrieval` provider and
-  continues to prohibit Chroma use pending an upstream fix and verification.
-  The image Dockerfile also requires Node 24.18.0 for the build; that
-  image has not been qualified or published.
+An unreleased source candidate. Session archive and cleanup recover on
+filesystems without no-replace rename; the tracked LLM gateway accepts a
+64,000-token completion allowance; the Web Composer delivers live progress
+over an authenticated server-sent event subscription; and the Composer chat
+drops its "Auto-apply on" chip and the "Create source" offer.
 
-**Composer fixes and store compatibility.** The combined source candidate adds
-private failure evidence, ordered CSV lookups, clarification fixes and terminal
-park/reset/restore controls. Session epoch 74 adds immutable graph parks and
-operation-bound recovery checkpoints. Session epoch 72 adds durable Composer jobs
-and ingress bindings in the preceding candidate. Landscape epoch 49 remains unchanged.
-A Landscape database already at epoch 49 remains usable if its complete schema
-matches current admission. Qualification uses explicitly new compatible stores.
-Unsupported session, Landscape and local-auth stores must be preserved and refused
-before incompatible writes. Do not migrate, recreate, delete or restamp an existing
-store to satisfy this candidate; select a separately provisioned new target.
-The temporary no-backwards-compatibility window has no fixed expiry. Historical
-cutover instructions are not authority to modify existing stores for this fix.
-This is an unreleased source candidate. No 0.8.3 tag, image digest, registry publication,
-live cloud qualification or production readiness is established here. The
-streaming work retains all 102 original obligations and four supplemental
-collections; two original reports remain unavailable. Final default Python,
-PostgreSQL, real HTTPS and browser acceptance are still required before a
-release claim. Use only a separately verified published image tag or digest.
+**Store compatibility.** Session epoch 74 adds immutable graph parks and
+operation-bound recovery checkpoints. Session epoch 72 adds durable Composer
+jobs and ingress bindings in the preceding candidate. Landscape epoch 49
+remains unchanged. A Landscape database already at epoch 49 remains usable if
+its complete schema matches current admission. Unsupported session, Landscape
+and local-auth stores must be preserved and refused before incompatible
+writes. Do not migrate, recreate, delete or restamp an existing store to
+satisfy this candidate; select a separately provisioned new target.
 
 ## 0.8.2 - Unreleased (Bounded validation and release-check hardening)
 
-- **Azurite test tooling uses an owned, bounded diagnostic formatter.** Replace
-  the affected `sprintf-js` dependency only for the locked Tedious tooling
-  consumer. The replacement preserves all driver diagnostic formats and
-  removes floating-point precision operations (CVE-2026-97058). The strict
-  dependency audit remains required; CI also verifies installed consumer
-  resolution, format compatibility and blob source/sink tests without allowing
-  an unavailable emulator to silently skip that coverage.
+An unreleased source candidate. Composer validation keeps resource use
+bounded, and release checks verify eligible PR-only evidence through merged
+lineage.
 
-- **Composer validation keeps resource use bounded.** Source data-contract
-  demand analysis limits the source-by-field hypothesis work before copying
-  guarantees. Schema propagation reuses structural votes and stops cyclic
-  traversal. Imported capacity diagnostics remain available to the planner
-  and review surfaces. The import preview checks text size before parsing,
-  bounds file reads, rejects aliases and contains parser/conversion failures.
 - **Reference joins reject expressions and values that can exhaust memory.**
   Materialized reference outputs have a 64 MiB canonical-byte limit in addition
-  to the existing cell limit. Output expressions that can amplify text through
-  concatenation, formatting, multiplication, eager containers or repeated
-  string-copying calls are refused. Safe expression builtins validate argument
-  counts before evaluation. Pipelines using these patterns must reduce retained
-  values or simplify their output expressions before running.
-- **Source inference and redaction handle rejected input more carefully.**
-  JSON, S3, Azure Blob and Dataverse sources commit field-resolution updates
-  after schema validation and contract inference, so failures in those steps
-  do not expand normalization state.
-  Malformed braced ODBC password values remain redacted, and Composer claim
-  matching avoids excessive regex backtracking. The frontend dependency override
-  adds a bounded braces-nesting guard for its audit graph.
-- **Composer policy feedback preserves the relevant rejection.** Source and
-  transform prevalidation carries policy error codes through planner feedback
-  and audit redaction. Transform prevalidation checks the subject without
-  synthetic source/sink plugins adding unrelated enablement failures. Invalid
-  profile aliases produce field-specific diagnostics.
-- **Release checks verify eligible PR-only evidence through merged lineage.**
-  The image gate accepts the trusted PR head's checks only when its tree matches
-  the resulting image commit and the merged PR/workflow provenance is verified.
-  Incomplete, ambiguous or pending evidence still refuses publication. Automatic
-  paid judge-quality validation was removed from CI; test timing and recovery
-  diagnostics were made more deterministic. Branch preflight can refresh its
-  named remote base without moving a local branch.
-- **Runtime dependencies exclude two newly disclosed vulnerable versions.**
-  The base install requires fsspec 2026.6.0 or newer for its reference-template
-  sandbox fix (CVE-2026-104851). The LLM, Web UI and all-feature extras require
-  multidict 6.9.1 or newer, below version 7, for its C-extension reference-leak
-  fix (CVE-2026-104874).
-- **Gateway image qualification checks current BuildKit SLSA v1 records.**
-  Each target platform must carry an SBOM and provenance matching the expected
-  source, workflow and build run. Missing or conflicting identities refuse
-  qualification and release promotion; image scans, signing, signature
-  verification and smoke checks remain required.
+  to the existing cell limit, and output expressions that can amplify text are
+  refused. Pipelines using these patterns must reduce retained values or
+  simplify their output expressions before running.
+- **Runtime dependencies exclude two vulnerable versions.** The base install
+  requires fsspec 2026.6.0 or newer (CVE-2026-104851). The LLM, Web UI and
+  all-feature extras require multidict 6.9.1 or newer, below version 7
+  (CVE-2026-104874).
 
 **Upgrade and publication notes.** Session epoch 71 and Landscape epoch 49
 are unchanged from 0.8.1; this release adds no schema-epoch cutover. Installations
@@ -2378,217 +1649,23 @@ intended commit before using container installation instructions.
 
 ## 0.8.1 - 2026-09-10 (Replica recovery and deployment hardening)
 
-- **Composer CSV repair guidance follows the runtime field contract.** Source
-  inspection exposes normalized row keys and original-label mappings. Uploaded
-  sample headers cannot become planner-authored guarantees; rejection feedback
-  identifies supported runtime contracts and user acknowledgement. Cancelled
-  requests retain public validation guidance and offer a correlated retry,
-  while the saved pipeline remains visibly a draft for the unfinished request.
-- **Composer recovery preserves request intent, evidence and cancellation
-  ownership.** Source proof follows configured CSV/JSON interpretation and
-  distinguishes sampled keys from all-row failures. Batch rejections carry
-  actionable codes, and partial model discovery retains useful expansion.
-  Recovery respects explanation and no-change requests while retaining
-  authorized build repair. Chat Stop cancels work started from Checks, and
-  creating or switching sessions maintains each request's own busy state.
-- **Web search and API retrieval now support bounded POST bodies and structured
-  results.** `web_scrape` accepts fixed URLs, row-bound query parameters,
-  JSON, URL-encoded forms, and payload-store-backed multipart uploads. It can
-  validate JSON/XML responses, extract bounded HTML or JSON records with
-  provenance, and follow bounded GET pagination. Exact origin policies cover
-  initial requests, redirects, pagination, and resolved detail links;
-  configured headers require `ELSPETH_FINGERPRINT_KEY` and stay on the initial
-  origin across redirects. POST requests have no automatic retry or redirect,
-  and pipelines containing them refuse automatic resume. Authenticated fetches
-  and live browser execution remain unavailable. See the
-  [web scrape reference](docs/reference/web-scrape-transform.md).
-- **Finite file sources can opt into recovery from sealed input.** Set
-  `snapshot_for_resume: true` on a single `csv` or `json` source before the
-  original live run. The engine seals the full validated emission stream
-  before downstream processing, then resumes from retained bytes even if the
-  input file changes or disappears. It preserves source indexes, contracts,
-  quarantine decisions, and validation-error identities. The serialized
-  snapshot is capped at 64 MiB; multi-source snapshot mode is refused.
-  Payload purge retains dependencies needed by active runs and retained
-  snapshots. See the [resume runbook](docs/runbooks/resume-failed-run.md).
-- **Pipeline operations require a live deployment-wide `user` role.** An
-  authenticated active human must also hold this grant to author, execute,
-  replay, cancel, or obtain progress tickets. Durable admission and WebSocket
-  consumption recheck authority; administrator status alone does not grant
-  workload access. Grant the appropriate workload role when admitting users.
-  Administrators can purge never-activated pending identities under the
-  configured retention policy, with exact deletion IDs in the audit trail.
-  Machine authentication and the reserved `auditor`/`oversight` route roles
-  remain unavailable. See the [identity guide](docs/guides/identity-providers.md).
-- **Web and Composer control boundaries reject recognized credential
-  material before persistence or dispatch.** Checks cover user-authored
-  control content, pipeline options, tool arguments, and provider-authored
-  audit metadata, including reasoning and tool-call identities. Refusals
-  report a safe category and surface rather than the candidate value. Use
-  supported secret references; blob data-plane content is outside this
-  control-content detector. Audit scrubbing also handles supported scalar
-  and mapping subclasses.
-- **Composer source changes reconcile approval evidence, and generated LLM
-  fields carry the runtime's actual output contract.** Blob-backed source
-  changes update authoritative reviews. Multi-query output names and types
-  follow the configured query prefixes; operational LLM fields take precedence
-  over colliding extracted fields. A multi-query node cannot require its own
-  generated fields as upstream input; move those requirements to downstream
-  consumers. Interpretation changes validate against immutable catalog and
-  profile facts, reducing work performed while session state is locked.
-- **Recovery and retention refuse inconsistent evidence.** Restored coalesce
-  tokens must match their recorded row, step, and payload; journal batch and
-  sink-error ordinals require exact integers. Retried audit-export reservations
-  reuse their original effect position. Purge retries account for already
-  absent bytes when updating reproducibility grades, and corrupt source
-  dependency metadata holds the affected payloads rather than deleting them.
-  Resume and follower admission reuse one validated graph, avoiding a second
-  binding of transform input types.
-- **Local account removal is fenced to the credential generation observed
-  when removal began.** A concurrent password reset or registration refuses
-  stale removal before identity mutation; refresh the account and retry.
-- **Canonical JSON refuses overflowing numeric literals.** Corrupt audit
-  input that decodes to infinity remains a decode error rather than becoming
-  a usable value.
-- **CI and delivery use trusted Nyx runners with isolated checkouts.** Ordinary
-  workflows run locally; cloud-topology acceptance remains a separate cloud
-  exception and fork pull requests do not run on trusted workers. Signed
-  trust-tier clearance remains an operator step, separate from CI. The optional
-  LLM gateway now has its own frozen dependency lock, digest-pinned build
-  inputs, and required dependency, image, smoke, and conformance checks.
-  Dependency floors include PyJWT 2.14 and oauthlib 4; the AnyIO lock and
-  Azurite's Moment override also move to patched releases.
-- **Deployment security assurance has a reusable documentation pack.** The
-  [assurance index](docs/security-assurance/README.md) links the system scope,
-  trust boundaries, controls, risks, and evidence, while distinguishing source
-  implementation from deployment acceptance and operator responsibilities.
-- Composer guidance now teaches source-carried field names, typed transform outputs, projected template rows, batch output-mode capabilities, and routed batch or missing-field failures using current runtime rules.
-- **Web fetches refuse the IPv6 unspecified address and IPv4-embedding and
-  special-purpose ranges.** The SSRF address policy now blocks `::` (which
-  reaches local listeners like `0.0.0.0`), `192.0.0.0/24`, `198.18.0.0/15`,
-  `240.0.0.0/4`, and the IPv4-compatible (`::/96`), NAT64 (`64:ff9b::/96`,
-  `64:ff9b:1::/48`) and 6to4 (`2002::/16`) prefixes by default. Those
-  embedded forms of the metadata address `169.254.169.254`, and Azure
-  WireServer `168.63.129.16`, are always blocked, even under an operator
-  `allowed_ranges` policy; previously `64:ff9b::a9fe:a9fe` passed an
-  allow-everything policy.
-- **CI audits both npm lockfiles.** The
-  `Dependency and License Audit` job now runs `npm audit --package-lock-only
-  --audit-level=low` on the frontend lockfile (compiled into the release image)
-  and on the root test-tooling lockfile, beside the existing `pip-audit` step;
-  any advisory fails CI. The frontend moves to `dompurify` 3.4.16 and `mermaid`
-  11.17.2 (which adds `fastdom` and `strictdom`), and its `undici` override for
-  `openapi-typescript` moves from 6.28.0 to 6.29.0. The root tooling moves to
-  `azurite` 3.37.0 and overrides `uuid` to `^11.1.1`.
-- **SECURITY.md names a security mailbox.** Reports go to GitHub private
-  vulnerability reporting or to `cloudengineering@dta.gov.au`; the public-issue
-  fallback is removed.
-- **Delivered audit exports now have a standalone verifier.**
-  `elspeth audit-export verify` independently re-derives signed JSON exports
-  and portable CSV bundles, including record signatures and chain, chunk and
-  snapshot hashes, final manifest, exact CSV projections and file set. It
-  resolves the authenticated signer ID through explicit historical
-  key-to-environment mappings, refuses unsigned evidence by default, and
-  labels the explicit `--allow-unsigned` path as integrity-only. Enabled
-  exports must now state `signing_mode`; deployments can set
-  `authentication_policy: required` to reject unsigned export configuration.
-  Verification copies each delivered regular file once into bounded private
-  storage and verifies only that captured snapshot. Success reports an
-  `artifact_digest` (the exact JSON file SHA-256 or canonical CSV directory
-  bundle hash); it does not lock the source path, so later consumers must keep
-  stable custody or revalidate that digest before using the source again.
-- **CI containers have more file descriptors and durable test diagnostics.**
-  Test and Integration containers use `--ulimit nofile=65536:524288` to avoid
-  mid-suite descriptor exhaustion. Test output uses concise failure summaries
-  and uploads a JUnit report regardless of outcome. Build-push jobs use
-  per-run checkouts to avoid root-owned files left by earlier runner jobs.
+Replica recovery, declared data contracts and deployment hardening.
+PostgreSQL-backed replicas share Composer progress, run events, WebSocket
+tickets and rate budgets, and an admitted run can recover after a replica is
+lost. Transform outputs use a contract declared before the first row
+(ADR-050) and a template sees only its declared fields (ADR-051). The release
+also adds workflow governance (approval, review, a shared library and
+per-person quotas, off by default), a standalone audit-export verifier and
+the `azure_ai_search` and `batch_rank` plugins.
 
 **Breaking pre-1.0 schema cutover:** `SESSION_SCHEMA_EPOCH` advances from 53
-to 71 for durable Composer progress, request lifecycle leases, identity owner
-foreign keys, approval revocation provenance, run admission decisions, sparse
-proposal arguments, structured validation errors, approved prompt artifact provenance,
-64-bit quota policy limits, nullable token-ledger prompt/completion measures
-(unknown usage is NULL, never zero), and timestamp-leading indexes for
-container-wide quota scans, durable fork failure diagnostics, the
-freeform default preference with removal of the retired mode banner field, and
-ordered coalesce branches and source order in composer authority hashes.
-Session epoch 62 requires nullable backend suggestions in durable advisor
-completion gates and rejects earlier stores at startup before session reload.
-Session epoch 63 makes the `blob_inline_resolutions.content_hash` CHECK and the
-four `blob_replacement_cleanups` evidence-hash CHECKs enforce the full lowercase
-SHA-256 shape rather than the length alone, and gives every remaining session
-digest column its own shape CHECK.
-It also adds `interpretation_events.surface_origin`: review cards raised by
-the state-revert, YAML-import and E2E-seed routes now record that origin with
-empty LLM provenance, where they previously wrote the route name into the
-model, provider and `composer_skill_hash` columns.
-Session epoch 65 makes `completion_gates.advisor_signoff.note` a required key in
-the persisted composer-meta envelope, so a blocked turn can show the advisory
-reviewer's own bounded words beside the block; the strict parser refuses an
-envelope written without the key rather than defaulting one.
-Session epoch 66 requires control-message v2 checksums that bind the origin,
-provider role, schema and content together. Stored v1 control messages use
-content-only checksums and cannot be replayed by this release; epoch-65 session
-databases must also be recreated, not relabelled as epoch 66.
-Session epoch 67 binds the order of mapping-form coalesce branches and of the
-multi-source `sources` map in the composer authority hashes (draft, content,
-private-argument, dispatch-binding) and the advisor sign-off fingerprint.
-Every stored composition content hash moves, so epoch-66 session databases
-cannot be re-verified and must be recreated; there is no legacy hash path.
-Session epoch 68 adds `compose_checkpoint` and `ordinary_proposal_checkpoint`
-to the persisted proposal rebase reasons. These events keep pending proposals
-bound to the current composition head across checkpoints. Earlier readers
-reject the new reasons, so epoch-67 session databases must also be recreated.
-Session epoch 69 adds immutable freeform message ingress receipts that bind
-each accepted client request UUID to one user message and its originally
-requested nullable state. Exact transport retries can recover that acceptance
-without inserting another user message.
-Session epoch 70 stores the first-run tutorial Build stage. The tutorial
-composes through the ordinary freeform planner while retaining explicit Run,
-Audit and Graduation steps.
+to 71, and Landscape `SQLITE_SCHEMA_EPOCH` advances from 38 to 49.
 Session epoch 71 removes mode-specific operation state and adds mode-neutral
 durable receipts for session fork and state revert. Earlier Sessions stores
 must be recreated; there is no compatibility reader or in-place migration.
-Landscape `SQLITE_SCHEMA_EPOCH` advances from 38 to 49 for immutable web
-run-start permit binding, recoverable pre-effect admission, nullable LLM token
-usage, the quota-policy/secret-wiring evidence used at admission, and the matching
-approved prompt artifact link on LLM calls. The artifact identifies effective
-query templates and the system prompt; it no longer hashes an unused fallback.
-Epoch 42 requires admission evidence v2 with per-principal token quota usage
-and limits; stored v1 evidence is incompatible and must not be relabelled.
-Epoch 43 gives every Landscape digest column a shape CHECK: SQLite ignores the
-declared `VARCHAR` width, so `String(64)` alone admitted any text. It also
-removes the never-written `nodes.schema_hash` column and its always-null key in
-the exported node record.
-Epoch 44 records the actual run mode and source run, links replayed calls to
-their source calls, stores verification decisions, and numbers source/preflight
-operation occurrences under the run leader.
-Epoch 45 records one durable collector-group failure verdict per group,
-including groups with no arrived members. Run results report these separately
-from failed rows. The verdict's `failure_reason` is a closed vocabulary under a
-CHECK, and each failed member's hold names its group. A Landscape store created
-from an earlier 0.8.1 pre-release build at epoch 46 lacks that CHECK and is
-refused at startup; recreate it.
-Epoch 46 records each valid source row's exact contract for replay and verify
-of sparse source streams. Its scheduler event vocabulary also includes
-`resume_requeue_failed`; a Landscape store created from an earlier 0.8.1
-pre-release build at epoch 46 has the narrower `event_type` CHECK and is
-refused at startup; recreate it.
-Epoch 47 indexes verification decisions by run, time, and call ID for bounded
-exports and indexes node states by run to detect misplaced verdicts without a
-full verification-table scan. Populated epoch-46 Landscape stores must be
-recreated.
-Epoch 48 hands a source-quarantined row to its sink through a durable
-PENDING_SINK work item written in the same transaction that records it, and
-resume re-drives only scheduler work: it never re-derives a source row, and it
-refuses (recording a value-free `resume_refused` coordination event) a run with
-an undecided token that no scheduler work covers. A store written before epoch
-48 can hold a quarantined token with no work item, which resume would now
-refuse as corruption, so it is refused at startup; recreate it.
-Epoch 49 widens the authentication-event CHECK to admit
-`pending_identities_purged`; epoch-48 Landscape stores must also be recreated.
-These changes share one paired cutover; the intermediate ACA epochs are not a
-separate deployment requirement.
+A Landscape store created from an earlier 0.8.1 pre-release build at epoch 46
+is refused at startup; recreate it. These changes share one paired cutover;
+the intermediate ACA epochs are not a separate deployment requirement.
 
 ELSPETH does not migrate either predecessor database in place before 1.0.
 Archive or export required evidence, stop the old service, recreate stale
@@ -2602,573 +1679,63 @@ Preserve `data/auth.db` and follow the account re-admission guidance in the
 Do not roll older code back over the recreated databases; keep the service
 drained and repair this release forward.
 
-- **Transform outputs declare, sources infer-and-lock (ADR-050).** Transform,
-  aggregation, and collector outputs now use a contract declared before the
-  first row: operator type takes precedence over plugin type, then nullable
-  `any`. Data-dependent type variance no longer locks a transform to its
-  first output. A value that violates the declaration routes through
-  `on_error` with a value-free reason naming the declarer; an undeclared
-  created field remains a framework error. Batch violations fail the batch or
-  collector group at flush.
-  Operator declarations also govern carried fields, including guardrail
-  pass-throughs and field-mapper renames. Sources continue to infer and lock;
-  differing source contracts can still share a sink. An exact `int` satisfies
-  a `float` declaration in runtime and edge validation without conversion;
-  `bool` does not. This also permits an observed source's later integer under
-  a locked float type.
-  Recorded transform output contracts and dependent contract/prompt hashes
-  change. Resuming an older run fails with `FrameworkBugError` at the first
-  node whose recorded type differs; matching types continue with
-  `source: declared`. There is no compatibility shim. See
-  [ADR-050](docs/architecture/adr/050-transform-outputs-declare-sources-infer-and-lock.md).
-- **Declarations use the field name the row carries.** A source header
-  `Name` becomes `name`; declarations must use `name`, even where a row
-  lookup can resolve the original header. This applies to schema fields,
-  required fields, column options, scan fields, conversion fields, sink
-  headers/mappings, and transform targets. Validation and Composer report
-  `field_name_header_spelling` where upstream contracts prove the alias.
-  Otherwise transforms and aggregations route affected rows with
-  `declared_field_is_header_spelling` or `target_is_header_spelling`;
-  sinks end the run with every affected token recorded. Replace
-  `type_coerce` `field: Price`, `json_explode` `array_field: Name`, or
-  `keyword_filter` `fields: [Name]` with the normalized name.
-  Source `field_mapping` and transform renames carry aliases forward, so
-  declare the final target, not its original header or an earlier name.
-  Headerless CSV mappings use the authored column spelling. Aliases follow
-  each upstream path separately, exclude error-only paths, and stop when the
-  field is dropped; an unrelated field created later does not inherit them.
-  Creating a second field under an arriving field's alias is refused or
-  routed, and mutually aliasing targets such as `total` and `Total` are
-  refused at configuration. Re-creating `name` while its renamed field
-  `c` still carries that alias is refused: use another name or target `c`.
-  A genuine rename to a new literal target, including `{Name: Name}` over
-  header `Name`, remains valid and its declaration governs the emitted
-  field, not a required upstream field.
-  Composer now checks constructed input contracts, including optional
-  declared fields, and reports `edge_field_type_incompatible` consistently
-  with runtime validation. This fixes false refusals of transform-created
-  and batch-created fields and false acceptance of incompatible optional
-  fields. Field normalization remains version `1.0.1`; see
-  [ADR-050](docs/architecture/adr/050-transform-outputs-declare-sources-infer-and-lock.md)
-  for output declaration semantics.
-- **A template sees only its declared fields (ADR-051).** LLM prompts and
-  multi-query `row.source_row` render against a projected row:
-  `required_input_fields: [name]` exposes that field, `[]` exposes the
-  whole row, and an omitted declaration exposes none. Indirect Jinja reads
-  can no longer send undeclared columns to a provider. Undeclared reads,
-  membership tests, `get`, and `is defined` tests fail the row with
-  `template_rendering_failed`; a declared-but-absent field still supports
-  the normal default/undefined guards.
-  Static validation rejects provably invalid reads and computed keys unless
-  `[]` is explicit. Original-header lookups work only when a reaching row
-  can carry that spelling; generated fields, identity sources, renamed-away
-  headers, and closed schemas cannot invent a header alias. Whole-row
-  iteration, filters, and `dict(row)` operate on the declared view; a
-  declared list is unused only when the template never reads the context row.
-  Multi-query source-row reads must be covered by
-  `required_input_fields` itself, including aliases and attribute filters;
-  `image_inputs` alone does not cover them.
-  `<response_field>_variables_hash` now binds the projected values.
-  Web required-control coverage protects the declaration plus query
-  `input_fields`; an omitted or `[]` declaration requires a guardrail
-  scanning `fields: all`. Shipped example prompts remain byte-identical.
-  See [ADR-051](docs/architecture/adr/051-a-template-sees-only-its-declared-fields.md).
-- **RAG query templates use the same visibility boundary.**
-  `rag_retrieval` and `azure_ai_search` expose
-  `required_input_fields` plus `query_field`; an omitted declaration exposes
-  the query field alone and `[]` exposes the whole row. Validation refuses
-  undeclared literal reads, computed keys without `[]`, unsupported row
-  object operations, and unbound top-level names other than `query` or
-  `row`. Extra declared fields are refused when the template never reads
-  the context row. Reads that static analysis cannot prove fail the row
-  instead of disclosing undeclared data. Replace dictionary methods on
-  `row` with filters or `dict(row)`; see
-  [ADR-051](docs/architecture/adr/051-a-template-sees-only-its-declared-fields.md).
-- **Templates use one row API under every declaration.** A template row has
-  fields and one method, `get`. Configuration refuses row-field calls,
-  calling row data or values built only from it, `row.get` without a call,
-  and reserved attribute names `contract`, `to_dict`, and
-  `to_checkpoint_format`, including under `required_input_fields: []`.
-  Use `row | list`, `row | items | list`, `row | dictsort`, or
-  `dict(row)` for whole-row operations and `row['contract']` for a
-  reserved-name column. `{{ row }}`, JSON/string filters, `last`,
-  `urlencode`, and `pprint` operate on the projected mapping;
-  `reverse` reverses field names and `random` selects a field name,
-  including on nested mappings.
-  Methods on field values remain valid, such as `row.note.upper()`.
-  Methods on values built from the whole row, such as `dict(row).items()`,
-  work under `[]` for single-query LLM and RAG templates; under a declared
-  list their method names still undergo field checks, and multi-query
-  templates refuse these forms. Calls that static analysis cannot follow
-  into mapping values, macro parameters, or namespace attributes fail at
-  render with a value-free reason rather than executing row data.
-  A single-query prompt using the whole row with its declaration omitted is
-  refused. Multi-query `input_fields` names cannot be `source_row` or a
-  mapping method name such as `items`, `keys`, or `get`.
-  See [ADR-051](docs/architecture/adr/051-a-template-sees-only-its-declared-fields.md)
-  for the API and refusal contract.
-- **Templates refuse invalid literals before rows run.** Validation and
-  Composer now reject unknown filters/tests even in conditional branches or
-  names supplied to `map`, `select`, `reject`, `selectattr`, and
-  `rejectattr`. Numeric literals that overflow to infinity are also refused.
-  `truncate` rejects a non-integer or boolean length, a negative length,
-  a length shorter than its literal ending, a non-string ending, and negative
-  or non-numeric leeway. It also rejects excess positional arguments,
-  unknown keywords, and duplicate arguments.
-  Checks use only the arguments they need: a row-derived argument elsewhere
-  does not hide an invalid literal. Checks requiring a row value or an
-  unresolved `**` argument remain per-row; constant arithmetic is not
-  evaluated during validation. For example, `truncate(10.5, end=row.e)`
-  is refused, while `truncate(0, end=row.e)` can build because the ending
-  may be empty.
-- **Plugin-computed and LLM structured outputs have bound types.** Shipped
-  plugins declare concrete computed types for statistics, reports, retrieval,
-  and document analysis; unconstrained row data and list/mapping outputs stay
-  `any`. Invalid computed output routes as the plugin's fault
-  (`declared_by: plugin`). LLM structured fields bind `integer` to
-  `int`, `number` to `float`, `boolean` to `bool`, and
-  `string`/`enum` to `str`. LLM transforms and sources normalize
-  integral `5.0` to `5` for `integer` and `7` to `7.0` for
-  `number`; fractional integers remain invalid.
-  Validation refuses an LLM's own schema type that cannot admit its bound
-  output, including any non-`any` declaration for its usage mapping/null.
-  A downstream `int` declaration for an LLM `number` is still checked
-  per row and now fails even when the provider answers with an integral
-  number: declare `float`. Recorded contracts and their hashes change,
-  while JSON/CSV sink bytes remain unchanged. See
-  [ADR-050 Decision 12](docs/architecture/adr/050-transform-outputs-declare-sources-infer-and-lock.md#decision).
-- **Collector group failures are counted where failures are reported.** A
-  collector group that fails as a whole now shows in the web run's failure
-  categories and in MCP error analysis, one entry per failed member token
-  under the group's recorded reason code (`collector_missing_members`,
-  `collector_transform_error`, `collector_contract_violation`); before, its
-  members ended failed but the categories were empty and MCP
-  `errors.total` was 0. `get_run_summary` gains `errors.collector_group`, and
-  `errors.total` now adds it to validation and transform errors;
-  `get_error_analysis` gains `collector_group_failures` (groups and member
-  tokens per collector and reason, including a group no member reached).
-  Failed groups keep their own count, `collector_groups_failed`. Every reader
-  takes these numbers from one counting authority, and a member's hold that
-  disagrees with its group's verdict is refused as audit corruption. A
-  collector plugin's returned error is now scrubbed and stored structurally
-  on the flush state, as the aggregation seam already did.
-- **A row missing an input field a transform's options name is routed, not
-  a run-ending error.** Behind an observed or open upstream the build cannot
-  prove that a field a transform derives from its options is present, so a
-  row lacking it used to end the run with exit 4
-  (`DeclaredRequiredInputFieldsViolation`, or a raw `KeyError` in
-  `json_explode`). Such a row is now refused before the transform runs and
-  routed through `on_error` with reason `missing_field`, naming only the
-  configured fields, never a row value (ADR-013 Amendment 2026-09-27). This
-  covers `field_mapper` mapping sources, `reference_join` `key_field`,
-  `blob_csv_expand` and `blob_json_expand` (`text_field`, `blob_ref_field`,
-  `content_type_field`), `blob_text_expand`, `pdf_rasterize` and
-  `aws_textract_inline_analysis` `blob_ref_field`,
-  `aws_textract_document_analysis` `key_field`/`bucket_field`/`version_field`,
-  `azure_document_intelligence` `source_field`, `rag_retrieval` and
-  `azure_ai_search` `query_field`, `blob_fetch` and `web_scrape` `url_field`,
-  `llm` `image_inputs` columns, and `json_explode` `array_field`. A field the build did prove present (every upstream
-  guarantees it), or one the row carries while its contract lost it, is still
-  our defect and ends the run. After a `merge: union` coalesce whose policy
-  can lose a branch (`best_effort`, `quorum`, `first`), a field counts as
-  proved only when every branch guarantees it: a branch that declares no
-  guarantees can be the whole merged row, so a field only another branch
-  creates is a fact about the row and a row without it routes. For the same
-  reason a `mode: fixed` consumer after such a coalesce is no longer refused
-  at build for a field only one branch guarantees; it checks each row.
-  Aggregations and collectors classify a buffered
-  row's missing `schema.required_fields` column with the same rule: an
-  unproven absence fails the batch through `on_error`, and a proven one ends
-  the run with every buffered row recorded `failed` first (aggregation
-  and collector alike). An
-  `llm` `image_inputs` entry marked `required: false` is no longer treated as
-  a required input, so a row without that image is sent without it instead of
-  being refused.
-- **A batch mixing rows with and without an optional field no longer ends
-  the run.** A `batch_replicate` batch where some rows carry `copies_field`
-  and others do not (each of those uses `default_copies`) used to end the run
-  with a `PassThroughContractViolation` for a field the plugin never
-  received. The aggregation flush's pass-through check now takes each
-  buffered row's input fields as the single-row check always has: the fields
-  its contract declares and its payload carries. A transform that drops a
-  field still ends the run when every buffered row that produced output
-  carried that field (`output_mode: transform`) or when the paired row
-  carried it (`output_mode: passthrough`). A row the transform quarantines
-  inside the batch no longer weakens the `transform`-mode check: before, a
-  quarantined row lacking a field let the transform drop that field from
-  every output and the run finished. The same rule applies when a resumed run
-  re-checks a batch output committed before a crash. In `transform` mode the
-  check cannot tie an output row to the row it came from, so dropping a field
-  that only some of the emitting rows carried is not detected there. A batch
-  transform whose quarantine record contradicts itself still ends the run
-  with `BatchQuarantineContradictionError` (a Tier-1 invariant error). This
-  covers malformed `quarantined_indices`, or rows emitted while every input
-  is claimed quarantined. Every buffered row is recorded `failed` before the
-  run ends.
-- **Batch passthrough requires an explicit one-row-per-input capability.**
-  Validation, run start, and Composer require
-  `flush_emits_one_row_per_buffered_row = True` on a batch plugin used with
-  `output_mode: passthrough`; the default is `False`. Reducers,
-  `batch_replicate`, and `batch_outlier_annotator` do not qualify even
-  when a particular batch happens to emit one row per input. Use
-  `output_mode: transform` or an eligible plugin such as `batch_rank`.
-  Composer now accepts the default transform mode consistently with runtime.
-  A plugin that declares the capability but returns another shape still
-  raises `BatchPassthroughShapeError`, after recording every buffered row
-  failed. Previously unsupported flush shapes could leave undecided tokens.
-  See [Plugin Protocol — Output Mode](docs/contracts/plugin-protocol.md#output-mode).
-- **A failed coalesce group no longer ends a healthy run with exit 4.** When
-  an arriving branch completed a group failure that consumed two or more
-  arrived branches (a `select` branch that never arrived under `quorum`, or a
-  type conflict between branches such as a `value_transform` rewrite beside a
-  passthrough of the same field), every consumed row was recorded `failed`,
-  but the run counted only the arriving one and stopped at the end with
-  "Live-vs-audit terminal counter mismatch" (exit 4). Every failure path of a
-  coalesce or row_union group now counts each consumed row once, and the run
-  ends PARTIAL (exit 1), or FAILED (exit 2) when no row succeeded. The
-  reported failed-group count (`rows_coalesce_failed`) is unchanged — it was
-  already taken from the audit trail; the run's internal cross-check of it now
-  agrees with the audit for a group failed by an arrival or a branch loss, so
-  it no longer logs a tolerated divergence for such a group (a group failed
-  before any branch arrived is counted when its first straggler arrives, as
-  the audit counts it).
-- **`rows_coalesce_failed` counts each failed coalesce or row_union group.**
-  The audit count keyed a failed group by its source row, so when a
-  `json_explode` fed a fork and two exploded items of one row each failed
-  their merge, the run reported one failed group (and logged a tolerated
-  live/audit divergence). It is now keyed by the fork group each merge
-  actually waits on — the key the coalesce and row_union executors use — so
-  that run reports two, matching the live count, and a resumed run
-  reconstructs the same number. A live count above the audit count is no
-  longer logged and tolerated: it ends the run as a counter-parity failure
-  (exit 4), like every other live/audit counter mismatch.
-- **A union coalesce whose branches certainly disagree on a field's type is
-  refused at build.** When every branch merges on every row (`require_all`)
-  and two branches each carry a field whose type is fixed before the first
-  row but differs — a `value_transform` rewrite whose expression remains
-  untyped or `field_mapper` dotted extraction (`any`) beside a source's
-  declared `price: int`, carried
-  through a passthrough or a rename — every row failed the merge with
-  `contract_type_conflict`, yet `elspeth validate` and the composer admitted
-  the pipeline whenever the branches were observed. `elspeth validate`, the
-  build and the composer now refuse it (`coalesce_union_type_incompatible`),
-  naming both declaring nodes; declare the type on every branch's output
-  schema (`mode: flexible`) or write the computed value under a new name.
-  A type known only from the rows (an observed upstream) still fails each row
-  at the merge, and that reason now names `any` rather than `object`.
-- **Expression targets carry provable types before row 1.** A
-  `value_transform` expression over declared inputs now publishes its result
-  type and derived nullability; unknown results remain nullable `any`, and an
-  authored target type still takes precedence. An observed-mode `type_coerce`
-  also publishes each successful conversion type. Typed downstream consumers
-  can therefore build from either result, and a union coalesce accepts equal
-  branch types it previously refused. A target declaration certainly at odds
-  with its expression is refused at build; a data-dependent mismatch still
-  routes the row with a value-free reason naming the declarer.
-- **`union_collision_policy: fail` no longer ends the run on a collision.**
-  A field name two arriving branches both carried raised
-  `CoalesceCollisionError` out of the run at the first colliding row (exit 4,
-  a traceback, the remaining rows never read). When the collision is certain
-  from config — every merge the arrival policy can perform sees two branches
-  that both guarantee the same field, as when a `fixed` source's columns are
-  forwarded on every branch — `elspeth validate` and the build now refuse the
-  pipeline, naming each field and its branches and the remedies (`first_wins`
-  / `last_wins`, `merge: nested` or `select`). A collision on fields the rows
-  carry (an observed upstream) fails that row's group: each consumed branch row
-  is recorded failed with the value-free reason `union_field_collision`, the
-  collision record stays on each failed coalesce state, and the run goes on.
-  `best_effort` and `first`, which can merge a single branch, are never
-  refused. The composer cannot author this policy (its import is refused),
-  so it has no second surface to agree with.
-- **New batch plugin `batch_rank`: rank rows within a batch and keep every
-  row.** It adds `<prefix>_rank`, `<prefix>_percentile`,
-  `<prefix>_ranked_count` and `<prefix>_batch_size` (default prefix `rank`)
-  to every buffered row, ranking a numeric `value_field` (`order:
-  descending|ascending`, `ties: competition|dense`), and emits exactly one row
-  per buffered row, in order. A null, absent or non-finite value keeps its row
-  with a null rank and percentile; a present text or boolean value fails the
-  whole batch (routed by `on_error`, value-free reason). It is the one shipped
-  batch plugin that declares `flush_emits_one_row_per_buffered_row`, so it
-  runs under `output_mode: passthrough`, where the same tokens continue
-  downstream, as well as under `transform`.
-  `examples/batch_rank_passthrough` ranks prompt candidates by judge score and
-  shortlists the top two per prompt, and contrasts the lineage of the two
-  modes.
-- **Large batches, sink writes, and expansions respect database parameter
-  limits.** Audit reads, member locks, result/failure writes, expansion
-  read-back, lease recovery, and resume adoption now use bounded statements
-  within the original transaction. This avoids run-ending bound-parameter
-  errors and undecided rows on SQLite (32,766 parameters) and PostgreSQL
-  (65,535). A 40,000-row SQLite `batch_stats` batch completed with every
-  row recorded; its largest insert page used 11,000 parameters and its
-  largest other statement 903. Local-file recovery-evidence limits remain
-  separate, as described below.
-- **A database error is recorded without its SQL or bound values.** The
-  audit trail recorded a failing statement's driver text as the operation's
-  error message, bound row payloads included (up to 450,969 characters for
-  one refused batch release). Landscape connections no longer render bound
-  parameters into error text, and the audit trail records a database error
-  by its type name.
-- **Known limit: one local-file sink write of more than about 12,600 rows
-  still stops the run.** The json, csv, text and document sinks record every
-  row's ordinal in the write's recovery evidence, which is capped at 64 KiB,
-  so a single write that large fails with `safe_evidence canonical JSON
-  exceeds the 64 KiB limit` and leaves its rows with no outcome (measured: a plain
-  15,000-row run on release/0.8.1). Aggregation batches that emit a summary
-  row are not affected.
-- **A follower started with `elspeth join` retries transient failures.** It
-  applies the run's `retry` settings, as `elspeth run` does, so an LLM 429, a
-  network error or a lost template render worker is retried there instead of
-  sending the row to `on_error` after one attempt (`transient_error_no_retry`).
-  A row re-claimed after its lease was reaped now starts above every attempt
-  the lost claim recorded; before, a re-claim after an in-claim retry
-  re-inserted a recorded attempt, the reclaiming process stopped with a Tier-1
-  `LandscapeRecordError` and the row was left with no outcome (reachable in a
-  resume of a leader that died mid-retry). A run can no longer be finalised
-  successful while a row whose claim died mid-row has no outcome: it now ends
-  `FAILED` instead of `COMPLETED`.
-- **Quarantined source rows survive crashes without re-validation.** Source
-  quarantine evidence and its sink work item now commit together. Resume
-  re-drives recorded scheduler work instead of re-reading source rows, so a
-  previously quarantined row cannot be lost or reclassified as successful.
-  Valid and quarantined rows reach their recorded sinks, and the run reports
-  `completed_with_failures`.
-  Resume refuses an undecided token with no covering work item and records a
-  `resume_refused` event identifying tokens without row values. Coverage
-  includes open work that forked, expanded, or collected the token. A run
-  cannot be stamped successful while any row lacks an outcome. Preview now
-  says “Scheduler work items (to re-drive)” rather than “Unprocessed rows”.
-  See the [resume runbook](docs/runbooks/resume-failed-run.md).
-- **Resume requeues work left failed by an unexpected error.** After source
-  loading completes, resume can requeue an undecided failed work item at its
-  recorded node under a new attempt number, with a
-  `resume_requeue_failed` event. Failed items retain their row data until
-  decided. This covers errors after end-of-source aggregation/collection and
-  follower errors while the leader completes ingestion.
-  Fix the underlying cause before resuming; otherwise the run fails again.
-  Decided rows are not reprocessed. Incomplete source ingestion still refuses
-  recovery and requires a new run unless eligible sealed input was recorded.
-  Re-execution is at-least-once: an external call made before the failure may
-  be repeated. See the [resume runbook](docs/runbooks/resume-failed-run.md).
-- **Numbers outside canonical JSON bounds become row failures.** A source
-  integer beyond ±(2**53-1) is quarantined through
-  `on_validation_failure` with `[non_canonical_number]`, rather than
-  ending ingestion with an undecided token. The check applies after coercion
-  to declared, `any`, extra, and nested values. Quarantine sanitization
-  nulls such numbers, as it already did `NaN` and `Infinity`.
-  Transforms, aggregations, and collectors apply the same output rule through
-  their error routing, with a value-free canonical-JSON reason.
-  `blob_rows` refuses a configured `size_bytes` above 2**53-1.
-  A source bypassing schema validation still ends the run, with the source
-  row index in the diagnostic.
-- **Stored canonical JSON preserves large finite floats.** Floats in
-  [2**53, 1e21) serialize in integer notation under RFC 8785; ordinary JSON
-  decoding previously turned them into integers outside ELSPETH's safe range.
-  The inverse canonical decoder now restores the hashed double at sink,
-  effect-plan, predecessor-snapshot, row/call payload, and source-replay
-  boundaries. Valid rows no longer fail at publication or recovery for this
-  reason, including database effects already committed remotely and recorded
-  discard/quarantine evidence checked by verify.
-- **`examples/batch_error_routing`** shows a failed aggregation batch end to
-  end. One order's amount is a string, so its whole batch of three fails:
-  `settings.yaml` routes all three rows, with their original values, to the
-  `on_error` sink; `settings_discard.yaml` records them as quarantined; and
-  `settings_declared.yaml` declares a `value_transform` output `int`, which
-  routes the bad row on its own before the batch. All three end `PARTIAL`
-  (exit 1) by design. The README gives the audit queries that show the
-  outcomes, the single divert and the value-free reason.
-- **VANguard identity residual.** Configured administrator seeding is consumed
-  permanently, authentication audit reuses an application-owned engine, and
-  authority withdrawal revokes awaiting approvals and refuses new execution.
-  Run decisions retain quota-policy identifiers and a canonical wiring hash;
-  token-quota deployments refuse chargeable work while complete accounting
-  remains unavailable. Nullable call counters preserve reported usage,
-  including zero and usage reported on failed responses.
-- **Authentication events in signed exports.** Operator exports record an
-  explicit inclusion policy and bounded event snapshot. Omitted history and
-  an included empty set are distinct. Web exports refuse deployment-wide
-  history, and no historical identity snapshot is invented from current rows.
-- **Workflow-governance readiness switch.** An off-by-default setting now
-  refuses `/api/ready` when governance is requested with open local
-  registration or without a compartment marking. It is the configuration
-  boundary for the approval, review and library authorities below.
-- **Approval, review, shared library and per-person quotas.** With workflow
-  governance on, a session owner can send a state for approval (blocking) or
-  for review (non-blocking), reviewers attest against a server-computed content
-  digest, pipelines can be published to a shared library, and per-identity
-  limits on model tokens per day and stored bytes are admitted at the boundary
-  rather than reported after the fact. Attestation is a ledger, not a control:
-  nothing refuses on it. An approver also gets a read-only audit view of the
-  runs, approvals, attestations and authentication events for the identities in
-  their scope. With governance off — the default — none of this is enforced and
-  runs are admitted without an approval, as before.
-- **People & access in one place.** Authorized administrators can find a person
-  and manage access, roles, approvers, usage limits and local sign-in from one
-  searchable panel. Live local administrators can manage local accounts, and
-  neither the web UI nor the operator CLI can remove the last administrator
-  who can still sign in.
-- **Freeform is the Composer default.** New users open in Freeform, and the
-  tutorial hands off to it. Composer puts
-  blocking readiness decisions and their next actions beside the conversation,
-  including the controls for requesting an approval.
-- **Review follows the content that will run.** Composer requires the complete
-  live prompt for approval and binds the approved artifact to the effective
-  system and query prompts. Advisor evidence and injection checks include the
-  shared system prompt and up to eight query templates, with further queries
-  marked as withheld. Stale review actions are rejected after the source or
-  prompt changes.
-- **Composer validation honors authored contracts.** It evaluates every
-  declared semantic requirement and accepts the documented string form of
-  explicit schema fields for authored LLM nodes.
-- **Advisor blocks preserve the conversation.** A blocked turn keeps the
-  Composer reply and shows the reviewer's bounded finding and repair action.
-  Structured verdicts distinguish a rejected graph from a transient review
-  failure: transient failures can be retried, while an unchanged rejected
-  graph is not reviewed repeatedly.
-- **Uploaded material is validated against its contents.** Composer can use
-  uploaded CSV or JSON reference tables in `reference_join` and uploaded text
-  in an LLM prompt. Readiness validation reads the authorized, pinned bytes;
-  missing, changed or invalid content is refused before execution.
-- **The "Save for review" gesture is renamed "Share inspect link".** The old
-  name read as a request addressed to someone, which is what the new send-for-
-  review verb actually does; this one mints a link that anyone holding it can
-  inspect. Only the visible name changes — the endpoint, its telemetry
-  vocabulary and the share-link lifecycle are untouched.
-- **Bedrock credentials in API keys & secrets.** The `llm` transform and LLM
-  source accept an optional Amazon Bedrock API key (`api_key`, sent as a
-  bearer token) or static IAM credentials (`aws_access_key_id`,
-  `aws_secret_access_key`, optional `aws_session_token`); the two are mutually
-  exclusive and the AWS default credential chain remains the default, so
-  task-role deployments are unchanged. Bedrock LLM profiles may name an API
-  key through `credential_scope`/`credential_ref`. The default
-  `server_secret_allowlist` gains `AWS_BEARER_TOKEN_BEDROCK`,
-  `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN`.
-  Credentials are injected below the audited client and never enter a
-  recorded call, and profiled nodes may not author them.
-- **Server-only secret mode.** `ELSPETH_WEB__USER_SECRETS_ENABLED=false`
-  disables user-scoped secrets end to end: the secrets API refuses create and
-  delete with 403, stored user secrets are neither listed nor resolved nor
-  allowed to shadow a server secret, and the panel renders read-only. See the
-  [environment reference](docs/reference/environment-variables.md).
-- **Composer LLM steps always carry both prompts.** Composer validation now
+### Breaking and operator-visible changes
+
+- **Pipeline operations require a live deployment-wide `user` role.** An
+  authenticated active human must also hold this grant to author, execute,
+  replay, cancel, or obtain progress tickets; administrator status alone does
+  not grant workload access. Grant the appropriate workload role when
+  admitting users. See the [identity guide](docs/guides/identity-providers.md).
+- **Transform outputs declare, sources infer-and-lock (ADR-050).** Recorded
+  transform output contracts and dependent contract/prompt hashes change.
+  Resuming an older run fails with `FrameworkBugError` at the first node whose
+  recorded type differs. There is no compatibility shim.
+- **Azure AI Search retrieval is its own transform (breaking).** The
+  `azure_search` provider is removed from `rag_retrieval`, which now serves
+  Chroma only: YAML that used `provider: azure_search` must move to the new
+  `azure_ai_search` plugin, and `managed_identity_client_id` is now
+  `client_id`. Web-authored pipelines reach a search service only through an
+  operator profile declared in the new `ELSPETH_WEB__AZURE_SEARCH_PROFILES`
+  setting, whose `indexes` pin is mandatory (`"any"` is the explicit opt-out).
+  See the
+  [environment reference](docs/reference/environment-variables.md#azure-ai-search).
+- **Enabled audit exports must state `signing_mode`;** deployments can set
+  `authentication_policy: required` to reject unsigned export configuration.
+  `elspeth audit-export verify` independently re-derives signed JSON exports
+  and portable CSV bundles and refuses unsigned evidence by default.
+- **Composer LLM steps always carry both prompts.** Composer validation
   rejects an `llm` node without a `system_prompt`
   (`llm_system_prompt_missing`) or without a user prompt
-  (`llm_user_prompt_missing`). The planner keeps the prompt you gave as the
-  user prompt, drafts a system prompt when none was given and says so, or asks
-  first; the server never writes prompt text. A multi-query node keeps one
-  shared system prompt with one user prompt per query. The step's
-  configuration box shows "System prompt" and "User prompt" first, one user
-  row per query, and marks a missing role. Existing Composer sessions whose
-  LLM step has no system prompt now fail validation, and adding one reopens
-  that step's prompt review. YAML pipelines are unaffected: the runtime
-  `system_prompt` option stays optional.
-- **Azure AI Search retrieval is its own transform (breaking).** The new
-  `azure_ai_search` transform (Azure RAG) takes flat options (`endpoint`,
-  `index`, `api_key` or `use_managed_identity` with `client_id`, and
-  `field_content`, `field_id`, `field_title`, `field_url`, `field_vector` for
-  the index field names), and records its readiness probe in the audit trail
-  before the first row. The `azure_search` provider is removed from
-  `rag_retrieval`, which now serves Chroma only: YAML that used
-  `provider: azure_search` must move to the new plugin, and
-  `managed_identity_client_id` is now `client_id`. Web-authored pipelines reach
-  a search service only through an operator profile declared in the new
-  `ELSPETH_WEB__AZURE_SEARCH_PROFILES` setting, whose `indexes` pin is
-  mandatory (`"any"` is the explicit opt-out); the endpoint, key and identity
-  never appear in an authored pipeline. This replaces the blanket refusal of
-  managed identity in web pipelines, and the `managed_identity_policy`
-  validation check is removed with it. See the
-  [environment reference](docs/reference/environment-variables.md#azure-ai-search)
-  and the [Container Apps runbook](docs/runbooks/azure-container-apps-cold-install.md).
-- **LLM costs use an explicit billing identity.** Operator profiles can name a
-  `pricing_model` separately from the model used for routing; accounting keeps
-  provider usage and price provenance, and reports an unknown price as
-  unavailable. Azure reasoning deployments now receive the required completion
-  token parameter. Set `temperature: null` on LLM nodes using those deployments
-  so Azure does not reject their row calls.
-- **Web run limits are operator configurable.**
-  `ELSPETH_WEB__EXECUTION_RATE_LIMIT` controls the external-call rate for
-  web-executed pipelines; the default remains 60 calls per minute per service.
-
-- **Web progress survives interrupted connections.** PostgreSQL-backed
-  replicas share Composer progress, run events, WebSocket tickets and rate
-  budgets, and an admitted run can recover after a replica is lost. The Run
-  view also recovers progress after a stream ends while the tab is closed;
-  temporary backend failures reconnect, and stale Composer poll responses
-  cannot roll progress backward.
-- **Coordination deadlines are decided from fresh post-lock database time.**
-  Lease deadlines are now issued after locked admission rather than from a
-  clock sampled before it, and sink-effect clocks are sampled after their lease
-  locks. A deadline derived from a pre-lock reading could be stale by the width
-  of the lock wait, so two workers could disagree about when a lease expired.
-- **A PostgreSQL heartbeat lock timeout is degraded liveness, not failure.**
-  A contended heartbeat no longer fails the run closed; the lock timeout is
-  classified as degraded liveness and retried.
-- **Landscape failures survive transaction unwind.** An invalidated
-  transaction no longer discards the failure that caused it, so the original
-  error reaches the audit trail instead of the rollback's own error.
-- **Blob custody stays fenced across durable effects and recovery.** Collector
-  blob custody and fatal archive failures are preserved, and custody walkers
-  reject null canonical sections rather than treating them as empty. Cleanup
-  metrics no longer expose session or blob identifiers as labels.
-- **Document and storage boundaries fail closed.** Azure safety scans reject
-  rows with no scannable text; Azure Blob reads and CSV writes enforce byte
-  limits, and replayed sink effects bind to the storage account. PDF
-  rasterization rejects missing or duplicate worker pages before emitting
-  results.
-- **Release signing stays under operator custody.** CI workflows no longer
-  bind the judge-metadata signing key. Push checks still require verification
-  and fail closed without it; authoritative verification requires an
-  operator-controlled context.
-- **SSO hardening.** Dormancy is enforced on bound identities, bound profiles
-  refresh, database work is offloaded off the request path, and response
-  streams carry size caps.
-- **Azure Container Apps deployment.** Schema credentials are isolated from
-  the application identity, revision secret bindings are retained across
-  revisions, and Key Vault write authority is confirmed before SQL bootstrap.
-  Acceptance is desktop-only; no live cloud acceptance is claimed. See the
-  [platform reference](docs/reference/deployment-platforms.md#azure)
-  for the Single/sticky configuration and operating limitations.
-- **The composer transcript keeps the planner's key order.** Replayed
-  `set_pipeline` arguments were re-serialised with sorted keys, so on later
-  turns the model saw `sources`, row_union and coalesce branch maps in
-  alphabetical order, although that order is semantic. The transcript now
-  keeps the order the model sent.
-- **Composer approvals bind coalesce branch order and source order.** Two
-  compositions differing only in the order of mapping-form coalesce branches
-  (which decides `last_wins` collision winners) or of the multi-source
-  `sources` map (which decides ingest order) hashed equal, and an advisor
-  sign-off was carried onto the reordered graph. Both orders are now bound by
-  every composer authority hash and the advisor fingerprint (session epoch 67).
-  A planner `set_pipeline` whose row_union branch value is not a string now
-  persists as an argument error instead of failing audit persistence.
-- **Failure reasons identify the check without copying row values.**
-  Coercion, blob parsing, reference joins, web fetches, structured LLM output,
-  retrieval, expressions, gates, source ingestion, and sinks now retain
-  value-free diagnostic categories. Configured field names, literal
-  expression keys, expected/actual types, and stable failure codes remain;
-  dynamically computed keys, URLs, join values, response previews,
-  document key inventories, and invalid blob references do not. Well-formed
-  payload hashes remain where they identify stored content. Row and recorded
-  call payloads retain the underlying data under their own retention policy.
-  Expression failures name their category, such as `missing_key`;
-  missing `%` formatting keys now route through `on_error` or a
-  reference join's `on_miss` instead of crashing. Gates returning an
-  invalid route or type record type, string length where relevant, and the
-  condition without a value preview or digest. A source bypassing number
-  validation still ends the run, with source index, declared field, and
-  error type instead of the invalid number.
-  Dataverse key/binding refusals identify fields and duplicate member
-  ordinals. Encoding and serialization failures identify exception classes.
-  Database constraint diversions retain the driver's structured condition and
-  PostgreSQL constraint name, not SQL or bound values; for example,
-  `unique_violation (UniqueViolation) on constraint orders_email_key`
-  or `SQLITE_CONSTRAINT_UNIQUE`.
+  (`llm_user_prompt_missing`). Existing Composer sessions whose LLM step has
+  no system prompt now fail validation. YAML pipelines are unaffected.
+- **Azure reasoning deployments.** Set `temperature: null` on LLM nodes using
+  those deployments so Azure does not reject their row calls.
+- **New settings.** `ELSPETH_WEB__USER_SECRETS_ENABLED=false` disables
+  user-scoped secrets end to end. `ELSPETH_WEB__EXECUTION_RATE_LIMIT` controls
+  the external-call rate for web-executed pipelines; the default remains 60
+  calls per minute per service. The default `server_secret_allowlist` gains
+  `AWS_BEARER_TOKEN_BEDROCK`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and
+  `AWS_SESSION_TOKEN`.
+- **Finite file sources can opt into recovery from sealed input.** Set
+  `snapshot_for_resume: true` on a single `csv` or `json` source before the
+  original live run. See the
+  [resume runbook](docs/runbooks/resume-failed-run.md).
+- **The "Save for review" gesture is renamed "Share inspect link".** Only the
+  visible name changes.
+- **Web fetches refuse more address ranges by default,** including the IPv6
+  unspecified address and IPv4-embedding and special-purpose ranges.
+- **Failure handling.** A failed coalesce group no longer ends a healthy run
+  with exit 4, and `union_collision_policy: fail` no longer ends the run on a
+  collision. Failure reasons identify the check without copying row values.
+- **Known limit: one local-file sink write of more than about 12,600 rows
+  still stops the run.** The json, csv, text and document sinks record every
+  row's ordinal in the write's recovery evidence, which is capped at 64 KiB.
 
 ### Configuration changes to check before upgrading
 
 These checks have no compatibility path or deprecation window. Some previously
 delivered rows; others failed later, left undecided tokens, or recorded false
-contracts. The behavior summaries above describe the runtime consequences.
+contracts.
 
 | Configuration | Required action or new behavior |
 | --- | --- |
@@ -3197,99 +1764,18 @@ forward the production-path hardening prepared after 0.7.1. It adds
 scope-bound collectors, first-class document and multimodal primitives,
 stronger Composer data contracts and reader-focused review surfaces, a
 contributor-focused repository and Composer training package, and critical
-security and recovery fixes. The notes below intentionally cover only major
-changes and critical correctness or security fixes.
+security and recovery fixes.
 
 **Breaking pre-1.0 schema cutover:** `SESSION_SCHEMA_EPOCH` advances from 35
-to 53. Epoch 36 adds retryable blob-deletion cleanup, epoch 37 adds the
-completed guided-plan decline contract, epoch 38 adds the decline result
-message locator that pins the exact assistant message a decline replays, and
-epoch 39 adds the `policy_blocked` guided-operation failure code so a
-deployment-policy refusal settles as a permanent failure instead of being
-misattributed to the model provider. Epoch 40 makes the explicit coalesce
-`timeout_seconds` key required in persisted proposal payloads, including
-`null`, so epoch-39 sessions fail at startup instead of during guided replay.
-Epoch 41 does the same for the `node_options_summary` key the proposal and
-wiring review cards render, so an epoch-40 session cannot reach a stored
-payload whose projection no longer verifies. Epoch 42 retains the reviewed
-unproducible-output field gap on failed guided operations so retries replay the
-original closed HTTP failure envelope exactly. Epoch 43 adds the
-`run_diagnostics` chat writer principal so run-diagnostics LLM audit rows are
-attributed to their real writer instead of the compose loop. Epoch 44 adds
-the `planner_repair_exhausted` guided-operation failure code so planner
-repair exhaustion settles under its own honest classification instead of the
-provider-blaming invalid-response envelope. Epoch 45 moves web Textract
-authoring onto operator document profiles (ADR-036): sessions authored
-against the removed `bucket_field` projection or the old `deployment` alias
-no longer validate or replay. Epoch 46 makes no SQL-shape change; it advances
-in lockstep with the guided checkpoint schema cut from 10 to 11, whose
-`composer_meta` chat-history entries gain the occurrence-binding `turn_token`
-key so a guided Retry resubmits the exact persisted occurrence it answers
-instead of matching on content. Epoch 47 adds the `auto_commit.revoked`
-proposal-event type so an auto-commit blocked by the settlement-boundary
-trust-mode recheck leaves a durable audit record instead of silently falling
-back to the review path. Epoch 48 adds the `superseded` interpretation-event
-choice so a composition-state commit that extinguishes a reviewed site
-terminally retires the persisted pending review in the same transaction
-instead of leaving a zombie card that gates Run forever. Epoch 49 adds the
-`composition_rejection_events` table so a composer mutation-tool rejection's
-reason — the exact payload the planner saw — persists durably as session
-data instead of reaching the operator nowhere (elspeth-3e28029d2f). Epoch 50
-adds the `proposal.rebased` proposal-event type so a guided settlement that
-carries a still-pending proposal across the checkpoint it writes can move the
-proposal's anchor there and record the move, instead of leaving it anchored to
-a superseded checkpoint — which made the session unreadable through the guided
-route and killed the wire-review "edit this component" affordance
-(elspeth-ed67eb9d0d). Epoch 51 adds the multi-replica coordination substrate's
-schema. Three parts of it are written in production: the persistent
-session-operation authority (fenced, database-clock leases), monotonic
-user-secret row versions, and durable proposal blob-effect receipts. The
-`web_instances` membership table gained its typed writer in 0.8.0
-(elspeth-66a19780b1): every PostgreSQL-backed replica registers itself
-through `WebInstanceMembershipAuthority` after the startup sweeps, under the
-same instance id it fences with, renews its lease from the database clock,
-records `draining` as the first act of shutdown (readiness fails at once)
-and `stopped` after its executor drains; a peer's fence takeover and
-orphan-run recovery join that row before acting on a dead owner. The
-remaining epoch-51 tables — run-start permits, cross-replica
-websocket tickets, rate-limit state and bounded cleanup claims — are schema
-only: no production writer exists yet (follow-ups on elspeth-6f8c1714d5).
-Epoch 50 cannot represent those authorities or receipts and is rejected
-outright; no migration exists. That substrate carried the
-number 44 and then 48 on its original lane and shipped under neither — both of
-those integers already name different schemas on this release line, and the
-epoch sentinel is enforced by exact equality, so one integer must name exactly
-one shape. Epoch 52 carries the pluggable-SSO identity substrate: the auth
-provider discriminator widens from three values to five on both `sessions` and
-`user_secrets`, and the identity, org-tree and workflow-governance tables land
-in the same epoch so the sprint costs exactly one cutover window rather than
-two (elspeth-07cd19ba73). Epoch 53 adds `session_read_admissions`: one row per
-live shareable blob-read admission, written only by the session operation
-authority, so a released or expired read context is refused on its next proof
-instead of keeping read authority until the session is archived or deleted
-(elspeth-f98e0ae8b2); a writer advancing the fence epoch does not invalidate a
-shareable read.
-Landscape `SQLITE_SCHEMA_EPOCH` advances from 29 to 38. Epoch 30 adds durable
-row-union barrier attribution, epoch 31 closes scheduler status over the public
-six-state vocabulary, epoch 32 atomically records aggregation results and their
-ordered members, and epoch 33 adds the composite `(run_id, token_id)` outcome
-access path. Epoch 34 adds the unified-lineage groundwork:
-`token_lineage_frames`, `group_records`, `group_losses`, and journal-carried
-`lineage_path_json`. Epoch 35 retires the legacy fork, expand, and branch
-lineage columns and makes lineage frames and paths the sole lineage truth.
-Epoch 36 adds `coalesce_effects.group_id`, allowing sibling fork groups that
-share a row id to restore their independent merge receipts without a false
-audit-integrity failure. Epoch 37 widens the auth provider CHECK constraints
-on `auth_events` and `run_attributions` to admit `vanguard` and `google`; the
-constraint only widens, but Landscape compares declared CHECK text against the
-reflected constraint structurally, so it is a schema change like any other and
-cuts over in the same service-stop window as session epoch 52 — one window,
-two stores. Epoch 38 gives `scheduler_events` an auto-incrementing `seq`
-primary key that is the authoritative replay order; `event_id` becomes a
-non-unique content digest of the transition. Database-stamped events tie on
-`recorded_at` inside one SQLite second or one PostgreSQL transaction, so the
-old `(recorded_at, event_id)` key replayed them in hash order and two identical
-transitions of one work item in one second collided on the primary key.
+to 53. Epoch 36 adds retryable blob-deletion cleanup; later epochs add the
+multi-replica coordination substrate, the pluggable-SSO identity substrate
+and shareable blob-read admissions. Some of the coordination tables (run-start
+permits, cross-replica websocket tickets, rate-limit state and bounded cleanup
+claims) are schema only: no production writer exists yet.
+Landscape `SQLITE_SCHEMA_EPOCH` advances from 29 to 38. Epochs 34 and 35 make
+lineage frames and paths the sole lineage truth, and epoch 38 gives
+`scheduler_events` an auto-incrementing `seq` primary key that is the
+authoritative replay order.
 
 ELSPETH does not migrate either predecessor database in place before 1.0.
 Archive or export required evidence, stop the old service, recreate stale
@@ -3316,353 +1802,55 @@ and `RuntimeWebLLMProfile` becomes `RuntimeLLMProfile`, with the alias and
 secret-reference regexes promoted to public `PROFILE_ALIAS_PATTERN` and
 `SECRET_REF_PATTERN`. No compatibility aliases or re-exports remain.
 
+### Removed or changed behaviour
+
+- **Bearer tokens from the legacy `oidc` and `entra` providers are held to the
+  same envelope as an ID token:** `exp`, `iat`, `iss`, `sub` and `aud` are all
+  required, with a 60-second clock-skew allowance, so a provider that omits
+  `iat` or `sub` from its access tokens is refused where it was accepted
+  before. The header-driven bearer decoder is removed.
+- **The Cognito access-token mode (`oidc_audience_claim="client_id"`) is
+  removed and refused at startup;** Cognito registers as a confidential client
+  through the SSO profile.
+- **Composer pipeline recipes are removed:** the `list_recipes` and
+  `apply_pipeline_recipe` tools and the five bundled recipe templates.
+  Pipeline structure is authored by the planner through `set_pipeline` and the
+  graph-mutation tools.
+- **Web Textract authoring uses operator document profiles (ADR-036).** Web
+  deployments grant document locations through the operator-declared
+  `aws_textract_profiles` settings section. CLI/YAML `bucket_field` pipelines
+  are unchanged.
+
 ### Major changes
 
-- **Deployment and packaging have maintained production profiles** — the
-  release adds Docker Compose/PostgreSQL and native Linux systemd bundles,
-  retains the AWS ECS acceptance controller, and builds a pinned non-root image
-  with its Web Composer assets and selected dependency extras. A
-  provider-neutral `elspeth doctor` runs deployment readiness checks against a
-  target before it goes live.
-- **The cross-platform deployment contract is stated** — documentation now
-  names the supported set: Docker Compose, AWS ECS, native Linux, one Azure
-  Ubuntu VM, and Kubernetes BYO. A new AWS stack comes from the tracked AWS ECS
-  Terraform cold-install package, while the separate release acceptance
-  controller and the existing-service redeploy path use operator-supplied
-  task-definition ARNs; the Azure Container Apps Bicep bundle ships in
-  `deploy/azure-container-apps/` with provider-scoped receipts, replica > 1
-  probes and runbooks, and its live acceptance on dev hardware is an
-  operator-run step (elspeth-5ec3befc1a) that the support claim waits on.
-- **AWS and PostgreSQL paths align with their production contracts** — Composer
-  can use Bedrock through the AWS default credential chain, the packaged
-  PostgreSQL extra supports both locked SQLAlchemy driver paths, and acceptance
-  evidence is bound before release decisions.
-- **Composer evidence and validation are current-state bound** — durable retries
-  retain provider, prompt, failure, source, and fork evidence, while runtime
-  preflight and approved tutorial execution are keyed to the composition that
-  produced them.
-- **Correlated row unions are first-class Composer topology** — freeform,
-  guided, import/export, validation, and graph surfaces can author and inspect
-  plugin-free, require-all `row_union` barriers that release branch rows
-  unchanged in declared order for long-format processing. Canonical
-  configuration, build, runtime, and guided coverage is present; broader audit,
-  recovery, concurrency, browser-backed round-trip, and scale acceptance
-  remains deferred under the open row-union work.
-- **Forks, expansions, and barriers share one durable lineage model** — tokens
-  carry typed lineage-frame paths, while Landscape records group rosters,
-  settlement, and losses through one set of tables. New `scopes:` and
-  `collectors:` configuration closes expansion groups under explicit
-  `require_all` or `best_effort` policy. Bound-region validation, ordered
-  collector flushing, crash recovery, resume protection, MCP forensics, and
-  freeform and guided Composer authoring all use the same model.
-- **Document and multimodal pipelines gain first-class transforms** —
-  `pdf_rasterize` emits one PNG-and-text row per PDF page through an isolated
-  worker; `blob_json_expand` and `blob_text_expand` turn stored or inline
-  content into bounded row groups; and `reference_join` enriches rows from a
-  configuration-bound reference table. LLM sources and transforms support
-  typed structured output, and LLM transforms can consume bounded
-  payload-store images without persisting image bytes in audit metadata.
-- **Composer exposes data contracts and technical depth deliberately** — known
-  uploaded content supplies `guaranteed_fields`; unverifiable sources receive
-  an explicit user-reviewed data-contract question; and structural preflight
-  findings remain visible while interpretation reviews are pending. A
-  per-user `show_advanced` setting keeps the default interface outcome-focused
-  while retaining technical options, schemas, diagnostics, identifiers, and
-  YAML import behind disclosure.
-- **Composer's reader view uses plain language without hiding forensic detail**
-  — chat cards, Spec routing, run confirmation and history, validation, audit,
-  recovery, blob, and secret surfaces use display names, component
-  descriptions, and humanised reasons by default. Advanced mode exposes raw
-  identifiers and codes as visible secondary text on the main technical
-  surfaces instead of leaving them hover-only; unknown values remain verbatim
-  rather than becoming false prose. The graph, keyboard component list, Spec
-  tab, and decoder share one topology model, dangling routes say
-  `(not connected)`, and keyboard selection moves focus to the component's
-  configuration. GET and PATCH preferences decode against a closed,
-  parity-tested field set so server/client drift fails closed.
-- **The public repository separates contribution guidance from maintainer
-  working state** — `AGENTS.md` is a harness-neutral covenant,
-  `CONTRIBUTING.md` owns durable whole-tree gate guidance, and
-  `docs/maintainer/toolchain.md` describes optional maintainer automation.
-  Active plans and specifications use stable `docs/plans/` and `docs/specs/`
-  paths; implemented plans remain available through git history;
-  project-control registers remain local rather than published; and
-  machine-local provenance, personal identifiers, and the LFS-tracked demo
-  video no longer ship in repository clones. The demo remains available from
-  GitHub Releases.
-- **Project-owned skills and design assets have canonical locations** —
-  reusable agent skills live once under `.agents/skills/`, with compatibility
-  links for `.claude/skills/`, while the branded component library, design
-  tokens, examples, and UI kits live under top-level `design/`. This removes
-  copied skill trees and keeps the `elspeth-design` guidance independent of a
-  particular agent harness.
-- **Composer gains a one-hour training package** — a draft 37-slide,
-  minute-by-minute instructor guide and self-contained HTML deck take new users
-  from Sense, Decide, Act, and Audit through guided and freeform authoring,
-  proposal and decision review, validation, advanced graph shapes, execution,
-  YAML exchange, version history, and review sharing. The deck includes
-  speaker notes, exact UI language, hands-on exercises, and print support.
-- **Textract document locations bind through operator profiles on the web
-  surface** (ADR-036) — the transform gains a static `bucket` + `key_prefix`
-  location mode (mutually exclusive with `bucket_field`), web deployments
-  grant document locations through a dedicated operator-declared
-  `aws_textract_profiles` settings section, and the authoring projection flips
-  from a denylist to an allowlist so `bucket`, `bucket_field`, and `key_prefix`
-  are all web-inexpressible. Profiled runs persist `{profile, relative key}` in
-  AWS call records so operator-private bucket names never reach the audit
-  trail. No database table shape changed. CLI/YAML `bucket_field` pipelines are
-  unchanged.
-- **ADR numbering collisions are repaired** — two ADRs numbered 025 and two
-  numbered 026 are renumbered to `034-audited-inline-blob-content` and
-  `035-audit-hash-raw-vs-stored-asymmetry`, so every ADR number again names
-  exactly one decision. The record now runs 000–048, with 044 and 045 unused.
-  Twelve new ADRs are accepted this release: 032 (validate by trust domain),
-  033 (deferred-intent admission contract), 036 (Textract profile-bound
-  bucket), 037 (interpretation caps govern LLM churn only), 038 (non-terminal
-  ABANDONED path), 039 (unconstrained text framing), 040 (Composer/runtime
-  validation posture), 041 (state-engine supported profiles), 042 (group
-  settlement vocabulary and observability), 043 (project tooling), 046 (audit
-  grade is a product characteristic), and 047 (Landscape database-clock
-  authority). One ships as **Proposed** — 048 (required coordination token for
-  Landscape mutations), whose remaining threading lands in 0.8.1. Both
-  coordination decisions are described below.
-- **Pluggable single sign-on and one identity substrate** (elspeth-07cd19ba73,
-  design in `docs/specs/2026-09-02-pluggable-sso-design.md`) — the web service
-  exchanges the authorization code itself as a confidential client, hands the
-  browser a single-use code in the URL fragment, and resolves every login,
-  local or SSO, to one `identities` row that carries admission and quota.
-  Token validation has one decode path: the accepted signature algorithms are
-  fixed at construction from the identity-provider profile, and the header-
-  driven bearer decoder is removed (elspeth-e8a9973c37). Bearer tokens
-  presented by the legacy `oidc` and `entra` providers are therefore held to
-  the same envelope as an ID token — `exp`, `iat`, `iss`, `sub` and `aud` are
-  all required, with a 60-second clock-skew allowance — so a provider that
-  omits `iat` or `sub` from its access tokens is refused where it was accepted
-  before. The Cognito access-token mode (`oidc_audience_claim="client_id"`)
-  is removed and refused at startup; Cognito registers as a confidential
-  client through the SSO profile. Deleting a local account from the CLI now
-  retires its identity exactly as the web service does, so a re-created
-  username starts with a fresh identity rather than inheriting the old one's
-  admission and quota.
-- **Landscape custody, liveness and takeover decisions read the Landscape
-  database's clock** (ADR-047, elspeth-0ff11aa42e) — every lease deadline,
-  expiry comparison and takeover predicate under `core/landscape`,
-  `core/checkpoint` and the orchestrator used to be decided against whichever
-  process asked: either a `now` the caller passed into the repository verb, or
-  a process clock the repository read for itself. One process per Landscape
-  has one clock, so that was harmless; two or more replicas against one
-  Landscape are not. A replica whose clock runs ahead extends its own leader
-  seat further into the future than its peers believe, one whose clock runs
-  behind judges a live seat expired and takes it over, and nothing in the
-  schema or the fence can detect either, because every predicate compares a
-  stored deadline against a caller-supplied instant. The first leader fence,
-  worker liveness, scheduler leases and dispositions, barrier completion and
-  adoption, source-completion reconciliation, and sink-effect leases now take
-  their "now" from the Landscape database's own `CURRENT_TIMESTAMP` inside the
-  deciding transaction, after the locks that make the decision exclusive —
-  read once and bound into every predicate and deadline of that transaction, or
-  written in SQL at the leader fence itself. The `now` parameter is gone from
-  the coordination API and no injection seam replaces it; the absence of the
-  seam is the safety property. The Landscape and Sessions clocks remain
-  separate authorities that never cross: with the Sessions clock pinned to
-  2040, every Landscape family's written deadline still lands within a second
-  of Landscape database time, and a takeover cannot be won on the foreign
-  clock. Forensic timestamps (`created_at`, `recorded_at`) keep the process
-  clock — they are recorded, never compared.
-- **A Landscape mutation carries the authority it is written under**
-  (ADR-048, restoring ADR-030 D4's fence split; elspeth-43ddb79074) — a
-  mutation verb took `run_id: str`, a plain string minted by whoever called
-  it, so a replica that had lost leadership (evicted, drained, partitioned, or
-  resumed after a pause) still held a valid-looking run id and could still
-  write node states, outcomes, calls and the run's terminal status. Nothing in
-  the signature or the transaction could refuse it, because nothing in the
-  write path carried leadership. **This model is not complete in 0.8.0. It
-  completes in 0.8.1, and ADR-048 stays Proposed until it does.** What ships
-  here is the first tranche of it, and each piece stands on its own:
-  leadership travels as a value into the run-lifecycle, sink-effect,
-  checkpoint and audit-export verbs, which take a required, keyword-only,
-  exactly-typed `CoordinationToken`, put the verify-and-extend leader fence
-  first in the transaction that writes, and derive the run from the token
-  rather than from a second parameter that could disagree with it. A worker's
-  own liveness and departure writes take a distinct owned type,
-  `WorkerMembershipToken`, fenced against that worker's `run_workers`
-  registration in the same verify-UPDATE form so the row lock is held rather
-  than a snapshot read: requiring the leader token there would either stop a
-  follower making writes it legitimately makes, or hand it an authority it
-  does not hold, and one type meaning both would make that confusion
-  unprovable. A refused member write raises `RunMembershipLostError` with no
-  payload written and records a `fence_refusal` carrying no epoch, so the
-  ledger tells it apart from a leader refusal. The data-flow, execution and
-  scheduler repository families carry most of the threading that remains, and
-  a mutation they own is still written under a plain run id until 0.8.1
-  converts it. That remainder is measured rather than drifting: the four
-  frozen caller inventories are green, and the fencing gate names each
-  outstanding site instead of failing the build on it.
-- **Composer pipeline recipes are removed** — the `list_recipes` and
-  `apply_pipeline_recipe` tools, the five bundled recipe templates, and the
-  slot-schema contracts behind them. The server-side prose-to-recipe matcher
-  had already been excised; what remained shipped two tool declarations in
-  every composer request and, across 141 sessions and 707 tool calls,
-  produced no pipeline. The `recipe.index` planner information class is
-  retired with them — it was still advertised to the planner as discoverable
-  while no tool could resolve it. Pipeline structure is authored by the
-  planner through `set_pipeline` and the graph-mutation tools, per the
-  standing composer invariant that the LLM does the job.
+- **Deployment profiles.** The release adds Docker Compose/PostgreSQL and
+  native Linux systemd bundles, retains the AWS ECS acceptance controller, and
+  adds a provider-neutral `elspeth doctor` for deployment readiness checks. A
+  new AWS stack comes from the tracked AWS ECS Terraform cold-install package;
+  the Azure Container Apps Bicep bundle ships in
+  `deploy/azure-container-apps/`.
+- **One durable lineage model.** Forks, expansions and barriers share typed
+  lineage-frame paths, and new `scopes:` and `collectors:` configuration
+  closes expansion groups under explicit `require_all` or `best_effort`
+  policy. Correlated `row_union` barriers are first-class Composer topology.
+- **Document and multimodal transforms.** `pdf_rasterize`, `blob_json_expand`,
+  `blob_text_expand` and `reference_join` are added, and LLM sources and
+  transforms support typed structured output.
+- **Pluggable single sign-on and one identity substrate.** Every login, local
+  or SSO, resolves to one `identities` row that carries admission and quota.
+- **Landscape coordination.** Custody, liveness and takeover decisions read
+  the Landscape database's clock (ADR-047). A Landscape mutation carries the
+  authority it is written under (ADR-048): the run-lifecycle, sink-effect,
+  checkpoint and audit-export verbs take a required `CoordinationToken`. This
+  model is not complete in 0.8.0: the data-flow, execution and scheduler
+  repository families still write under a plain run id, and completion is
+  targeted for 0.8.1.
+- **Critical fixes** include: blob deletion cleanup remains retryable after
+  metadata commit, every token reaches a lifecycle answer when a run dies
+  (ADR-038), and generated multiline text is no longer silently discarded
+  (ADR-039).
 
-### Critical fixes
-
-- **Commit-disclosure correction (audit trail):** two 2026-08-07 commits
-  carry production fixes their subjects do not mention, an artifact of
-  concurrent agents staging broadly on a shared checkout. `6106365b9`
-  ("test(value_transform): …") also lands `_edge_field_type_conflict` in
-  `web/composer/state.py` — the whole of elspeth-f2eb8fef9f, the Stage-1
-  edge field-type conflict check. `2b4bbeb29` ("fix(composer): record the
-  preflight verdict…") also lands the Stage-2 accumulate-both-verdicts fix
-  in `core/dag/schema_validation.py` plus its integration test. Both fixes
-  are real and independently verified; this entry restores their
-  discoverability for `git log`/`blame` readers.
-- **Blob deletion cleanup remains retryable after metadata commit** — the
-  session store retains the exact staged tombstone until its unlink and parent
-  directory fsync both succeed, allowing direct and failed-fork cleanup to
-  resume safely after a process restart.
-- **Untrusted model and provider data stays inside its trust boundary** —
-  bounded ingress, source custody, protected-field propagation, and audit
-  redaction keep provider, pipeline, and tool payloads out of unapproved
-  surfaces.
-- **Guided source custody fails closed without bricking the session** — custody
-  correlation now uses raw source state before generic redaction, eliminating
-  false mismatches on fork-rehydrated sources. Exited and completed sessions
-  whose retained review no longer binds remain readable through a fully masked
-  `custody_unavailable` projection instead of a 500, without exposing private
-  source paths. Active writes are rejected inside the composition-state
-  transaction before the tip advances, legacy invalid tips return a named 409,
-  and guided re-entry refuses before settlement while leaving the reviewed tip
-  available for recovery by reverting to a bindable version. A byte-stability
-  corpus protects every previously valid projection and stored guided-response
-  hash.
-- **A wired secret requires both destination authorization and user approval**
-  — the server denies every secret-to-plugin-option wiring unless a
-  deployment rule matches the exact destination. Immediately before execution,
-  the authenticated caller must acknowledge the disclosed wiring set with a
-  token bound to the exact composition; planner prose and Composer tool calls
-  cannot approve it. Redirected and error-path `web_scrape` URLs are also
-  fingerprinted before they reach rows or audit evidence.
-- **Build and Composer preflight reject contracts the runtime cannot satisfy**
-  — validation follows declared value-preserving paths through observed
-  producers, treats every `field_mapper` mapping source as a required input,
-  derives environment-placeholder protection from each plugin's
-  output-affecting options, and asks the publication authority which nodes
-  require mandatory controls. Pipelines that previously validated and then
-  failed every row now stop before execution with an attributable remedy.
-- **Composer's review surfaces reflect the actual graph and run data** — CSV
-  previews honour quoting, coalesce diagrams and text alternatives show every
-  inbound branch, missing output records carry an explanation, guided replies
-  may retain several deferred intents, and advisor and share messages
-  distinguish pending review, withheld prose, skipped checks, and terminal
-  verdicts.
-- **Composer preflight cannot silently reuse stale meaning** — the runtime
-  preflight cache is keyed by composition content, including unsaved state.
-- **Every token reaches a lifecycle answer when a run dies** (ADR-038) — a
-  contract violation raised mid-load previously stranded its buffered tokens
-  at `closure='open'` on a run no resume could recover. Non-resumable runs now
-  record `(outcome=NULL, path=ABANDONED)` inside the fenced terminal
-  transaction, accounting separates abandoned from pending tokens, and closure
-  gains an `abandoned` state. Resumable runs keep buffered tokens honestly
-  open.
-- **Resume advice matches the gate resume enforces** — `can_resume` evaluates
-  the same source-lifecycle gate as `resume()`, and the CLI suggests resuming
-  after an interrupt only when that gate says it can succeed.
-- **Authentication and deployment state fail closed** — local auth files,
-  external identity keys, token expiry, JWT secrets, deployment roots, and ECS
-  PostgreSQL transport must pass their admission checks before use.
-- **Generated multiline text is no longer silently discarded** (ADR-039) — the
-  `text` sink refuses any value carrying a CR or LF record separator, so an LLM
-  answer spanning paragraphs was diverted row by row and published as a
-  zero-byte artifact while the run reported success. A producer whose framing
-  cannot be decided statically now declares `TextFraming.UNCONSTRAINED` rather
-  than abstaining, which turns that composition into a build-time contract
-  conflict instead of a runtime diversion. A new `document` sink publishes a
-  single unframed value, and the `line_explode` and `report_assemble` remedies
-  the refusal names are authorized on the web surface, so the repair it
-  recommends is one the Composer can actually take.
-- **A doubly-violating sink edge states both verdicts, not whichever raised
-  first** — a sink can simultaneously miss a required field and refuse an
-  undeclared one, and only the extras half used to survive. Its remedies
-  ("add the extra fields", "relax to flexible", "drop the extras") cannot
-  supply a field nothing guarantees, so the author — often an LLM authoring
-  loop — was handed a repair that leaves the graph invalid. Both verdicts are
-  now accumulated into one error carrying both field sets.
-- **A locked consumer narrower than what its upstream provably delivers is now
-  a build-time error** — a `mode: fixed` schema admits exactly its declared
-  fields, and edge validation now checks that lock against every field the
-  graph proves the producer delivers (`guaranteed_fields`), not only against
-  the fields the producer's own schema declares. Pipelines that previously
-  validated green and then killed every row at the consumer's input preflight
-  — a pass-through transform forwarding more than it declares, or a union
-  coalesce merging under-declared branches — are rejected at build with both
-  field lists, and the Web Composer reports the same verdict at authoring time
-  (its guarantee walk now sees through union coalesces instead of abstaining).
-  Narrowing a wide stream on purpose needs a projection, not a schema edit:
-  insert a `field_mapper` with `select_only: true` ahead of the locked
-  consumer — declaring fewer fields on the consumer cannot drop fields an
-  upstream guarantees will arrive.
-- **A guarantee-forgiven field with a conflicting ancestor type is now a
-  build-time error** — the guarantee channel proves a field's presence without
-  its type, so a consumer-required field the producer never declared used to
-  pass build on presence alone even when an ancestor DID type it (a `fixed`
-  source declaring `id: int` four nodes upstream) and the consumer demands an
-  incompatible type (`id: str`): the build stayed green and every row died
-  typed at the consumer's input preflight. Edge validation now walks the
-  guarantee topology for the nearest ancestor declaration and rejects on a
-  unanimous, concrete, incompatible type — the same verdict declaring the
-  field on the producing branches would have produced, attributed to the
-  declaring node. Where the type is genuinely unknowable (observed ancestors,
-  `any` declarations, branches that disagree) the forgiveness stands and the
-  per-row preflight keeps the verdict. Re-typing a stream on purpose needs a
-  declared conversion: insert a `type_coerce` transform declaring the target
-  type in its `schema.fields` ahead of the consumer. In support of this,
-  `type_coerce` with a declaring (non-observed) schema now includes its
-  conversion targets in its output schema declaration even when the input
-  schema omits them — the transform rewrites those fields' types either way,
-  and leaving the rewrite undeclared hid it from build-time validation (and
-  from this check's ancestor walk, which would otherwise enforce a stale
-  upstream type in both directions).
-- **A deposed leader could still clear the barrier markers its successor had
-  just set** (elspeth-ee18e446ff) — `reset_adoption_marker_to_pending`, the
-  crash-window recovery that clears `barrier_adopted_epoch` on BLOCKED coalesce
-  rows so the new leader's first intake re-adopts them properly, ran on a bare
-  write transaction. Its own docstring argued it needed no epoch fence because
-  a concurrent old-leader adoption attempt would fail the CAS — but that CAS
-  guards a different verb, and this one has none, so nothing it did was
-  protected by the sentence excusing it. One takeover is enough to break it: a
-  leader still inside journal restore, whose lease has lapsed and whose seat a
-  successor has taken, reaches the write with nothing to refuse it and clears
-  the markers under a live successor, leaving no refusal record. The second
-  instance is worse — leader A stalls in restore, B takes the seat at the next
-  epoch and begins adopting, and A's in-flight restore then resets exactly the
-  markers B has just set. The verb now takes the leader token and fences
-  first, so a deposed epoch is refused with zero mutation of the marker and a
-  durable `fence_refusal`; an empty work-item list still returns before the
-  fence, because there is no database effect to fence.
-- **Blob custody holds its own PostgreSQL advisory-lock class** — the
-  session-level lock a blob write holds across its reservation, file write and
-  finalize (`_blob_custody_session_lock`) now uses
-  `ELSPETH_BLOB_CUSTODY_LOCK_CLASSID` (`0x424C4F42`, "BLOB") instead of
-  sharing `ELSPETH_SESSIONS_LOCK_CLASSID` with the session-operation fence.
-  Session- and transaction-level advisory locks share one lock space, so
-  under the shared class every fence acquire, renew and release on a session
-  queued behind that session's filesystem persistence; on a multi-replica
-  deployment a renew starved past the lease window becomes a spurious
-  takeover. The transaction-scoped phase locks inside the reservation and
-  finalize transactions keep the sessions class. Pinned by the PostgreSQL
-  proof that a lease renew completes while a blob persist for the same
-  session is paused inside its rename
-  (`tests/testcontainer/web/test_blob_custody_lock_isolation_postgres.py`).
-  The class is internal to PostgreSQL advisory locking: no schema, bundle or
-  operator action. Replicas of different versions serialise custody on
-  different keys; every maintained platform's rollout contract is zero-overlap
-  replacement (`docs/reference/deployment-platforms.md`), and an overlap of
-  old and new replicas is outside it. elspeth-ee9861baf6.
+---
 
 ## 0.7.1 - 2026-07-23 (Recoverable effects and Composer proposal-validation coverage)
 
@@ -3680,1999 +1868,141 @@ stop the old service, recreate stale session and Landscape stores, then install
 0.7.1. Do not roll older code back over the recreated databases; keep the
 service drained and repair this release forward.
 
-### Major changes
-
-- **Durable, replay-safe external effects** — built-in file, object, database,
-  Dataverse, and Chroma sinks now reserve and persist an immutable publication
+- **Durable, replay-safe external effects.** Built-in file, object, database,
+  Dataverse, and Chroma sinks reserve and persist an immutable publication
   plan before external publication, fence the active worker, and reconcile
   uncertain outcomes before retrying. Audit exports use the same effect
-  coordinator and sealed snapshots. The protocol prevents a crash or lost
-  response from silently duplicating publication; an unprovable result remains
-  explicitly blocked. Operators resume a recovered export with
+  coordinator. Operators resume a recovered export with
   `elspeth export-resume <run-id> --execute`; see the
   [sink-effect recovery runbook](docs/runbooks/sink-effect-recovery.md).
-- **Shared Composer proposal and validation contract** — guided-staged
+- **Shared Composer proposal and validation contract.** Guided-staged
   authoring covers seven of nine maintained parity fixtures through the
   shared proposal and validation contract used by freeform and guided-full
   authoring.
-  The current code-proven limitations are cross-sink write-failure fallback and
-  require-all coalesce; freeform and guided-full can author those shapes. A
-  candidate remains separate from committed state until review and wire
-  confirmation, and closed rejection codes feed bounded, auditable repair
-  rather than silent replanning.
-- **Durable Composer operations** — guided planning, start admission, failed
-  operation evidence, fork replay, and proposal confirmation are persisted and
-  fenced. Competing mutations receive a fast conflict, stale responses settle
-  without overwriting newer state, and every planner attempt records its final
-  disposition.
-- **Supported AWS ECS runtime profile** — the release adds a lean Fargate web
-  image, validate-only startup and deployment doctor, Aurora PostgreSQL, EFS,
-  task-role S3 access, Bedrock provider and guardrails, Cognito authorization
-  code with PKCE, plus CloudWatch and X-Ray telemetry. See the
+- **Supported AWS ECS runtime profile.** See the
   [AWS ECS deployment runbook](docs/runbooks/aws-ecs-deployment.md).
-- **Principal-bound web plugin policy** — catalog, Composer, import,
-  validation, execution, and delayed export now use one auditable plugin-policy
-  snapshot. Operator profiles expose approved Azure or AWS model controls
-  without writing private provider bindings into pipeline state.
-- **First-class structural queue and text endpoints** — queues can fan multiple
-  upstream routes into one downstream node without merging records, while text
-  joins CSV and JSON as a supported source and atomic sink format.
+- Also: durable Composer operations, a principal-bound web plugin policy, and
+  first-class structural queues and text source and sink endpoints.
 
-### Critical fixes
-
-- **Crash recovery no longer repeats completed sink or export work** — durable
-  effect streams, ordered members, target-side ledgers, remote spooling, and
-  exact reconciliation close the publication gap between external success and
-  local acknowledgement. Failsink members retain the exact primary effect that
-  produced them.
-- **State-engine transitions are atomic at crash and contention seams** —
-  source completion, child scheduling, aggregation continuation, coalesce
-  completion, routing decisions, batch membership, and terminal outcomes now
-  persist with their controlling state transition. Run-scoped ownership and
-  lease fencing prevent cross-run or stale-worker mutation.
-- **Composer cancellation and concurrency cannot wedge a session** — aborted
-  freeform or guided turns settle before durable resynchronisation; startup
-  waits for backend timing; fork quota failures replay as stable HTTP 413; and
-  concurrent guided submissions settle as retryable conflicts instead of
-  queued duplicate work.
-- **DAG contracts propagate through routing and barrier nodes** — nested
-  pass-through fields, pure-routing gates, queue fan-in, fork destinations, and
-  coalesce union guarantees now reach downstream validation in graph order.
-  The fixes prevent valid graphs from being rejected and invalid sink contracts
-  from reaching execution.
-- **Security-sensitive failures remain inside their trust boundary** — provider
-  error text and blob redirect URLs are redacted from audit data, unknown LLM
-  providers return closed rejection codes, remote OTLP endpoints require TLS,
-  malformed ODBC brace syntax fails closed, and auth state compensates when its
-  audit write cannot be persisted.
 ## 0.7.0 - 2026-07-09 (LLM-primary guided pipeline creation)
 
-Guided pipeline creation becomes LLM-primary. The guided composer is
-reworked so each stage of a pipeline — source, then sink, then transforms,
-then the final wiring — is driven by a language model through the
-`/guided/chat` endpoint, which applies the model's proposed change to the
-in-progress pipeline in place rather than asking the operator to author
-plugin options by hand. A revise mode reopens a committed stage and amends
-it against its current state, and the flow terminates at a new wiring stage
-whose completion is gated by an advisor sign-off. Current user-facing guidance
-lives in `docs/release/composer-guide.md`; implemented design records were
-removed from the active public docs tree, with git history remaining the public
-provenance record and maintainers optionally preserving local ignored archives.
-
-The web session database and Landscape audit database both reset on upgrade:
-`SESSION_SCHEMA_EPOCH` advances to 26 and `SQLITE_SCHEMA_EPOCH` advances to
-22. The audit schema now run-scopes `routing_events` with composite state/edge
-foreign keys so routing decisions cannot cross audit-run boundaries. The
-untagged 0.6.1 maintenance line is folded into this release rather than tagged
-separately (the same precedent as 0.5.4 into 0.6.0).
-
-### Added
-
-#### LLM-primary staged guided pipeline creation
-
-- **Each guided stage is built by a language model through `/guided/chat`**
-  — the guided composer drives source, sink, transform, and wiring as
-  ordered stages; at each stage the model interprets the operator's chat and
-  applies the resulting change to the in-progress pipeline in place, instead
-  of the operator hand-authoring plugin options. The source, sink, and
-  transform drivers accept the current node so a committed stage can be
-  revised, and a revise-mode addendum carries the prior stage state into the
-  model's context (`revise_context`). The free-text sink driver auto-drops
-  its wrapper, and a source driver routes a URL-row source to the web-scrape
-  recipe.
-- **`WorkflowProfile` value type** — a new closed-enum profile is threaded
-  through guided-session bootstrap and persisted on `GuidedSession`,
-  distinguishing a tutorial walk from an ordinary guided session. It is
-  surfaced on every `GuidedSessionResponse` (via a `WorkflowProfileResponse`
-  field), mirrored onto the TypeScript `GuidedSession`, seeded by a new
-  idempotent `POST /guided/start` entry endpoint, and stripped on fork so a
-  tutorial profile cannot leak into a forked session.
-  `GUIDED_SESSION_SCHEMA_VERSION` advances 5→7 across the release.
-- **`STEP_4_WIRE` wiring stage with a confirm-wiring contract** — a terminal
-  wiring stage is added to the guided order; it rebuilds the pipeline edges
-  from the model's connection labels, renders them with a contract overlay,
-  and is gated by an explicit `CONFIRM_WIRING` payload with pinned
-  required/nested keys. An invalid confirm re-emits the wire turn rather than
-  completing, and a stale terminal stamp is cleared on a wire redirect.
-- **Advisor sign-off authority at the wire stage** — a persisted-counter-
-  bound wire sign-off runner gates the `STEP_4_WIRE` terminal on an advisor
-  checkpoint (`run_signoff_checkpoint`), with a sign-off verdict classifier,
-  differentiated sign-off audit names, fail-closed handling of blocked
-  findings, and a whole-pipeline `REQUEST_ADVISOR` escape that re-emits —
-  never auto-completes — the wire turn. The advisor pass counter is
-  persisted on the guided session, and an optimistic-concurrency
-  `step_index` 409 guards a guided respond against a lost update.
-- **Pending-interpretation gate in the guided flow** — guided sessions
-  project pending interpretation cards (invented source, pipeline decision,
-  …) at the persist seam and block advancement until they are resolved,
-  extending the interpretation-surfacing model into the guided flow with a
-  backend run-tier backstop.
-#### Guided mode reframed as a conversational builder
-
-- **A docked chat paired with an always-visible verification panel** — the
-  guided surface is reworked into a docked chat conversation paired with an
-  always-visible verification panel: a plain-language gloss and a validation
-  summary sit above the live pipeline graph so the operator can read what the
-  model built as it is built, with a `ComposingIndicator` during the build.
-- **Read-only interpretation decision cards with a View→Approve gate** — each
-  interpretation decision renders as a read-only summary card that leads with
-  the model's own rationale, carries an `Explain` button backed by grounded
-  advisory context, and gates advancement behind a two-stage View→Approve
-  acknowledgement over a card stack.
-
-#### Always-on prompt-shield review
-
-- **Prompt-shield review is now always-on** — the previously advisory
-  (RC5.2-demoted) prompt-shield review is made always-on, with its State A
-  decoupled and a three-state (A/B/C) shield-state helper plus an
-  availability resolver; the B-vs-C shield refinement is wired into the
-  confirm-wiring route, where the repair turn stages the fail-safe shield
-  C-draft.
-
-#### Passive first-run tutorial — synthetic web-scrape recut
-
-- **Canonical first-run scenario retargeted to web-scrape extraction** — the
-  hello-world tutorial now teaches source→transform→sink by having a model
-  rate a set of synthetic government-style pages, over a deterministic
-  synthetic-sample URL backed by an SSRF resolver; the staging rubric harness
-  is retargeted to match, with assumption and shield-override teaching-moment
-  copy. The tutorial runs as a staged guided walk through
-  `TutorialGuidedShell` (a welcome bookend wrapping an embedded guided
-  `ChatPanel`) with prepopulated, locked stage prompts, and never falls
-  through to the freeform composer body.
-- **Tutorial wired to public GitHub Pages** — the scrape pages are served
-  from public GitHub Pages rather than synthetic in-app pages, and the
-  tutorial uses the DTA abuse contact rather than a personal dev domain.
-- **`allowed_hosts` SSRF slot on the web-scrape recipe** — an optional
-  `allowed_hosts` slot is added to the web-scrape recipe as an SSRF
-  enforcement boundary (not a slot-inaccessibility control), with the
-  tutorial-sample GET surface injecting the allowed host at the accept seam
-  and a blank `tutorial_sample_base_url` rejected at config time.
-- **Five-input tutorial cache key** — the tutorial cache key now folds the
-  staged guided skill hash and the recipe-catalog content hash
-  (`guided_staged_skill_hash`, `recipe_catalog_content_hash`) alongside its
-  existing inputs, so a change to either the staged skill or the recipe
-  catalog invalidates a stale tutorial build.
-- **Tutorial workspace promoted to the guided layout and relaid out** — the
-  first-run tutorial adopts the guided layout as its canonical shell: a
-  freeform-parity conversation column, an action-zone decision surface, and a
-  320px artifact rail, with the guided composer docked at the bottom to match
-  the live composer. The tutorial can be reset from preferences at any time,
-  and its stage is now persisted so a mid-tutorial reload resumes at the saved
-  stage — including post-run — rather than restarting at the welcome bookend
-  (backed by the new `user_preferences` tutorial-resume columns; see
-  Operational).
-
-#### Azure Document Intelligence enrichment transform
-
-- **`azure_document_intelligence` enrichment transform** — a new transform
-  plugin enriches rows by sending a document to Azure AI Document
-  Intelligence and folding the extracted layout/content back onto the row. It
-  is registered under the `azure_document_intelligence` plugin name and
-  declared as an external-call boundary in the audit-readiness expectations,
-  with fail-closed page-count handling and host:port pinning on its endpoint.
-
-#### Blob-backed document ingestion transforms
-
-- **`blob_fetch` transform** — a new HTTP(S) fetch transform stores an
-  operator-authorised remote document in the run payload store and emits a
-  blob reference plus fetch metadata (`content_type`, `size_bytes`,
-  `sha256`, HTTP status, final URL, and final resolved IP). The transform is
-  an external-call audit boundary, uses the existing SSRF-safe HTTP client,
-  requires wire-visible `abuse_contact` and `fetch_reason` headers, and keeps
-  the accepted file surface behind an explicit content-type allowlist for
-  text, CSV, JSON/JSONL, and XML payloads.
-- **`blob_csv_expand` transform** — a new row-expansion transform reads a
-  payload-store CSV blob and emits one output row per CSV data row while
-  preserving the upstream row, so URL/document identifiers continue to
-  disambiguate rows after expansion. It supports header normalization,
-  explicit columns for headerless CSVs, field mappings, row-index emission,
-  blob-size and row-count limits, and schema-contract propagation for the
-  expanded rows.
-- **Web/composer integration for blob workflows** — guided composer guidance
-  now treats remote document ingestion as a manifest source followed by
-  `blob_fetch` and a parser transform, not as a new source plugin. Web
-  execution validation applies the same public-only SSRF policy to
-  `blob_fetch` as `web_scrape`, audit-readiness now classifies parser
-  transforms with `Determinism.IO_READ` as boundary surfaces, and
-  `examples/blob_transforms/` demonstrates both offline CSV blob expansion
-  and an opt-in hosted tutorial HTML fetch.
-
-#### ELSPETH design system and marketing website
-
-- **Typed React primitive library (`components/ui`)** — a typed primitive
-  library (Button, Card, Input, Textarea, Tabs, AlertBanner, StatusBadge,
-  TypeBadge, WordMark) lands under
-  `src/elspeth/web/frontend/src/components/ui/`, font weights and wordmark
-  tracking are tokenized, and `LoginPage` is migrated onto the primitives as
-  an exemplar.
-- **Standalone marketing website (`website/`)** — a static, design-token-
-  based marketing site is added at `website/`, separate from the application
-  frontend, and hardened for public release: the example pipeline YAML uses
-  the real secret-reference syntax (`${VAR}` for the CLI, `{secret_ref: NAME}`
-  for the Composer) so a published example runs as written; the data-source
-  list, the two authoring modes, and the Web Composer on-ramp (`elspeth web`)
-  are reconciled against the source tree; WCAG 2.1 AA contrast and Level-A
-  semantics (skip link, `<main>` landmark, heading order, native data tables)
-  are added; the icon set is vendored locally in place of a third-party CDN;
-  and the colour theme follows the operating-system preference and persists
-  across pages.
-
-#### CLI and TUI inspection
-
-- **Machine-readable plugin catalog inspection** — `elspeth plugins list
-  --format json` and `elspeth plugins inspect <source|transform|sink> <name>
-  --format json` expose catalog descriptions, config fields, JSON Schema, and
-  Composer knob schema for automation and docs tooling.
-- **Graph-backed `elspeth explain` TUI** — the lineage explorer now renders a
-  selectable run/branch/node/token/status tree from recorded graph edges,
-  including branch labels, repeated DAG joins, focused evidence views, refresh,
-  and non-interactive `--no-tui` / `--json` fallbacks.
-
-#### Web Composer auth and local user operations
-
-- **Local Composer user-management CLI** — `elspeth composer users add` and
-  `elspeth composer users remove` manage `data/auth.db` without requiring
-  operators to run Python snippets against `LocalAuthProvider`.
-- **Email-verified local registration mode** —
-  `ELSPETH_WEB__REGISTRATION_MODE=email_verified` creates pending local users,
-  writes one-use verification links to `data/email-verifications.jsonl`, and
-  activates users through `/api/auth/verify-email` / `?verify_token=...`.
-  Non-local deployments must set `ELSPETH_WEB__PUBLIC_BASE_URL`.
-
-#### Release review tooling
-
-- **Codex panel-review foundation** — `scripts/codex_panel_review.py` adds a
-  single-file, multi-lens SME review runner with strict structured findings,
-  cache-friendly prompt layering, dry-run/cache-hit reporting, and a
-  fail-closed evidence gate for unanchored findings.
-
-### Changed
-
-- **Composer routes decomposed into an area package** — the monolithic
-  `routes/composer.py` is decomposed into a `routes/composer/` area package,
-  splitting the route module without changing its HTTP surface.
-- **Release documentation cleanout completed** — the remaining implemented
-  plans and design specs under `docs/plans/`, `docs/plans/`, and
-  `docs/specs/` were removed from tracked active docs while
-  keeping `docs/` focused on current user, operator, architecture, and release
-  documentation. Maintainers may preserve the removed files in a local ignored
-  archive; public provenance remains available through git history.
-- **Explicit `ProcessorMode` and a public follower-drain surface** — the
-  engine's leader/follower processor mode is made an explicit value and the
-  follower drain is promoted to a public surface, replacing the previous
-  implicit mode selection so the run coordinator's behaviour is legible at the
-  seam rather than inferred.
-- **Dead `aggregation_boundaries` checkpoint knob removed** — the unused
-  aggregation-boundaries checkpoint configuration option is deleted from the
-  config surface (pre-release tech-debt removal; there is no data to migrate).
-- **Dynamic attribute probes replaced with explicit contracts** — the
-  remaining `hasattr`/fallback attribute probing is removed across provider
-  response parsing, export sink shape handling, plugin lifecycle attributes,
-  journal platform checks, composer trust seams, and web route application
-  state; each site now declares the contract it relies on and fails closed
-  when that contract is not met. Provider response parsing keeps to data-only
-  reads while still mapping Pydantic extra fields, so provider token counts,
-  costs, and cache-usage siblings remain captured.
-
-### Fixed
-
-Assorted engine, web, and frontend correctness fixes land alongside the
-headline work.
-
-- **Run/session durability and liveness** — the run-event replay cursor is
-  made durable; follower liveness is forced per claim and unregistered
-  claimants are fenced; session quota writers are serialized; a dependency
-  settings-hash snapshot is taken before a run; empty assistant audit rows
-  are rejected; and coalesce-branch sink collisions are rejected.
-- **Composer and guided robustness** — dynamic-source-from-chat resolves to a
-  committable inline source; blob source names are validated; guided audit
-  payload refs are persisted; the guided source-chat resolver is guarded;
-  tutorial runs are rate-limited; stale guided default entries no longer
-  break the frontend; and a completed guided wizard no longer re-fires on
-  remount.
-- **Provider and MCP boundary hygiene** — OpenRouter preflight response
-  bodies are validated and a stale catalog is cleared on a failed refresh;
-  MCP enum tool arguments are validated, malformed mutation validation is
-  deferred, and runtime preflight summary operations are counted; malformed
-  `Content-Length` is rejected; and non-standard HTTP status codes are
-  audited.
-- **Catalog, config, and allowlist** — aliased plugin knobs surface under
-  their user-facing alias; env schema option overrides are normalized; and a
-  dangling allowlist `allow_hits` entry degrades to skip-and-warn instead of
-  crashing the run.
-- **Engine fail-closed hardening** — a wave of integrity fixes make the run
-  engine refuse to proceed on ambiguous state rather than silently guess:
-  `resume()` re-verifies checkpoint currency and topology at entry; checkpoint
-  writes, the heartbeat, and best-effort transforms fail closed on Tier-1
-  integrity errors; coalesce journal restore fails closed on unknown or
-  overlapping branches; unmapped traversal nodes fail closed via an explicit
-  structural allowlist; scheduler disposition writes are membership-fenced;
-  transform-error audit is recorded before terminal completion; diverted sink
-  anchors are closed when the primary audit fails; `PENDING_SINK` replay
-  preserves the persisted error hash; and condition-trigger fire times are
-  sampled at observation rather than backdated.
-- **Guided and tutorial front-end robustness** — the guided chat seam gains a
-  discriminator, self-heal, and reload-resume; a dead resume session is
-  recovered and the tutorial runs once rather than re-firing on remount;
-  advisory replies reject tool-scaffold leaks and clamp the decision headline;
-  assistant markdown renders in the flat transcript; and the wire-stage
-  advisor dead-end is closed.
-- **Chat and node-config layout tamed on wide displays** — chat bubbles are
-  held to a centred reading column and the node-config inspector stacks its
-  option rows, so neither sprawls edge-to-edge on a wide viewport.
-- **YAML export/import round-trip fidelity** — a pipeline exported to YAML and
-  re-imported preserves its `source_blob_ids` sidecar and reattaches the
-  guided `blob_ref` without leaking a filesystem path; export is unblocked for
-  secret-bearing pipelines; and the import path is hardened against pasted
-  input.
-- **Validation-error legibility** — a pydantic missing-source / missing-sink
-  error is reframed into novice-facing copy at settings-load, and chat
-  validation-failure injections are humanised through a store-safe frontend
-  module (`validationHumaniser.ts`).
-- **Secret-field heuristic false positives** — structural field names that
-  merely end in `_key` (`data_key`, `alternate_key`) are exempted from the
-  secret-field heuristic by exact name, so a JSON source's `data_key` or a
-  Dataverse sink's `alternate_key` is no longer misclassified as a credential.
-- **Sink, provider, and HTTP correctness** — CSV sink stringification
-  `ValueError`s propagate instead of being swallowed; non-string Chroma
-  required fields are diverted; generic Dataverse 4xx responses fail closed;
-  lost-branch union schema fields are tolerated; absolute-path SQLite DSNs keep
-  their slash count through sanitization; and `AuditedHTTPClient` no longer
-  double-decompresses gzip bodies.
-- **Silent-degradation paths converted to structured failures** — the
-  FAILED-resume counter baseline handles only database `OperationalError`, so
-  other audit corruption signals propagate instead of degrading to partial
-  counters; race-created journal parent directories are verified owner-only
-  through a symlink-refusing check rather than skipping enforcement when the
-  directory already exists; catalog plugin-schema parsing is extracted into a
-  typed parser so a malformed plugin schema can no longer under-detect
-  required secret fields; guided respond reads required turn-response keys
-  directly so schema drift crashes instead of silently evaluating to
-  `False`; and guided-session payloads serialized before the
-  `on_validation_failure` field existed are refused at session rehydrate
-  rather than silently defaulted (pre-release session stores are recreated
-  at deploy).
-
-### Security
-
-A large trust-boundary hardening body lands in this release. The fixes keep
-tool arguments, provider diagnostics, and audit anchors from leaking caller
-data or being forged, and tighten transport and endpoint authentication.
-
-- **Declarative redaction of composer tool arguments and responses** — source
-  option values, recipe slots, set-pipeline options, blob-discovery extra
-  arguments, advisor unknown arguments, and unexpected mutation tool
-  arguments are redacted before they reach an audit record or a model. CSV
-  header-mismatch evidence is redacted; advisor and OpenRouter provider /
-  diagnostic errors are redacted before LLM evaluation; exception redaction
-  is preserved through the operation audit; MCP preflight crash errors and
-  Azure managed-identity auth failures are sanitized; and embedded PEM key
-  blocks are redacted.
-- **Forged audit anchors blocked** — forged or operator-anchored LLM audit
-  anchors are rejected, so a model cannot inject a counterfeit audit
-  reference; the HTML fragment separator is escaped and file-output audit
-  URIs are encoded.
-- **Transport and endpoint authentication tightened** — websocket
-  authentication moves from a JWT-in-query parameter to tickets; HTTPS is
-  required for bearer and OpenRouter endpoints; the Prometheus metrics
-  endpoint requires authentication; managed-identity RAG configs are blocked;
-  blob mutations are gated behind approval; recovery execution is bound to
-  reviewed state; web-authored OpenRouter base URLs are gated to the canonical
-  endpoint; AWS IPv6 metadata endpoints are blocked alongside the existing
-  SSRF-safe web controls; and the secret inventory is made metadata-only.
-- **CI judge-tool fail-closed gates and signature verification
-  (`elspeth_lints`)** — agent judge tools fail closed; judge-tool reads are
-  gated through the scrubber and blocked on signing paths; rejudge and new
-  judge-metadata signatures are verified in the audit gates; justify prompts
-  are bound to the scan snapshot; stale v1 scope migrations are refused; and
-  unverified fork-allowlist signatures are rejected.
-- **Key-separated judge-signature handoff (`elspeth_lints`)** — agents now
-  stage trust-tier review bundles through the key-free `elspeth-judge` MCP
-  server, while operators mint or rotate signed judge metadata only through
-  the key-bearing `elspeth-lints sign-bundle` / `rekey` CLI. CI is verify-only
-  and the obsolete `scripts/cicd/sign_accept_backlog.py` path is removed.
-- **Bounded budgets** — sequential LLM retry budgets and MCP Landscape query
-  limits are bounded so a runaway model or query cannot exhaust the host.
-- **Key Vault `vault_url` restricted to approved Azure endpoints** — the Azure
-  Key Vault `vault_url` is constrained to the approved `*.vault.azure.net`
-  endpoint class by a host check (which a bare suffix test cannot enforce),
-  with an optional exact-URL pin via `ELSPETH_KEYVAULT_ALLOWED_VAULT_URLS`,
-  closing an SSRF vector where a foreign vault URL could redirect the
-  managed-identity challenge; edge whitespace is normalised before validation.
-- **Blob sink path allowlist scoped to the owning session** — composer blob
-  writes and reads are confined to the session that owns them, and the session
-  id is threaded through shareable-review validation, so one session cannot
-  address another session's blob paths.
-- **Database credentials scrubbed before audit persistence** — `odbc_connect`
-  connection-string passwords and database-node DSN passwords are scrubbed
-  before they can reach an audit record or a fingerprint.
-- **Output-echoed fields reject environment-variable placeholders** — the
-  `report_assemble` transform rejects env-var placeholders in the fields it
-  echoes to output, so an unresolved `${VAR}` cannot be surfaced as literal
-  content.
-- **Host environment exposure reduced** — commencement gates no longer receive
-  the process environment by default, and in-memory pipeline YAML loading no
-  longer expands host environment variables unless the caller explicitly opts in.
-- **Further audit-export and gate hardening** — raw failing rows are redacted
-  from audit exports by default; CSV audit exports neutralize spreadsheet
-  formulas; JSONL filesystem exports are staged before publish; harness
-  credentials are kept out of the eval `curl` argv and backfill sink paths are
-  restricted to data roots; and the `elspeth_lints` gates gain reaudit-limit,
-  allowlist-expiry, stale-judged-signature, and override-hash-IO fail-closed
-  handling.
-
-### Operational
+Guided pipeline creation becomes LLM-primary: each stage of a pipeline
+(source, sink, transforms, then the final wiring) is driven by a language
+model, and the flow ends at a wiring stage gated by an advisor sign-off. The
+untagged 0.6.1 maintenance line is folded into this release.
 
 - **The web session database and Landscape audit database both reset on
-  upgrade.** `SESSION_SCHEMA_EPOCH` advances to 26 and
-  `SQLITE_SCHEMA_EPOCH` advances to 22. `GUIDED_SESSION_SCHEMA_VERSION`
-  reached 7 over the release (5→7), and those guided fields live in the
-  `composition_states.composer_meta` JSON blob, so they add no SQL column. The
-  final 25→26 session epoch bump adds first-run-tutorial resume columns
-  (`tutorial_stage`, `tutorial_session_id`, `tutorial_run_id`,
-  `tutorial_source_data_hash`) to `user_preferences`; the Landscape epoch bump
-  run-scopes `routing_events` with composite state/edge foreign keys. Before
-  first start on 0.7.0, stop `elspeth-web.service`, archive and remove
-  `data/sessions.db` plus sidecars and the configured Landscape audit DB plus
-  sidecars, then restart so both schemas are recreated. `data/auth.db` is
-  separate, so local user accounts survive. Procedure:
-  `docs/runbooks/staging-session-db-recreation.md`, including the hardened
-  archive steps — `PRAGMA wal_checkpoint(TRUNCATE)` before copying each
-  database, destroy or secure the archives at the end of the deploy window,
-  and rotate `settings.secret_key` so an archived copy of encrypted
-  `user_secrets` rows is inert under the new key.
+  upgrade.** `SESSION_SCHEMA_EPOCH` advances to 26 and `SQLITE_SCHEMA_EPOCH`
+  advances to 22. Before first start on 0.7.0, stop the service, archive and
+  remove `data/sessions.db` plus sidecars and the configured Landscape audit
+  DB plus sidecars, then restart so both schemas are recreated. `data/auth.db`
+  is separate, so local user accounts survive.
 - **Ship a frontend dist rebuilt from this release's source.** The web UI is
-  served from `src/elspeth/web/frontend/dist/`, which is gitignored and built
-  out of band (`cd src/elspeth/web/frontend && npm run build`); it is produced
-  by neither CI nor the Docker image. The 0.7.0 frontend carries the new
-  `components/ui` primitive library, the `LoginPage` migration onto it, the
-  tokenized font weights, and the guided wiring-stage / tutorial-shell
-  changes, so producing the 0.7.0 web deploy MUST rebuild the dist from
-  `release/0.7.0` HEAD rather than reuse a prebuilt bundle; a stale bundle
-  will not render the new login, email-verification, design-token, or guided
-  wire-stage surfaces.
-- **CLI/MCP audit database defaults consolidate under `data/`.** Ad-hoc CLI and
-  MCP Landscape defaults now point at `data/audit.db` instead of the older
-  `state/audit.db` path, matching the release's system-database layout and
-  reducing accidental split-brain audit stores during local operator work.
-- **Local and CI gate behaviour is explicit.** The operator-approved pre-commit
-  cleanup removes the whole-tree wardline hook from the local hook set; release
-  agents still run `wardline scan . --fail-on ERROR` explicitly before handoff
-  when external-input boundaries are touched. CodeQL now runs the
-  `security-extended` query suite without `security-and-quality`, matching the
-  release's security-gate posture and avoiding quality-only noise from blocking
-  the release.
+  served from `src/elspeth/web/frontend/dist/`, which is built out of band
+  (`cd src/elspeth/web/frontend && npm run build`).
+- **CLI/MCP audit database defaults consolidate under `data/`.** Ad-hoc CLI
+  and MCP Landscape defaults now point at `data/audit.db` instead of the older
+  `state/audit.db` path.
+- **Key Vault `vault_url` is restricted to approved Azure endpoints**
+  (`*.vault.azure.net`), with an optional exact-URL pin via
+  `ELSPETH_KEYVAULT_ALLOWED_VAULT_URLS`.
 
 ---
 
 ## 0.6.0 - 2026-06-20 (cross-process multi-worker run coordination)
 
-The single-worker-to-multi-worker transition. Multiple cooperating
-processes on one host may now operate against a single run backed by one
-WAL SQLite audit database: one leader (source ingest, barrier trigger
-evaluation, checkpoints, finalization, sink I/O) and any number of
-claim-only followers attached through the new `elspeth join` entry point.
-The deployment shape, its alternatives, and the operator requirements are
-recorded in ADR-030. Builds on the 0.5.4 maintenance fixes below.
+Multiple cooperating processes on one host may operate against a single run
+backed by one WAL SQLite audit database: one leader and any number of
+claim-only followers attached through the new `elspeth join` entry point
+(ADR-030).
 
-The audit database schema epoch advances to 21; per the delete-the-DB
-migration policy operators delete the prior database before first run on
-this version.
-
-### Added
-
-- **`elspeth join <run_id>`** — attach a follower to a RUNNING run. A
-  second worker joining is the supported feature; racing `resume()`
-  remains refused. Admission is one atomic transaction gated on run
-  status, pipeline-config-hash equality, and a live leader seat, after a
-  filesystem preflight that fails with an operator-actionable error when
-  the worker cannot write the database, its directory, or the WAL
-  sidecars.
-- **Run-level worker registry and heartbeat** — a dedicated heartbeat
-  thread beats the worker row and the leader seat in one transaction;
-  liveness drives takeover and reaping decisions.
-- **Dead-leader takeover** — a run left RUNNING under a dead leader is now
-  resumable via `elspeth resume` (previously a wedged, unrecoverable
-  state); a leader frozen holding the write lock surfaces an
-  operator-actionable error naming the process to terminate before
-  resuming.
-- **`examples/multi_worker` and `examples/multi_worker_showcase`** — two
-  runnable examples for the multi-worker feature. `multi_worker` is
-  self-verifying: it backgrounds a leader, attaches a follower via
-  `elspeth join`, and asserts that two or more workers each completed at
-  least one row using `scheduler_events` lease-owner attribution.
-  `multi_worker_showcase` demonstrates a wider multi-source / concurrent
-  spectacle without a correctness assertion. Both are registered in
-  `examples/README.md` and `examples/AGENTS.md`.
-- **`examples/concurrent_scheduler`** — a runnable proof that the scheduler
-  keeps multiple token lifecycles open at once: two three-row CSV sources
-  feed a count-6 `batch_stats` barrier that can only fire if all six tokens
-  are alive simultaneously (one-at-a-time draining would deadlock). It
-  ships with read-only SQL attribution queries confirming both sources fed
-  the single batch.
-
-### Changed
-
-- **Barrier buffers are journal-first** — aggregation and coalesce
-  acceptance is durable in the scheduler journal before it enters
-  executor memory, so barrier state spans workers and survives takeover
-  (ADR-029 amended).
-- **Leader writes are epoch-fenced** — finalization, run-status changes,
-  checkpoints, barrier completion, lease recovery, and source ingest each
-  verify leadership inside their transaction; a superseded leader's writes
-  are refused, not applied.
-- **Cross-process write discipline** — writable Landscape transactions
-  take the WAL write lock at `BEGIN IMMEDIATE`; dashboard and audit-story
-  read paths open read-only (ADR-030 §D5).
-- **Lease recovery is liveness-aware** — an expired item lease held by a
-  worker whose registry heartbeat is still live is revived, not reaped, so
-  a long in-flight model call is no longer mistaken for a dead worker.
-- **Web composer enforces implicit-required contracts for named typed
-  sources** — the predicate that decided whether a producer was a typed
-  source matched only the bare string `"source"`, so it returned `False`
-  for every *named* source (producer id `source:<name>`). The
-  implicit-required parity check therefore never fired for the headline
-  multi-source case: the pipeline validated green at compose time but
-  runtime Phase-2 type validation rejected it. The predicate now uses
-  `is_source_producer_id()`, closing the compose-green / runtime-red
-  divergence (elspeth-3332619032).
-
-See the rewritten `docs/runbooks/scheduler-lease-recovery.md` for N>1
-recovery procedures and operator guidance (worker count, lease sizing,
-shared group/clock requirements, per-worker forensic journals).
-
-### Fixed
-
-Plugin-boundary correctness — the plugins-subsystem remediation. Each of
-these defects let a plugin coerce, fabricate, or self-contradict at the
-trust boundary without an honest audit record; the fixes keep the boundary
-truthful (no silent Tier-3 coercion, no fabricated statistics, no
-fail-open scanning, no row that fails its own contract).
-
-- **`AzureBlobSource` CSV parses strictly** — the source built its
-  `csv.reader` without `strict=True`, so malformed quoting (data after a
-  closing quote) was silently merged into adjacent fields and, when the
-  field count still matched, passed through as a valid row with no
-  quarantine and no audit record. It now parses with `strict=True` like
-  `CSVSource`: the malformed row is recorded and quarantined, and
-  processing stops because the parser state is no longer trustworthy
-  (elspeth-ebe13515f4).
-- **`batch_stats` skips and reports `None` instead of crashing the run** —
-  a `None` value field raised `TypeError`, which the aggregation executor
-  records FAILED and re-raises, aborting the whole run; an all-`None` group
-  additionally hit a `mean = 0/0` `ZeroDivisionError`. `None` is now
-  skipped and reported in `skipped_missing` / `skipped_missing_indices`
-  (mirroring `skipped_non_finite`), and a group with no aggregatable values
-  returns an audited `validation_failed` error naming each skipped row
-  rather than a fabricated `count=0`/`sum=0`. Genuine wrong types still
-  raise at the boundary (elspeth-e62478e5db).
-- **`batch_outlier_annotator` no longer fabricates `robust_z_score=0.0`
-  when MAD=0** — any batch where more than half the values are identical
-  (common for score/count data) drove the median absolute deviation to
-  zero, which the annotator reported as a robust z-score of `0.0`,
-  silently disabling outlier detection exactly when it mattered. It now
-  applies the Iglewicz–Hoaglin mean-absolute-deviation modified z-score
-  when spread is still present, and emits an honest `None` (never `0.0`)
-  for a wholly identical batch (elspeth-a46c6e361f).
-- **Non-finite scanner uses `isinstance`, not exact-type checks** —
-  `_find_non_finite_value_path` gated container recursion on exact type, so
-  a `NaN`/`Infinity` nested inside a `Mapping` subclass (e.g. `OrderedDict`)
-  or a `tuple` subclass (e.g. a namedtuple) bypassed the source-boundary
-  non-finite gate entirely — a fail-open leak into audit hashing. The
-  float, mapping, sequence, and ndarray checks now use `isinstance`; `bool`
-  stays excluded and masked-array `NaN` is still treated as absent.
-- **`value_transform` retypes the output contract on a typed-field
-  overwrite** — overwriting an existing typed field with a
-  different-typed result (e.g. an `int` price recomputed as a `float`) left
-  the stale `FieldContract.python_type` in place, so the emitted row failed
-  its own `out.contract.validate(...)` — a self-contradictory audit record.
-  An overwrite whose runtime type differs from the declared type now
-  rebuilds that field's contract to the value's type, preserving
-  `original_name` / `required` / `source` / `nullable`; `object`/`any`
-  fields are left untouched.
-- **`AzureBlobSink` CSV no longer diverts valid rows in flexible/observed
-  mode** — the per-row staging probe trial-encoded each row against only
-  the first row's keys, while the real serializer computes field names
-  cumulatively across all rows. A later row carrying a valid extra field
-  (legitimate in flexible/observed mode) tripped `DictWriter`'s
-  `extrasaction='raise'` and was routed to the failure sink before the
-  serializer that would have accepted it ever ran — silent data loss. The
-  probe now uses the same schema-aware field set as the serializer, so a
-  valid late-appearing field is kept while a genuine fixed-mode
-  column-lock violation is still diverted per-row.
-- **`batch_experiment_compare` no longer fabricates inferential statistics
-  for a singleton arm** — `stdev` is undefined at n=1 and was reported as
-  an honest `None`, but the comparison then coerced that `None` to `0.0`
-  in the standard-error term, so an arm with a single value still produced
-  a real `standard_error`, `z_score`, and 95% confidence interval from a
-  zero-variance assumption. When either arm has undefined variance the
-  standard error, z-score, and interval are now all `None`.
-- **`batch_effect_size` emits `None` pooled dispersion for two singletons**
-  — when both groups had a single value the pooled-variance denominator
-  (`n₁+n₂−2`) is zero and the pooled standard deviation is undefined, but
-  it was reported as a real `0.0` (while the per-group stdevs and Cohen's
-  *d* were correctly `None`). The pooled standard deviation is now `None`
-  in that case, consistent with the other undefined dispersion statistics.
-- **`json_source` and `dataverse` narrow their header catch to
-  configuration faults** — both caught broad `ValueError` around header
-  normalization, so a configuration mistake (a `field_mapping` collision,
-  an unknown key) was silently quarantined as if it were a per-row data
-  error. The catch is now scoped to `ExternalHeaderError`, so a config
-  fault surfaces at the boundary instead of as a phantom quarantine.
-- **`CSVSink` and `AzureBlobSink` trial-encode each row before staging** —
-  a single unencodable character (e.g. an emoji written to a `cp1252`
-  sink) bypassed the per-row divert path and raised `UnicodeEncodeError`
-  at write time, aborting the whole batch with no per-row audit record.
-  Each row is now trial-encoded individually during staging, so the codec
-  fault is caught as a per-row diversion and the surrounding good rows are
-  still written.
-- **`database_sink` diverts `DataError` per row and serializes flexible
-  extra columns** — a `DataError` (e.g. integer overflow on a typed
-  column) is per-row attributable but was missing from the divert arms, so
-  it crashed the batch instead of diverting the offending row. Separately,
-  typed-field serialization now covers all fields, not only declared ones,
-  so a flexible-mode row carrying an extra typed column is serialized
-  correctly.
-- **RAG `count()` inside `search()` is guarded like `query()`** — the bare
-  `count()` call had no exception handling, so a transient backend error
-  (`ChromaError`, `ConnectionError`, `TimeoutError`, `OSError`) escaped as
-  a raw traceback that crashed the run with no quarantine and no audit
-  record. It now shares the `query()` except arms.
-- **Chroma readiness probe widens its catch and closes its client** — the
-  probe missed plain `ValueError` (raised by `chromadb` when the server is
-  unreachable) and `httpx` transport errors, which escaped as raw
-  tracebacks and aborted the commencement gate; it also leaked the
-  `HttpClient`. The except set is widened and the client is closed in a
-  `finally` block.
-- **Sequential multi-query transforms retry transient errors within a
-  bounded budget** — a transient 429/5xx/network error on a sequential
-  multi-query row propagated immediately and failed the row. Such errors
-  are now retried locally within a `max_capacity_retry_seconds` budget
-  (mirroring the Azure capacity-retry pattern), without re-running queries
-  that already succeeded for the same row; on budget exhaustion the row
-  diverts as `retry_timeout`, while non-retryable errors (context-length,
-  content-policy) still fail immediately.
-- **RAG query returns a `missing_field` error instead of a bare
-  `KeyError`** — a missing query field raised an uncaught `KeyError` with
-  no audit record; a presence check now returns a structured
-  `missing_field` error, consistent with the rest of the RAG boundary.
-- **`web_scrape` treats unenumerated 4xx responses as errors, not
-  content** — codes outside the handled set (400, 402, 405, 410, …) were
-  returned as successful responses and their error-page body was
-  fingerprinted and audited as real content, corrupting change detection.
-  They now raise a non-retryable client error; 408 Request Timeout raises
-  a retryable one.
-- **`web_scrape` guards content type and body size before extraction** —
-  there was no `Content-Type` check and no size cap, so a binary response
-  (image, PDF, `application/octet-stream`) was extracted and fingerprinted
-  as text. A content-type guard now rejects non-text responses and a
-  configurable cap rejects oversized bodies before extraction. (The size
-  cap is a post-buffer guard; the streaming pre-buffer cap follow-up is
-  noted below.)
-- **`batch_classifier_metrics` accepts an all-negative batch as data** —
-  when `positive_label` was configured but absent from the batch (a
-  legitimate outcome in rare-positive monitoring) the plugin returned
-  `validation_failed`. An all-negative batch now yields honest
-  zero-positive metrics; only a batch with no labels at all remains an
-  error.
-- **LLM `chat_completion` records the call before re-raising on a
-  malformed response** — the `response.usage` /
-  `response.choices[0].message` reads happened outside the guarded region,
-  so a malformed provider response left no Landscape record even though
-  tokens had been consumed. The reads are now guarded; on failure the call
-  is recorded as ERROR with the raw response captured before a
-  non-retryable client error is raised.
-- **Field-resolution rebuild is a union, not a replace** — in
-  `json_source`, `azure_blob_source`, and `dataverse`, a later sparse row
-  introducing a new key replaced the field-resolution set with only that
-  row's fields, discarding previously seen keys and corrupting the
-  field-resolution audit record. The rebuild now merges all observed keys
-  across all rows.
-- **`AzureBlobSource` rejects a headerless CSV with no columns or schema at
-  configuration time** — the `has_header=False` / no-columns path invented
-  numeric field names (`"0"`, `"1"`, …) that are not valid identifiers,
-  broke `field_mapping`, and skipped field resolution entirely, leaving the
-  audit record permanently absent. That configuration is now refused at
-  startup with an operator-actionable error.
-- **Statistical batch transforms emit `None` for every undefined statistic,
-  never a fabricated `0.0`** — extending the singleton-arm fixes above to
-  the rest of the family: `batch_distribution_profile` emits `None` stdev
-  at n=1; `batch_paired_preference` emits `None` for an all-tie preference
-  rate and for the standard error / interval when an arm has n≤1; and
-  `batch_outlier_annotator` emits `None` (not `0.0`) for the standard
-  z-score when the batch standard deviation is zero.
-- **Six batch transforms guard against non-finite group keys** — a `NaN`
-  float or `Decimal('NaN')` used as a group-by key silently fragments
-  groups (because `NaN != NaN`). The non-finite group-key guard already in
-  `batch_effect_size` is now ported to `batch_experiment_compare`,
-  `batch_distribution_profile`, `batch_paired_preference`, `batch_stats`,
-  `batch_top_k`, and `batch_drift_compare`, including the `Decimal` arm.
-- **`batch_paired_preference` errors on a duplicate variant within a
-  pair** — two rows sharing the same variant label silently used the first
-  and dropped the second (silent data loss). The plugin now detects and
-  errors on a duplicate variant before processing the pair.
-- **`batch_replicate` records the quarantine row index, not the row body** —
-  the invalid-copies quarantine entry embedded the full row content in its
-  audit metadata, leaking Tier-2/3 data into the audit record. It now
-  records the row index only.
-
-Two engine-level correctness fixes also land in this release:
-
-- **Aggregation resume no longer bricks a run after a FAILED-flush crash** —
-  a crash between marking aggregation tokens terminally failed and
-  releasing their BLOCKED scheduler rows left durable BLOCKED rows whose
-  tokens were already terminal; on resume the restore path saw an empty
-  live-BUFFERED set and raised `AuditIntegrityError` on every attempt,
-  making the run permanently unresumable. The aggregation restore arm now
-  journal-releases BLOCKED rows whose tokens carry a terminal outcome
-  before restoring, mirroring the proven coalesce path (elspeth-55546a6fd6).
-- **Multi-worker N>1 leader/follower coordination hardened** — the real
-  `elspeth join` end-to-end exercise surfaced and closed several N>1
-  defects: a follower whose leader finalized mid-drain now exits clean
-  rather than reporting eviction; the post-finalize source-lifecycle write
-  no longer downgrades a terminal `EXHAUSTED` state; `elspeth run` /
-  `elspeth resume` surface a takeover as a clean eviction exit instead of a
-  fatal traceback; the session-fork blob-copy invariant is no longer
-  suppressed when the blob map is empty; the peer-lease wait is bounded to
-  the liveness window and honours shutdown; follower teardown propagates
-  Tier-1 audit-integrity errors instead of swallowing them; and the
-  `PENDING_SINK` drain correctly recognizes peer-owned work and loops until
-  no peer leases or scheduled work remain.
-
-The shipped `examples/multi_worker` harness also had its pass/fail verdict
-corrected: a follower exiting non-zero was logged but not folded into the
-final decision, so the run could print PASS after a worker failed. The
-verdict now requires both the attribution assertion (≥2 workers each
-completed a row) and a clean exit from the leader and every follower.
-
-A follow-up is tracked for `web_scrape`'s `max_body_bytes`, which is
-enforced only after `AuditedHTTPClient` has already buffered and
-audit-captured the full body; a true pre-buffer cap belongs in the shared
-client as a streaming byte-limit (elspeth-a6f246d02a).
-
-### Operational
-
-- **The web session database also resets on upgrade (in addition to the
-  audit DB above)** — the session database schema epoch advances to 19
-  (`SESSION_SCHEMA_EPOCH`). It is not migrated in place: 0.6.0 boot fails
-  closed on a pre-0.6.0 session DB with `SessionSchemaError: Session DB
-  schema version 18 does not match SESSION_SCHEMA_EPOCH=19. Pre-release
-  ELSPETH does not migrate session databases. Delete the session DB file
-  and restart.` Before first start on 0.6.0, stop `elspeth-web.service`,
-  back up and remove `data/sessions.db` (and its `-wal`/`-shm` sidecars),
-  and restart; the bootstrap recreates the schema on first start.
-  `data/auth.db` is a SEPARATE file — local user accounts survive the
-  reset. Procedure: `docs/runbooks/staging-session-db-recreation.md`.
-- **Ship a frontend dist rebuilt from this release's source** — the web UI
-  is served from `src/elspeth/web/frontend/dist/`, which is gitignored and
-  built out of band (`cd src/elspeth/web/frontend && npm run build`); it is
-  produced by neither CI nor the Docker image. Producing the 0.6.0 web
-  deploy MUST rebuild the dist from `release/0.6.0` HEAD rather than reuse a
-  prebuilt bundle. A dist built before `ebbf90fcd` (the ADR-025
-  plural-`sources` migration) reads the dropped singular `state.source` and
-  crashes the chat panel with `TypeError: Cannot read properties of
-  undefined (reading 'options')` on guided source-select and on reloading
-  any composed session.
+- The audit database schema epoch advances to 21; operators delete the prior
+  database before first run on this version.
+- The web session database also resets on upgrade: its schema epoch advances
+  to 19 and it is not migrated in place. Before first start on 0.6.0, stop the
+  service, back up and remove `data/sessions.db` (and its `-wal`/`-shm`
+  sidecars), and restart. `data/auth.db` is a separate file, so local user
+  accounts survive the reset.
+- Ship a frontend dist rebuilt from this release's source.
 
 ---
 
 ## 0.5.4 - 2026-06-20 (maintenance fixes folded into 0.6.0)
 
-Maintenance line opened on top of RC-5.3, carrying correctness fixes that
-post-date the 0.5.3 cut. These fixes ship as part of the 0.6.0 release
-rather than as a standalone 0.5.4 tag.
-
-### Fixed
-
-- **`tier_1_decoration` lint no longer crashes on vendored trees** — the
-  repo-wide TDE2 pass and its candidate scan now walk the tree through the
-  shared `iter_python_files` excluded-dir filter instead of a raw
-  `rglob("*.py")`, so an unparseable third-party file under `.venv` / cache
-  directories can no longer hard-crash the gate.
+Maintenance fixes that shipped as part of the 0.6.0 release rather than as a
+standalone 0.5.4 tag.
 
 ---
 
 ## 0.5.3 - 2026-06-08 (RC-5.3 — Correctness, Audit Integrity, and Release Gating)
 
-RC-5.3 is a correctness and hardening release on top of the RC-5.2 composer
-train. It carries one new composer capability (operator-set sampling), tightens
-the release pipeline so images cannot publish ahead of their required checks,
-and lands a broad body of audit-integrity, trust-tier, output-contract, and
-frontend recovery fixes. The theme is evidence integrity under failure: audit
-rows are no longer written before the work they describe is real, output
-contracts reject sparse or malformed rows at the sink boundary rather than
-downstream, trust-tier error semantics raise typed faults instead of crashing
-or fabricating, and the web composer no longer renders stale responses after
-navigation. No schema migrations are introduced.
-
-A second body of work landed on the `release/0.5.3` branch after the initial
-RC-5.3 cut and is folded into this release. Two structural changes anchor it —
-the **orchestrator god-class decomposition** (the run/resume engine split into
-focused collaborators) and a new **tutorial-reliability e2e battery** — alongside
-the **composer advisor-authority redesign** (the advisor is now a mandatory,
-model-distinct reviewer with deterministic early/end checkpoints, replacing the
-old reactive self-trigger) and two systematic bug-fix burn-downs across the CI/CD
-enforcement scanners (`elspeth_lints`) and the engine/core/plugins trust-tier and
-audit-integrity paths.
-
-### Added
-
-- **Operator-set sampling configuration (ADR-027)** — the web composer now
-  sources its LLM sampling parameters from operator-set configuration rather
-  than per-call defaults, threaded through the guided chain/chat solvers, the
-  boot probe, and auto-title. The `ComposerLLMCall` audit contract records the
-  resolved sampling so an auditor can reconstruct exactly how each model call
-  was parameterised. See
-  `docs/architecture/adr/027-composer-operator-set-sampling.md`.
-- **Release required-checks gate** — `scripts/cicd/check_release_required_checks.py`
-  gates container-image publication in `build-push.yaml` on the release's
-  required checks having passed, so an image can no longer be pushed ahead of
-  its CI evidence.
-- **Large-scale checkpoint policy** — documented checkpoint behaviour for
-  large-scale runs (`docs/reference/configuration.md`, the
-  `examples/large_scale_test` settings) with a policy test pinning it.
-- **OpenRouter catalog source check** — Landscape database-compatibility guards
-  now require an OpenRouter catalog source check before relying on catalog
-  provenance.
-- **Composer advisor authority** — the web orchestrator now requires a
-  model-distinct advisor and runs deterministic checkpoints rather than relying
-  on the model to ask for review. A non-blocking **early advisory checkpoint**
-  fires once per session, and an **end gate acts as final authority** with a
-  fail-closed re-review loop on its own separate budget. Both reuse the existing
-  audited LLM call path so the review itself is captured in the trail.
-- **Prescriptive government URLs in the hello-world tutorial**, so the
-  first-run experience exercises the canonical "rate these gov pages" flow
-  against known-good sources.
-- **Tutorial-reliability e2e battery** — a new frontend Playwright harness
-  (`tests/e2e/`) drives the hello-world tutorial against a live staging backend
-  across N runs, scoring four dimensions (a/b/c/d) with per-run record types, a
-  batch aggregator, and a version-stamped trend log, so first-run reliability
-  regressions are caught before release.
-
-### Changed
-
-- **Trust-tier branch-join correctness** — the `tier_model` rule and its
-  `trust_boundary` suppression now resolve branch joins correctly; the
-  `core` / `plugins` / `web` enforce-tier allowlists were reconciled to match.
-- **Fail closed on conflicting original headers** — `display_headers` now fails
-  closed when original headers conflict instead of silently picking one.
-- **Stale allowlists fail the gate** — non-tier stale allowlist entries now fail
-  CI rather than passing silently.
-- **Repo hygiene** — `AGENTS.md` and `CLAUDE.md` are no longer tracked; the
-  session hook regenerates them on disk, so tracking them only produced
-  perpetual churn.
-- **Advisor is now mandatory** — the reactive advisor self-trigger is retired
-  (proactive-security trigger retained) and the advisor-disabled code paths are
-  removed, so a composer session can no longer run un-reviewed. Composer-skill
-  critical rules were hoisted into high-attention zones, and the skill now
-  documents backend-run advisor checkpoints instead of the reactive framing.
-- **ReorderBuffer clamps negative `buffer_wait_ms`** on clock skew rather than
-  scheduling a negative wait.
-- **Orchestrator decomposition** — the run/resume engine (`core.py`, ~2,950 LOC)
-  was split into focused collaborators (`RunCeremony`, `SourceIterationDriver`,
-  `CheckpointCoordinator`, `RunExecutionCore`, `ResumeCoordinator`), reducing the
-  god-class to ~1,030 LOC with no behavioural change to the run path. The
-  decomposition surfaced several pre-existing audit-path defects that the
-  burn-downs below then fixed.
-- **Tutorial path is no longer special-cased on the backend** — the
-  tutorial-only state normalization that repaired the composed pipeline only on
-  the tutorial path was removed, so a tutorial run now exercises the same backend
-  code as any other run (composer correctness is fixed at the source rather than
-  papered over with a tutorial-only shim).
-
-### Fixed
-
-- **Audit integrity and determinism** — artifact streaming now verifies bytes
-  against the audit hash before serving, composer MCP delete preserves audit
-  history, `resolved_prompt_template_hash` is preserved across read/export and
-  validated before insert, SSRF-safe success and empty-corpus Chroma retrievals
-  are each recorded once, and the replayer advances only on a concrete result.
-  Per-item detail in git history.
-- **Output contracts and sink/source boundaries** — sparse-field output
-  contracts (Azure Blob, Dataverse, `JSONSource`, narrative-summary), complete
-  custom-CSV-header enforcement, database/Chroma/JSON sink write-safety
-  preflights, and Dataverse OData-unsafe-lookup rejection were corrected at the
-  boundary.
-- **Trust-tier and web error semantics** — web-session Tier-1 paths raise typed,
-  upstream-interpretable errors, composer routes surface provider detail, and
-  redaction masks the file-blob storage-path carrier (storage-path leak closed).
-- **Web composer recovery and stale-response guards** — stale responses are
-  guarded across session selection, navigation, blob loads, execution-start,
-  YAML refetch, and run-outputs state; stores clear on logout; loop closure
-  during progress scheduling is treated as shutdown.
-- **Sessions, Landscape, and CI/CD gates** — session index/constraint validation
-  checks column sets, Landscape read-only mode keeps live WAL audit DBs visible,
-  and the adapter-budget / cicd-judge gates and RC5.3 allowlist drift were
-  repaired.
-- **Composer reliability and execution orchestrator** — a fail-closed pre-run
-  validation gate, a preflight-repair gate, advisor-blocked orphan-placeholder
-  surfacing, advisor end-gate reach into prompt-template pipelines, and
-  boot-probe / authoring-guard robustness closed the composer-reliability fixes.
-- **Trust-tier and audit-integrity burn-down (engine / core / plugins)** — typed
-  `AuditIntegrityError` for malformed checkpoints, teardown that no longer masks
-  the primary failure, shape-checked retrieval boundaries, telemetry-accounting
-  integrity, replay-safe Chroma audit hashing, config-time validation hardening,
-  and sparse-row `field_mapping` correctness. Per-item detail in git history.
-- **CI/CD enforcement-scanner burn-down (`elspeth_lints`)** — the allowlist-
-  expiry, attribution (`gve_attribution`), frozen-annotation, freeze-guard,
-  component-type, contract-manifest, `tier_1_decoration` / `audit_evidence_nominal`
-  / `tier_model`, and composer `catch_order` rules were all made fail-closed and
-  broadened, and the CI lanes themselves now fail closed. Per-rule detail in git
-  history.
-
-### Security
-
-- **Frontend dependency advisories patched** within existing semver ranges
-  (lockfile-only; no major-version or source change) — `vite` ≤6.4.1 → 6.4.3
-  (HIGH: dev-server path traversal and arbitrary file read), `dompurify`
-  ≤3.3.3 → 3.4.8 (four XSS sanitizer bypasses), `mermaid` 11.14 → 11.15 (Gantt
-  DoS and `classDef` CSS/HTML injection), and `uuid` <11.1.1 (buffer-bounds,
-  transitive). `npm audit` reports zero remaining advisories; the frontend
-  suite and build remain green.
-- **SSRF Host header brackets literal IPv6 authorities** instead of emitting an
-  ambiguous, splittable host.
-- **Secret-echo closed** — the commencement gate no longer echoes an environment
-  secret in its failure reason, and `record_validation_error` no longer leaks row
-  content via `str(e)`.
-- **DSN audit sanitization no longer double-encodes `odbc_connect`**, and
-  rate-limit bucket-name sanitization is now injective (distinct buckets cannot
-  collide).
-- **Env-var-name regex anchored with `\A…\Z`** rather than `^…$`, closing a
-  multiline-injection gap.
-
-### Dependencies
-
-- **Runtime image → Python 3.13** — the Docker base moves from
-  `python:3.12-slim` to `python:3.13-slim` (digest-pinned), aligning the
-  shipped runtime with the release interpreter that dev and CI exercise.
-  `requires-python` remains `>=3.12`. (Dependabot proposed 3.14; declined in
-  favour of the tested 3.13 baseline.)
-- **GitHub Actions bumped to current majors** (SHA-pinned) — `actions/checkout`
-  4→6, `actions/upload-artifact` 4→7, `docker/build-push-action` 5→7,
-  `actions/setup-python` 5→6, `actions/setup-node` 4→6, and the `docker/*`
-  setup/login/metadata actions.
-- The breaking frontend majors dependabot grouped with the security fixes
-  (React 18→19, Vite 6→8, TypeScript 5.7→6.0) are **deferred** to a dedicated
-  migration — blocked upstream by `openapi-typescript` still requiring
-  TypeScript 5.x.
-
-> **Baseline drift — resolved before release.**
-> `tests/unit/elspeth_lints/fixtures/fingerprint_baseline.json` drifted as
-> RC-5.3 commits landed. The baseline was regenerated after the signed enforce
-> gate verified green and the signed `tier_model` allowlists were reconciled;
-> `test_baseline_capture_is_self_consistent` passes at the release HEAD.
+A correctness and hardening release on top of the RC-5.2 composer train:
+operator-set sampling, a release pipeline in which images cannot publish ahead
+of their required checks, the orchestrator decomposition and a broad body of
+audit-integrity, trust-tier and output-contract fixes. No schema migrations
+are introduced. The advisor is now mandatory, so a composer session can no
+longer run un-reviewed. The Docker base moves from `python:3.12-slim` to
+`python:3.13-slim`.
 
 ---
 
 ## 0.5.2 - 2026-05-19 (RC-5.2 — Guided Composer, Durable Progress, and Recovery UX)
 
-RC-5.2 is the large Web Composer release train that folds the guided-mode
-wizard, composer progress persistence, manifest-keyed redaction, per-step chat,
-chat-as-data-entry, interpretation review, shareable completion gestures,
-frontend recovery UX, CI/CD gate consolidation, release-documentation refreshes,
-and RC5.2 hardening back onto `main`. It moves the composer from a best-effort
-interactive surface toward an audited, recoverable authoring system: model
-calls, tool dispatch, redacted tool payloads, persisted transcript rows,
-interpretation decisions, recovery diffs, and operator-visible failure causes
-now share one evidence story.
+The large Web Composer release train: the guided-mode wizard, composer
+progress persistence, manifest-keyed redaction, interpretation review and
+frontend recovery UX.
 
-### Added
-
-#### Composer Guided Mode
-
-- **Composer guided mode** — new structured-protocol wizard for first-time
-  pipeline authors. Source → sink → transforms in three steps; closed
-  six-turn taxonomy; deterministic recipe pre-match; LLM-read-only with
-  respect to pipeline state. Ships alongside the unmodified freeform
-  composer; mode transition uses progressive disclosure. Implementation design
-  detail is preserved in git history rather than active docs.
-- **ComposerLLMCall audit channel** — every `solve_chain` invocation in
-  guided mode now records a `ComposerLLMCall` audit row (provider, model,
-  status, latency, prompt/completion tokens). Pairs with the existing
-  `ComposerToolInvocation` audit channel so an auditor can reconstruct
-  both what the model was asked and what tools it then dispatched.
-
-#### Composer Progress Persistence (durable, recoverable authoring)
-
-- **Schema (Phase 1A)** — new audit columns on `chat_messages` (tool-call
-  linkage, `sequence_no`, `writer_principal`) with biconditional CHECK
-  constraints, a `composition_states.provenance` enum, and new `run_events` and
-  (INERT, read-side) `audit_access_log` tables with per-session indices. Applied
-  by recreation, not Alembic — see *Operational* below.
-- **Single-transaction turn primitive** — `persist_compose_turn` /
-  `persist_compose_turn_async` writes the assistant message, redacted tool rows,
-  and composition state atomically, with advisory-lock serialization and
-  contiguous per-session `sequence_no` reservation under concurrent writers. A
-  testcontainer-backed Postgres lane exercises the cross-DB semantics SQLite
-  cannot model. Implementation design detail is preserved in git history rather
-  than active docs.
-- **Redaction walker + MANIFEST** — every composer tool now has an explicit
-  redaction policy (type-driven Pydantic argument models plus declarative
-  entries) so LLM-supplied argument and response payloads are made Tier-1-safe;
-  Pydantic validation errors route through the `ToolArgumentError` ARG_ERROR
-  channel without leaking per-field detail, and a manifest-parity adequacy guard
-  pins a byte-identical redaction snapshot. Per-entry detail in git history.
-- **Atomic compose-loop persistence** — `_compose_loop` persists assistant
-  messages, tool-call breadcrumbs, redacted payloads, and state snapshots through
-  `persist_compose_turn` even when tools fail, cancellation lands mid-turn, or a
-  plugin crash triggers recovery; a bounded per-turn tool-call cap emits
-  `tool_call_cap_exceeded`, and audit-grade transcript reads opt into
-  `include_tool_rows` through `audit_access_log`.
-- **Frontend recovery panel** — the frontend detects recoverable composer
-  failures and opens a dedicated recovery surface rendering the assistant
-  transcript, redacted tool rows, and a before/after state diff, plus an ESLint
-  `npm run lint` gate for the recovery / guided-mode UI.
-
-#### RC5.2 Hotfix Integration
-
-- **Auth, audit, and execution hardening** — local/Entra auth flows now audit
-  token issuance, failure classes, login outcomes, and web-run attribution into
-  Landscape (redacting JWKS failure detail, suppressing token-response caching),
-  and web execution classifies validation errors, sanitizes broad execution
-  errors, persists resolved run config, and rejects misplaced secret refs.
-- **Engine/plugin and frontend fixes** — checkpoint resume/coalesce parsing,
-  pending batch row identity, JSON sink parent creation, sink preflight timing,
-  Web Scrape fail-closed boundaries, and LLM provider preflight were tightened,
-  alongside guided/catalog/run accessibility and theming fixes (contrast,
-  forced-colors, cross-tab theme sync, screen-reader-safe status). Per-item
-  detail in git history.
-
-#### Composer UX Redesign, Preferences, and Review Flow
-
-- **Composer preferences** — a new preferences schema, service, and routes let
-  users choose their composer starting mode, with backend validation and
-  write-failure alerting.
-- **Chat as data entry** — short chat inputs can project into audited inline blob
-  sources with source provenance, hash evidence, MIME parsing, and ambiguity
-  handling.
-- **LLM interpretation review** — ambiguous prompt-template decisions can pause
-  for operator review, persist append-only interpretation events, gate execution
-  while unresolved, and surface guided/freeform review widgets in chat.
-- **Completion gestures and shareable reviews** — composer sessions gained
-  completion events, HMAC-signed shareable review links, YAML-export audit
-  events, narrative result views, and shared-inspection views.
-- **First-run tutorial and mode guidance** — a hello-world tutorial introduces
-  the composer with persistent tutorial state, cache-skip telemetry, and explicit
-  freeform/guided switching guidance.
-- **Catalog reshape and audit-readiness UI** — plugin catalog cards, filters,
-  audit characteristics, inline chat-source entry, SideRail audit status, and
-  graph/YAML modals were rebuilt around the new composer information architecture.
-
-#### Engine, Transform, and Plugin Additions
-
-- **Batch-aware aggregation context** — transforms can receive
-  `AggregationBatchContext`, enabling the new `report_assemble` transform with
-  metadata-collision checks.
-- **Composer knob schema lowering** — plugin option metadata now lowers into
-  one-knob composer schemas, with discriminated plugin protocol support,
-  visible-when scope guards, and recipe-slot adapters.
-- **Determinism declaration enforcement** — plugin infrastructure enforces
-  determinism declarations mechanically via `__init_subclass__`.
-
-#### CI, Lints, and Release Documentation
-
-- **`elspeth-lints` static analyzer (ADR-023)** — custom CI analyzers moved into
-  the `elspeth-lints` package with rule fixtures, parity harnesses, SARIF output,
-  and rule-author docs; CI now consolidates static analysis, gates RC branches,
-  runs CodeQL and dependency/license checks, makes Playwright E2E a required
-  signal, and enforces cohort-attribution trailers on telemetry-backfill commits.
-- **Release docs cleanout** — RC-1/RC-2 changelog fragments, superseded release
-  snapshots, frozen architecture packs, and completed handover corpora were
-  removed from active docs, while current release/assurance/audit documents stay
-  linked from `docs/README.md`; generated PDF output now defaults under
-  `tools/pdf/out/`.
-
-### Changed
-
-- **`SessionServiceImpl` write contracts tightened** — `add_message()` now
-  requires `writer_principal=`, `save_composition_state()` requires
-  `provenance=`, and `__init__()` requires `telemetry=` and `log=` (constructed
-  via `build_sessions_telemetry()`); each principal/provenance value is enforced
-  by a CHECK constraint.
-- **Exit-from-COMPLETED terminal returns 200** — guided sessions in
-  `kind=completed` accept `control_signal=exit_to_freeform` via POST
-  `/api/sessions/{id}/guided/respond` and transition to `kind=exited_to_freeform`
-  (previously returned 409).
-- **Guided-mode prompt loading** — the guided composer skill pack is split into
-  base plus step-specific prompt files, allowing step-scoped context without
-  flattening all guidance into one prompt; guided mode also gains a separate
-  per-step advisory chat channel with persisted history and `ComposerChatTurn`
-  audit rows.
-- **Composer dependency packaging** — `chromadb`, `html2text`, and
-  `beautifulsoup4` are now mandatory dependencies rather than optional `rag` /
-  `web` extras, matching the composer and web-scrape surfaces that import them
-  during normal operation.
-- **Session schema durability** — session SQLite engines now set WAL,
-  `busy_timeout`, synchronous PRAGMA, schema epoch guards, orphan PENDING-row
-  recovery, and cross-DB hash spot-checks for interpretation runtime handoff.
-- **Composer chain-solver and frontend validation refinements** — the guided
-  chain solver constrains tool-response shape and surfaces malformed responses
-  via the auto-drop channel; MCP finite-status fields use narrower literals with
-  CI-checked cross-language drift; frontend validation became cache-aware; and
-  the hash router moved off retired Spec/Runs tabs to graph/YAML/catalog modal
-  actions. Per-item detail in git history.
-
-### Removed
-
-- **Composer replacement-shape machinery** —
-  `_runtime_preflight_failure_message`, `_enforce_replacement_non_prefix_invariant`,
-  `_ReplacementBranch`, and `_INTERCEPTED_ASSISTANT_HISTORY_PREFIX` are deleted
-  (with the 7 tests pinning them); the compose loop's augmentation shape is now
-  the sole codepath.
-- **Retired composer IA surfaces** — the old Spec tab, Runs tab, SessionSidebar,
-  and inspector panel/page were removed after their capabilities moved into the
-  SideRail, modals, session switcher, run history, output panels, and validation
-  banner.
-- **Optional dependency extras and active-doc clutter** — the `web` and `rag`
-  extras were retired once their packages became mandatory, and superseded prompt
-  files, generated review sidecars, completed handovers, and archived checklists
-  were removed from active docs.
-
-### Operational
-
-- **Sessions DB schema deployment requires recreation** — Phase 1A's
-  new columns, tables, CHECKs, and partial unique indices are not
-  applied via Alembic. Per `project_db_migration_policy`: stop the
-  service, archive the old `sessions.db`, restart. The bootstrap
-  creates the new schema on first start. Procedure documented in
-  `docs/runbooks/staging-session-db-recreation.md`.
-- **Phase 5 interpretation deployment requires two DBs to move together** —
-  `interpretation_events_table`, `interpretation_review_disabled`, and the
-  Landscape `calls_table.resolved_prompt_template_hash` handoff require the
-  session DB and Landscape audit DB to be reset together on schema cutover.
-  The staging recreation runbook documents the coupled reset.
-- **Frontend-only deploys require static rebuild, not service restart** —
-  `npm run build` refreshes `src/elspeth/web/frontend/dist/`; backend Python,
-  dependency, environment, systemd, or Caddy changes still require
-  `elspeth-web.service` restart.
-- **Current PR check posture** — PR #39 now includes more than 770 committed
-  branch commits over `main`, including the docs-cleanout merge. The PR body and
-  release docs should be treated as the review map for the whole RC5.2 train,
-  not for a single feature slice.
+- The session database requires recreation (stop the service, archive the old
+  `sessions.db`, restart), and the session DB and Landscape audit DB are reset
+  together on schema cutover.
+- `chromadb`, `html2text` and `beautifulsoup4` are mandatory dependencies; the
+  `web` and `rag` extras were retired.
 
 ---
 
 ## [0.5.1] - 2026-05-11 (RC-5.1 — Composer Correctness, Validator Hardening, and Audit-Integrity Coverage)
 
-RC-5.1 is a correctness and assurance follow-up to RC-5. The Web Composer's
-authoring loop, validation surface, and run-evidence views all received targeted
-hardening; a new `identity_node_advisory` validator detects identity passthroughs
-that obscure observed-sink lineage; the `data_dir` config is now resolved to an
-absolute path at validation time; pipeline recipes, source inspection, and a
-forced-repair loop with proof diagnostics extend the composer authoring surface;
-and the Landscape audit-integrity test surface gains direct coverage for four
-ADR-019-family invariants that previously had zero unit tests. Frontend UX received
-a Tier-1 panel-review pass covering accessibility, focus management, and operator
-visibility.
-
-### Added
-
-#### RC5-UX Substrate, Composer, and Execution Evidence
-
-- **Substrate framing** — the README now presents ELSPETH as a high-assurance
-  pipeline substrate with two authoring surfaces (hand-edited YAML and the Web
-  Composer) that target the same primitives, graph-validation contracts,
-  executor, and Landscape audit trail rather than a bolt-on workflow builder.
-- **Expanded Web Composer surface** — authenticated sessions, versioned
-  composition state, blob management, secret references, chat-first authoring,
-  graph/spec/YAML inspection, validation, execution, cancellation, and output
-  artifact review are now part of the documented authoring surface.
-- **Audited, runtime-shaped composer loop** — composer plugin discovery, state
-  mutation, validation, YAML export, blob/secret tools, and advisor hints all
-  happen through explicit tool contracts; previews, `/validate`, and `/execute`
-  use runtime assembly and graph-validation contracts rather than a separate
-  best-effort UI validator.
-- **Run evidence and cancellation visibility** — web execution exposes
-  Landscape-derived run accounting, diagnostics snapshots, discard summaries, and
-  the full output artifact manifest/content surfaces, and in-progress runs carry
-  a distinct cancellation-requested state while work drains toward `cancelled`.
-
-#### Composer Reliability and Operator Visibility
-
-- **Audited composer LLM calls** — composer requests use deterministic sampling
-  where supported and record temperature/seed, provider cache counters,
-  Anthropic-style prompt-cache markers, and provider-reported reasoning token
-  counts in the LLM audit sidecar without fabricating missing values; normal chat
-  history still hides those internals.
-- **Advisor escalation contract** — the optional advisor tool is gated behind
-  explicit trigger categories so the composer can ask for frontier-model help
-  only under mechanically validated conditions.
-- **Advisor-conditional skill markers** — composer prompt assembly strips
-  `<!-- ADVISOR-ONLY -->` and `<!-- ADVISOR-DISABLED -->` regions depending on
-  whether the advisor tool is enabled, so an advisor-disabled deployment can no
-  longer leak `request_advisor_hint` guidance to the composer LLM.
-- **Hard-mode evaluation harness** — reusable shell tooling and scenario fan-out
-  capture validation transport failures, composer regressions, and per-row output
-  evidence for demo-readiness checks.
-
-#### Plugin and Contract Surface
-
-- **Plugin-declared semantic contracts** — plugins can now publish semantic
-  facts, requirements, comparison outcomes, and composer assistance text; the
-  composer, MCP server, HTTP validation, and `/execute` surfaces expose the
-  same contract shape.
-- **Statistical batch plugin family** — added runnable local examples for
-  `batch_distribution_profile`, `batch_experiment_compare`,
-  `batch_classifier_metrics`, `batch_paired_preference`,
-  `batch_drift_compare`, `batch_outlier_annotator`,
-  `batch_data_quality_report`, `batch_top_k`, `batch_threshold_summary`, and
-  `batch_effect_size`.
-- **Value-source and schema-contract guidance** — plugin catalogs and composer
-  guidance now carry richer missing-dependency, schema vocabulary, and repair
-  hints so an invalid pipeline points at the contract it violated.
-
-#### Audit and Accounting Model
-
-- **Two-axis terminal outcome model** — RC5-UX separates lifecycle outcome from
-  terminal path/provenance so success, failure, routed, discarded, fallback, and
-  structural bookkeeping cases no longer overload a single row outcome.
-- **Run accounting split** — routed success/failure, token lifecycle counts,
-  source-row counts, discard summaries, and closure integrity are reported as
-  distinct units instead of being inferred from one `rows_routed` number.
-- **Per-tool-call composer audit** — both the web composer and the standalone
-  composer MCP server persist the tool-call decision trail that produced a
-  pipeline.
-
-#### CI, Policy, and Test Surface
-
-- **Policy gates expanded** — branch work added or tightened gates for
-  component types, guard symmetry, audit evidence nominal typing, tier-1
-  decoration, contract manifests, composer exception channels, composer catch
-  order, and tier-model allowlists.
-- **Frontend Playwright baseline** — a real browser E2E harness now boots the
-  FastAPI backend and Vite frontend, with an initial smoke proof and fixme
-  specs for composer-correctness acceptance paths.
-
-#### Validator and Pipeline Authoring (RC-5.1)
-
-- **`identity_node_advisory` validator check** — `validate_pipeline` now detects
-  identity passthrough nodes wired between transforms and observed sinks, where
-  the passthrough silently degrades observed-sink lineage. The check is gated by
-  an exemption matrix locked in by tests and surfaces as an actionable composer
-  repair hint.
-- **Composer pipeline recipes** — `apply_pipeline_recipe` MCP tool plus two
-  initial templates compose a multi-node pipeline from a single named recipe,
-  with deep-frozen `RecipeSpec.slots` and slot defaults validated against
-  `slot_type` at construction.
-- **Source inspection MCP tool** — new `inspect_source` MCP tool surfaces
-  external-data shape and silent-failure modes as warnings, supporting
-  "look before you wire" composer sessions; hostile-input coverage included.
-- **Forced-repair loop with proof diagnostics** — `preview_pipeline` runs a
-  proof step emitting a `proof_diagnostics` array; the composer's forced-repair
-  loop fires on the resumed-session first turn and plumbs `repair_turns_used`
-  into `composition_states.composer_meta`. `compute_proof_diagnostics` verifies
-  blob `content_hash` so a stale blob cannot pass the proof gate.
-- **`<OPERATOR_REQUIRED>` sentinels for identity-bearing fields** — the composer
-  skill replaces literal example values for `web_scrape.http.abuse_contact` and
-  `scraping_reason` with angle-bracket sentinels and an explicit resolution order
-  (operator-supplied → deployment-identity → ask). The angle-bracket form lets a
-  placeholder validator mechanically reject any YAML that still carries a
-  sentinel.
-- **Hard rule against silent operator-input rewrites** — the composer skill now
-  forbids silent normalisations of operator-supplied strings (e.g. prepending
-  `https://`, lowercasing, trailing-slash strip); any rewrite must be confirmed
-  by the operator or routed through a recorded normalisation step so it appears
-  in the YAML and build summary.
-- **Implicit-decision disclosure ("Decisions I made on your behalf")** — a new
-  Build Summary Discipline subsection requires the composer to enumerate
-  operator-invisible authoring decisions (identity headers, model/provider/
-  temperature, output shape and routing, format choices, allowlist defaults,
-  surviving operator-input rewrites) with explicit provenance markers
-  (`default` / `picked` / `deployment-identity` / `operator-supplied`).
-
-#### Run Evidence and Operator Visibility (RC-5.1)
-
-- **Run outputs panel** — frontend `RunOutputsPanel` exposes the full
-  audit-evidence manifest for a run, with downloadable artifacts gated by a
-  per-artifact `downloadable` flag and backed by a new `/artifacts/preview`
-  execution endpoint.
-- **`data_dir` resolved to absolute path** — `WebSettings` resolves `data_dir`
-  to an absolute path at validation time, eliminating ambiguity where relative
-  paths were interpreted against different working directories at validate vs.
-  run time.
-- **Failure-sample aggregation in run-level errors** — a new
-  `web/execution/failure_samples` module aggregates the top distinct
-  `transform_errors` rows so a failed run's top-level error message carries
-  actionable detail rather than a single bubble-up exception string.
-- **Operator-visibility polish** — cancellation-requested runs carry a distinct
-  badge separate from terminal `cancelled`, GraphView preserves pan/zoom across
-  topology changes, and Tier-3 source inspection surfaces silent-failure modes
-  (e.g. all-rows quarantined) as warnings.
-
-#### Audit Integrity Test Coverage (RC-5.1)
-
-- **Direct audit-integrity invariant coverage** — unit tests added for four
-  ADR-019-family invariants that previously had none (deferred-invariant sweep,
-  `_validate_token_row_ownership` lineage guard, `link_validation_error_to_row`
-  quarantine branches, and all 12 `_REQUIRED_COMPOSITE_FOREIGN_KEYS` entries),
-  plus residual SSRF blocklist boundary cases (the `::ffff:0:0/96` IPv4-mapped
-  range and seven others) in `web_scrape`.
-
-#### Contracts and Lifecycle (RC-5.1)
-
-- **Lifecycle symmetry and contract-test derivation** — runtime-config protocols
-  expose paired `_on_start_called` / `_on_complete_called` flags so asymmetric
-  implementations become structurally detectable, and contract tests now derive
-  the runtime-config inventory from introspection rather than a hand-maintained
-  list.
-
-### Changed
-
-- **README front door refreshed for RC-5** — the README now leads with the
-  high-assurance substrate, the gap ELSPETH closes, the two authoring audiences,
-  parallel YAML/Web Composer start paths, the capability map, and the
-  audit/assurance model, and the quickstart uses the `elspeth web` default port
-  `8451`.
-- **Batch-specific LLM transforms retired from the public story** —
-  `azure_batch_llm` and `openrouter_batch_llm` are no longer advertised; use the
-  regular `llm` transform with provider pooling/multi-query for throughput and
-  the statistical batch transforms for audit-attributable local aggregation.
-- **Default `on_validation_failure` is now `discard`** — the default per-source
-  validation-failure behaviour changed to `discard` with documented quarantine
-  semantics, replacing the prior implicit fall-through.
-- **Unknown-plugin composer error is now actionable** —
-  `_prevalidate_plugin_options` surfaces an unknown plugin id as a structured
-  rejection instead of a silent fail-open, and rejected-mutation entries now lead
-  `validation.errors` as the primary diagnostic.
-- **Composer audit-trail honesty** — augment-shape preflight failures retain the
-  model's original prose instead of a generic summary, and `apply_pipeline_recipe`
-  explicitly reports a destructive replacement in the composer audit trail.
-
-### Fixed
-
-- **Wire-visible identity fabrication (Tier-1 audit-integrity defect)** — the
-  composer skill previously carried `compliance@example.com` and a generic
-  scraping reason as the canonical worked example for the
-  `web_scrape.http.abuse_contact` / `scraping_reason` fields, and the LLM was
-  copying those literals into generated YAML verbatim. A reproduced eval
-  session shipped a fabricated abuse-contact email as an HTTP header to three
-  external `.gov.au` sites — a confident wrong answer to a third party we have
-  no relationship with. Closed by the `<OPERATOR_REQUIRED>` sentinel rewrite,
-  the silent-rewrite hard rule, and the implicit-decision disclosure block
-  (see *Validator and Pipeline Authoring (RC-5.1)*).
-- **Composer skill correctness** — a multi-commit sweep closed skill-text
-  fabrication and silent-shape-downgrade loopholes, widened the grounding
-  detector, scoped state-claim grounding correction, forbade identity nodes
-  between transforms and observed sinks, and narrowed the `ComposerResult`
-  pairing invariant.
-- **Composer frontend and audit-shape fixes** — a Tier-1 accessibility panel
-  review fixed `aria-controls` / `aria-expanded`, `aria-live` scoping, and
-  validation-colour decoupling; the SecretsPanel form recovers cleanly on a
-  failed `createSecret`; and `augment` / `replace` audit shapes now use symmetric
-  producer-side invariants.
-
----
+A correctness and assurance follow-up to RC-5: Web Composer authoring-loop and
+validation hardening, the `identity_node_advisory` validator, and `data_dir`
+resolved to an absolute path at validation time.
 
 ## [0.5.0] (RC-5 — Web UX Composer + Systematic Hardening)
 
-Full web application platform for chat-first pipeline composition, three-provider authentication, session management with versioning, blob storage, secret management, background pipeline execution with WebSocket progress, and a React frontend themed to DTA/AGDS guidelines. Also: sink failsink pattern for per-row write failure routing, pipeline composer MCP server, DAG schema propagation (`output_schema_config` as single source of truth), declaration-trust / compiler-boundary hardening for pre-data runtime guarantees, frontend UX refresh (A1-A7), composer agent tooling (B1-B5) and skill pack update (C1-D4), guard symmetry CI scanner, `TokenRef` type, exception hygiene with `TIER_1_ERRORS`, a 200+ bug closure campaign across all subsystems, and a comprehensive test hygiene sweep removing ~500 low-value tests while adding ~200 gap-filling tests.
-
-### Added
-
-#### Declaration-Trust / Compiler-Boundary Hardening
-
-- **Declaration-trust framework** — generalized ELSPETH's config-to-execution contract into a first-class declaration-trust system. Declarations trusted during graph construction and web validation — including pass-through behavior, declared input/output fields, schema mode, source guaranteed fields, sink required fields, and empty-emission governance — are now explicit, validated at compile time where possible, enforced by CI manifest/scanner guardrails, recorded in the run header via the runtime VAL manifest, and re-verified at runtime with audit-complete violation reporting. This moves the web UX closer to a true compiler front-end: a configuration that validates is one that satisfies every pre-data runtime guarantee ELSPETH can assess before Tier 3 data arrives.
-
-#### Web UX Composer Platform
-
-- **`elspeth web` CLI command** — FastAPI app factory with `[webui]` extra, `WebSettings` config model, and default port 8451, serving the Vite-built React SPA from `src/elspeth/web/frontend/dist/` with `/api` and `/ws` proxying.
-- **DTA/AGDS theming and accessibility** — deep teal, green accent, and GOLD semantic colours matching Australian Government Design System guidelines, plus skip-to-content links, reduced-motion support, touch-target sizing, session creation/archive guards, and destructive-action confirmation.
-
-#### Authentication Subsystem
-
-- **`AuthProvider` protocol** — pluggable identity model (`AuthenticationError` base) with three providers: `LocalAuthProvider` (bcrypt + JWT issuance), `OIDCAuthProvider` (OpenID Connect with JWKS discovery and key caching), and `EntraAuthProvider` (Microsoft Entra ID with tenant validation and group claims).
-- **Auth surface** — `get_current_user` route-level middleware, login/token-refresh/profile/config routes, and a configurable registration endpoint (`open`, `email_verified`, `closed`).
-- **python-jose → PyJWT migration** — replaced the unmaintained library across all auth code.
-
-#### Plugin Catalog
-
-- **`CatalogService` protocol and implementation** — plugin discovery service with REST API routes wired into the app factory.
-
-#### Session Management
-
-- **SQLAlchemy Core schema + `SessionServiceImpl`** — session database with migrations, and CRUD/versioning/run-enforcement (`RunAlreadyActiveError`) behind `SessionServiceProtocol`, with a full REST API (pagination, state pruning, upload hardening).
-- **Fork-from-message** — create new session versions branching from specific conversation messages, with a text source plugin.
-- **Concurrency and lifecycle hardening** — DB-level constraints replacing application-level TOCTOU checks, all DB calls moved off the async event loop via a thread-pool executor, and orphan cleanup wired into the FastAPI lifespan with UUID path parameters.
-
-#### Blob Storage Manager
-
-- **Blob storage subsystem** — data model, service, and migration; REST API and app wiring; frontend, composer-tool, and execution integration; schema inference; and upload dedup, quota enforcement, and file cleanup.
-
-#### Secret Reference System
-
-- **Historical `$secret{name}` reference resolution** — `SecretResolution` audit extension accepting `"env"` / `"user"` sources, a recursive `resolve_secret_refs()` config tree-walk, and `ServerSecretStore` / `WebSecretService` chained resolution with allowlist enforcement, env-var boundary, and fingerprint audit. Current Composer authoring uses `{secret_ref: NAME}` markers for new nodes and `wire_secret_ref(...)` for existing components.
-- **Secret-system surface and hardening** — REST API, composer tools, execution integration, frontend wiring, plus audit trail, fingerprints, leakage prevention, and input validation.
-
-#### Pipeline Execution Layer
-
-- **Background pipeline runs** — `ExecutionServiceImpl` with WebSocket progress streaming, dry-run validation, and late-client seeding (clients connecting after run start receive current state).
-- **Cancel-vs-execute race closure** — atomic state transition preventing concurrent execution attempts.
-
-#### Pipeline Composer (LLM Tool-Use)
-
-- **Frozen composition data models** — `SourceSpec`, `NodeSpec`, `EdgeSpec`, `OutputSpec`, `PipelineMetadata` with deep immutability.
-- **`ComposerService` LLM tool-use loop** — composition tools and YAML generator, prompt/message management, and integration into the session API, with Stage 1 validation (warnings, suggestions, status tint).
-- **Composer loop hardening** — dual-counter loop guard, discovery cache, partial state recovery, rate limiting, and tool registry.
-
-#### Pipeline Inspector
-
-- **Inspector UX overhaul** — EdgeSpec/NodeSpec fixes, graph readability improvements, version selector, catalog drawer.
-
-#### Pipeline Composer MCP Server
-
-- **`elspeth-composer` MCP server** — full pipeline composition toolset via Model Context Protocol (plugin discovery, state mutation, validation, YAML generation, session persistence), with a Claude Code pipeline-composer skill pack for interactive MCP-driven building.
-
-#### Sink Failsink Pattern
-
-- **Per-row write-failure routing contracts** — `RowDiversion` and `SinkWriteResult`, a new `DIVERTED` terminal row state with a `rows_diverted` counter, and a mandatory `on_write_failure` config field on `SinkSettings` (`route_to`, `discard`, `fail`).
-- **Failsink DAG wiring and validation** — `BaseSink._divert_row()` (with `FrameworkBugError` guard), automatic `__failsink__` DIVERT edges in the DAG builder, construction-time `validate_sink_failsink_destinations()`, and `SinkExecutor.write()` failsink dispatch on per-row write failure.
-
-#### DAG Schema Propagation
-
-- **`output_schema_config` as single source of truth** — populated for all node types (source, transform, gate, aggregation, coalesce) at construction time. `_assign_schema` refactored to only set `output_schema_config`, dropping the parallel dict write.
-
-#### Frontend UX Refresh (A1-A7)
-
-- **Frontend UX refresh (A1-A7)** — categorized blob-manager folders, markdown/Mermaid rendering in chat (DOMPurify-sanitized), validation errors routed through chat, a default 50/50 graph/chat split, a relocated secrets button, per-node validation indicators, a three-state pipeline status indicator, and design-token / orchestration-extraction cleanup.
-
-#### Composer Agent Tooling (B1-B5)
-
-- **Composer agent tooling (B1-B5)** — blob CRUD, structured validation, path redaction, and pipeline diff for the composer MCP server.
-
-#### Composer Skill Pack Update
-
-- **Composer skill pack (C1-C8, D1-D4)** — expanded skill definitions plus the deployment skill layer for composer interactions.
-
-#### Web Group E
-
-- **Unified file storage** — blob refresh and inline source docs (file-handling consolidation).
-
-#### Guard Symmetry Scanner
-
-- **`enforce_guard_symmetry` CI tool** — detects write/read guard parity gaps (every Landscape write site must have a corresponding read guard), with a GitHub Actions workflow and allowlist support.
-
-#### TokenRef Type
-
-- **`TokenRef` frozen dataclass** — bundles `token_id + run_id` in `contracts/`, replacing loose 2-tuple passing; the Landscape API accepts `TokenRef` directly (`coalesce_tokens`, `_validate_token_run_ownership`) and read sites crash on corruption via `AuditIntegrityError` loader guards.
-
-#### Exception Hygiene
-
-- **`TIER_1_ERRORS` constant** — canonical tuple of exception types for Tier 1 catch sites, applied across all layers.
-
-#### Server Configuration
-
-- **Default port 8451** — server config design with skill restoration.
-
-### Fixed
-
-- **~100+ bug closure campaign (P1) across all subsystems** — Landscape/checkpoint/DAG integrity, plugin transform/source/sink contracts, engine orchestrator/processor/executor invariants, web execution races, and a large `cluster:null-check` sweep, including SSRF / auth-bypass / userinfo-leak hardening, with crash-on-invalid replacing silent-skip throughout. Per-bug detail in git history.
-- **Web platform hardening** — successive code-review rounds across sessions, blobs, auth, and execution closed a blob IDOR guard, FK constraints, an Entra-issuer / SNI / regex / cancel-race set, OIDC flow and blob-quota atomicity, and startup/auth regressions.
-- **Post-RC5-cut systematic bug sweep (~130 bugs)** — audit integrity, silent failure, security, race conditions, resource leaks, freeze gaps, validation-too-late, and type/contract safety across nine-plus clusters. Per-bug detail in git history.
-- **Engine, contract, and tier-model hygiene** — deep-immutability frozen dataclasses, unjustified `.get()` elimination on Tier 1/2 data, narrowed broad exception handlers, non-finite float rejection, unconditional `validate_input`, and assorted infrastructure/contract fixes (canonical-JSON NumPy handling, HTTP-method serialization, TOCTOU guards, timezone-aware session columns).
-- **Landscape audit-integrity guards** — `complete_node_state()` / `complete_batch()` terminal-overwrite guards, `DIVERTED` added to the Tier 1 outcome read guards, and terminal outcomes derived from the `RowOutcome` enum (closing the DIVERTED recovery gap).
-- **Security** — DSN credential scrubbing (`_sanitize_dsn()` strips credentials from query parameters), Mermaid SVG DOMPurify sanitization, and composer path resolution against `data_dir` rather than CWD.
-
-### Changed
-
-- **README web startup docs** — explicit instructions for the `.[webui]` extra, building the frontend, `ELSPETH_WEB__SECRET_KEY`, creating a local auth user, and running the MVP locally.
-- **Refactor and lint hygiene** — plugin-manager singleton extracted from `cli.py` to `manager.py`, 532 mypy/ruff errors resolved across the suite, and duplicated error-formatting / no-op-guard logic factored out (`_raise_if_invalid`, `_make_span`).
-- **Stale schema-mode references** — `fields: dynamic` → `mode: observed` across docs.
-
-### Removed
-
-- **errorworks test suite** — tests belong in the standalone package.
-- **`archive/` directory** — all content preserved in git history.
-
-### Tests
-
-- **Comprehensive test-hygiene sweep across all subsystems** — removed ~500 low-value tests and added ~200 behavioural gap-filling tests, plus new Azure Blob / DAG-validation / Web-Composer / Web-Auth coverage and post-cut gap closure (IDOR, timezone, Chroma metadata, mock-spec enforcement, audit error paths). Per-subsystem counts in git history.
+The web application platform for chat-first pipeline composition: three-provider
+authentication, session management with versioning, blob storage, secret
+management, background pipeline execution with WebSocket progress and a React
+frontend. Also the sink failsink pattern and the pipeline composer MCP server.
 
 ## [0.4.1] (RC-4.1 — RAG Ingestion Pipeline)
 
-Complete RAG ingestion story: ChromaSink for vector store population, pipeline `depends_on` for run sequencing, commencement gates for pre-flight go/no-go checks, and readiness contracts on retrieval providers. First pipeline-level orchestration primitives. Designed as a generic multi-stage pipeline pattern — RAG is the first consumer, but any plugin needing pre-populated external state can use the same mechanisms.
-
-### Added
-
-#### ChromaSink Plugin
-
-- **ChromaSink** — new sink plugin writing pipeline rows into ChromaDB collections. Three `on_duplicate` modes: `overwrite` (upsert), `skip` (pre-filter existing IDs), `error` (pre-check and reject). Canonical content hash computed before write for audit integrity.
-- **`FieldMappingConfig`** — explicit field mapping from row fields to ChromaDB concepts (`document_field`, `id_field`, `metadata_fields`). No convention-based defaults — operator declares exactly what goes where.
-- **`DuplicateDocumentError`** — structured exception with `collection` and `duplicate_ids` (stored as immutable tuple) for `on_duplicate: error` mode.
-- **ChromaDB metadata type validation** — metadata field values are validated as `str`, `int`, `float`, `bool`, or `None` at write time, before sending to ChromaDB. Invalid types (e.g. `dict`, `datetime`) crash with a `TypeError` naming the exact field, type, row index, and document ID.
-
-#### Pipeline `depends_on` Mechanism
-
-- **`depends_on` top-level config key** — declare pipelines that must run before the main pipeline starts. Each dependency is a fully independent pipeline run with its own `run_id`, Landscape records, and checkpoint stream.
-- **`bootstrap_and_run()`** — reusable headless pipeline entry point in `cli_helpers.py` (L3). Handles secret resolution, passphrase handling, and directory creation. Injected into the dependency resolver via `PipelineRunner` protocol.
-- **Circular dependency detection** — DFS cycle detector on canonicalized paths (`Path.resolve()`), with 3-level depth limit for nested dependencies.
-- **Sequential execution** — dependencies run in declared order. `KeyboardInterrupt` propagates as-is (not wrapped in `DependencyFailedError`).
-- **`DependencyRunResult`** — frozen dataclass with `run_id`, `settings_hash`, `duration_ms`, `indexed_at` for audit correlation.
-- **Resume behaviour** — `elspeth resume` does NOT re-run dependencies. Fresh run required if dependencies need re-running.
-
-#### Commencement Gates
-
-- **`commencement_gates` top-level config key** — go/no-go conditions evaluated after dependencies complete, before the main pipeline starts.
-- **`ExpressionParser` `allowed_names` extension** — gate expressions use the existing AST-whitelist parser with configurable namespace names (`collections`, `dependency_runs`, `env`). No `eval()`.
-- **Pre-flight context** — assembled from dependency results, collection probes, and environment variables. Deep-frozen before gate evaluation (TOCTOU-safe). `env` excluded from Landscape audit snapshots to prevent secret leakage.
-- **`collection_probes` explicit config** — operators declare which collections to probe. Probes assembled from explicit config, not auto-scanned from plugin configs.
-- **`CommencementGateResult`** — frozen dataclass with `context_snapshot` deep-frozen via `freeze_fields()`.
-
-#### Readiness Contract
-
-- **`check_readiness()` on `RetrievalProvider` protocol** — returns `CollectionReadinessResult` (L0). Single-attempt, no retry. Called during `on_start()` after provider construction.
-- **`ChromaSearchProvider.check_readiness()`** — collection count check with narrowed exception handling (connectivity errors only, not broad `except Exception`).
-- **`AzureSearchProvider.check_readiness()`** — raw `httpx` count endpoint probe (not `AuditedHTTPClient`, which requires row-scoped `state_id`/`token_id` unavailable during `on_start()`).
-- **RAG transform readiness guard** — `on_start()` checks both `reachable` and `count`. Raises `RetrievalNotReadyError` with `collection` and `reason` fields, with distinct messages for "empty" vs "unreachable".
-
-#### Shared Infrastructure
-
-- **`CollectionReadinessResult`** — unified frozen dataclass in L0 (`contracts/probes.py`) for all collection readiness checks. Used by probes, providers, and transforms.
-- **`CollectionProbe` protocol** — L0 protocol for collection readiness probes, injectable into L2 engine without layer violations.
-- **`ChromaConnectionConfig`** — shared Pydantic model for ChromaDB connection fields. Composed by `ChromaSinkConfig`, `ChromaSearchProviderConfig`, and `CollectionProbeConfig`. Collection name validated (min 3 chars, regex pattern).
-- **`RetrievalNotReadyError`** — structured exception with keyword-only `collection` and `reason` fields.
-- **`DependencyFailedError`** — structured exception with `dependency_name`, `run_id`, `reason`.
-- **`CommencementGateFailedError`** — structured exception with deep-frozen `context_snapshot`.
-
-#### Landscape Audit Trail
-
-- **`preflight_results` table** — new Landscape table recording dependency runs and gate evaluations per pipeline run. `result_type` discriminator with `CheckConstraint`. Canonical JSON serialization via `deep_thaw()` + `canonical_json()`.
-- **Readiness check outcomes recorded** — transform readiness results persisted alongside dependency and gate results.
-- **Deferred recording pattern** — pre-flight results computed in `bootstrap_and_run()`, carried through `orchestrator.run()` as `PreflightResult`, recorded after `begin_run()`. Same pattern as `secret_resolutions`.
-- **Dependency run correlation** — query run metadata links to indexing run via `run_id`, `settings_hash`, `indexed_at`. Auditor can trace: question → retrieved chunks → source documents → indexing decision → corpus state.
-
-#### End-to-End Example
-
-- **`examples/chroma_rag_indexed/`** — complete example: indexing pipeline (CSV → ChromaSink) + query pipeline (`depends_on` + commencement gate + RAG retrieval). Replaces the standalone `seed_collection.py` script with an audited pipeline.
-- **CLI preflight wiring** — `elspeth run` now executes `depends_on` and commencement gates when configured.
-
-### Fixed
-
-#### Exception Hygiene Completion
-
-- **3 overly-broad `except Exception` catches narrowed** to specific exception types in azure_batch, completing the exception narrowing sweep.
-- **`batch_batch_timeout` double-prefix bug** — corrected in azure_batch per-row failure reason field. The prefix was applied twice, producing malformed reason strings.
-- **Test asserting the bug** — corrected test that was asserting the buggy double-prefix behaviour rather than the correct single-prefix.
-- **`TransformErrorCategory` and `TransformActionCategory` Literal gaps closed** — added missing category values that were valid at runtime but not in the type definitions.
-- **HMAC-equivalent key pair filtering** — fingerprint property test now correctly filters HMAC-equivalent key pairs to avoid false failures.
-
-#### Tier 1 Audit Integrity Hardening
-
-- **`require_int()` utility** — Tier 1 int-field validator rejecting `bool` (Python's `isinstance(True, int)` footgun) and enforcing `min_value` bounds. Applied to 19 int fields across 13 audit dataclasses, plus `node_state_context`, `token_usage`, `batch_checkpoint`, `BufferEntry`, and `ResumePoint`.
-- **TypedDict export records** — 15 typed shapes replacing `dict[str, Any]` in `LandscapeExporter._iter_records()`. `record_type` narrowed to `Literal` per record for mypy discriminated union support.
-- **`CoalescePolicy` and `MergeStrategy` StrEnums** — replace bare strings in `CoalesceMetadata` and all call sites. Serialization-safe via `StrEnum`.
-- **`Mapping[str, object]` write-path narrowing** — Tier 1 write paths in recorder and repositories narrowed from `dict[str, Any]` to `Mapping[str, object]` for tighter type safety.
-- **`allow_nan=False`** — added to 6 `json.dumps()` calls in audit-path code, preventing NaN/Infinity from silently entering the Landscape.
-
-### Changed
-
-- **`ExpressionParser`** — now supports configurable `allowed_names` parameter (default `["row"]` for existing callers). Gate expressions use `["collections", "dependency_runs", "env"]`.
-- **`ChromaSearchProviderConfig`** — refactored to compose `ChromaConnectionConfig` for shared validation. `to_connection_config()` method added.
-- **`ElspethSettings`** — gains optional `depends_on`, `commencement_gates`, `collection_probes` fields.
-
----
+RAG ingestion: ChromaSink for vector store population, pipeline `depends_on`
+for run sequencing, commencement gates and readiness contracts on retrieval
+providers.
 
 ## [0.4.0] (RC-4.0 — Plugins, Contracts, and Correctness)
 
-Major feature release: Dataverse and RAG retrieval plugins, output schema contract enforcement, audit provenance boundary, freeze/serialize coherence, errorworks migration, and a 64-bug systematic sweep. Completes the RC-3.4 hardening sprint and delivers the first external-system plugin integrations. Also includes the agentic code threat model discussion paper (v0.1–v0.4) with MkDocs wiki and LaTeX build pipeline.
-
-### Added
-
-#### Dataverse Source and Sink Plugins
-
-- **`DataverseSource`** — Microsoft Dataverse integration via OData v4 REST API. Supports structured OData queries and FetchXML with schema contracts. Pagination, SSRF validation, and rate limiting via the new `DataverseClient`.
-- **`DataverseSink`** — upsert-only writes via PATCH with alternate key, idempotent for retries. Pre-processes all rows before HTTP calls.
-- **`DataverseClient`** — pure protocol client handling authentication, pagination, SSRF validation, and rate limiting for the OData v4 API.
-- **Shared utility extraction** — fingerprinting (`fingerprinting.py`) and strict JSON parsing (`json_utils.py`) extracted from `AuditedHTTPClient` into shared modules. 288 new tests.
-
-#### RAG Retrieval Transform
-
-- **`RAGRetrievalTransform`** — full retrieval-augmented generation transform with lifecycle management, process flow, and telemetry. Declared output schema config for downstream contract enforcement.
-- **`RetrievalProvider` protocol** — L0 protocol with `RetrievalChunk` result type. Two implementations: `ChromaSearchProvider` (ephemeral/persistent/client modes, distance normalization) and `AzureSearchProvider` (score normalization, Tier 3 validation).
-- **Query construction** — three modes: `field` (direct row field), `template` (string interpolation), `regex` (pattern extraction from row data).
-- **Context formatting** — `numbered`, `separated`, and `raw` modes for assembling retrieved chunks into LLM context.
-- **Shared template infrastructure** — extracted from LLM plugin for reuse by RAG query construction.
-- **`PluginRetryableError`** — new base exception class. `LLMClientError` and `WebScrapeError` re-parented under it. Processor retry dispatch updated. New retrieval error categories added to `TransformErrorCategory`.
-- **Example pipelines** — `examples/chroma_rag/` (standalone RAG) and `examples/chroma_rag_qa/` (RAG + LLM Q&A).
-
-#### Output Schema Contract Enforcement
-
-- **`_output_schema_config`** — new class attribute on `BaseTransform` with `_build_output_schema_config` helper. All field-adding transforms now declare their guaranteed output fields.
-- **`FrameworkBugError` guard** — DAG builder crashes if a transform declares output fields but is missing `_output_schema_config`, preventing silent schema drift.
-- **Integration tests** — full enforcement test and edge validation tests for output schema contracts.
-
-#### Audit Provenance Boundary Enforcement
-
-- **LLM audit metadata migration** — both batch and multi-query transforms now store audit fields in `success_reason` instead of polluting row data. Per-query provenance dicts collected and merged into `success_reason["metadata"]`.
-- **`Call` return from `get_ssrf_safe()`** — `AuditedHTTPClient` now surfaces the `Call` object for audit correlation.
-- **`payload_store` removed from `PluginContext`** — plugins access blob storage through `recorder.store_payload()` only, enforcing the provenance boundary.
-
-#### Freeze/Serialize Coherence
-
-- **Frozen container support in `contracts/hashing.py`** — canonical JSON serialization now handles `MappingProxyType`, `tuple`, and `frozenset` natively, resolving impedance mismatch between `deep_freeze` and hashing at L0.
-- **Property tests** — hash equivalence (frozen == unfrozen), cross-module parity tests, frozen round-trip contract tests.
-- **5 live bugs patched** — `MappingProxyType` NaN bypass, enum export, SSRF metadata, shallow thaw.
-- **Thaw-refreeze elimination** — `plugin_context.record_call` no longer round-trips through thaw/refreeze. `ArtifactDescriptor` uses `deep_freeze` instead of shallow `MappingProxyType` wrap.
-
-#### CI Enforcement
-
-- **`enforce_freeze_guards.py`** — AST-based CI scanner detecting forbidden freeze patterns in `__post_init__`: bare `MappingProxyType` wraps (FG1) and `isinstance` type guards to skip freezing (FG2). Per-file allowlists with `max_hits`.
-- **`enforce_mutable_annotations.py`** — CI linter detecting `list[]`/`dict[]`/`set[]` annotations on frozen dataclass fields. Allowlist for justified exceptions. *(Not yet merged — tracked for future implementation.)*
-- **`freeze_fields()` promoted** to `contracts/freeze.py` as the canonical freeze utility. All freeze guards standardised.
-
-#### web_scrape SSRF Allowlist
-
-- **`allowed_hosts` configuration** — three-tier IP validation: `ALWAYS_BLOCKED_RANGES` (link-local, broadcast, multicast) → user allowlist (CIDR) → standard blocked ranges. Accepts `"public_only"` (default), `"allow_private"`, or explicit CIDR list. Threaded through redirect chain. 62 new tests.
-- **Dual URL audit output** — both hostname and resolved IP URLs surfaced for audit comparison.
-
-### Changed
-
-- **`PipelineConfig` annotations** — `list`/`dict` fields changed to `Sequence`/`Mapping` to match frozen runtime types.
-- **Field normalization mandatory** — removed `normalize_fields` toggle from `CSVSource`, `AzureBlobSource`, and `DataverseSource`. Header normalization always applied at the source boundary. Dunder name regression test added.
-- **errorworks migration** — ChaosLLM, ChaosWeb, and ChaosEngine moved to external `errorworks` PyPI package (≥0.1.1). In-tree `chaosengine/`, `chaosllm/`, `chaosweb/`, `chaosllm_mcp/` directories deleted. Stale CLI subcommands removed.
-- **Fabricated audit records removed** — `CallType.HTTP` records from `batch_replicate` validation and fabricated `variables_hash` sentinel from batch audit metadata.
-- **Logger hygiene** — redundant logs removed, LLM `success_reason` audit metadata enriched.
-
-### Fixed
-
-#### RC4-Bugsweep (64 bugs across 13 clusters)
-
-- **Broad-except swallowing framework errors** (6 bugs) — narrowed to specific exception types.
-- **Exception type hygiene** (5 bugs) — replaced generic exceptions with domain-specific error types.
-- **Dead code in exception handling** (4 bugs) — removed unreachable exception paths.
-- **Missing audit on exception paths** (3 bugs) — added audit recording to previously silent failure paths.
-- **Dataverse subsystem** (4 bugs) — sink pre-processing, source boundary validation.
-- **Dataverse source Tier 3 boundary** (4 bugs) — trust boundary validation at OData response boundary.
-- **`__post_init__` type guards** (4 bugs) — construction-time validation on checkpoint/engine dataclasses.
-- **Freeze/immutability** (6 bugs) — `deep_freeze` Mapping support, shallow wrap elimination.
-- **Tier 3 trust boundary validation** (5 bugs) — external system response validation.
-- **LLM parallel execution audit integrity** (3 bugs) — concurrent audit recording correctness.
-- **CI gate, retrieval, aggregation, verifier, CSV** (17 bugs) — cross-cutting correctness fixes.
-- **IntegrityError propagation, `node_id` misattribution, buffer state corruption** (3 bugs).
-- **Coalesce `rows_coalesced` double-increment** (1 bug) in timeout/flush path.
-- **RAG subsystem** (3 bugs) — crash detection, resource cleanup, truncation budget.
-- **ChromaDB distance type guard** (2 bugs) — crash on corrupt index instead of silent skip. Improved crash messages with collection name, doc ID, and remediation.
-
-#### Additional Fixes
-
-- **Plugin exception catch hygiene** (5 bugs) — pooling, search, sink, processor.
-- **Exception type and chain hygiene** (5 bugs) — across contracts/engine/plugins.
-- **Tier 1 checkpoint deserialization** — crash on corruption, don't coerce.
-- **`AuditIntegrityError` misattribution** — prevented by outer exception handlers via dedicated error guard.
-- **Unwrapped `record_call` SUCCESS paths** — all wrapped in `AuditIntegrityError`.
-- **CLAUDE.md compliance** — defensive patterns, immutability, structlog, test types.
-
-#### Mutation Testing
-
-- **Checkpoint restore and WHERE clause exactness** — 71 new tests killing mutation survivors across 3 landscape repositories.
-- **`canonical.py`** — 13 tests for None/NaT passthrough and numpy sanitization survivors.
-- **`lineage.py`** — 3 tests for sink filter equality and terminal filtering survivors.
-
-### Design Documentation
-
-- Historical design specs and implementation plans from this era are no longer
-  active docs. They are preserved in git history or the dated docs archives;
-  start from the current ADRs, contracts, and archive manifests rather than old
-  `docs/` paths.
-
----
+Dataverse and RAG retrieval plugins, output schema contract enforcement and
+the audit provenance boundary. Field normalization became mandatory (the
+`normalize_fields` toggle was removed from `CSVSource`, `AzureBlobSource` and
+`DataverseSource`), and ChaosLLM, ChaosWeb and ChaosEngine moved to the
+external `errorworks` package.
 
 ## [0.3.4] (RC-3.4 — Systematic Hardening)
 
-Systematic hardening sprint driven by 191-bug triage, mutation testing, and code quality sweep. Focus: audit integrity, deep immutability, construction-time validation, exception hygiene, and elimination of defensive anti-patterns. No new features — pure correctness and reliability work.
-
-### Fixed
-
-#### Audit Integrity & Tier 1 Hardening
-
-- **PayloadNotFoundError domain exception** — `PayloadStore` protocol, `FilesystemPayloadStore`, and `MockPayloadStore` now raise `PayloadNotFoundError` instead of generic `KeyError`, preventing accidental catch by `except KeyError:` dict-lookup handlers. All five caller sites updated. PURGED paths now emit debug logs with `content_hash` for operational visibility.
-- **PayloadIntegrityError → AuditIntegrityError** — `get_call_response_data` now catches `PayloadIntegrityError` and translates to `AuditIntegrityError` with run/call context, instead of letting raw integrity errors escape the landscape layer.
-- **AuditIntegrityError for Tier 1 corruption** — Lineage queries, edge lookups, and purge grade updates now raise `AuditIntegrityError` instead of generic `ValueError` when encountering corrupt audit data.
-- **Silent default=str fallback removed** — Journal serialization no longer silently coerces unserializable types via `default=str`. Non-serializable data now crashes immediately, exposing the upstream bug.
-- **BatchCheckpointState tuple restoration** — `from_dict()` now restores tuple types after JSON round-trip instead of leaving them as lists, preserving Tier 1 checkpoint invariants.
-- **Null-content LLM responses recorded** — Null-content responses are now recorded in the audit trail before raising, closing an audit gap where failed LLM calls left no trace.
-- **Exception type hygiene** — `ValueError` replaced with `AuditIntegrityError` or `OrchestrationInvariantError` at 12 sites where the generic type misrepresented the failure category.
-- **Tier 1 invariants in graph.py** — DAG graph now crashes on invalid source count, missing route labels, and defensive `.get()` patterns that masked corruption.
-- **Programming-error guards in exporters** — Exporters and journal now raise `AuditIntegrityError` or `FrameworkBugError` instead of silently continuing on corrupt state.
-- **Dead `ExecutionError.from_dict()` deleted** — Removed dead deserialization method; `TokenUsage.from_dict()` now rejects bool values that would silently coerce to int.
-
-#### Deep Immutability & Frozen Dataclass Hardening
-
-- **Central freeze/thaw utilities** — New `deep_freeze()` and `deep_thaw()` functions standardize immutability across all frozen dataclasses, replacing ad-hoc `deepcopy` calls.
-- **deep_freeze recursion** — Now recurses into tuples, frozensets, and `MappingProxyType` contents, closing gaps where nested mutable containers survived freezing.
-- **Mutable dict fields frozen** — All frozen checkpoint dataclasses now freeze mutable dict fields at construction, preventing post-construction mutation of Tier 1 data.
-- **Category A mutable-frozen bugs** — Enforced deep immutability on 5 frozen dataclasses where mutable fields were exposed.
-- **Category B mutable-frozen bugs** — Froze 5 additional DTOs with mutable internal state.
-- **`slots=True` on all frozen dataclasses** — Added `slots=True` to `ResumeCheck`, `ResumePoint`, `RowDataResult`, `_GateEntry`, and all remaining frozen dataclasses that lacked it.
-- **Contracts layer hardened** — Frozen sets, `deep_freeze` over `deepcopy`, `AuditIntegrityError` for checkpoint corruption.
-- **HTTP DTO headers copied before freezing** — Prevents shared mutable header dicts from being modified after DTO construction.
-- **Frozen constants and LineageResult** — Immutability hardened across engine constants and lineage query results.
-- **Frozen/shared data structure enforcement** — Cleared `cluster:mutable-frozen` bug cluster.
-
-#### Construction-Time Validation (`__post_init__`)
-
-- **12 frozen dataclass types validated** — Added `__post_init__` validation enforcing invariants at construction time across contracts and engine types.
-- **Remaining `cluster:missing-post-init` types** — Completed validation coverage for all frozen dataclasses that lacked construction-time checks.
-- **NaN bypass and generator truthiness** — Fixed `__post_init__` validators that failed to detect NaN values and generators that evaluated truthy regardless of content.
-- **Coalesce checkpoint DTO validation** — `CoalesceTokenCheckpoint` and `CoalescePendingCheckpoint` now enforce non-empty identifiers, non-negative timing, dict types, and disjoint branch keys.
-- **Config-time validation** — Added validation for free-string fields, encoding, delimiters, and cross-field invariants at settings load time, clearing `cluster:config-validation`.
-
-#### Exception Handling Hygiene
-
-- **Exception chains preserved** — Replaced `from None` with `from exc` across 16 files, preserving diagnostic context in exception chains.
-- **5 broken exception chains repaired** — Fixed `raise X from None` patterns in engine, plugins, and CLI that destroyed root-cause information.
-- **22 broad `except Exception` catches narrowed** — Replaced overly broad catches with specific exception types, clearing `cluster:broad-except`.
-- **Missing programming-error re-raises** — Added `FrameworkBugError`/`AuditIntegrityError` re-raise guards to telemetry `except` blocks that swallowed system errors.
-- **Generic exceptions replaced** — Domain-specific error types (`AuditIntegrityError`, `GraphValidationError`, `OrchestrationInvariantError`) replace generic `ValueError`/`RuntimeError`, clearing `cluster:wrong-exception-type`.
-- **Silent skips → explicit crashes** — 6 audit-gap bugs where code silently returned on invalid state now crash with invariant violation messages.
-
-#### Defensive Pattern Removal
-
-- **`hasattr()` banned unconditionally** — All 3 occurrences replaced with type-safe alternatives. `hasattr` is no longer allowlistable in the tier model enforcer.
-- **Defensive `.get()` → required-fields validation** — `AggregationNodeCheckpoint.from_dict()` and other Tier 1 deserializers now validate required fields explicitly instead of using `.get()` with defaults.
-- **Defensive access patterns removed** — Two passes across typed and Tier 1 data, replacing `.get(key, default)` with direct access on data we own.
-- **CUSTOM header mode fail-closed** — Sink header mode `CUSTOM` now raises on unmapped fields instead of silently falling back to normalized names.
-
-#### Data Fabrication Elimination
-
-- **10 `cluster:fabrication` bugs fixed** — Replaced fabricated defaults (`None` → `0`, missing → empty string) with explicit validation or propagation of absence.
-- **LLM batch, DB sink, and coalesce fabrication** — Eliminated silent default injection in three additional paths where missing data was replaced with invented values.
-
-#### Audit-Gap Bug Fixes
-
-- **4 TOCTOU races, silent blank rows, checkpoint invariant** — Fixed race conditions in concurrent audit writes and checkpoint state transitions.
-- **3 credential leak, buffer corruption, record ordering** — Closed credential exposure in error messages, buffer mutation after read, and out-of-order audit record insertion.
-- **2 rowcount validation, dict mutation** — Added rowcount assertions for fork/coalesce/expand writes; fixed in-place dict mutation in sequential multi-query.
-- **4 row_data serialization, replayer Tier 1 reads** — Protected row_data from mutation during serialization; hardened replayer reads to crash on corruption.
-- **Audit-gap silent failures recorded** — Error file download, malformed JSONL, and batch quarantine now record failures instead of silently dropping them.
-
-#### Plugin & Engine Fixes
-
-- **`_prepare_call_payloads` extracted** — Deduplicates payload preparation between `record_call` and `record_operation_call`.
-- **`_make_checkpoint_after_sink_factory` extracted** — Deduplicates checkpoint-after-sink closure across orchestrator paths.
-- **`dataclass_to_dict` tuple handling** — Now handles tuples correctly; fixed `has_retries` off-by-one comparison.
-- **Azure client close-before-null** — `CallDataResult` discriminated type replaces ambiguous `None` return from Azure client operations.
-- **Missing fingerprint key crashes** — Auth header fingerprinting now crashes on missing key instead of silently skipping; non-finite row indices recorded in batch stats.
-- **Broken output port and shutdown timeout** — Batch mixin now crashes on broken output ports and respects shutdown timeout instead of silently continuing.
-- **Purge grade updates wrapped individually** — Prevents stale grades after partial payload deletion.
-- **Absent finish_reason accepted** — LLM responses with no `finish_reason` field (distinct from non-STOP values) are now accepted; Azure batch file ID guards added.
-- **Per-query templates pre-compiled at init** — Separates structural errors (config, caught at startup) from operational errors (per-row, caught at render).
-- **Coalesce `_completed_keys` for late arrivals** — Late-arriving tokens after resume are now correctly detected via completed-keys tracking.
-- **Route-label enforcement at construction** — Moved from runtime lookup to DAG construction time; `get_route_label()` simplified.
-- **`select_branch` KeyError wrapped** — Now raises `GraphValidationError` with context instead of bare `KeyError`.
-- **`_get_node()` extracted in AggregationExecutor** — Unifies node validation, removes dead code.
-
-#### Type Design
-
-- **22 type-design bugs fixed** — 14 across engine, contracts, and plugins; 8 across engine, landscape, plugins, and verifier. Tightened field types, added missing validation, removed dead fields.
-- **Checkpoint and call_data contracts hardened** — Type design improvements in checkpoint and call_data contract types.
-
-#### Logging & Telemetry
-
-- **stdlib logging → structlog** — Replaced in batch mixin, multi_query, azure_blob_source, and azure_batch.
-- **Telemetry emitted before null-content raise** — Telemetry events are now emitted before raising on null-content LLM responses, closing an observability gap.
-- **Journal payload load errors caught** — Journal now catches and translates `PayloadNotFoundError` and `OSError` from payload store with diagnostic context.
-- **LLM finish-reason fail-closed** — Restructured `_finish_reason_error` from blocklist to allowlist (accept only `STOP` and absent). Unknown finish reasons now rejected as non-retryable errors.
-- **Shutdown checkpoint skip logging** — `_checkpoint_interrupted_progress` emits structured `shutdown_checkpoint_skipped` warning with diagnostic context instead of silently returning.
-- **Schema epoch directional guard** — `_sync_sqlite_schema_epoch` raises `SchemaCompatibilityError` on future epochs instead of silently downgrading.
-- **Checkpoint recovery type annotation** — `_get_buffered_checkpoint_token_ids` parameter typed as `Checkpoint` instead of `Any`.
-- **SQLite read-only audit inspection** — `LandscapeDB.from_url(..., create_tables=False)` no longer stamps `PRAGMA user_version`, preserving forensic access.
-
-#### Test Infrastructure (ChaosLLM/ChaosWeb)
-
-- **Malformed header overrides** — ChaosLLM and ChaosWeb now handle malformed header overrides gracefully instead of crashing the test server.
-- **ChaosLLM template pre-compilation** — Templates pre-compiled at init for faster test execution.
-- **Flaky purge test fixed** — `test_grade_update_failures_logged` used `capsys` which is unreliable when prior tests reconfigure structlog; switched to `structlog.testing.capture_logs()`.
-
-### Changed
-
-- `isinstance` allowlist compacted from flat entries into per-file rules with `max_hits` caps
-- Code review findings remediated — frozen field access, `deep_thaw` frozenset, DTO validation
-
-### Added
-
-- **Agentic code threat model discussion paper** — Comprehensive research paper covering forward analysis for agentic security, control strength hierarchy, incentive misalignment analysis, ISM control citations, and ACF framework. Multiple revisions through v0.3 with LaTeX build pipeline and DTA brand guidelines.
-- **`PayloadNotFoundError`** — Domain exception in `PayloadStore` protocol, replacing generic `KeyError` for missing payload lookups.
-- **`CallDataResult` discriminated type** — Replaces ambiguous `None` returns from Azure client data operations.
-- DAG validation tests for route-label and sink-map invariants
-- Coalesce checkpoint unit tests for `_get_buffered_checkpoint_token_ids` and `restore_from_checkpoint` rejection paths
-
-### Removed
-
-- Dead lifecycle hooks, stale comments, unused imports across engine and plugins
-- Dead code and process-tracking comments in ChaosLLM and ChaosWeb
-- Dead code, tombstone comments, and process-tracking prefixes across codebase
-
-### Tests
-
-- 6 P0 mutation survivors killed across canonical, lineage, tokens, triggers, and coalesce
-- 15 P1 mutation survivors killed across topology, lineage, tokens, triggers, coalesce, payload, exporter, executors, and outcomes
-- 9 test-gap bugs closed with 25 new tests across executors, coalesce, DAG, sinks, and plugins
-- 2 remaining test-gap bugs closed — purge command and MCP analyzer queries
-
----
+A hardening sprint with no new features: audit integrity, deep immutability,
+construction-time validation and exception hygiene.
 
 ## [0.3.3] (RC-3.3 — Architectural Remediation)
 
-4-phase remediation sprint driven by full architecture analysis. Focus: audit integrity hardening, layer enforcement, and elimination of defensive-pattern violations.
-
-### T10: LLM Plugin Consolidation
-
-Collapsed 6 LLM transform classes (~4,950 lines) into a unified `LLMTransform` with provider dispatch, eliminating ~3,300 lines of duplication. Strategy pattern: `LLMProvider` protocol handles transport (Azure SDK vs OpenRouter HTTP), two processing strategies (`SingleQueryStrategy` / `MultiQueryStrategy`) handle row logic, shared `LangfuseTracer` handles tracing.
-
-- Extracted shared infrastructure: `LangfuseTracer` (~600 lines deduplicated), `PromptTemplate` system, validation utilities
-- Created `LLMProvider` protocol with `AzureLLMProvider` and `OpenRouterLLMProvider` implementations
-- Single plugin registration: `plugin: llm` + `provider: azure|openrouter`; old names raise `ValueError` with migration guidance
-- Deleted 5 old source files, updated 16 example YAMLs and 10 documentation files
-
-### T17: PluginContext Protocol Split
-
-Decomposed the god-object `PluginContext` (20+ fields) into 4 phase-based protocols in `contracts/contexts.py` — `SourceContext`, `TransformContext`, `SinkContext`, `LifecycleContext` — narrowing each plugin method signature to only the fields that pipeline phase actually needs. Concrete `PluginContext` structurally satisfies all 4 protocols; engine executors mutate concrete fields between steps while plugins see read-only views via protocol typing. 23 plugin files updated.
-
-### T18: Orchestrator/Processor Decomposition
-
-Pure extract-method refactoring of the two largest engine files, reducing maximum method size to ≤150 lines with no behavior change. Extracted 7 methods from `orchestrator/core.py` and 3 from `processor.py`. Introduced typed parameter bundles (`GraphArtifacts`, `RunContext`, `LoopContext`) and discriminated union types for transform/gate outcomes.
-
-### T19: Landscape Repository Pattern
-
-Refactored `LandscapeRecorder` from 8 mixins into 4 composed domain repositories — `RunLifecycleRepository`, `ExecutionRepository`, `DataFlowRepository`, `QueryRepository` — split by pipeline-phase domain. `LandscapeRecorder` is now a pure delegation facade (~91 public methods, zero logic).
-
-### Plugins Restructure (SDA Alignment)
-
-Reorganized the flat `plugins/` directory into 4 SDA-aligned subfolders: `infrastructure/` (shared base classes, clients, batching, pooling), `sources/`, `transforms/`, `sinks/`. 247 files changed, ~200 imports rewritten.
-
-### Protocol Relocation (L3→L0)
-
-Moved `SourceProtocol`, `TransformProtocol`, `SinkProtocol`, `BatchTransformProtocol`, and `GateResult` from `plugins/infrastructure/` (L3) to `contracts/` (L0). Eliminates the engine→plugins layer violation that forced L2 code to import from L3.
-
-### Fixed
-
-- **Pending coalesce resume gaps** — Added typed coalesce checkpoint DTOs, persisted pending coalesce state in checkpoint records, restored coalesce barriers on resume, and taught recovery to exclude buffered coalesce tokens from replay. Graceful shutdown can now resume fork/join pipelines without losing pending joins or replaying already-buffered rows.
-- **Interrupted resume checkpoint ordering** — Resumed runs now rebase checkpoint sequence numbers from the previous resume point before writing fresh checkpoints, so a second interrupted resume continues from the newest durable progress marker instead of falling back to an older checkpoint.
-- **SQLite schema compatibility posture** — Replaced the ad hoc `checkpoints.coalesce_state_json` required-column gate with an explicit SQLite schema epoch stamp via `PRAGMA user_version`, preserving intentional pre-1.0 schema breaks while keeping a clear future migration seam.
-- **Buffered-only resume shutdown semantics** — Resume now honors a pre-set shutdown signal before any end-of-source aggregation/coalesce flushes, so buffered-only checkpoints are re-checkpointed for another resume instead of being flushed to sinks.
-- **Frozen audit records** — Added `frozen=True, slots=True` to all 16 mutable audit record dataclasses in `contracts/audit.py`. Mutations now crash at the mutation site instead of silently corrupting the Tier 1 audit trail.
-- **FrameworkBugError/AuditIntegrityError re-raise** — Added explicit re-raise before all broad `except Exception` handlers (13 sites across 7 files). System-level errors now always propagate. Structural AST test enforces bare `raise` pattern at all 17 guard sites.
-- **Silent failure remediation** — Comprehensive review of error handling across LLM plugins and plugin infrastructure. Silent fallbacks converted to proper exceptions or `TransformResult.error()` with diagnostic context. Missing optional packages now raise `RuntimeError` with install instructions instead of silently degrading.
-- **azure_batch silent passthrough** — `_process_single` else branch now raises `RuntimeError` instead of silently passing through unprocessed rows as "processed", matching the hardened pattern in `openrouter_batch`.
-- **Assert removal** — Replaced 18 `assert` statements across 10 plugin files with explicit `if/raise RuntimeError`. Asserts are stripped by `python -O`, silently removing safety checks.
-- **Truthiness checks** — Fixed 21 `if x:` / `x or default` patterns across 8 files that silently excluded valid zero values and empty strings. All replaced with explicit `is not None` checks.
-- **LLM transform bugs** — Fixed limiter dispatch using wrong config attribute, `response_format` not passed to provider, `output_fields` not extracted from multi-query responses, NaN/Infinity not rejected in LLM JSON responses
-- **Layer violations resolved** — Moved `ExpressionParser` from `engine/` to `core/`, `MaxRetriesExceeded` and `BufferEntry` to `contracts/`, created `RuntimeServiceRateLimit` in `contracts/config/`. 10 upward import violations → 0.
-- **OpenRouter parallel query client race** — Parallel multi-query runs shared a cached `AuditedHTTPClient` by `state_id`; first query to finish destroyed the transport for siblings. Added reference counting so client closes only when last query releases it.
-- **Aggregation BUFFERED lifecycle gap** — Triggering token on count-threshold flush skipped `BUFFERED` and went directly to terminal. Moved `BUFFERED` recording before `should_flush()` check so every aggregation token follows `BUFFERED` → terminal.
-- **BatchReplicate quarantine audit gap** — Buffer-time recording changed from `CONSUMED_IN_BATCH` (terminal) to `BUFFERED` (non-terminal) for transform-mode aggregation, enabling per-token `QUARANTINED` recording when batch transforms quarantine individual rows.
-- **KeywordFilter fail-closed on non-string values** — Security transform was silently passing non-string values in explicitly configured fields (fail-open). Now returns error with `reason='non_string_field'`.
-- **Multi-query regressions from T10** — Restored field type validation against declared `output_fields` type/enum constraints; restored pooled execution with AIMD capacity backoff; fixed Pydantic schema missing `output_fields`; fixed `_output_schema_config` using unprefixed single-query fields.
-- **LLM empty/whitespace content detection** — Azure and OpenRouter providers now raise `ContentPolicyError` for empty or whitespace-only content before `LLMQueryResult` construction.
-- **LLM content-filter finish reason fail-open** — Unified single-query and multi-query `LLMTransform` paths now treat `finish_reason=content_filter` as `reason='content_filtered'` instead of recording provider-filtered fallback text as successful output.
-- **Telemetry/Landscape hash divergence** — Telemetry hashes now read from recorded `Call` object instead of recomputing independently, eliminating divergence for datetime/Decimal/bytes/numpy payloads.
-- **URL password fingerprint encoding** — Fingerprinting now decodes percent-encoding before HMAC, so fingerprint represents the actual secret, not the URL-encoded form.
-- **TUI coalesce error crash on older records** — `_validate_coalesce_error` crashed with `KeyError` on pre-RC3.3 records. Added schema shape detection; older records render with degraded-format note.
-- **Graceful shutdown end-of-source synthesis** — Interrupted runs no longer force `END_OF_SOURCE` aggregation flushes or resolve pending coalesces just because shutdown arrived after the current row.
-- **Graceful shutdown resumability for buffered pipelines** — Interrupted aggregation/coalesce runs now persist a shutdown checkpoint before raising, so buffered state remains resumable even when no sink token was written yet.
-- **CLI explain passphrase silently swallowed** (T4) — YAML parse errors when `--settings` was explicitly provided now exit with code 1 and clear error message.
-- **MCP `diagnose()` quarantine count unscoped** (T5) — Was counting all historical runs; now scoped to last 24 hours, matching "what's broken right now?" purpose.
-- **ChaosLLM MCP CLI broken** (T27) — Called nonexistent `serve()` instead of `run_server()`, masked by `# type: ignore` comments.
-- **Azure AI tracing silent no-op** — Wired `_configure_azure_monitor()` into `LLMTransform.on_start()` with provider compatibility validation (Azure-only); replaced broad `except TypeError` with explicit `None` check so real SDK errors propagate.
-- **Contract-level fixes** — `Token.run_id` false optional removed; `CoalesceFailureReason` TypedDict replaced with frozen dataclass (3 dead fields deleted, 4 fields made required); dead `version` parameter removed from `stable_hash()`; Call XOR invariant (`state_id` vs `operation_id`) now enforced at construction; `RawCallPayload.to_dict()` returns shallow copy per immutability contract; `SanitizedDatabaseUrl` rewrote DSN handling to use `urllib.parse` (keeping `contracts/` a leaf layer).
-- **Code review remediation** — 4 critical (provider key validation split, `REPR_FALLBACK` row data state, `AuditIntegrityError` in `ExecutionError.from_dict()`, type-narrow `_convert_retryable_to_error_result`), 8 important, 6 suggestion fixes.
-- **CI/CD failures resolved** — ruff lint/format, mypy stale `type: ignore`, contracts allowlist, tier model (31 stale fingerprints refreshed).
-
-### Changed
-
-- Extracted `contracts/hashing.py` — primitive-only `canonical_json`, `stable_hash`, and `repr_hash` (RFC 8785 + hashlib, no pandas/numpy). Breaks circular dependency between `contracts/` and `core/canonical.py`.
-- Aggregation `on_error` is now required for aggregation transforms
-- DTO mapper classes renamed from `*Repository` to `*Loader` to avoid confusion with new domain repositories
-- **Test infrastructure overhaul (P0.5a–P4)** — 6-phase systematic hardening of the test suite, eliminating brittle coupling to internal constructors:
-  - P0.5a–b: New factories (`make_recorder_with_run()`, `register_test_node()`, etc.) and refactored existing factories to delegate through them
-  - P1: Replaced ~350 direct `PluginContext(...)` constructions across 53 files with centralized `make_context()` factory
-  - P2: Replaced ~452 inline `LandscapeDB.in_memory()`/`LandscapeRecorder(...)` constructions across 76 files with factory calls. Net −715 lines
-  - P3: Replaced ~529 lines of duplicated inline test plugin classes across 10 files with shared `tests.fixtures.plugins` imports
-  - P4: Re-raise guards in telemetry/orchestrator/operation tracking, frozen evidence types (`ExceptionResult`, `FailureInfo`), aggregation DRY via `accumulate_row_outcomes()` + `ExecutionCounters`
-- Resolved all 401 mypy errors across test suite — removed ~74 stale `# type: ignore` comments, added union-type narrowing guards, fixed module re-exports, wrapped `NewType` constructors, fixed protocol signatures (103 files)
-- `PluginBundle` frozen dataclass replaces `dict[str, Any]` return from `instantiate_plugins_from_config()`, enabling mypy checking on all access sites
-- Fingerprint primitives (`get_fingerprint_key()`, `secret_fingerprint()`) moved to `contracts/security.py` as stdlib-only implementations
-- Redundant `.value` on `StrEnum` usage removed across checkpoint, landscape repositories, MCP, and tests
-- Removed file-path header comments from 128 source files
-- Azure safety transform consolidation (T14) — extracted shared batch infrastructure into `BaseAzureSafetyTransform` and `safety_utils.py`
-
-### Added
-
-- Typed coalesce checkpoint contracts (`CoalesceCheckpointState`, `CoalescePendingCheckpoint`, `CoalesceTokenCheckpoint`) plus CLI resume visibility for whether a checkpoint carries coalesce state
-- **ADR-006**: Layer Dependency Remediation — documents the strict 4-layer model and CI enforcement strategy
-- Full architecture analysis (23 documents covering all 13 subsystems)
-- **Security posture brief** — Comprehensive document covering threat model, security controls, assurance evidence, and residual risk for ELSPETH v0.3.0
-- **TYPE_CHECKING layer import detection** — `enforce_tier_model.py` CI gate now detects `TYPE_CHECKING` imports crossing layer boundaries as allowlistable findings
-- **MCP server `_ToolDef` registry** replacing if/elif dispatch chain (T15)
-- ~150 new tests across hardening, code review, and infrastructure phases
-
-### Removed
-
-- Dead code: `BaseLLMTransform` (3,473 lines, zero subclasses), `RequestRecord` dataclass, `TokenManager.payload_store` parameter, `populate_run()` (raw SQL bypass of `LandscapeRecorder`), LLM validation utilities (`render_template_safe`, `check_truncation`)
-- ~21 low-value tests (vacuous assertions, mock-testing, implementation coupling)
-- Superseded aggregation helpers replaced by shared `accumulate_row_outcomes()`
-
-### Tests
-
-- Full suite: approximately 10,500 tests — mypy/ruff/contracts all clean
-- P0.5a–P4 test infrastructure overhaul: centralized factories, shared fixtures, eliminated ~1,700 lines of duplicated test boilerplate
-
----
+A remediation sprint driven by full architecture analysis: audit integrity
+hardening, layer enforcement, LLM plugin consolidation and the
+orchestrator/processor decomposition.
 
 ## [0.3.0] - 2026-02-22 (RC-3.2)
 
-### Highlights
-
-- **Schema Contracts** — First-row-inferred field contracts propagated through the DAG and recorded in the audit trail
-- **Declarative DAG Wiring** — Every edge explicitly named and validated at construction time
-- **PipelineRow** — Typed row wrapper replacing raw dicts throughout the pipeline
-- **Strict Typing at Audit Boundaries** — Every `dict[str, Any]` crossing into the Landscape audit trail replaced with frozen dataclasses, eliminating an entire class of silent data-corruption bugs
-- **Test Suite v2** — Complete rewrite with 8,000+ tests across unit, property, integration, E2E, and performance layers
-- **178-Bug Triage** — Systematic closure of 160+ bugs across 8 hardening phases
-
-### Added
-
-- Schema contract system: inference, propagation, sink header modes, and audit recording
-- Typed DTOs at audit boundaries: `BatchCheckpointState`, `WebOutcomeClassification`, `NodeStateContext`, `CoalesceMetadata`, `AggregationCheckpointState`, `TokenUsage`, `GateEvaluationContext`, `AggregationFlushContext`, `CallPayload` protocol with typed request/response pairs
-- `NodeStateGuard` context manager enforcing terminal-state invariants in all executors
-- `detect_field_collisions()` utility preventing silent data overwrites across all transforms
-- Azure Key Vault secrets backend with audit trail
-- SQLCipher encryption-at-rest for the Landscape database
-- WebScrape transform with SSRF prevention and content fingerprinting
-- ChaosWeb fake server for stress-testing HTTP transforms
-- Langfuse v3 tracing for LLM plugins
-- Per-branch transforms between fork and coalesce nodes
-- Graceful shutdown (SIGINT/SIGTERM) for run and resume paths
-- DIVERT routing for quarantine/error sink paths
-
-### Fixed
-
-- **P0:** DNS rebinding TOCTOU in SSRF, JSON sink data loss on crash, content safety / prompt shield fail-open
-- Frozen dataclass DTOs replacing `dict[str, Any]` at 10+ audit trail boundaries — eliminates runtime KeyError risk and tier-model allowlist entries
-- `PluginContext.update_checkpoint()` replaced with `set_checkpoint()` (replacement semantics) — fixes P1 bug where dict merge lost checkpoint updates on restored batch state
-- NaN/Infinity rejection at JSON parse and schema validation boundaries
-- Resume row-drop, batch adapter crash, gate-to-gate routing crash
-- Telemetry DROP-mode evicting newest instead of oldest events
-- SharedBatchAdapter duplicate-emit race condition (first-result-wins preserved)
-- AzureBlobSink multi-batch overwrite, CSVSource multiline skip_rows, JSONL multibyte decoding
-
-### Changed
-
-- Orchestrator, LandscapeRecorder, MCP server, and executors decomposed from monoliths into focused modules
-- Checkpoint API typed: `get_checkpoint()` returns `BatchCheckpointState | None`, `set_checkpoint()` accepts typed state
-- Pre-commit hooks scan full codebase (12 hooks, check-only)
-- docs/ restructured from 792 files to 62 files
-- All Alembic migrations deleted (pre-release, no users)
-
-### Removed
-
-- Gate plugin subsystem — routing is now config-driven only
-- Beads (bd) issue tracker — migrated to legacy issue tracker
-- V1 test suite (7,487 tests, 222K lines) — replaced by v2
-- Dead plugin protocols (CoalesceProtocol, GateProtocol, PluginProtocol)
-
----
+Schema contracts, declarative DAG wiring, `PipelineRow` and strict typing at
+audit boundaries. The gate plugin subsystem was removed (routing is
+config-driven only) and all Alembic migrations were deleted.
 
 ## [0.1.0] - 2026-02-02 (RC-2)
 

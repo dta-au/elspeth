@@ -56,3 +56,18 @@ export function dispatchClaimedAuthoringFocusIntent(intent: number): void {
   if (!isCurrentWorkspaceViewIntent(intent)) return;
   window.dispatchEvent(new Event(FOCUS_AUTHORING_EVENT));
 }
+
+/** Ctrl+\ and the palette's "Hide or show conversation": a true toggle of the
+ *  authoring pane. ComposerWorkspace owns the listener (desktop: collapse or
+ *  restore; narrow: switch between the Compose and Pipeline views). */
+export const TOGGLE_AUTHORING_EVENT = "elspeth:toggle-authoring";
+
+export function dispatchAuthoringToggleIntent(): void {
+  claimWorkspaceViewIntent();
+  window.dispatchEvent(new Event(TOGGLE_AUTHORING_EVENT));
+}
+
+export function dispatchClaimedAuthoringToggleIntent(intent: number): void {
+  if (!isCurrentWorkspaceViewIntent(intent)) return;
+  window.dispatchEvent(new Event(TOGGLE_AUTHORING_EVENT));
+}

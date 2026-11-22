@@ -33,6 +33,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from enum import StrEnum
 from threading import Lock
+from types import MappingProxyType
 from typing import Any, Final, NotRequired, Required, TypedDict, cast, get_args
 
 from rfc8785 import CanonicalizationError
@@ -367,7 +368,8 @@ _SOURCE_CUSTODY_RULES: Final[tuple[str, ...]] = (
     "A file the user NAMES but never uploaded, whose content is not in the "
     "conversation, has NO legal binding: source paths must resolve to real "
     "session-blob storage, so an invented path is always rejected. Discover "
-    "first (list_blobs / list_composer_blobs); if nothing matches, ask one "
+    "first (list_blobs / list_composer_blobs; after an `Incomplete list:` "
+    "hint, a file missing from the list may still exist); if nothing matches, ask one "
     "narrow upload/selection question — or, on a surface with no question "
     "channel, decline with a named gap. Never fabricate a path, blob id, or "
     "stand-in rows.",
@@ -1768,8 +1770,9 @@ def _digest_entries(plugins: list[PluginSummary]) -> list[_PluginDigestEntry]:
     catalog, unlike every worked exemplar this module renders; and it is the
     largest of the reference fields. ``usage_when_to_use`` is not carried
     either — ``purpose`` and ``capability_tags`` already say what a plugin is
-    for. Both stay reachable through ``list_sources``/``list_transforms``/
-    ``list_sinks``, which return the whole ``PluginSummary``.
+    for. Both stay reachable through ``list_sources``/``list_sinks``, which
+    return the whole ``PluginSummary``; the ``list_transforms`` selection index
+    carries neither.
     """
     entries: list[_PluginDigestEntry] = []
     for plugin in plugins:
@@ -1791,6 +1794,21 @@ def _digest_entries(plugins: list[PluginSummary]) -> list[_PluginDigestEntry]:
     return entries
 
 
+# Where each omitted prose fact is returned whole. list_sources/list_sinks echo
+# every PluginSummary. list_transforms is a selection index: it carries the
+# purpose (``description``) verbatim but not the prohibition, which only the
+# chosen plugin's get_plugin_schema result carries. A get_plugin_schema
+# omission is per-text only (one oversized prohibition, one gap); the over-cap
+# fallback never applies it.
+_DIGEST_DETAILS_VIA: Final[Mapping[str, Mapping[str, str]]] = MappingProxyType(
+    {
+        "sources": MappingProxyType({"purpose": "list_sources", "not_for": "list_sources"}),
+        "transforms": MappingProxyType({"purpose": "list_transforms", "not_for": "get_plugin_schema"}),
+        "sinks": MappingProxyType({"purpose": "list_sinks", "not_for": "list_sinks"}),
+    }
+)
+
+
 def _digest_size(digest: _DiscoveryDigest) -> int:
     """Settle the self-describing canonical byte count."""
     while True:
@@ -1800,20 +1818,39 @@ def _digest_size(digest: _DiscoveryDigest) -> int:
         digest["budget"]["canonical_bytes_used"] = rendered_size
 
 
-def _omit_digest_text(entry: _PluginDigestEntry, field: str, *, details_via: str) -> bool:
-    """Replace one whole prose fact with a deterministic JIT disclosure."""
+def _omit_digest_text(entry: _PluginDigestEntry, field: str, *, details_via: str, only_if_smaller: bool = False) -> bool:
+    """Replace one whole prose fact with a deterministic JIT disclosure.
+
+    ``only_if_smaller`` keeps the text inline when its canonical member is not
+    larger than the omission stub that would replace it: a stub that grows the
+    digest saves nothing and costs the planner a read.
+    """
     if field == "purpose":
         if "purpose" not in entry:
             return False
-        value = entry.pop("purpose")
+        value = entry["purpose"]
     else:
         if "not_for" not in entry:
             return False
-        value = entry.pop("not_for")
+        value = entry["not_for"]
     omission: _OmittedPublicText = {
         "sha256": hashlib.sha256(value.encode("utf-8")).hexdigest(),
         "details_via": details_via,
     }
+    if only_if_smaller:
+        # Sized without serializing (the digest's serialization count is
+        # bounded): the stub member is ASCII of known length, and canonical
+        # JSON never renders a string shorter than its UTF-8 bytes plus two
+        # quotes. Comparing against that floor never omits a text whose stub
+        # is the larger.
+        stub_member_bytes = len(f'"{field}_omitted":{{"details_via":"","sha256":""}}') + len(details_via) + len(omission["sha256"])
+        text_member_floor_bytes = len(f'"{field}":""') + len(value.encode("utf-8"))
+        if stub_member_bytes >= text_member_floor_bytes:
+            return False
+    if field == "purpose":
+        entry.pop("purpose")
+    else:
+        entry.pop("not_for")
     if field == "purpose":
         entry["purpose_omitted"] = omission
     else:
@@ -1882,9 +1919,9 @@ def discovery_digest(
                 entry["required_options"] = public_required
                 break
     ordered_sections = (
-        (digest["sources"], "list_sources"),
-        (digest["transforms"], "list_transforms"),
-        (digest["sinks"], "list_sinks"),
+        (digest["sources"], _DIGEST_DETAILS_VIA["sources"]),
+        (digest["transforms"], _DIGEST_DETAILS_VIA["transforms"]),
+        (digest["sinks"], _DIGEST_DETAILS_VIA["sinks"]),
     )
     for entries, details_via in ordered_sections:
         for entry in entries:
@@ -1896,14 +1933,24 @@ def discovery_digest(
                 if (
                     type(value) is str
                     and len(value.encode("utf-8")) > _DISCOVERY_DIGEST_MAX_PUBLIC_TEXT_BYTES
-                    and _omit_digest_text(entry, field, details_via=details_via)
+                    and _omit_digest_text(entry, field, details_via=details_via[field])
                 ):
                     digest["budget"]["omitted_public_text_count"] += 1
     if _digest_size(digest) > _DISCOVERY_DIGEST_MAX_CANONICAL_BYTES:
+        # Over-cap fallback: omit whole public prose, recoverable by one
+        # list_* call per kind, but only where the stub is smaller than the
+        # text it replaces (a short purpose's stub would grow the digest). A
+        # TRANSFORM prohibition stays inline: only that plugin's
+        # get_plugin_schema returns it, so omitting every one would declare a
+        # schema-read gap for the whole catalog. A transform prohibition is
+        # omitted only by the per-text rule above. If the digest still exceeds
+        # the cap, the invariant below refuses it.
         for entries, details_via in ordered_sections:
             for entry in entries:
                 for field in ("purpose", "not_for"):
-                    if _omit_digest_text(entry, field, details_via=details_via):
+                    if details_via[field] == "get_plugin_schema":
+                        continue
+                    if _omit_digest_text(entry, field, details_via=details_via[field], only_if_smaller=True):
                         digest["budget"]["omitted_public_text_count"] += 1
         _digest_size(digest)
     if _digest_size(digest) > _DISCOVERY_DIGEST_MAX_CANONICAL_BYTES:
@@ -1911,26 +1958,44 @@ def discovery_digest(
     return digest
 
 
-def discovery_digest_detail_tools(authoring_aids: _PlannerAuthoringAids) -> tuple[str, ...]:
-    """Return the exact inventory tools needed to rehydrate omitted prose."""
+def _digest_omission_reads(authoring_aids: _PlannerAuthoringAids) -> tuple[frozenset[str], frozenset[str]]:
+    """Return the inventory tools and the transform names whose reads rehydrate omitted prose."""
     digest = authoring_aids["discovery_digest"]["plugins"]
-    section_tools = (
-        (digest["sources"], "list_sources"),
-        (digest["transforms"], "list_transforms"),
-        (digest["sinks"], "list_sinks"),
+    sections = (
+        (digest["sources"], _DIGEST_DETAILS_VIA["sources"]),
+        (digest["transforms"], _DIGEST_DETAILS_VIA["transforms"]),
+        (digest["sinks"], _DIGEST_DETAILS_VIA["sinks"]),
     )
-    required: set[str] = set()
-    for entries, expected_tool in section_tools:
+    tools: set[str] = set()
+    schema_reads: set[str] = set()
+    for entries, expected in sections:
         for entry in entries:
-            purpose_omission = entry["purpose_omitted"] if "purpose_omitted" in entry else None
-            prohibition_omission = entry["not_for_omitted"] if "not_for_omitted" in entry else None
-            for omission in (purpose_omission, prohibition_omission):
+            omissions = (
+                ("purpose", entry["purpose_omitted"] if "purpose_omitted" in entry else None),
+                ("not_for", entry["not_for_omitted"] if "not_for_omitted" in entry else None),
+            )
+            for field, omission in omissions:
                 if omission is None:
                     continue
-                if omission["details_via"] != expected_tool:
+                if omission["details_via"] != expected[field]:
                     raise RuntimeError("discovery_digest_details_tool_invariant")
-                required.add(expected_tool)
-    return tuple(tool for tool in ("list_sinks", "list_sources", "list_transforms") if tool in required)
+                if omission["details_via"] == "get_plugin_schema":
+                    schema_reads.add(entry["name"])
+                else:
+                    tools.add(omission["details_via"])
+    return frozenset(tools), frozenset(schema_reads)
+
+
+def discovery_digest_detail_tools(authoring_aids: _PlannerAuthoringAids) -> tuple[str, ...]:
+    """Return the exact inventory tools needed to rehydrate omitted prose."""
+    tools, _schema_reads = _digest_omission_reads(authoring_aids)
+    return tuple(tool for tool in ("list_sinks", "list_sources", "list_transforms") if tool in tools)
+
+
+def discovery_digest_schema_reads(authoring_aids: _PlannerAuthoringAids) -> tuple[str, ...]:
+    """Return the transforms whose omitted prohibition only their get_plugin_schema result carries."""
+    _tools, schema_reads = _digest_omission_reads(authoring_aids)
+    return tuple(sorted(schema_reads))
 
 
 _DISCOVERY_DIGEST_GUIDANCE: Final[str] = (
@@ -2889,6 +2954,7 @@ __all__ = [
     "build_schema_contract_evidence",
     "discovery_digest",
     "discovery_digest_detail_tools",
+    "discovery_digest_schema_reads",
     "fork_coalesce_exemplar_args",
     "fork_row_union_exemplar_args",
     "planner_expression_grammar",

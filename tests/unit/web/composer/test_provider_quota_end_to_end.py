@@ -183,7 +183,8 @@ async def test_real_admission_settles_spend_before_refusing_next_dispatch(
             with pytest.raises(ChargeableAdmissionRefused) as caught:
                 await _audited_dispatch(turn, tokens=1)
     turn.assert_audit(guards=2, calls=1, private=0)
-    assert len(turn.requests) == 2
+    # The second, identical check reuses the first check's allow in this session.
+    assert len(turn.requests) == 1
     assert caught.value.decision.refusal_reason is AdmissionRefusalReason.QUOTA_EXCEEDED
     assert dispatches == ["sent"]
     assert len(refusals) == 1
@@ -208,7 +209,8 @@ async def test_timeout_with_unknown_usage_blocks_next_physical_call(quota_servic
             with pytest.raises(ChargeableAdmissionRefused) as caught:
                 await _audited_dispatch(turn, tokens=1)
     turn.assert_audit(guards=2, calls=1, private=0)
-    assert len(turn.requests) == 2
+    # The second, identical check reuses the first check's allow in this session.
+    assert len(turn.requests) == 1
     with engine.connect() as connection:
         usage = connection.execute(select(token_usage_ledger_table)).one()
     assert usage.prompt_tokens is None and usage.completion_tokens is None
@@ -574,7 +576,8 @@ async def test_utc_midnight_reopens_daily_allowance_without_retiming_old_usage(q
             clock[0] += timedelta(seconds=1)
             await _audited_dispatch(turn, tokens=1, finished_at=before_midnight + timedelta(seconds=1))
     turn.assert_audit(guards=3, calls=2, private=0)
-    assert len(turn.requests) == 3
+    # Later identical checks reuse the first check's allow in this session.
+    assert len(turn.requests) == 1
     with engine.connect() as connection:
         usage = connection.execute(select(token_usage_ledger_table).order_by(token_usage_ledger_table.c.recorded_at)).all()
     assert [row.prompt_tokens for row in usage] == [1000, 1]
@@ -799,7 +802,8 @@ async def test_auto_title_physical_transport_attempt_has_one_quota_outcome(
                 assert len(requests) == 1
                 assert turn.coordinator.all_completed
                 turn.assert_audit(guards=1, calls=1, private=0)
-                assert len(turn.requests) == 1
+                # One check: the user prompt and the documents in separate calls.
+                assert len(turn.requests) == 2
                 with engine.connect() as connection:
                     attempt = connection.execute(select(quota_provider_attempts_table)).one()
                     usage = connection.execute(select(token_usage_ledger_table)).one()

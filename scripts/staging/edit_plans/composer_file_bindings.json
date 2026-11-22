@@ -1,0 +1,1212 @@
+{
+  "format": "elspeth-composer-edit-plan/2",
+  "name": "composer-file-bindings",
+  "description": "Connect and reconnect files, from an empty pipeline: a source re-pointed at three other files, a reference join re-pointed three times, an LLM step whose prompt and system prompt are bound to files and re-bound (uploaded files and files the Composer writes), a query template, a file_inject entry and a named reference table each bound and re-bound twice, a one-row-per-file source re-pointed once, then every component removed. The battery uploads each file as the user would before the message that names it.",
+  "start": "empty",
+  "pass_rule": "all_passed_as_found",
+  "forbidden_tools": [
+    "set_pipeline"
+  ],
+  "targets": {},
+  "edits": [
+    {
+      "id": "create-source-and-sink",
+      "message": "Read the uploaded file orders_a.csv as the pipeline's source, and add an output named battery_out that writes every row as JSON lines to the file battery_results.jsonl and discards any rows it cannot write. Connect the source straight to battery_out.",
+      "expect": [
+        {
+          "equals": "/sources/source/plugin",
+          "value": "csv"
+        },
+        {
+          "bound": "/sources/source/options/blob_ref",
+          "file": "orders_a.csv"
+        },
+        {
+          "new_output": "battery_out",
+          "fields": {
+            "plugin": "json",
+            "on_write_failure": "discard"
+          },
+          "options": {
+            "path": {
+              "ends_with": "battery_results.jsonl"
+            }
+          },
+          "option_keys": [
+            "path",
+            "format",
+            "mode",
+            "schema",
+            "indent",
+            "encoding",
+            "collision_policy",
+            "headers"
+          ]
+        },
+        {
+          "chain": {
+            "from": "source",
+            "to": "battery_out",
+            "via": []
+          }
+        },
+        {
+          "files": [
+            "orders_a.csv"
+          ]
+        }
+      ],
+      "attach": [
+        "orders_a.csv"
+      ],
+      "may_change": [
+        "/sources/source"
+      ],
+      "edges_touching": [
+        "source",
+        "battery_out"
+      ],
+      "tools_all": [
+        "set_source_from_blob",
+        "set_output"
+      ]
+    },
+    {
+      "id": "source-to-orders-b",
+      "message": "Use the uploaded file orders_b.csv as the source's file instead of orders_a.csv.",
+      "expect": [
+        {
+          "bound": "/sources/source/options/blob_ref",
+          "file": "orders_b.csv"
+        },
+        {
+          "files": [
+            "orders_b.csv"
+          ]
+        }
+      ],
+      "attach": [
+        "orders_b.csv"
+      ],
+      "tools_any": [
+        "set_source_from_blob"
+      ]
+    },
+    {
+      "id": "source-to-orders-c",
+      "message": "Use the uploaded file orders_c.csv as the source's file instead of orders_b.csv.",
+      "expect": [
+        {
+          "bound": "/sources/source/options/blob_ref",
+          "file": "orders_c.csv"
+        },
+        {
+          "files": [
+            "orders_c.csv"
+          ]
+        }
+      ],
+      "attach": [
+        "orders_c.csv"
+      ],
+      "tools_any": [
+        "set_source_from_blob"
+      ]
+    },
+    {
+      "id": "source-to-orders-d",
+      "message": "Use the uploaded file orders_d.csv as the source's file instead of orders_c.csv.",
+      "expect": [
+        {
+          "bound": "/sources/source/options/blob_ref",
+          "file": "orders_d.csv"
+        },
+        {
+          "files": [
+            "orders_d.csv"
+          ]
+        }
+      ],
+      "attach": [
+        "orders_d.csv"
+      ],
+      "tools_any": [
+        "set_source_from_blob"
+      ]
+    },
+    {
+      "id": "sink-to-results-2",
+      "message": "Make the output battery_out write to the file battery_results_2.jsonl instead of battery_results.jsonl.",
+      "expect": [
+        {
+          "ends_with": "/outputs/battery_out/options/path",
+          "value": "battery_results_2.jsonl"
+        }
+      ],
+      "tools_any": [
+        "patch_output_options",
+        "set_output"
+      ]
+    },
+    {
+      "id": "add-reference-join",
+      "message": "Add a reference join step named battery_regions between the source and battery_out that looks up each row's region_code in the uploaded file regions_a.csv (CSV, key column region_code) and adds that entry's region_name as a field named region_name. Write null when there is no match, and discard any rows that fail in it.",
+      "expect": [
+        {
+          "new_node": "battery_regions",
+          "fields": {
+            "plugin": "reference_join",
+            "node_type": "transform",
+            "on_error": "discard"
+          },
+          "option_keys": [
+            "default_values",
+            "key_field",
+            "lookups",
+            "on_miss",
+            "output",
+            "reference_content",
+            "reference_format",
+            "reference_key_name",
+            "reference_source",
+            "required_input_fields",
+            "schema",
+            "tables"
+          ]
+        },
+        {
+          "bound": "/nodes/battery_regions/options/reference_content",
+          "file": "regions_a.csv"
+        },
+        {
+          "chain": {
+            "from": "source",
+            "to": "battery_out",
+            "via": [
+              "battery_regions"
+            ]
+          }
+        },
+        {
+          "files": [
+            "orders_d.csv",
+            "regions_a.csv"
+          ]
+        }
+      ],
+      "attach": [
+        "regions_a.csv"
+      ],
+      "tools_any": [
+        "splice_transform",
+        "upsert_node"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ]
+    },
+    {
+      "id": "reference-to-regions-b",
+      "message": "Use the uploaded file regions_b.csv as the reference table of the step battery_regions instead of regions_a.csv.",
+      "expect": [
+        {
+          "bound": "/nodes/battery_regions/options/reference_content",
+          "file": "regions_b.csv"
+        },
+        {
+          "files": [
+            "orders_d.csv",
+            "regions_b.csv"
+          ]
+        }
+      ],
+      "attach": [
+        "regions_b.csv"
+      ],
+      "tools_any": [
+        "wire_blob_inline_ref"
+      ]
+    },
+    {
+      "id": "reference-to-regions-c",
+      "message": "Use the uploaded file regions_c.csv as the reference table of the step battery_regions instead of regions_b.csv.",
+      "expect": [
+        {
+          "bound": "/nodes/battery_regions/options/reference_content",
+          "file": "regions_c.csv"
+        },
+        {
+          "files": [
+            "orders_d.csv",
+            "regions_c.csv"
+          ]
+        }
+      ],
+      "attach": [
+        "regions_c.csv"
+      ],
+      "tools_any": [
+        "wire_blob_inline_ref"
+      ]
+    },
+    {
+      "id": "reference-to-regions-d",
+      "message": "Use the uploaded file regions_d.csv as the reference table of the step battery_regions instead of regions_c.csv.",
+      "expect": [
+        {
+          "bound": "/nodes/battery_regions/options/reference_content",
+          "file": "regions_d.csv"
+        },
+        {
+          "files": [
+            "orders_d.csv",
+            "regions_d.csv"
+          ]
+        }
+      ],
+      "attach": [
+        "regions_d.csv"
+      ],
+      "tools_any": [
+        "wire_blob_inline_ref"
+      ]
+    },
+    {
+      "id": "add-llm-step",
+      "message": "Add an LLM step named battery_llm between battery_regions and battery_out, with the prompt \"Summarise order {{ row['order_id'] }} for {{ row['item'] }} in one sentence.\" Write its answer to a field named summary, and discard any rows that fail in it.",
+      "expect": [
+        {
+          "new_node": "battery_llm",
+          "fields": {
+            "plugin": "llm",
+            "node_type": "transform",
+            "on_error": "discard"
+          },
+          "option_keys": [
+            "allow_blank_input_fields",
+            "api_key",
+            "api_version",
+            "approved_prompt_artifact_hash",
+            "aws_access_key_id",
+            "aws_secret_access_key",
+            "aws_session_token",
+            "backoff_multiplier",
+            "base_url",
+            "contract_major",
+            "deployment_name",
+            "endpoint",
+            "image_inputs",
+            "input_checks",
+            "lookup",
+            "lookup_source",
+            "max_capacity_retry_seconds",
+            "max_dispatch_delay_ms",
+            "max_image_bytes",
+            "max_images_per_call",
+            "max_tokens",
+            "min_dispatch_delay_ms",
+            "model",
+            "output_fields",
+            "pool_size",
+            "pricing_model",
+            "profile",
+            "prompt_template",
+            "prompt_template_parts",
+            "prompt_template_source",
+            "provider",
+            "queries",
+            "query_input_mode",
+            "recovery_step_ms",
+            "region_name",
+            "required_capabilities",
+            "required_input_fields",
+            "response_field",
+            "response_format",
+            "result_checks",
+            "schema",
+            "system_prompt",
+            "system_prompt_source",
+            "temperature",
+            "timeout_seconds",
+            "tracing"
+          ]
+        },
+        {
+          "equals": "/nodes/battery_llm/options/prompt_template",
+          "value": "Summarise order {{ row['order_id'] }} for {{ row['item'] }} in one sentence."
+        },
+        {
+          "equals": "/nodes/battery_llm/options/response_field",
+          "value": "summary"
+        },
+        {
+          "chain": {
+            "from": "source",
+            "to": "battery_out",
+            "via": [
+              "battery_regions",
+              "battery_llm"
+            ]
+          }
+        }
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "battery_llm",
+        "card": "agent_written"
+      },
+      "tools_any": [
+        "splice_transform",
+        "upsert_node"
+      ]
+    },
+    {
+      "id": "prompt-to-file-1",
+      "message": "Use the uploaded file prompt_user_1.txt as the prompt of the step battery_llm, replacing its current prompt.",
+      "expect": [
+        {
+          "bound": "/nodes/battery_llm/options/prompt_template",
+          "file": "prompt_user_1.txt",
+          "content": "Summarise order {{ row['order_id'] }} for {{ row['item'] }} in the region {{ row['region_name'] }} in one sentence. Prompt version 1.\n"
+        },
+        {
+          "files": [
+            "orders_d.csv",
+            "prompt_user_1.txt",
+            "regions_d.csv"
+          ]
+        }
+      ],
+      "attach": [
+        "prompt_user_1.txt"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "battery_llm",
+        "card": "user_files"
+      },
+      "tools_any": [
+        "wire_blob_inline_ref"
+      ],
+      "may_change": [
+        "/nodes/battery_llm/options/prompt_template_parts"
+      ]
+    },
+    {
+      "id": "prompt-to-file-2",
+      "message": "Use the uploaded file prompt_user_2.txt as the prompt of the step battery_llm, replacing prompt_user_1.txt.",
+      "expect": [
+        {
+          "bound": "/nodes/battery_llm/options/prompt_template",
+          "file": "prompt_user_2.txt",
+          "content": "Summarise order {{ row['order_id'] }} for {{ row['item'] }} in the region {{ row['region_name'] }} in one sentence. Prompt version 2.\n"
+        },
+        {
+          "files": [
+            "orders_d.csv",
+            "prompt_user_2.txt",
+            "regions_d.csv"
+          ]
+        }
+      ],
+      "attach": [
+        "prompt_user_2.txt"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "battery_llm",
+        "card": "user_files"
+      },
+      "tools_any": [
+        "wire_blob_inline_ref"
+      ]
+    },
+    {
+      "id": "prompt-to-file-3",
+      "message": "Use the uploaded file prompt_user_3.txt as the prompt of the step battery_llm, replacing prompt_user_2.txt.",
+      "expect": [
+        {
+          "bound": "/nodes/battery_llm/options/prompt_template",
+          "file": "prompt_user_3.txt",
+          "content": "Summarise order {{ row['order_id'] }} for {{ row['item'] }} in the region {{ row['region_name'] }} in one sentence. Prompt version 3.\n"
+        },
+        {
+          "files": [
+            "orders_d.csv",
+            "prompt_user_3.txt",
+            "regions_d.csv"
+          ]
+        }
+      ],
+      "attach": [
+        "prompt_user_3.txt"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "battery_llm",
+        "card": "user_files"
+      },
+      "tools_any": [
+        "wire_blob_inline_ref"
+      ]
+    },
+    {
+      "id": "system-prompt-to-file-1",
+      "message": "Use the uploaded file prompt_system_1.txt as the system prompt of the step battery_llm.",
+      "expect": [
+        {
+          "bound": "/nodes/battery_llm/options/system_prompt",
+          "file": "prompt_system_1.txt"
+        },
+        {
+          "files": [
+            "orders_d.csv",
+            "prompt_system_1.txt",
+            "prompt_user_3.txt",
+            "regions_d.csv"
+          ]
+        }
+      ],
+      "attach": [
+        "prompt_system_1.txt"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "battery_llm",
+        "card": "user_files"
+      },
+      "tools_any": [
+        "wire_blob_inline_ref"
+      ]
+    },
+    {
+      "id": "system-prompt-to-file-2",
+      "message": "Use the uploaded file prompt_system_2.txt as the system prompt of the step battery_llm instead of prompt_system_1.txt.",
+      "expect": [
+        {
+          "bound": "/nodes/battery_llm/options/system_prompt",
+          "file": "prompt_system_2.txt"
+        },
+        {
+          "files": [
+            "orders_d.csv",
+            "prompt_system_2.txt",
+            "prompt_user_3.txt",
+            "regions_d.csv"
+          ]
+        }
+      ],
+      "attach": [
+        "prompt_system_2.txt"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "battery_llm",
+        "card": "user_files"
+      },
+      "tools_any": [
+        "wire_blob_inline_ref"
+      ]
+    },
+    {
+      "id": "system-prompt-to-file-3",
+      "message": "Use the uploaded file prompt_system_3.txt as the system prompt of the step battery_llm instead of prompt_system_2.txt.",
+      "expect": [
+        {
+          "bound": "/nodes/battery_llm/options/system_prompt",
+          "file": "prompt_system_3.txt"
+        },
+        {
+          "files": [
+            "orders_d.csv",
+            "prompt_system_3.txt",
+            "prompt_user_3.txt",
+            "regions_d.csv"
+          ]
+        }
+      ],
+      "attach": [
+        "prompt_system_3.txt"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "battery_llm",
+        "card": "user_files"
+      },
+      "tools_any": [
+        "wire_blob_inline_ref"
+      ]
+    },
+    {
+      "id": "system-prompt-written-file",
+      "message": "Write a new file named prompt_system_4.txt containing exactly \"You write short, plain summaries of invented test orders. System version 4.\" and use it as the system prompt of the step battery_llm instead of prompt_system_3.txt.",
+      "expect": [
+        {
+          "bound": "/nodes/battery_llm/options/system_prompt",
+          "file": "prompt_system_4.txt",
+          "content": "You write short, plain summaries of invented test orders. System version 4."
+        },
+        {
+          "files": [
+            "orders_d.csv",
+            "prompt_system_4.txt",
+            "prompt_user_3.txt",
+            "regions_d.csv"
+          ]
+        }
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "battery_llm",
+        "card": "agent_written"
+      },
+      "tools_all": [
+        "create_blob",
+        "wire_blob_inline_ref"
+      ]
+    },
+    {
+      "id": "prompt-written-file",
+      "message": "Write a new file named prompt_user_4.txt containing exactly \"Summarise order {{ row['order_id'] }} for {{ row['item'] }} in the region {{ row['region_name'] }} in one sentence. Prompt version 4.\" and use it as the prompt of the step battery_llm instead of prompt_user_3.txt.",
+      "expect": [
+        {
+          "bound": "/nodes/battery_llm/options/prompt_template",
+          "file": "prompt_user_4.txt",
+          "content": "Summarise order {{ row['order_id'] }} for {{ row['item'] }} in the region {{ row['region_name'] }} in one sentence. Prompt version 4."
+        },
+        {
+          "files": [
+            "orders_d.csv",
+            "prompt_system_4.txt",
+            "prompt_user_4.txt",
+            "regions_d.csv"
+          ]
+        }
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "battery_llm",
+        "card": "agent_written"
+      },
+      "tools_all": [
+        "create_blob",
+        "wire_blob_inline_ref"
+      ]
+    },
+    {
+      "id": "add-query-step",
+      "message": "Add an LLM step named battery_score between battery_llm and battery_out with one query named tone, whose input input_1 is the row's item field and whose template is the uploaded file query_tone_1.txt. Discard any rows that fail in it.",
+      "expect": [
+        {
+          "new_node": "battery_score",
+          "fields": {
+            "plugin": "llm",
+            "node_type": "transform",
+            "on_error": "discard"
+          },
+          "option_keys": [
+            "allow_blank_input_fields",
+            "api_key",
+            "api_version",
+            "approved_prompt_artifact_hash",
+            "aws_access_key_id",
+            "aws_secret_access_key",
+            "aws_session_token",
+            "backoff_multiplier",
+            "base_url",
+            "contract_major",
+            "deployment_name",
+            "endpoint",
+            "image_inputs",
+            "input_checks",
+            "lookup",
+            "lookup_source",
+            "max_capacity_retry_seconds",
+            "max_dispatch_delay_ms",
+            "max_image_bytes",
+            "max_images_per_call",
+            "max_tokens",
+            "min_dispatch_delay_ms",
+            "model",
+            "output_fields",
+            "pool_size",
+            "pricing_model",
+            "profile",
+            "prompt_template",
+            "prompt_template_parts",
+            "prompt_template_source",
+            "provider",
+            "queries",
+            "query_input_mode",
+            "recovery_step_ms",
+            "region_name",
+            "required_capabilities",
+            "required_input_fields",
+            "response_field",
+            "response_format",
+            "result_checks",
+            "schema",
+            "system_prompt",
+            "system_prompt_source",
+            "temperature",
+            "timeout_seconds",
+            "tracing"
+          ]
+        },
+        {
+          "bound": "/nodes/battery_score/options/queries/tone/template",
+          "file": "query_tone_1.txt"
+        },
+        {
+          "chain": {
+            "from": "source",
+            "to": "battery_out",
+            "via": [
+              "battery_regions",
+              "battery_llm",
+              "battery_score"
+            ]
+          }
+        },
+        {
+          "files": [
+            "orders_d.csv",
+            "prompt_system_4.txt",
+            "prompt_user_4.txt",
+            "query_tone_1.txt",
+            "regions_d.csv"
+          ]
+        }
+      ],
+      "attach": [
+        "query_tone_1.txt"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "battery_score",
+        "card": "user_files"
+      },
+      "tools_any": [
+        "splice_transform",
+        "upsert_node"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ]
+    },
+    {
+      "id": "query-to-file-2",
+      "message": "Use the uploaded file query_tone_2.txt as the template of the query tone in the step battery_score instead of query_tone_1.txt.",
+      "expect": [
+        {
+          "bound": "/nodes/battery_score/options/queries/tone/template",
+          "file": "query_tone_2.txt"
+        },
+        {
+          "files": [
+            "orders_d.csv",
+            "prompt_system_4.txt",
+            "prompt_user_4.txt",
+            "query_tone_2.txt",
+            "regions_d.csv"
+          ]
+        }
+      ],
+      "attach": [
+        "query_tone_2.txt"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "battery_score",
+        "card": "user_files"
+      },
+      "tools_any": [
+        "wire_blob_inline_ref"
+      ]
+    },
+    {
+      "id": "query-to-file-3",
+      "message": "Use the uploaded file query_tone_3.txt as the template of the query tone in the step battery_score instead of query_tone_2.txt.",
+      "expect": [
+        {
+          "bound": "/nodes/battery_score/options/queries/tone/template",
+          "file": "query_tone_3.txt"
+        },
+        {
+          "files": [
+            "orders_d.csv",
+            "prompt_system_4.txt",
+            "prompt_user_4.txt",
+            "query_tone_3.txt",
+            "regions_d.csv"
+          ]
+        }
+      ],
+      "attach": [
+        "query_tone_3.txt"
+      ],
+      "approve": {
+        "kind": "llm_prompt_template",
+        "node": "battery_score",
+        "card": "user_files"
+      },
+      "tools_any": [
+        "wire_blob_inline_ref"
+      ]
+    },
+    {
+      "id": "add-file-inject",
+      "message": "Add a step named battery_guide between battery_score and battery_out that writes the whole text of the uploaded file guidance_a.txt into a field named guidance on every row, as one text file entry named style. Discard any rows that fail in it.",
+      "expect": [
+        {
+          "new_node": "battery_guide",
+          "fields": {
+            "plugin": "file_inject",
+            "node_type": "transform",
+            "on_error": "discard"
+          },
+          "option_keys": [
+            "default_content",
+            "files",
+            "key_field",
+            "mode",
+            "on_miss",
+            "output_field",
+            "required_input_fields",
+            "schema"
+          ]
+        },
+        {
+          "bound": "/nodes/battery_guide/options/files/style/content",
+          "file": "guidance_a.txt"
+        },
+        {
+          "chain": {
+            "from": "source",
+            "to": "battery_out",
+            "via": [
+              "battery_regions",
+              "battery_llm",
+              "battery_score",
+              "battery_guide"
+            ]
+          }
+        },
+        {
+          "files": [
+            "guidance_a.txt",
+            "orders_d.csv",
+            "prompt_system_4.txt",
+            "prompt_user_4.txt",
+            "query_tone_3.txt",
+            "regions_d.csv"
+          ]
+        }
+      ],
+      "attach": [
+        "guidance_a.txt"
+      ],
+      "tools_any": [
+        "splice_transform",
+        "upsert_node"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ]
+    },
+    {
+      "id": "inject-to-guidance-b",
+      "message": "Use the uploaded file guidance_b.txt for the file entry style of the step battery_guide instead of guidance_a.txt.",
+      "expect": [
+        {
+          "bound": "/nodes/battery_guide/options/files/style/content",
+          "file": "guidance_b.txt"
+        },
+        {
+          "files": [
+            "guidance_b.txt",
+            "orders_d.csv",
+            "prompt_system_4.txt",
+            "prompt_user_4.txt",
+            "query_tone_3.txt",
+            "regions_d.csv"
+          ]
+        }
+      ],
+      "attach": [
+        "guidance_b.txt"
+      ],
+      "tools_any": [
+        "wire_blob_inline_ref"
+      ]
+    },
+    {
+      "id": "inject-to-guidance-c",
+      "message": "Use the uploaded file guidance_c.txt for the file entry style of the step battery_guide instead of guidance_b.txt.",
+      "expect": [
+        {
+          "bound": "/nodes/battery_guide/options/files/style/content",
+          "file": "guidance_c.txt"
+        },
+        {
+          "files": [
+            "guidance_c.txt",
+            "orders_d.csv",
+            "prompt_system_4.txt",
+            "prompt_user_4.txt",
+            "query_tone_3.txt",
+            "regions_d.csv"
+          ]
+        }
+      ],
+      "attach": [
+        "guidance_c.txt"
+      ],
+      "tools_any": [
+        "wire_blob_inline_ref"
+      ]
+    },
+    {
+      "id": "add-table-join",
+      "message": "Add a reference join step named battery_items between battery_guide and battery_out with one reference table named items, read from the uploaded file items_a.csv (CSV, key column item). It looks up each row's item in that table and adds the entry's category as a field named category; write null when there is no match, and discard any rows that fail in it.",
+      "expect": [
+        {
+          "new_node": "battery_items",
+          "fields": {
+            "plugin": "reference_join",
+            "node_type": "transform",
+            "on_error": "discard"
+          },
+          "option_keys": [
+            "default_values",
+            "key_field",
+            "lookups",
+            "on_miss",
+            "output",
+            "reference_content",
+            "reference_format",
+            "reference_key_name",
+            "reference_source",
+            "required_input_fields",
+            "schema",
+            "tables"
+          ]
+        },
+        {
+          "bound": "/nodes/battery_items/options/tables/items/reference_content",
+          "file": "items_a.csv"
+        },
+        {
+          "chain": {
+            "from": "source",
+            "to": "battery_out",
+            "via": [
+              "battery_regions",
+              "battery_llm",
+              "battery_score",
+              "battery_guide",
+              "battery_items"
+            ]
+          }
+        },
+        {
+          "files": [
+            "guidance_c.txt",
+            "items_a.csv",
+            "orders_d.csv",
+            "prompt_system_4.txt",
+            "prompt_user_4.txt",
+            "query_tone_3.txt",
+            "regions_d.csv"
+          ]
+        }
+      ],
+      "attach": [
+        "items_a.csv"
+      ],
+      "tools_any": [
+        "splice_transform",
+        "upsert_node"
+      ],
+      "tools_all": [
+        "wire_blob_inline_ref"
+      ]
+    },
+    {
+      "id": "table-to-items-b",
+      "message": "Use the uploaded file items_b.csv for the reference table items of the step battery_items instead of items_a.csv.",
+      "expect": [
+        {
+          "bound": "/nodes/battery_items/options/tables/items/reference_content",
+          "file": "items_b.csv"
+        },
+        {
+          "files": [
+            "guidance_c.txt",
+            "items_b.csv",
+            "orders_d.csv",
+            "prompt_system_4.txt",
+            "prompt_user_4.txt",
+            "query_tone_3.txt",
+            "regions_d.csv"
+          ]
+        }
+      ],
+      "attach": [
+        "items_b.csv"
+      ],
+      "tools_any": [
+        "wire_blob_inline_ref"
+      ]
+    },
+    {
+      "id": "table-to-items-c",
+      "message": "Use the uploaded file items_c.csv for the reference table items of the step battery_items instead of items_b.csv.",
+      "expect": [
+        {
+          "bound": "/nodes/battery_items/options/tables/items/reference_content",
+          "file": "items_c.csv"
+        },
+        {
+          "files": [
+            "guidance_c.txt",
+            "items_c.csv",
+            "orders_d.csv",
+            "prompt_system_4.txt",
+            "prompt_user_4.txt",
+            "query_tone_3.txt",
+            "regions_d.csv"
+          ]
+        }
+      ],
+      "attach": [
+        "items_c.csv"
+      ],
+      "tools_any": [
+        "wire_blob_inline_ref"
+      ]
+    },
+    {
+      "id": "remove-items",
+      "message": "Remove the step battery_items and connect battery_guide directly to battery_out.",
+      "expect": [
+        {
+          "absent": "/nodes/battery_items"
+        },
+        {
+          "chain": {
+            "from": "source",
+            "to": "battery_out",
+            "via": [
+              "battery_regions",
+              "battery_llm",
+              "battery_score",
+              "battery_guide"
+            ]
+          }
+        },
+        {
+          "files": [
+            "guidance_c.txt",
+            "orders_d.csv",
+            "prompt_system_4.txt",
+            "prompt_user_4.txt",
+            "query_tone_3.txt",
+            "regions_d.csv"
+          ]
+        }
+      ],
+      "tools_any": [
+        "remove_node"
+      ]
+    },
+    {
+      "id": "remove-guide",
+      "message": "Remove the step battery_guide and connect battery_score directly to battery_out.",
+      "expect": [
+        {
+          "absent": "/nodes/battery_guide"
+        },
+        {
+          "chain": {
+            "from": "source",
+            "to": "battery_out",
+            "via": [
+              "battery_regions",
+              "battery_llm",
+              "battery_score"
+            ]
+          }
+        },
+        {
+          "files": [
+            "orders_d.csv",
+            "prompt_system_4.txt",
+            "prompt_user_4.txt",
+            "query_tone_3.txt",
+            "regions_d.csv"
+          ]
+        }
+      ],
+      "tools_any": [
+        "remove_node"
+      ]
+    },
+    {
+      "id": "remove-score",
+      "message": "Remove the step battery_score and connect battery_llm directly to battery_out.",
+      "expect": [
+        {
+          "absent": "/nodes/battery_score"
+        },
+        {
+          "chain": {
+            "from": "source",
+            "to": "battery_out",
+            "via": [
+              "battery_regions",
+              "battery_llm"
+            ]
+          }
+        },
+        {
+          "files": [
+            "orders_d.csv",
+            "prompt_system_4.txt",
+            "prompt_user_4.txt",
+            "regions_d.csv"
+          ]
+        }
+      ],
+      "tools_any": [
+        "remove_node"
+      ]
+    },
+    {
+      "id": "remove-llm",
+      "message": "Remove the step battery_llm and connect battery_regions directly to battery_out.",
+      "expect": [
+        {
+          "absent": "/nodes/battery_llm"
+        },
+        {
+          "chain": {
+            "from": "source",
+            "to": "battery_out",
+            "via": [
+              "battery_regions"
+            ]
+          }
+        },
+        {
+          "files": [
+            "orders_d.csv",
+            "regions_d.csv"
+          ]
+        }
+      ],
+      "tools_any": [
+        "remove_node"
+      ]
+    },
+    {
+      "id": "remove-regions",
+      "message": "Remove the step battery_regions and connect the source directly to battery_out.",
+      "expect": [
+        {
+          "absent": "/nodes/battery_regions"
+        },
+        {
+          "chain": {
+            "from": "source",
+            "to": "battery_out",
+            "via": []
+          }
+        },
+        {
+          "files": [
+            "orders_d.csv"
+          ]
+        }
+      ],
+      "tools_any": [
+        "remove_node"
+      ]
+    },
+    {
+      "id": "source-to-file-rows",
+      "message": "Replace the source with one that reads one row per file from the uploaded files notes_a.txt and notes_b.txt, still connected straight to battery_out.",
+      "expect": [
+        {
+          "equals": "/sources/source/plugin",
+          "value": "blob_rows"
+        },
+        {
+          "files": [
+            "notes_a.txt",
+            "notes_b.txt"
+          ]
+        }
+      ],
+      "edges_touching": [
+        "source",
+        "battery_out"
+      ],
+      "attach": [
+        "notes_a.txt",
+        "notes_b.txt"
+      ],
+      "may_change": [
+        "/sources/source"
+      ],
+      "tools_any": [
+        "set_source_from_blobs"
+      ]
+    },
+    {
+      "id": "file-rows-to-notes-c-d",
+      "message": "Make the source read the uploaded files notes_c.txt and notes_d.txt instead of notes_a.txt and notes_b.txt.",
+      "expect": [
+        {
+          "files": [
+            "notes_c.txt",
+            "notes_d.txt"
+          ]
+        }
+      ],
+      "attach": [
+        "notes_c.txt",
+        "notes_d.txt"
+      ],
+      "may_change": [
+        "/sources/source/options/blobs"
+      ],
+      "tools_any": [
+        "set_source_from_blobs"
+      ]
+    },
+    {
+      "id": "remove-source-and-output",
+      "message": "Remove the source and the output battery_out, so the pipeline is empty again.",
+      "expect": [
+        {
+          "absent": "/sources/source"
+        },
+        {
+          "absent": "/outputs/battery_out"
+        },
+        {
+          "files": []
+        }
+      ],
+      "new_errors": [
+        "no_source_configured",
+        "no_sinks_configured"
+      ],
+      "tools_all": [
+        "clear_source",
+        "remove_output"
+      ]
+    }
+  ]
+}

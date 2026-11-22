@@ -259,7 +259,7 @@ repos:
         entry: .venv/bin/python scripts/cicd/generate_skill_inventory.py --check
         language: system
         pass_filenames: false
-        files: ^(src/elspeth/web/composer/(skills/pipeline_composer\.md|tools/(declarations|_registry|_dispatch|blobs|generation|outputs|secrets|sessions|sources|transforms)\.py)|scripts/cicd/generate_skill_inventory\.py)$
+        files: ^(src/elspeth/web/composer/(skills/pipeline_composer\.md|tools/(declarations|_registry|_dispatch|blobs|generation|outputs|reports|secrets|sessions|sources|transforms)\.py)|scripts/cicd/generate_skill_inventory\.py)$
 
       # Telemetry-backfill cohort-attribution trailer enforcement.
       # Runs at commit-msg stage; rejects commits that touch a cohort directory

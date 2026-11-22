@@ -12,7 +12,7 @@ down instead of importing upward from L3.
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -207,6 +207,7 @@ class InlineCustodyRequest:
     creating_provider: str | None
     creating_composer_skill_hash: str | None
     creating_arguments_hash: str | None
+    identity_arguments_hash: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -556,6 +557,17 @@ class BlobServiceProtocol(Protocol):
 
     def get_blob_sync(self, blob_id: UUID, context: SessionOperationContext) -> BlobRecord:
         """Get scoped metadata synchronously for a preflight worker."""
+        ...
+
+    def get_blobs_sync(self, blob_ids: Iterable[UUID], context: SessionOperationContext) -> tuple[BlobRecord, ...]:
+        """Get several blobs' scoped metadata in one fenced transaction, in ascending id order.
+
+        Every record is read under one exact-fence check, so all of them come
+        from one snapshot. A blob that is missing or outside the fence's
+        session custody fails the whole read with ``BlobNotFoundError``, as
+        ``get_blob_sync`` does for one. Duplicate ids are read once; no ids
+        returns ``()`` without opening a transaction.
+        """
         ...
 
     def read_blob_content_sync(self, blob_id: UUID, context: SessionOperationContext) -> tuple[BlobRecord, bytes]:

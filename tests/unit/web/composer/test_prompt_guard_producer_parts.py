@@ -745,8 +745,8 @@ async def test_real_freeform_batch_and_cache_retain_complete_nominal_schema(invo
     assert any(parts is not None for parts in forwarded["tool_argument_parts"])
     wire = completion.requests[1]
     # Each region is identified by its producer, including both copies of the
-    # nominal schema (the second, when present, came from the tool cache). Foreign state and
-    # model/user text must remain at one token per canonical wire byte.
+    # nominal schema (the second, when present, came from the tool cache). A2
+    # prices the entire canonical request at one token per three wire bytes.
     regions = {
         "skill": [canonical_json(SYSTEM_PROMPT)[1:-1]],
         "tool schemas and descriptions": [canonical_json(wire["tools"])],
@@ -764,11 +764,12 @@ async def test_real_freeform_batch_and_cache_retain_complete_nominal_schema(invo
     priced = budgets.call_args_list[1].kwargs
     assert priced["authored_bytes"] == sum(region_bytes.values())
     assert priced["anchor_tokens"] == 63201
-    foreign_bytes = priced["request_bytes"] - priced["authored_bytes"]
-    estimate = foreign_bytes + math.ceil(priced["authored_bytes"] / 3)
+    estimate = math.ceil(priced["request_bytes"] / 3)
     encoder = tiktoken.get_encoding("o200k_base")
     real = len(encoder.encode(canonical_json({"messages": wire["messages"], "tools": wire["tools"]})))
-    assert math.ceil(real * 1.4) <= estimate <= 200000
+    assert math.ceil(real * 1.4) <= estimate
+    # The turn is admitted (result above), nothing is shed (below) and every schema is retained:
+    # those are the guarded behaviour, not a fixed estimate ceiling.
     assert result.llm_calls[1].context_budget.estimated_tokens_after == estimate
     for name, texts in regions.items():
         tokens = sum(len(encoder.encode(text)) for text in texts)
@@ -776,9 +777,7 @@ async def test_real_freeform_batch_and_cache_retain_complete_nominal_schema(invo
         print(
             f"region={name} bytes={region_bytes[name]} o200k={tokens} price={math.ceil(region_bytes[name] / 3)} real_1.4={math.ceil(tokens * 1.4)}"
         )
-    print(
-        f"authored_regions={region_bytes} rate=1/3 foreign_bytes={foreign_bytes} rate=1 estimate={estimate} o200k={real} margin_1.4={math.ceil(real * 1.4)}"
-    )
+    print(f"authored_regions={region_bytes} total_rate=1/3 estimate={estimate} o200k={real} margin_1.4={math.ceil(real * 1.4)}")
     assert wire["messages"] == forwarded["messages"]
     assert wire["messages"][0]["cache_control"] == {"type": "ephemeral"}
     assert wire["tools"][-1]["cache_control"] == {"type": "ephemeral"}

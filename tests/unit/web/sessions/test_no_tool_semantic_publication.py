@@ -37,6 +37,7 @@ from elspeth.web.sessions.models import (
 from elspeth.web.sessions.routes._helpers import _composer_history_content
 from tests.helpers.advisor_review import parse_advisor_publication_review
 from tests.helpers.composer_operations import message_body, submit_and_settle
+from tests.helpers.prompt_guard_audit import assert_prompt_guard_wire_payload
 from tests.unit.web.sessions.test_routes import _make_app
 from tests.unit.web.sessions.test_run_composer_turn import _seed_output_only_draft, _TestSnapshotFactory
 
@@ -309,7 +310,7 @@ async def test_actual_end_semantics_and_each_physical_transition(
     def shield_response(http_request):
         assert http_request.url.host in {"primary-shield.example.test", "advisor-shield.example.test"}
         payload = json.loads(http_request.content)
-        assert payload["userPrompt"] == user_message
+        assert_prompt_guard_wire_payload(payload, user_prompt=user_message)
         shield_requests.append((http_request.url.host, payload))
         return httpx.Response(
             200,

@@ -118,7 +118,9 @@ from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.composer_fakes import StaticPluginSnapshotFactory
 from tests.fixtures.identities import ensure_test_identity, wire_test_pipeline_user_authority
+from tests.helpers.async_rendezvous import wait_for_event_or_producer
 from tests.helpers.composer_operations import (
+    RunningComposerOperation,
     SettledComposerOperation,
     current_head_state_id,
     current_head_state_id_sync,
@@ -130,6 +132,7 @@ from tests.helpers.composer_operations import (
     settle_sync,
     submit_and_settle,
 )
+from tests.helpers.prompt_guard_audit import assert_prompt_guard_check_shape, assert_prompt_guard_wire_payloads
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
@@ -361,13 +364,30 @@ def _capture_turn_exception(monkeypatch: pytest.MonkeyPatch) -> list[BaseExcepti
     return captured
 
 
+async def _wait_for_operation_event(
+    client: AsyncClient, operation: RunningComposerOperation, event: asyncio.Event, *, waiting_for: str
+) -> None:
+    """Wait for ``event``, raced against the worker drive that is meant to set it.
+
+    The drive (``run_until_idle``) gathers its jobs with
+    ``return_exceptions=True``, so when it goes idle first the failure lives in
+    the operation record; report that snapshot instead of a bare timeout.
+    """
+
+    async def snapshot() -> str:
+        polled = await client.get(operation.poll_path)
+        return f"operation snapshot {polled.status_code} {polled.text}"
+
+    await wait_for_event_or_producer(event, operation.drive, waiting_for=waiting_for, explain=snapshot)
+
+
 async def _cancel_registered_composer(
     client: AsyncClient, app: FastAPI, *, path: str, body: dict[str, object], composer: _CancellableComposer
 ):
     from httpx import Response
 
     async with running_operation_async(client, app, path=path, body=body) as operation:
-        await asyncio.wait_for(composer.entered.wait(), timeout=3)
+        await _wait_for_operation_event(client, operation, composer.entered, waiting_for="composer turn entering compose()")
         cancelled = await client.post(f"{operation.poll_path}/cancel")
         assert cancelled.status_code in (200, 202), cancelled.text
         await operation.drive
@@ -803,8 +823,13 @@ def _install_required_route_prompt_shields(app: FastAPI, monkeypatch: pytest.Mon
         assert request.headers["Ocp-Apim-Subscription-Key"] == "route-shields-fixture-key"
         payload = json.loads(request.content)
         assert type(payload) is dict and set(payload) == {"userPrompt", "documents"}
-        assert type(payload["userPrompt"]) is str and payload["userPrompt"]
+        assert type(payload["userPrompt"]) is str
         assert type(payload["documents"]) is list and all(type(item) is str for item in payload["documents"])
+        # The user prompt and the documents are inspected in separate calls.
+        if payload["userPrompt"]:
+            assert payload["documents"] == []
+        else:
+            assert payload["documents"]
         requests.append(payload)
         return httpx.Response(
             200,
@@ -835,7 +860,7 @@ def _assert_required_route_guard_checks(envelopes: Sequence[Mapping[str, Any]], 
     assert len({check["audit_id"] for check in checks}) == len(roles)
     assert len({(check["operation_id"], check["operation_epoch"]) for check in checks}) == 1
     for check in checks:
-        assert check["schema_version"] == 1
+        assert_prompt_guard_check_shape(check)
         assert check["mode"] == "required"
         assert check["adapter"] == "azure_prompt_shields"
         assert check["policy_fingerprint"] == mount.client.policy_fingerprint
@@ -1122,7 +1147,7 @@ def test_send_message_keeps_assistant_reply_when_auto_title_transport_fails(tmp_
     assert any(row["role"] == "assistant" and row["content"] == "Here is your answer." for row in messages.json())
 
     assert physical_title_calls == 1
-    assert all(request["userPrompt"] == "Build a CSV pipeline" for request in guard_requests)
+    assert_prompt_guard_wire_payloads(guard_requests, user_prompt="Build a CSV pipeline")
     records = asyncio.run(app.state.session_service.get_messages(uuid.UUID(session["id"]), limit=None))
     audit = [record.tool_calls[0] for record in records if record.role == "audit"]
     assert [envelope["_kind"] for envelope in audit] == ["prompt_guard_audit", "llm_call_audit"]
@@ -3988,7 +4013,7 @@ class TestSessionCRUDRoutes:
             service.get_active_run = _get_active_run_spy  # type: ignore[method-assign]
 
             delete_task = asyncio.create_task(client.delete(f"/api/sessions/{session_id}"))
-            await asyncio.wait_for(ownership_checked.wait(), timeout=2.0)
+            await wait_for_event_or_producer(ownership_checked, delete_task, waiting_for="delete passing its ownership check")
             await asyncio.sleep(0)
 
             assert not active_run_checked.is_set()
@@ -6242,9 +6267,8 @@ class TestMessageRoutes:
         ]
         _assert_required_route_guard_checks(envelopes, guard_mount, roles=["composer", "advisor", "advisor"])
         assert guard_requests
-        assert all(
-            request["userPrompt"] == f"Build a pipeline that reads {prompt_canary}.csv and writes rows to results.jsonl."
-            for request in guard_requests
+        assert_prompt_guard_wire_payloads(
+            guard_requests, user_prompt=f"Build a pipeline that reads {prompt_canary}.csv and writes rows to results.jsonl."
         )
         assert len(physical) == 3 and len(attempts) == 2 and len(passes) == 1
         planner_cohort = [
@@ -7044,7 +7068,8 @@ class TestLiteLLMErrorRedaction:
             if envelope["_kind"] == DIAGNOSTIC_EVIDENCE_KIND
         ]
         assert [evidence.status for evidence in private] == ["provider_request", "provider_failure", "operation_failure"]
-        assert guard_requests and all(request["userPrompt"] == "Hello" for request in guard_requests)
+        assert guard_requests
+        assert_prompt_guard_wire_payloads(guard_requests, user_prompt="Hello")
         with service._engine.connect() as connection:
             attempts = connection.execute(select(quota_provider_attempts_table)).all()
             usage = connection.execute(select(token_usage_ledger_table)).all()
@@ -11126,7 +11151,8 @@ def test_persisted_empty_assistant_prose_is_omitted_from_provider_history(
         if envelope["_kind"] == DIAGNOSTIC_EVIDENCE_KIND
     ]
     assert [evidence.status for evidence in private] == ["provider_request", "provider_failure", "operation_failure"]
-    assert guard_requests and all(request["userPrompt"] == "Try again" for request in guard_requests)
+    assert guard_requests
+    assert_prompt_guard_wire_payloads(guard_requests, user_prompt="Try again")
 
 
 def test_composer_chat_history_skips_audit_tool_messages() -> None:
@@ -12431,17 +12457,17 @@ async def test_send_message_shielded_llm_call_persist_completes_under_a_real_out
             body=message_body("Will be cancelled inside the shielded persist"),
         ) as operation,
     ):
-        await asyncio.wait_for(composer.entered.wait(), timeout=3)
+        await _wait_for_operation_event(client, operation, composer.entered, waiting_for="composer turn entering compose()")
         cancellation = await client.post(f"{operation.poll_path}/cancel")
         assert cancellation.status_code in (200, 202)
-        await asyncio.wait_for(entered_persist.wait(), timeout=3)
+        await _wait_for_operation_event(client, operation, entered_persist, waiting_for="cancelled turn entering its audit persist")
         assert composer.owner is not None
         composer.owner.cancel(COMPOSER_CANCEL_REQUESTED)
         await asyncio.sleep(0)
         assert not composer.owner.done()
         release_persist.set()
         await asyncio.wait_for(operation.drive, timeout=5)
-        await asyncio.wait_for(persist_completed.wait(), timeout=3)
+        await _wait_for_operation_event(client, operation, persist_completed, waiting_for="shielded audit persist completing")
         terminal = await client.get(operation.poll_path)
         assert SettledComposerOperation(operation.accepted, terminal).error()[0] == 499
     assert captured == [cancelled]
@@ -12528,11 +12554,13 @@ async def test_recompose_repeat_cancel_joins_cleanup_before_releasing_lease(tmp_
             client, app, path=f"/api/sessions/{service.session.id}/recompose", body=recompose_body(str(user_msg.id))
         ) as operation,
     ):
-        await asyncio.wait_for(composer.entered.wait(), timeout=3)
+        await _wait_for_operation_event(client, operation, composer.entered, waiting_for="composer turn entering compose()")
         cancellation = await client.post(f"{operation.poll_path}/cancel")
         assert cancellation.status_code in (200, 202)
         try:
-            await asyncio.wait_for(entered.wait(), timeout=3)
+            await _wait_for_operation_event(
+                client, operation, entered, waiting_for=f"cancelled recompose entering its blocked {blocked_write} write"
+            )
             assert composer.owner is not None
             composer.owner.cancel(COMPOSER_CANCEL_REQUESTED)
             with pytest.raises(TimeoutError):
@@ -12605,7 +12633,7 @@ async def test_compose_cancel_preserves_original_when_cleanup_child_fails(tmp_pa
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         body = message_body("Hello") if route == "messages" else recompose_body(str(user_msg.id))
         async with running_operation_async(client, app, path=f"/api/sessions/{service.session.id}/{route}", body=body) as operation:
-            await asyncio.wait_for(composer.entered.wait(), timeout=3)
+            await _wait_for_operation_event(client, operation, composer.entered, waiting_for="composer turn entering compose()")
             cancellation = await client.post(f"{operation.poll_path}/cancel")
             assert cancellation.status_code in (200, 202)
             await asyncio.wait_for(operation.drive, timeout=5)

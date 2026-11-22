@@ -1465,6 +1465,7 @@ def test_pipeline_decision_tool_schema_advertises_public_vocabulary_through_supp
 
     expected_public_terms = {
         "drop_raw_html_fields",
+        "gate_condition_authored",
         "prompt_injection_shield_recommendation",
         "web_scrape_http_identity",
     }

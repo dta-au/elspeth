@@ -410,13 +410,18 @@ def test_external_target_doctor_initializes_then_runtime_stays_validate_only(
     def latency(*_args: object) -> None:
         time.sleep(query_delay)
 
-    def delayed_probe(engine: Engine, *, kind: Literal["session", "landscape"]) -> tuple[readiness.ReadinessCheck, ...]:
+    def delayed_probe(
+        engine: Engine,
+        *,
+        kind: Literal["session", "landscape"],
+        schema_verdicts: readiness.SchemaShapeVerdicts,
+    ) -> tuple[readiness.ReadinessCheck, ...]:
         if hold_first_probe and kind == "session" and not entered.is_set():
             entered.set()
             assert release.wait(timeout=15), "test did not release the first readiness probe"
         event.listen(engine, "before_cursor_execute", latency)
         try:
-            return original_probe(engine, kind=kind)
+            return original_probe(engine, kind=kind, schema_verdicts=schema_verdicts)
         finally:
             event.remove(engine, "before_cursor_execute", latency)
 

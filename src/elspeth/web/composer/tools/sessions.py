@@ -9,7 +9,7 @@ from types import MappingProxyType
 from typing import Annotated, Any, Final, Literal, NotRequired, TypedDict, cast
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, StrictInt, field_validator
 from pydantic import ValidationError as PydanticValidationError
 
 from elspeth.contracts.blobs import ALLOWED_MIME_TYPES
@@ -21,11 +21,16 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationSource,
 )
 from elspeth.contracts.enums import OutputMode, is_llm_authored_creation_modality
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.sink import FILE_SINK_PLUGIN_SLASH_TEXT
 from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
+from elspeth.core.blobs_inline import BLOB_INLINE_AGGREGATE_BYTE_CAP, BLOB_INLINE_PER_REF_BYTE_CAP
 from elspeth.core.canonical import stable_hash
+from elspeth.web.blobs.protocol import BlobQuotaExceededError
+from elspeth.web.composer.inline_prompt_limit import inline_prompt_refusal_message, new_long_inline_prompt
 from elspeth.web.composer.path_canonicalization import canonical_sink_local_paths
+from elspeth.web.composer.pipeline_custody import finalize_pipeline_custody_sync, prepare_pipeline_custody, prompt_call_arguments_hash
 from elspeth.web.composer.protocol import (
     INTERPRETATION_RATE_CAP_PER_SESSION_DAY_EXPECTATION,
     INTERPRETATION_RATE_CAP_PER_TERM_EXPECTATION,
@@ -43,6 +48,7 @@ from elspeth.web.composer.protocol import (
 )
 from elspeth.web.composer.redaction import (
     SetPipelineArgumentsModel,
+    _InlineBlobModel,
     _OmittableString,
     redact_source_storage_path,
 )
@@ -105,6 +111,7 @@ from elspeth.web.composer.tools._common import (
     _serialize_output,
     _serialize_set_pipeline_arguments,
     _serialize_source,
+    _server_staged_requirement_boundary,
     _validate_mutation_arguments,
     _validate_plugin_name,
     _validate_sink_path,
@@ -118,6 +125,9 @@ from elspeth.web.composer.tools._common import (
     validate_composer_file_sink_collision_policy,
 )
 from elspeth.web.composer.tools.blobs import (
+    PROMPT_UNCHANGED_NODE_IDS_KEY,
+    PROMPT_UNCHANGED_NOTE,
+    PROMPT_UNCHANGED_NOTE_KEY,
     _blob_create_payload,
     _blob_creation_provenance,
     _file_inject_node_option_error,
@@ -125,7 +135,12 @@ from elspeth.web.composer.tools.blobs import (
     _persist_prepared_blob_create,
     _prepare_blob_create,
     _PreparedBlobCreate,
+    _PromptReplacement,
+    _resolve_blob_quota_bytes,
     _structured_prompt_template_refusal,
+    _whole_prompt_text_replacement,
+    _written_options_for_prompt_replacement,
+    _written_options_keeping_an_unchanged_prompt,
 )
 from elspeth.web.composer.tools.declarations import (
     GRAPH_EFFECTS,
@@ -151,12 +166,18 @@ from elspeth.web.composer.tools.sources import (
     _source_authoring_options,
     _source_component_id,
 )
-from elspeth.web.composer.tools.state_responses import PIPELINE_STATE_RESPONSE_CONTRACT
+from elspeth.web.composer.tools.state_inspection import bounded_state_inspection, enforce_state_inspection_limit
+from elspeth.web.composer.tools.state_responses import (
+    PIPELINE_STATE_RESPONSE_CONTRACT,
+    has_duplicate_component_identities,
+    pipeline_state_changes,
+)
 from elspeth.web.credential_guard import (
     CREDENTIAL_REFUSAL_DETAIL,
     CredentialMaterialRefused,
     require_no_credential_material_in_state,
 )
+from elspeth.web.execution._validation_materialization import llm_prompt_file_scalar_field
 from elspeth.web.interpretation_state import (
     BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX,
     INTERPRETATION_REQUIREMENTS_KEY,
@@ -251,6 +272,10 @@ class RequestAdvisorHintArgumentsModel(BaseModel):
 
 class GetPipelineStateArgumentsModel(BaseModel):
     component: _OmittableString = None
+    since_start: bool = False
+    field_path: str | None = Field(default=None, max_length=512)
+    offset_chars: StrictInt = Field(default=0, ge=0)
+    expected_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
     model_config = ConfigDict(extra="forbid")
 
@@ -474,7 +499,7 @@ def canonicalize_authored_node_review_requirements(
     ``interpretation_state._coerce_requirement`` however MANDATES ``id`` and
     ``status`` (only ``draft`` / ``event_id`` / ``accepted_*`` default), and the
     always-on prompt-injection-shield advisory walk in
-    ``CompositionState.validate`` (``prompt_shield_recommendation_warning_pairs``
+    ``CompositionState.validate`` (``prompt_shield_recommendation_warning_groups``
     -> ``_llm_has_shield_recommendation`` -> ``_requirements``) reaches that
     parser through a path with no ``try``/``except``. So the exact short form the
     skill asks the planner to author raised ``KeyError('id')`` and escaped the
@@ -594,6 +619,7 @@ class SetPipelineCandidate:
 
     result: ToolResult
     prepared_inline_blob: _PreparedBlobCreate | None
+    prepared_prompt_blobs: tuple[tuple[str, _PreparedBlobCreate], ...] = ()
 
     @property
     def acceptable(self) -> bool:
@@ -642,6 +668,32 @@ def _no_source_configured_repair(state: CompositionState) -> str:
         f"{guidance} The existing singular source is blob-bound: retain its source.blob_id; "
         "use source.inline_blob only when intentionally supplying new literal data."
     )
+
+
+def _inline_file_size_refusal(prepared_prompt_blobs: list[tuple[str, _PreparedBlobCreate]]) -> str | None:
+    """Name the inline-file size limit this call's new files break, with the figures, or None.
+
+    Counts only the files this call writes, one per binding; files already
+    bound are counted by validation, which applies the same pipeline total.
+    """
+    over_file_cap = [
+        f"{field_path} is {len(item.content_bytes)} bytes"
+        for field_path, item in prepared_prompt_blobs
+        if len(item.content_bytes) > BLOB_INLINE_PER_REF_BYTE_CAP
+    ]
+    if over_file_cap:
+        return (
+            f"Inline file over the per-file limit of {BLOB_INLINE_PER_REF_BYTE_CAP} bytes: {'; '.join(over_file_cap)}. "
+            "Shorten each named file."
+        )
+    total = sum(len(item.content_bytes) for _field_path, item in prepared_prompt_blobs)
+    if total > BLOB_INLINE_AGGREGATE_BYTE_CAP:
+        return (
+            f"The new inline files in this call total {total} bytes across {len(prepared_prompt_blobs)} files; "
+            f"the limit for all file-held text in one pipeline is {BLOB_INLINE_AGGREGATE_BYTE_CAP} bytes. "
+            "Remove a file or shorten the largest ones."
+        )
+    return None
 
 
 @trust_boundary(
@@ -697,10 +749,39 @@ def build_set_pipeline_candidate(
     user_message_id = context.user_message_id
     interpretation_requirements_are_internal = context._interpretation_requirements_are_internal
     prepared_inline_blob: _PreparedBlobCreate | None = None
+    prepared_prompt_blobs: list[tuple[str, _PreparedBlobCreate]] = []
 
     def _candidate(result: ToolResult) -> SetPipelineCandidate:
         normalized = normalize_tool_result_validation(result, context.catalog)
-        return SetPipelineCandidate(result=normalized, prepared_inline_blob=prepared_inline_blob)
+        size_refusal = _inline_file_size_refusal(prepared_prompt_blobs) if normalized.success else None
+        if size_refusal is not None:
+            normalized = normalize_tool_result_validation(
+                _candidate_rejection_result(
+                    state,
+                    size_refusal,
+                    error_code="BLOB_QUOTA_EXCEEDED",
+                    rejected_component=None,
+                ),
+                context.catalog,
+            )
+        if session_id is not None and context.executing_proposal_id is None and normalized.success:
+            long_prompt = new_long_inline_prompt(state, normalized.updated_state)
+            if long_prompt is not None:
+                node_id, field, words, characters = long_prompt
+                normalized = normalize_tool_result_validation(
+                    _candidate_rejection_result(
+                        state,
+                        inline_prompt_refusal_message(field, words, characters),
+                        error_code="inline_prompt_too_long",
+                        rejected_component=f"node:{node_id}",
+                    ),
+                    context.catalog,
+                )
+        return SetPipelineCandidate(
+            result=normalized,
+            prepared_inline_blob=prepared_inline_blob,
+            prepared_prompt_blobs=tuple(prepared_prompt_blobs),
+        )
 
     def _failure_result(
         rejected_state: CompositionState,
@@ -1514,16 +1595,134 @@ def build_set_pipeline_candidate(
     # 2. Validate node plugins and options
     canonical_node_options: dict[int, Mapping[str, Any]] = {}
     current_nodes = {node.id: node for node in state.nodes}
+    superseded_review_ids: list[str] = []
+    prompt_unchanged_node_ids: list[str] = []
     for node_index, node in enumerate(validated.nodes):
         node_id = node.id
         node_ref = f"node:{node_id}"
         node_type = node.node_type
         node_plugin = node.plugin
         node_options: Mapping[str, Any] = node.options
+        if node_plugin == "llm":
+            authored_options = dict(node_options)
+            prompt_sites: list[tuple[str, dict[str, Any], str]] = [
+                (name, authored_options, name) for name in ("prompt_template", "system_prompt")
+            ]
+            queries = authored_options.get("queries")
+            if isinstance(queries, list):
+                copied_queries = [dict(query) if isinstance(query, Mapping) else query for query in queries]
+                authored_options["queries"] = copied_queries
+                for query_index, query in enumerate(copied_queries):
+                    if isinstance(query, dict):
+                        query_name = query.get("name")
+                        query_key = query_name if type(query_name) is str and query_name else query_index
+                        prompt_sites.append((f"queries.{query_key}.template", query, "template"))
+            elif isinstance(queries, dict):
+                copied_named_queries = {name: dict(query) if isinstance(query, Mapping) else query for name, query in queries.items()}
+                authored_options["queries"] = copied_named_queries
+                for query_name, query in copied_named_queries.items():
+                    if isinstance(query, dict):
+                        prompt_sites.append((f"queries.{query_name}.template", query, "template"))
+            for field_path, container, key in prompt_sites:
+                value = container.get(key)
+                if type(value) is not dict or "inline_blob" not in value:
+                    continue
+                path = f"node:{node_id}.options.{field_path}"
+                if llm_prompt_file_scalar_field(path) is None:
+                    _record_component_rejection(
+                        _failure_result(
+                            state,
+                            "File-backed LLM prompts bind only to scalar prompt fields.",
+                            error_code="inline_blob_field_path_invalid",
+                            rejected_component=node_ref,
+                        )
+                    )
+                    continue
+                if set(value) != {"inline_blob"}:
+                    _record_component_rejection(
+                        _failure_result(
+                            state,
+                            f"{field_path} requires only the inline_blob member.",
+                            error_code="inline_blob_field_path_invalid",
+                            rejected_component=node_ref,
+                        )
+                    )
+                    continue
+                if node_options.get("prompt_template_parts") is not None and field_path == "prompt_template":
+                    _record_component_rejection(
+                        _failure_result(
+                            state,
+                            "A structured prompt must use its prompt_template_parts or a separate file binding.",
+                            error_code="prompt_template_parts_required",
+                            rejected_component=node_ref,
+                        )
+                    )
+                    continue
+                if session_engine is None or session_id is None or data_dir is None:
+                    _record_component_rejection(
+                        _failure_result(
+                            state,
+                            f"{field_path} inline_blob requires session storage context.",
+                            error_code="source_binding_context_unavailable",
+                            rejected_component=node_ref,
+                        )
+                    )
+                    continue
+                try:
+                    blob = _InlineBlobModel.model_validate(value["inline_blob"])
+                except PydanticValidationError:
+                    _record_component_rejection(
+                        _failure_result(
+                            state,
+                            f"{field_path} requires inline_blob filename, text/plain mime_type and content.",
+                            error_code="inline_blob_field_path_invalid",
+                            rejected_component=node_ref,
+                        )
+                    )
+                    continue
+                if blob.mime_type != "text/plain":
+                    _record_component_rejection(
+                        _failure_result(
+                            state,
+                            f"{field_path} inline_blob requires text/plain.",
+                            error_code="inline_blob_not_text",
+                            rejected_component=node_ref,
+                        )
+                    )
+                    continue
+                provenance = _blob_creation_provenance(blob.content, context)
+                prepared = _prepare_blob_create(
+                    filename=blob.filename,
+                    mime_type=blob.mime_type,
+                    content=blob.content,
+                    description=blob.description,
+                    data_dir=data_dir,
+                    session_id=session_id,
+                    creation_modality=provenance.creation_modality,
+                    created_from_message_id=user_message_id,
+                    creating_model_identifier=provenance.creating_model_identifier,
+                    creating_model_version=provenance.creating_model_version,
+                    creating_provider=provenance.creating_provider,
+                    creating_composer_skill_hash=provenance.creating_composer_skill_hash,
+                    creating_arguments_hash=provenance.creating_arguments_hash,
+                )
+                prepared_prompt_blobs.append((path, prepared))
+                container[key] = {"blob_ref": prepared.blob_id, "mode": "inline_content", "sha256": prepared.content_hash}
+            node_options = authored_options
         # Echo tolerance (elspeth-c67fbbbd83): requirement rows echoed
         # verbatim from the stored node reduce to author shells; the
         # reconciliation pass below restores the server rows.
         if not interpretation_requirements_are_internal:
+            node_options, review_refusal = _server_staged_requirement_boundary(
+                node_options,
+                stored_options=current_nodes[node_id].options if node_id in current_nodes else None,
+                node_id=node_id,
+            )
+            if review_refusal is not None:
+                _record_component_rejection(
+                    _failure_result(state, review_refusal, error_code="server_owned_review_protected", rejected_component=node_ref)
+                )
+                continue
             node_options, node_requirement_echo = _normalize_echoed_interpretation_requirements(
                 node_options,
                 stored_options=current_nodes[node_id].options if node_id in current_nodes else None,
@@ -1560,6 +1759,29 @@ def build_set_pipeline_candidate(
             node_options = _normalize_trusted_legacy_interpretation_requirements(
                 node_options,
             )
+        # prompt_template as text with prompt_template_parts: null REPLACES
+        # that node's stored prompt (see _whole_prompt_text_replacement). Every
+        # rejection still returns the untouched ``state``, and reviews
+        # reconcile against it.
+        replacement: _PromptReplacement | None = None
+        if node_plugin == "llm" and node_id in current_nodes and current_nodes[node_id].plugin == "llm":
+            # The stored prompt's own text replaces nothing, whatever the parts key says.
+            kept_options = _written_options_keeping_an_unchanged_prompt(current_nodes[node_id].options, node_options, merge_patch=False)
+            if kept_options is not None:
+                node_options = kept_options
+                prompt_unchanged_node_ids.append(node_id)
+            replacement = _whole_prompt_text_replacement(current_nodes[node_id].options, node_options)
+        if replacement is not None:
+            # A stored row that is already non-canonical is refused first, so
+            # the replacement can never launder a malformed row away.
+            stored_error = _composition_canonical_interpretation_requirement_error(state, tool_name="set_pipeline")
+            if stored_error is not None:
+                _record_component_rejection(
+                    _failure_result(state, stored_error, error_code="interpretation_requirements_invalid", rejected_component=node_ref)
+                )
+                continue
+            node_options = _written_options_for_prompt_replacement(node_options, replacement)
+            superseded_review_ids.extend(replacement.superseded_review_ids)
         review_options = _options_with_default_llm_reviews(
             node_id=node_id,
             plugin=node_plugin,
@@ -1568,7 +1790,9 @@ def build_set_pipeline_candidate(
         )
         if node_plugin == "llm":
             structured_error = _structured_prompt_template_refusal(
-                node_id, current_nodes[node_id].options if node_id in current_nodes else {}, review_options
+                node_id,
+                replacement.base_options if replacement is not None else current_nodes[node_id].options if node_id in current_nodes else {},
+                review_options,
             )
             if structured_error is not None:
                 _record_component_rejection(
@@ -2111,6 +2335,19 @@ def build_set_pipeline_candidate(
         # matter how many components echoed.
         note_payload = {"server_owned_metadata_note": " ".join(dict.fromkeys(echoed_metadata_notes))}
         data = note_payload if data is None else {**data, **note_payload}
+    if superseded_review_ids:
+        # The replaced prompts' vague-term reviews, named so the model can tell
+        # the user which definitions no longer apply.
+        superseded_payload = {"superseded_review_ids": list(superseded_review_ids)}
+        data = superseded_payload if data is None else {**data, **superseded_payload}
+    if prompt_unchanged_node_ids:
+        # Nodes whose write carried the stored prompt's own text without its
+        # parts: their stored prompt structure and reviews were kept.
+        kept_payload = {
+            PROMPT_UNCHANGED_NODE_IDS_KEY: list(prompt_unchanged_node_ids),
+            PROMPT_UNCHANGED_NOTE_KEY: PROMPT_UNCHANGED_NOTE,
+        }
+        data = kept_payload if data is None else {**data, **kept_payload}
     return _candidate(
         _mutation_result(
             new_state,
@@ -2122,6 +2359,29 @@ def build_set_pipeline_candidate(
     )
 
 
+def _custody_arguments(
+    arguments: Mapping[str, JsonValue],
+    prepared_inline_blob: _PreparedBlobCreate | None,
+) -> dict[str, JsonValue]:
+    """Copy the direct call's arguments for pipeline custody.
+
+    This is the only place the direct ``set_pipeline`` path copies the whole
+    tool input. When the source file was already stored, the copy names it by
+    ``blob_id`` instead of carrying its bytes inline; every other argument is
+    kept as the caller sent it.
+    """
+    custody_args = dict(arguments)
+    if prepared_inline_blob is not None:
+        original_source = arguments["source"]
+        if type(original_source) is not dict:
+            raise AuditIntegrityError("set_pipeline candidate lost its original source")
+        source_args = dict(original_source)
+        del source_args["inline_blob"]
+        source_args["blob_id"] = prepared_inline_blob.blob_id
+        custody_args["source"] = source_args
+    return custody_args
+
+
 def _execute_set_pipeline(
     args: dict[str, Any],
     state: CompositionState,
@@ -2131,7 +2391,7 @@ def _execute_set_pipeline(
     candidate = build_set_pipeline_candidate(args, state, context)
     result = candidate.result
     prepared_inline_blob = candidate.prepared_inline_blob
-    if not result.success or prepared_inline_blob is None:
+    if not result.success or (prepared_inline_blob is None and not candidate.prepared_prompt_blobs):
         return result
 
     session_engine = context.session_engine
@@ -2143,23 +2403,83 @@ def _execute_set_pipeline(
             error_code="source_binding_context_unavailable",
             rejected_component="source",
         )
-    quota_error = _persist_prepared_blob_create(
-        prepared_inline_blob,
-        session_engine=session_engine,
-        session_id=session_id,
-        max_blob_storage_per_session_bytes=context.max_blob_storage_per_session_bytes,
-        session_operation_context=context.session_operation_context,
-        session_operation_authority=context.session_operation_authority,
+    original_arguments = cast(dict[str, JsonValue], args)
+    prompt_arguments_hash = (
+        prompt_call_arguments_hash(original_arguments, prepared_inline_blob)
+        if prepared_inline_blob is not None and candidate.prepared_prompt_blobs
+        else None
     )
-    if quota_error is not None:
-        return _candidate_rejection_result(state, quota_error, error_code="BLOB_QUOTA_EXCEEDED", rejected_component="source")
-
-    inline_payload = {"inline_blob": _blob_create_payload(prepared_inline_blob)}
-    if result.data is None:
-        data: dict[str, Any] = inline_payload
+    if prepared_inline_blob is not None:
+        quota_error = _persist_prepared_blob_create(
+            prepared_inline_blob,
+            session_engine=session_engine,
+            session_id=session_id,
+            max_blob_storage_per_session_bytes=context.max_blob_storage_per_session_bytes,
+            session_operation_context=context.session_operation_context,
+            session_operation_authority=context.session_operation_authority,
+        )
+        if quota_error is not None:
+            return _candidate_rejection_result(state, quota_error, error_code="BLOB_QUOTA_EXCEEDED", rejected_component="source")
+    if not candidate.prepared_prompt_blobs:
+        if prepared_inline_blob is None:
+            raise AuditIntegrityError("inline source preparation missing after candidate acceptance")
+        inline_payload = {"inline_blob": _blob_create_payload(prepared_inline_blob)}
+        if result.data is not None and not isinstance(result.data, Mapping):
+            raise AuditIntegrityError("set_pipeline candidate returned non-object data")
+        data = inline_payload if result.data is None else {**result.data, **inline_payload}
+        return replace(result, data=data)
+    if context.data_dir is None:
+        raise AuditIntegrityError("inline pipeline custody requires data_dir")
+    custody_args = _custody_arguments(original_arguments, prepared_inline_blob)
+    max_storage = _resolve_blob_quota_bytes(context.max_blob_storage_per_session_bytes)
+    preparation = prepare_pipeline_custody(
+        custody_args,
+        None,
+        session_id=session_id,
+        max_storage_per_session=max_storage,
+        prompt_blobs=candidate.prepared_prompt_blobs,
+        prompt_arguments_hash=prompt_arguments_hash,
+    )
+    try:
+        finalize_pipeline_custody_sync(
+            preparation,
+            engine=session_engine,
+            data_dir=context.data_dir,
+            max_storage_per_session=max_storage,
+            session_operation_context=context.session_operation_context,
+            session_operation_authority=context.session_operation_authority,
+        )
+    except BlobQuotaExceededError as exc:
+        return _candidate_rejection_result(
+            state,
+            f"Session blob quota exceeded: {exc.current_bytes} bytes would exceed {exc.limit_bytes} byte limit.",
+            error_code="BLOB_QUOTA_EXCEEDED",
+            rejected_component=None,
+        )
+    safe_candidate = build_set_pipeline_candidate(preparation.arguments, state, context)
+    if (
+        (candidate.acceptable and not safe_candidate.acceptable)
+        or safe_candidate.prepared_inline_blob is not None
+        or safe_candidate.prepared_prompt_blobs
+    ):
+        raise AuditIntegrityError("custody-safe pipeline failed canonical revalidation")
+    safe_result = safe_candidate.result if safe_candidate.result.success else result
+    if prepared_inline_blob is not None:
+        rebound_sources = dict(safe_result.updated_state.sources)
+        for name, source in result.updated_state.sources.items():
+            if source.options.get("blob_ref") == prepared_inline_blob.blob_id:
+                rebound_sources[name] = source
+        safe_result = replace(safe_result, updated_state=replace(safe_result.updated_state, sources=rebound_sources))
+    inline_payload = {"inline_blob": _blob_create_payload(prepared_inline_blob)} if prepared_inline_blob is not None else {}
+    if prepared_inline_blob is not None or not candidate.acceptable:
+        if result.data is not None and not isinstance(result.data, Mapping):
+            raise AuditIntegrityError("set_pipeline candidate returned non-object data")
+        data = inline_payload if result.data is None else {**result.data, **inline_payload}
     else:
-        data = {**cast(Mapping[str, Any], result.data), **inline_payload}
-    return replace(result, data=data)
+        if safe_result.data is not None and not isinstance(safe_result.data, Mapping):
+            raise AuditIntegrityError("set_pipeline custody returned non-object data")
+        data = {} if safe_result.data is None else {**safe_result.data}
+    return replace(safe_result, data=data)
 
 
 def _handle_set_pipeline(
@@ -2175,6 +2495,18 @@ def _set_pipeline_effects(arguments: Mapping[str, Any]) -> ToolEffects:
     validated = _validate_mutation_arguments(SetPipelineArgumentsModel, arguments, "set_pipeline arguments")
     if validated.source is not None and validated.source.inline_blob is not None:
         return ToolEffects((*GRAPH_EFFECTS.domains, EffectDomain.BLOB_STORE))
+    for node in validated.nodes:
+        if node.plugin == "llm":
+            options = node.options
+            if any(type(options.get(field)) is dict and "inline_blob" in options[field] for field in ("prompt_template", "system_prompt")):
+                return ToolEffects((*GRAPH_EFFECTS.domains, EffectDomain.BLOB_STORE))
+            queries = options.get("queries")
+            entries = queries.values() if isinstance(queries, Mapping) else queries if isinstance(queries, list) else ()
+            if any(
+                isinstance(query, Mapping) and type(query.get("template")) is dict and "inline_blob" in query["template"]
+                for query in entries
+            ):
+                return ToolEffects((*GRAPH_EFFECTS.domains, EffectDomain.BLOB_STORE))
     return GRAPH_EFFECTS
 
 
@@ -2186,7 +2518,11 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
     description=(
         "Atomically create or fully rebuild a pipeline. For a narrow edit to an existing pipeline, name the "
         "tool that matches the edit: `patch_node_options` for an option-only change, `splice_transform` to "
-        "insert one transform on a direct linear path, `upsert_node` / `upsert_edge` to add or rewire a node."
+        "insert one transform on a direct linear path, `upsert_node` / `upsert_edge` to add or rewire a node. "
+        "For an llm node that has a structured prompt, options with prompt_template text and prompt_template_parts: null "
+        "replace the whole prompt; `superseded_review_ids` names the old prompt's vague-term reviews that were removed. "
+        "To keep that prompt, send the node whole and unedited as get_pipeline_state(component='set_pipeline_arguments') "
+        "returns it; changed prompt_template text without prompt_template_parts is refused (prompt_template_parts_required)."
     ),
     json_schema={
         "type": "object",
@@ -2318,7 +2654,7 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                         },
                         "options": {
                             "type": "object",
-                            "description": "Plugin-specific node config. Row-column options use the field name carried by upstream rows, normally a normalized header or source field_mapping target."
+                            "description": 'Plugin-specific node config. Row-column options use the field name carried by upstream rows, normally a normalized header or source field_mapping target. For an LLM prompt_template, system_prompt or query template longer than 100 words or 1,000 prose characters, use {"inline_blob": {"filename": "prompt.txt", "mime_type": "text/plain", "content": "full text"}} at that field.'
                             + _LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
                         },
                         "condition": {"type": ["string", "null"]},
@@ -2548,12 +2884,32 @@ def _execute_get_pipeline_state(
     component = validated.component
     data: Any
 
-    if component == "set_pipeline_arguments":
+    if validated.since_start:
+        if component is not None:
+            return _failure_result(
+                state, "Use since_start=true without component to obtain all changes in this turn.", error_code="argument_error"
+            )
+        if context.baseline is None or context.baseline_kind != "request_start":
+            return _failure_result(
+                state,
+                "No turn-start graph is available on this surface. Use explicit full inspection.",
+                error_code="diff_baseline_unavailable",
+            )
+        if has_duplicate_component_identities(context.baseline) or has_duplicate_component_identities(state):
+            return _failure_result(
+                state,
+                "Changes-only inspection requires unique component identities. Use explicit full inspection.",
+                error_code="duplicate_component_identity",
+                with_state_validation=False,
+            )
+        data = pipeline_state_changes(context.baseline, state)
+    elif component == "set_pipeline_arguments":
         exact_arguments, round_trip_error = _serialize_set_pipeline_arguments(state)
         if round_trip_error is not None:
             return _failure_result(
                 state,
-                f"Pipeline cannot be represented as exact set_pipeline arguments: {round_trip_error}.",
+                f"Pipeline cannot be represented as exact set_pipeline arguments: {round_trip_error}. "
+                "Read the node or output you need by its id instead.",
                 error_code="round_trip_unavailable",
             )
         assert exact_arguments is not None
@@ -2581,37 +2937,57 @@ def _execute_get_pipeline_state(
         data = _serialize_full_pipeline_state(state, requested_component=None)
 
     data = redact_source_storage_path(data)
-    return _discovery_result(state, data)
+    result = _discovery_result(state, data)
+    return bounded_state_inspection(
+        result,
+        context,
+        field_path=validated.field_path,
+        offset_chars=validated.offset_chars,
+        expected_sha256=validated.expected_sha256,
+        since_start=validated.since_start,
+    )
+
+
+def _handle_get_pipeline_state(args: dict[str, JsonValue], state: CompositionState, context: ToolContext) -> ToolResult:
+    result = _execute_get_pipeline_state(args, state, context)
+    return enforce_state_inspection_limit(result, context)
 
 
 _GET_PIPELINE_STATE_DECLARATION = ToolDeclaration(
     name="get_pipeline_state",
-    handler=_execute_get_pipeline_state,
+    handler=_handle_get_pipeline_state,
     kind=ToolKind.DISCOVERY,
     response_contract=PIPELINE_STATE_RESPONSE_CONTRACT,
-    # Presence-keyed on the response field, never on a tool name: the planner
-    # palette carries this tool but no mutating tool, so a sentence asserting
-    # that a mutation already echoed the state would be false there. Keyed on
-    # "when a result carries applied_component" it is simply vacuous on a
-    # surface that never mutates, and true wherever it can apply.
-    description="Inspect the full current pipeline state including all "
-    "options for source, nodes, and outputs. When a mutation result carries "
-    "an applied_component field, that field is already the post-change state "
-    "of everything that mutation touched — read it there, and call this tool "
-    "for what it does not cover: a component the change did not touch, or "
-    "the whole document. A node or output request returns just `node` or "
-    '`output`; `component="source"` returns the `sources` map; '
-    "`set_pipeline_arguments` returns the flat pipeline document. For the web "
-    'set_pipeline tool, put that document inside {"pipeline": <document>}; do not '
-    "send its source/nodes/edges/outputs fields at the top level. A "
-    "full-state read (no component, or an alias) returns the whole document "
-    "with an `inspection` block: `requested_component` (what you asked for), "
-    "`resolved_component` (always `full` here — the request matched a "
-    "full-state alias), and `accepted_full_state_aliases` (the exact strings "
-    "that do).",
+    description=(
+        "Inspect graph or since_start changes. Oversized whole-graph reads return a structural `view`; "
+        "pages carry exact `content`, `encoding`, `field_path`, `offset_chars`, `total_chars`, `next_offset_chars` and `sha256`. "
+        "Use field_path for exact values; pass the hash to continue. "
+        "Changes give `baseline_kind`, `from_version`, `projection`, and `changes` with `operation`, `path`, optional `value`. "
+        'For the web set_pipeline tool, put the flat `set_pipeline_arguments` document inside {"pipeline": <document>}; do not send its source/nodes/edges/outputs fields at the top level. '
+        "Full diagnostic reads include `inspection`: `requested_component`, `resolved_component` and `accepted_full_state_aliases`."
+    ),
     json_schema={
         "type": "object",
         "properties": {
+            "field_path": {
+                "type": "string",
+                "maxLength": 512,
+                "description": "Exact JSON pointer: node /input or /options/system_prompt; output /options/<key>. Wrapper /node/input works. Source /sources/<name>/on_success or /on_success. Empty reads bounded pages.",
+            },
+            "offset_chars": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Page `offset_chars` (default 0) within `total_chars`. Follow `next_offset_chars`; supply the returned `sha256` as expected_sha256.",
+            },
+            "expected_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+                "description": "Content identity returned by the previous page; required when offset_chars is greater than zero.",
+            },
+            "since_start": {
+                "type": "boolean",
+                "description": "Return `changes` from `baseline_kind` request_start and `from_version`: each `operation` has a `path` and optional `value`. The `projection` keys components by ID. Do not combine with component; default false.",
+            },
             "component": {
                 "type": "string",
                 "description": (
@@ -2619,6 +2995,8 @@ _GET_PIPELINE_STATE_DECLARATION = ToolDeclaration(
                     "Accepted full-state aliases: omit component, pass 'full', 'all', 'pipeline', "
                     "or pass the empty string. Use 'set_pipeline_arguments' for the flat authoring document; "
                     'the web set_pipeline call requires {"pipeline": <document>}. '
+                    "That document is refused when a source bound with set_source_from_blob is named other than 'source' "
+                    "or sits beside other sources; then read the node or output by its id instead. "
                     "Ordinary inspection output is diagnostic only."
                 ),
             },

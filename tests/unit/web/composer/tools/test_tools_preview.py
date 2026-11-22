@@ -59,6 +59,53 @@ def passing_runtime_preflight() -> _SyncCallRecorder:
     )
 
 
+def _apply_model_built_fork(
+    state: CompositionState,
+    *,
+    gate_id: str,
+    connection: str,
+    branch_for: dict[str, str],
+    row_union_alias: dict[str, str] | None = None,
+) -> CompositionState:
+    """Build the fork the skill teaches, the way the model would: names it chooses, steps re-sent whole.
+
+    One ``upsert_node`` gate (``condition='True'``, routes to fork, one
+    ``fork_to`` branch per consumer), then one ``upsert_node`` per consumer
+    read from ``get_pipeline_state(component='set_pipeline_arguments')`` with
+    its ``input`` (or, for a row_union, the named ``branches`` alias) set to
+    its own branch. Every call must succeed.
+    """
+    aliases = row_union_alias or {}
+    nodes = {
+        node["id"]: dict(node)
+        for node in execute_tool("get_pipeline_state", {"component": "set_pipeline_arguments"}, state, _mock_catalog()).to_dict()["data"][
+            "nodes"
+        ]
+    }
+    calls: list[dict[str, Any]] = [
+        {
+            "id": gate_id,
+            "node_type": "gate",
+            "input": connection,
+            "condition": "True",
+            "routes": {"true": "fork", "false": "fork"},
+            "fork_to": list(branch_for.values()),
+        }
+    ]
+    for node_id, branch in branch_for.items():
+        node = nodes[node_id]
+        if node_id in aliases:
+            branches = {**node["branches"], aliases[node_id]: branch}
+            calls.append({**node, "branches": branches, "input": next(iter(branches.values()))})
+        else:
+            calls.append({**node, "input": branch})
+    for arguments in calls:
+        result = execute_tool("upsert_node", arguments, state, _mock_catalog())
+        assert result.success is True, result.to_dict()
+        state = result.updated_state
+    return state
+
+
 class TestPreviewPipelineSemanticContracts:
     """A preview's envelope ``validation`` carries semantic_contracts; ``data`` does not twin them (R4)."""
 
@@ -372,18 +419,17 @@ class TestPreviewPipeline:
                 "Ask published_success_connection; do not restate the set here."
             )
 
-    def test_duplicate_consumer_repair_does_not_mint_a_branch_onto_a_publisher_id(self) -> None:
-        """The consequence, end to end: the repair must not create a new error.
+    def test_duplicate_consumer_facts_mint_no_branch_name(self) -> None:
+        """The server names no branch, so it cannot mint one onto a publisher id.
 
-        Measured before the fix on this exact shape — the generated branch
-        name collided with the dangling aggregation's id and applying the
-        suggestion produced:
+        Measured before the suggestion became facts-only on this exact shape:
+        the server-generated branch name collided with the dangling
+        aggregation's id, and applying the suggestion produced
 
             Duplicate producer for connection 'shared_to_t1':
             aggregation 'shared_to_t1' and gate 'fork_shared' fork 'shared_to_t1'
 
-        One error in, a different error out, with the planner having done
-        exactly what it was told.
+        Now the entry states the connection and its consumers and nothing else.
         """
         from elspeth.web.composer.tools._common import _graph_repair_suggestions
 
@@ -442,22 +488,17 @@ class TestPreviewPipeline:
         validation = state.validate()
         assert any(error.error_code == "duplicate_connection_consumer" for error in validation.errors)
 
-        generated_branches: list[str] = []
-        for suggestion in _graph_repair_suggestions(state, validation):
-            for tool_call in suggestion["tool_sequence"]:
-                branches = tool_call.get("arguments", {}).get("fork_to")
-                if branches:
-                    generated_branches.extend(branches)
+        assert _graph_repair_suggestions(state, validation) == [
+            {
+                "code": "duplicate_connection_consumer",
+                "connection": "shared",
+                "reason": "One connection can feed one processing node; every node listed reads this one. Change only the input bindings; a routing_only rewire keeps a transform's options.",
+                "affected_consumers": [{"id": "t1"}, {"id": "t2"}, {"id": "feeder"}],
+            }
+        ]
 
-        assert generated_branches, "the duplicate-consumer repair produced no fork branches to check"
-        assert "shared_to_t1" not in generated_branches, (
-            "The repair minted a branch named 'shared_to_t1', which is already the implicit connection id of "
-            f"the dangling aggregation of that name. Generated: {generated_branches}. Applying this repair "
-            "creates a duplicate_connection_producer the pipeline did not have."
-        )
-
-    def test_preview_pipeline_suggests_fork_gate_for_duplicate_consumers(self) -> None:
-        """Duplicate consumers get a copyable fork-gate repair skeleton."""
+    def test_preview_pipeline_states_duplicate_consumer_facts_and_the_taught_fork_repairs_it(self) -> None:
+        """Duplicate consumers get the facts; the fork the skill teaches, with model-chosen names, repairs them."""
         state = (
             _empty_state()
             .with_source(
@@ -517,53 +558,36 @@ class TestPreviewPipeline:
 
         assert result.success is True
         assert any("Duplicate consumer for connection 'classified_rows'" in err["message"] for err in payload["errors"])
-        repairs = payload["graph_repair_suggestions"]
-        assert len(repairs) == 1
-        repair = repairs[0]
-        assert repair["code"] == "duplicate_consumer_connection"
-        assert repair["connection"] == "classified_rows"
-        assert repair["strategy"] == "insert_fork_gate"
-        assert repair["tool_sequence"][0]["arguments"]["input"] == "classified_rows_to_fraud_filter"
-        assert repair["tool_sequence"][1]["arguments"]["input"] == "classified_rows_to_regular_filter"
-        assert repair["tool_sequence"][2] == {
-            "tool": "upsert_node",
-            "arguments": {
-                "id": "fork_classified_rows",
-                "node_type": "gate",
-                "plugin": None,
-                "input": "classified_rows",
-                "on_success": None,
-                "on_error": None,
-                "options": {},
-                "condition": "True",
-                "routes": {"true": "fork", "false": "fork"},
-                "fork_to": ["classified_rows_to_fraud_filter", "classified_rows_to_regular_filter"],
-                "branches": None,
-                "policy": None,
-                "merge": None,
-                "trigger": None,
-                "output_mode": None,
-                "expected_output_count": None,
-            },
-        }
-        assert repair["tool_sequence"][-1] == {"tool": "preview_pipeline", "arguments": {}}
+        assert payload["graph_repair_suggestions"] == [
+            {
+                "code": "duplicate_connection_consumer",
+                "connection": "classified_rows",
+                "reason": "One connection can feed one processing node; every node listed reads this one. Change only the input bindings; a routing_only rewire keeps a transform's options.",
+                "affected_consumers": [{"id": "fraud_filter"}, {"id": "regular_filter"}],
+            }
+        ]
 
-        fixed_state = state
-        for step in repair["tool_sequence"][:-1]:
-            step_result = execute_tool(step["tool"], step["arguments"], fixed_state, _mock_catalog())
-            fixed_state = step_result.updated_state
+        fixed_state = _apply_model_built_fork(
+            state,
+            gate_id="split_classified",
+            connection="classified_rows",
+            branch_for={"fraud_filter": "to_fraud", "regular_filter": "to_regular"},
+        )
         fixed_validation = execute_tool("preview_pipeline", {}, fixed_state, _mock_catalog()).to_dict()["validation"]
 
         assert not any("Duplicate consumer for connection 'classified_rows'" in err["message"] for err in fixed_validation["errors"])
+        assert fixed_validation["graph_repair_suggestions"] == []
 
+    @pytest.mark.parametrize("barrier", ["row_union", "coalesce"])
     @pytest.mark.parametrize("duplicate_branch", ["control", "treatment"])
-    def test_duplicate_consumer_repair_patches_row_union_branch_and_validates(self, duplicate_branch: str) -> None:
-        """Every suggested mutation succeeds and repairs the real branch slot.
+    def test_duplicate_consumer_facts_name_a_row_union_branch_consumer_and_its_branch_slot_repairs(
+        self, duplicate_branch: str, barrier: str
+    ) -> None:
+        """A row_union or coalesce reading the shared connection through a mapped branch is a named consumer.
 
-        The deliberately minimal fork skeleton does not synthesize an inner
-        correlated barrier. It therefore leaves the pre-existing independent
-        fork-destination/topology issue visible for the planner's next repair
-        turn instead of silently changing downstream semantics.
+        The model-built fork re-points that branch slot's value. The slot does
+        not count as a reader of the new gate's branch, so a relay transform is
+        needed on it; the fixture's own standing errors stay visible.
         """
         branch_connections = {
             "control": "control_done",
@@ -634,7 +658,7 @@ class TestPreviewPipeline:
             .with_node(
                 NodeSpec(
                     id="variant_union",
-                    node_type="row_union",
+                    node_type=barrier,
                     plugin=None,
                     input="control_done",
                     on_success="unioned_rows",
@@ -644,8 +668,8 @@ class TestPreviewPipeline:
                     routes=None,
                     fork_to=None,
                     branches=branch_connections,
-                    policy=None,
-                    merge=None,
+                    policy="require_all" if barrier == "coalesce" else None,
+                    merge="union" if barrier == "coalesce" else None,
                 )
             )
             .with_node(
@@ -701,29 +725,58 @@ class TestPreviewPipeline:
         )
 
         preview = execute_tool("preview_pipeline", {}, state, _mock_catalog())
-        repair = preview.to_dict()["validation"]["graph_repair_suggestions"][0]
-        union_step = next(
-            step for step in repair["tool_sequence"] if step["tool"] == "upsert_node" and step["arguments"]["id"] == "variant_union"
+        [repair] = preview.to_dict()["validation"]["graph_repair_suggestions"]
+        assert repair["connection"] == duplicate_connection
+        assert repair["affected_consumers"] == [{"id": "duplicate_reader"}, {"id": "variant_union"}]
+        before = sorted((entry.error_code, entry.component) for entry in preview.validation.errors)
+
+        repaired_state = _apply_model_built_fork(
+            state,
+            gate_id="split_done",
+            connection=duplicate_connection,
+            branch_for={"duplicate_reader": "done_for_reader", "variant_union": "done_for_union"},
+            row_union_alias={"variant_union": duplicate_branch},
         )
-        repaired_branches = union_step["arguments"]["branches"]
-        repaired_connection = repaired_branches[duplicate_branch]
-
-        assert repaired_connection != duplicate_connection
-        assert union_step["arguments"]["input"] == (repaired_connection if duplicate_branch == "control" else "control_done")
-
-        repaired_state = state
-        for step in repair["tool_sequence"][:-1]:
-            step_result = execute_tool(step["tool"], dict(step["arguments"]), repaired_state, _mock_catalog())
-            assert step_result.success is True, step_result.to_dict()
-            repaired_state = step_result.updated_state
 
         repaired_preview = execute_tool("preview_pipeline", {}, repaired_state, _mock_catalog())
-        remaining_codes = {entry.error_code for entry in repaired_preview.validation.errors}
-        assert "duplicate_connection_consumer" not in remaining_codes
-        assert "row_union_input_mismatch" not in remaining_codes
-        assert "fork_branch_no_destination" in remaining_codes
+        after = sorted((entry.error_code, entry.component) for entry in repaired_preview.validation.errors)
+        repointed = next(node for node in repaired_state.nodes if node.id == "variant_union")
+        assert dict(repointed.branches or {})[duplicate_branch] == "done_for_union", "the repointed field is the branch slot's value"
 
-    def test_duplicate_consumer_repair_excludes_row_union_identity_branch(self) -> None:
+        # A barrier reads its slot through the mapping, which is not a fork destination (state.py fork rule):
+        # the new gate's branch is left without a reader. One relay transform on that branch gives it one.
+        relay = {
+            "id": "relay_union",
+            "node_type": "transform",
+            "plugin": "passthrough",
+            "input": "done_for_union",
+            "on_success": "done_for_union_rows",
+            "on_error": "discard",
+            "options": {"schema": {"mode": "observed"}},
+        }
+        relayed = execute_tool("upsert_node", relay, repaired_state, _mock_catalog())
+        assert relayed.success is True
+        union_node = next(
+            dict(node)
+            for node in execute_tool(
+                "get_pipeline_state", {"component": "set_pipeline_arguments"}, relayed.updated_state, _mock_catalog()
+            ).to_dict()["data"]["nodes"]
+            if node["id"] == "variant_union"
+        )
+        union_node["branches"] = {**union_node["branches"], duplicate_branch: "done_for_union_rows"}
+        union_node["input"] = next(iter(union_node["branches"].values()))
+        relayed_union = execute_tool("upsert_node", union_node, relayed.updated_state, _mock_catalog())
+        assert relayed_union.success is True
+        relayed_after = sorted((entry.error_code, entry.component) for entry in relayed_union.updated_state.validate().errors)
+
+        standing = [entry for entry in before if entry[0] != "duplicate_connection_consumer"]
+        nested = [("row_union_nested_fork_invalid", "node:variant_union")] if barrier == "row_union" else []
+        assert after == sorted([*standing, ("fork_branch_no_destination", "node:split_done"), *nested])
+        # Executed: the relay clears the unread branch. A coalesce is then repaired (only the fixture's own
+        # standing errors remain); a row_union still refuses a nested fork in front of it (a product limit).
+        assert relayed_after == sorted([*standing, *nested])
+
+    def test_duplicate_consumer_facts_exclude_row_union_identity_branch(self) -> None:
         """Identity barrier branches are direct COPY edges, not connection consumers."""
 
         def _consumer(node_id: str) -> NodeSpec:
@@ -777,20 +830,13 @@ class TestPreviewPipeline:
             "ordinary_a",
             "ordinary_b",
         ]
-        assert [step["arguments"]["id"] for step in repair["tool_sequence"] if step["tool"] == "upsert_node"] == [
-            "ordinary_a",
-            "ordinary_b",
-            "fork_control",
-        ]
 
-    def test_duplicate_consumer_repair_patches_one_node_once_for_two_branch_bindings(self) -> None:
-        """Two aliases of one row_union sharing a connection collapse to one upsert.
+    def test_duplicate_consumer_facts_name_one_node_once_for_two_branch_bindings(self) -> None:
+        """Two aliases of one row_union sharing a connection: the node is one consumer in the facts.
 
-        A repair skeleton rebuilt from the original node per binding emits two
-        ``upsert_node`` calls for the same id, and the second reverts the first
-        — applying the suggested sequence leaves the duplicate in place. The
-        patches must accumulate onto one payload per node id while the fork
-        gate still publishes one distinct branch per binding.
+        The error names each binding (it counts claims); the facts name the
+        node once. A model-built fork that gives each alias its own branch in
+        one ``upsert_node`` of the row_union clears the duplicate.
         """
         state = (
             _empty_state()
@@ -920,25 +966,32 @@ class TestPreviewPipeline:
         preview_validation = execute_tool("preview_pipeline", {}, state, _mock_catalog()).to_dict()["validation"]
         assert "duplicate_connection_consumer" in {entry["error_code"] for entry in preview_validation["errors"]}
         repair = next(entry for entry in preview_validation["graph_repair_suggestions"] if entry["connection"] == "union_out")
+        assert repair["affected_consumers"] == [{"id": "outer_union"}]
+        duplicate_error = next(entry for entry in preview_validation["errors"] if entry["error_code"] == "duplicate_connection_consumer")
+        assert duplicate_error["message"].count("row_union 'outer_union' mapped branch (outer_union)") == 2
 
-        upsert_ids = [step["arguments"]["id"] for step in repair["tool_sequence"] if step["tool"] == "upsert_node"]
-        assert len(upsert_ids) == len(set(upsert_ids)), repair["tool_sequence"]
-        assert upsert_ids.count("outer_union") == 1
-
-        union_step = next(step for step in repair["tool_sequence"] if step["arguments"].get("id") == "outer_union")
-        patched_branches = union_step["arguments"]["branches"]
-        assert patched_branches["control"] != patched_branches["treatment"]
-        assert "union_out" not in patched_branches.values()
-        assert union_step["arguments"]["input"] == patched_branches["control"]
-
-        gate_step = repair["tool_sequence"][-2]
-        assert gate_step["arguments"]["node_type"] == "gate"
-        assert sorted(gate_step["arguments"]["fork_to"]) == sorted(patched_branches.values())
-        assert repair["tool_sequence"][-1] == {"tool": "preview_pipeline", "arguments": {}}
-
+        nodes = {
+            node["id"]: dict(node)
+            for node in execute_tool("get_pipeline_state", {"component": "set_pipeline_arguments"}, state, _mock_catalog()).to_dict()[
+                "data"
+            ]["nodes"]
+        }
+        gate = {
+            "id": "split_union_out",
+            "node_type": "gate",
+            "input": "union_out",
+            "condition": "True",
+            "routes": {"true": "fork", "false": "fork"},
+            "fork_to": ["union_for_control", "union_for_treatment"],
+        }
+        outer = {
+            **nodes["outer_union"],
+            "input": "union_for_control",
+            "branches": {"control": "union_for_control", "treatment": "union_for_treatment"},
+        }
         repaired_state = state
-        for step in repair["tool_sequence"][:-1]:
-            step_result = execute_tool(step["tool"], dict(step["arguments"]), repaired_state, _mock_catalog())
+        for arguments in (gate, outer):
+            step_result = execute_tool("upsert_node", arguments, repaired_state, _mock_catalog())
             assert step_result.success is True, step_result.to_dict()
             repaired_state = step_result.updated_state
 

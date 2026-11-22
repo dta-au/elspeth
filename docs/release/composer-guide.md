@@ -1,7 +1,7 @@
 # ELSPETH Composer Guide
 
 **Document date:** 9 November 2026
-**Release covered:** 0.8.15 unreleased candidate
+**Release covered:** 0.8.16 unreleased candidate
 **Audience:** Evaluators, program teams, operators, and technical reviewers
 **Register:** Public-facing / lightly technical
 **Status:** Current capability guide
@@ -27,7 +27,7 @@ from a blank YAML file.
 |---|---|
 | Start from plain-language intent | Describe the workflow in chat and refine the model's proposal through follow-up instructions. |
 | Build with structure | Add or revise plural sources, sinks, transforms, queues, gates, forks, coalesces, final wiring, and plugin options through controlled UI turns. |
-| Keep the operator in control | See the session's authority mode, inspect versioned changes, and accept or reject changes that require approval. |
+| Keep the operator in control | Inspect versioned changes, and accept or reject changes that are waiting as proposals. |
 | Check readiness | Use the audit-readiness and live verification panels to see validation, plugin trust, provenance, retention, LLM interpretation, and secret status. |
 | Review the shape | Inspect the graph view and rendered YAML before running or sharing. |
 | Handle credentials safely | Reference secrets by name instead of placing secret values in pipeline configuration. |
@@ -50,10 +50,13 @@ The model proposes the pipeline structure. New sessions default to
 **Auto-apply on**: eligible changes can become versioned, audited pipeline
 state without an Accept click. A full-pipeline proposal auto-commits only when
 a green runtime preflight validates the candidate and the session remains in
-auto-apply mode. The chat header shows the authority mode. With
-**Approval required**, changes
-wait as proposals for explicit Accept or Reject; a full-pipeline proposal also
-remains pending when auto-commit's conditions are not met. Inspect the graph and
+auto-apply mode. The web UI has no control for this mode and does not display
+it; the transcript labels each change Composer applies. A session can be
+switched to **Approval required** only through the session's
+composer-preferences API (`PATCH /api/sessions/{session_id}/composer/preferences`,
+`trust_mode: "explicit_approve"`). In that mode changes wait as proposals for
+explicit Accept or Reject; a full-pipeline proposal also remains pending, in
+either mode, when auto-commit's conditions are not met. Inspect the graph and
 plain-language impact in either case. A rejected proposal can be revised in the
 next turn without silently replacing the operator's intent.
 

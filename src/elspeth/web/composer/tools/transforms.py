@@ -2,18 +2,26 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from hashlib import sha256
-from typing import Annotated, Any, Final, Literal, cast
+from typing import Annotated, Any, Final, Literal, TypedDict, cast
 
-from pydantic import BaseModel, ConfigDict, Field, StrictFloat, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, StrictBool, StrictFloat, TypeAdapter
 from pydantic import ValidationError as PydanticValidationError
 
 from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 from elspeth.contracts.enums import OutputMode
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.core.config import RuntimeNodeName
-from elspeth.web.composer.inventory_response_contracts import PLUGIN_INVENTORY_RESPONSE_CONTRACT
+from elspeth.core.templates import MAX_JINJA_TEMPLATE_BYTES, template_size_refusal
+from elspeth.web.composer.inventory_response_contracts import (
+    PLUGIN_INDEX_DETAILS_TOOL,
+    PLUGIN_INDEX_RESPONSE_CONTRACT,
+    PLUGIN_INVENTORY_RESPONSE_CONTRACT,
+)
+from elspeth.web.composer.plugin_policy_disclosure import ProhibitedPluginDisclosure
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import (
     ChangeSubstringArgumentsModel,
@@ -22,7 +30,7 @@ from elspeth.web.composer.redaction import (
     SpliceTransformArgumentsModel,
     _JsonInteger,
     _NodeTriggerModel,
-    _OmittableString,
+    _PipelineName,
     _StrictTimeoutSeconds,
 )
 from elspeth.web.composer.state import (
@@ -80,9 +88,16 @@ from elspeth.web.composer.tools._common import (
 )
 from elspeth.web.composer.tools._naming_disclosure import _disclose_node_name_constraints
 from elspeth.web.composer.tools.blobs import (
+    PROMPT_UNCHANGED_NODE_IDS_KEY,
+    PROMPT_UNCHANGED_NOTE,
+    PROMPT_UNCHANGED_NOTE_KEY,
     _file_inject_node_option_error,
     _llm_authored_inline_prompt_surface_error,
+    _PromptReplacement,
     _structured_prompt_template_refusal,
+    _whole_prompt_text_replacement,
+    _written_options_for_prompt_replacement,
+    _written_options_keeping_an_unchanged_prompt,
 )
 from elspeth.web.composer.tools.declarations import (
     EffectDomain,
@@ -97,11 +112,14 @@ from elspeth.web.composer.tools.prompt_target_responses import (
 )
 from elspeth.web.credential_guard import CredentialMaterialRefused, require_no_credential_material_for_tool
 from elspeth.web.interpretation_state import (
+    AUTHORING_METADATA_OPTION_KEYS,
     INTERPRETATION_REQUIREMENTS_KEY,
     PROMPT_TEMPLATE_PARTS_KEY,
     VAGUE_TERM_QUERY_OVERRIDE_PREFIX,
+    InterpretationReviewSite,
     approved_prompt_artifact_hash_from_options,
     composition_review_contract_error,
+    pending_execution_interpretation_sites,
     reconcile_authoritative_reviews,
     serialize_authoring_review_options,
 )
@@ -124,6 +142,7 @@ class _UpsertNodeArgumentsModel(BaseModel):
     id: str
     node_type: NodeType
     input: str
+    routing_only: StrictBool = False
     plugin: str | None = None
     on_success: str | None = None
     on_error: Annotated[str, Field(min_length=1)] | None = None
@@ -163,8 +182,11 @@ class _RemoveByIdArgumentsModel(BaseModel):
 
 
 class _SetMetadataPatchModel(BaseModel):
-    name: _OmittableString = None
-    description: _OmittableString = None
+    # An omitted field is unchanged; read the supplied set with exclude_unset.
+    # name refuses null and blank text: a set name is always a visible name.
+    # description admits null, which clears it to the empty default.
+    name: _PipelineName = None
+    description: str | None = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -175,35 +197,76 @@ class _SetMetadataArgumentsModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class _TransformPolicyCapabilityPayload(TypedDict):
+    capability: str
+    control_role: str | None
+    blocks_positive_detection: bool
+
+
+class _TransformIndexEntryPayload(TypedDict):
+    name: str
+    description: str
+    capability_tags: list[str]
+    web_config_authority: str
+    policy_capabilities: list[_TransformPolicyCapabilityPayload]
+
+
+class _TransformIndexPayload(TypedDict):
+    available: list[_TransformIndexEntryPayload]
+    prohibited: tuple[ProhibitedPluginDisclosure, ...]
+    details_tool: Literal["get_plugin_schema"]
+
+
+def _transform_index_payload(context: ToolContext) -> _TransformIndexPayload:
+    """Project the policy-visible transforms to selection facts; configuration stays with get_plugin_schema."""
+    return {
+        "available": [
+            {
+                "name": item.name,
+                "description": item.description,
+                "capability_tags": list(item.capability_tags),
+                "web_config_authority": item.web_config_authority.value,
+                "policy_capabilities": [
+                    {
+                        "capability": declaration.capability.value,
+                        "control_role": declaration.control_role.value if declaration.control_role is not None else None,
+                        "blocks_positive_detection": declaration.blocks_positive_detection,
+                    }
+                    for declaration in item.policy_capabilities
+                ],
+            }
+            for item in context.catalog.list_transforms()
+        ],
+        "prohibited": _prohibited_section(context.catalog.list_prohibited_transforms()),
+        "details_tool": PLUGIN_INDEX_DETAILS_TOOL,
+    }
+
+
 def _handle_list_transforms(
     arguments: dict[str, Any],
     state: CompositionState,
     context: ToolContext,
 ) -> ToolResult:
     _validate_mutation_arguments(EmptyToolArgumentsModel, arguments, "list_transforms arguments")
-    return _discovery_result(
-        state,
-        {
-            "available": context.catalog.list_transforms(),
-            "prohibited": _prohibited_section(context.catalog.list_prohibited_transforms()),
-        },
-    )
+    return _discovery_result(state, _transform_index_payload(context))
 
 
 _LIST_TRANSFORMS_DECLARATION = ToolDeclaration(
     name="list_transforms",
-    response_contract=PLUGIN_INVENTORY_RESPONSE_CONTRACT,
+    response_contract=PLUGIN_INDEX_RESPONSE_CONTRACT,
     handler=_handle_list_transforms,
     kind=ToolKind.DISCOVERY,
     description=(
-        "List available transform plugins. Each entry carries its full `config_fields` "
-        "(name, type, required, description, default per option), usage guidance, "
-        "`composer_hints`, and `secret_requirements` — not just a name and blurb. "
+        "List available transform plugins as a selection index: each entry carries only `name`, "
+        "`description`, `capability_tags`, `web_config_authority` and `policy_capabilities` "
+        "(`capability`, `control_role`, `blocks_positive_detection`), with no configuration. "
+        "Use `details_tool` (get_plugin_schema) for one plugin's configuration and "
+        "get_plugin_assistance for its guidance. "
         "The result's `prohibited` array names any transform categorically banned from "
-        "the web authoring surface by security policy, with its closed reason and "
-        "explanation — cite it when a user asks why a specific plugin is unavailable. "
-        "Call get_plugin_schema only for enum values, nested option shapes, or the "
-        "raw JSON schema; this listing already answers ordinary configuration questions."
+        "the web authoring surface by security policy, with its closed `reason` and "
+        "`explanation` — cite it when a user asks why a specific plugin is unavailable. "
+        "The request's `authoring_aids.discovery_digest` is the plugin index: call this listing "
+        "only for a fact it lacks."
     ),
     json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
     cacheable=True,
@@ -237,8 +300,8 @@ _LIST_SINKS_DECLARATION = ToolDeclaration(
         "The result's `prohibited` array names any sink categorically banned from "
         "the web authoring surface by security policy, with its closed reason and "
         "explanation — cite it when a user asks why a specific plugin is unavailable. "
-        "Call get_plugin_schema only for enum values, nested option shapes, or the "
-        "raw JSON schema; this listing already answers ordinary configuration questions."
+        "The request's `authoring_aids.discovery_digest` is the plugin index: call this listing "
+        "only for a fact it lacks. get_plugin_schema gives a chosen plugin's option contract."
     ),
     json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
     cacheable=True,
@@ -263,7 +326,7 @@ _UPSERT_NODE_DECLARATION_JSON_SCHEMA: dict[str, Any] = {
             "type": ["string", "null"],
             "description": (
                 "Plugin name. Required for transform/aggregation/collector. Explicitly supply it when replacing an existing "
-                "configured plugin node, including routing-only edits. Null for gate/coalesce/row_union/queue."
+                "configured plugin node; leave it out with routing_only=true. Null for gate/coalesce/row_union/queue."
             ),
         },
         "input": {
@@ -274,6 +337,15 @@ _UPSERT_NODE_DECLARATION_JSON_SCHEMA: dict[str, Any] = {
                 "by string, not by graph topology. For queue use its shared connection name; for coalesce "
                 "and row_union use the first branch connection as the required placeholder, while branches "
                 "provide the actual consuming bindings."
+            ),
+        },
+        "routing_only": {
+            "type": "boolean",
+            "description": (
+                "Set true to change only input, on_success and on_error of an existing transform; its plugin, "
+                "options (file-held prompts included) and description stay as stored. Send id, node_type 'transform', "
+                "input (the current one when it does not change) and only the routes that change. A null route is "
+                "refused. Default false."
             ),
         },
         "on_success": {
@@ -301,7 +373,8 @@ _UPSERT_NODE_DECLARATION_JSON_SCHEMA: dict[str, Any] = {
             "type": "object",
             "description": (
                 "Complete author-owned plugin config for transform, aggregation, and collector nodes. Explicitly supply it "
-                "when replacing an existing configured plugin node, even for routing-only edits; omitted options are not merged. "
+                "when replacing an existing configured plugin node; omitted options are not merged. With routing_only=true "
+                "leave options out; the stored options are kept. "
                 "A queue permits only its optional "
                 "description. Other structural kinds do not take plugin configuration. The schema: block declares what "
                 "ARRIVES for consumed fields and the OUTPUT type for fields the node creates. "
@@ -382,7 +455,7 @@ _UPSERT_NODE_DECLARATION_JSON_SCHEMA: dict[str, Any] = {
         },
         "description": {
             "type": ["string", "null"],
-            "description": _STEP_DESCRIPTION_DESCRIPTION,
+            "description": _STEP_DESCRIPTION_DESCRIPTION + " Leave it out with routing_only=true; the stored one is kept.",
         },
         "scope_name": {
             "type": ["string", "null"],
@@ -420,6 +493,9 @@ def _handle_upsert_node(
     if not result.success:
         return result
     validated = _UpsertNodeArgumentsModel.model_validate(arguments)
+    if validated.routing_only:
+        # No configuration changed, so no catalogue configuration hints.
+        return result
     node_id = validated.id
     node = next((n for n in result.updated_state.nodes if n.id == node_id), None)
     # Offensive programming: _execute_upsert_node succeeded above, so the
@@ -446,8 +522,15 @@ _UPSERT_NODE_DECLARATION = ToolDeclaration(
     description=(
         "Add or update a pipeline node. "
         "upsert_node replaces the node: when updating an existing configured transform/aggregation/collector, "
-        "explicitly supply plugin and complete author-owned options even for routing-only edits. "
-        "Read get_pipeline_state(component='set_pipeline_arguments') for the authoring payload. "
+        "explicitly supply plugin and complete author-owned options; read "
+        "get_pipeline_state(component='set_pipeline_arguments') for that authoring payload. "
+        "To change only what an existing transform reads or where its rows go, send routing_only=true with id, "
+        "node_type, input and only the routes that change: its plugin, options and description stay as stored, and "
+        "the call does not re-check them; the `validation` in the result covers the whole graph. Instead of the echo, "
+        "the result carries `routing_update` (`id`, `input`, `on_success`, `on_error`), `options_preserved` true, "
+        "`reopened_reviews` (`component_id`, `kind`, `user_term`; at most 32) and `reopened_review_count` (all of "
+        "them). A review of what feeds the step (prompt shield), of where an auto-wired control sits, or of a gate's "
+        "routes re-opens when the rewire changes that fact; each one must be approved again before a run. "
         "Fields are node_type-dependent: "
         "transform/aggregation use plugin+options; "
         "gate uses condition+routes (or fork_to) and optional node-level on_error; "
@@ -464,7 +547,11 @@ _UPSERT_NODE_DECLARATION = ToolDeclaration(
         "collector closes a declared EXPAND scope with a batch-aware plugin: "
         "set scope_name, scope_opener (the multi-row transform that opens the "
         "group), and scope_policy ('require_all' or 'best_effort', no default). "
-        "Omit fields that don't apply to your node_type."
+        "Omit fields that don't apply to your node_type. "
+        "For an llm node that has a structured prompt, options with prompt_template text and prompt_template_parts: null "
+        "replace the whole prompt; `superseded_review_ids` names the old prompt's vague-term reviews that were removed. "
+        "To keep that prompt, send the node whole and unedited as get_pipeline_state(component='set_pipeline_arguments') "
+        "returns it; changed prompt_template text without prompt_template_parts is refused (prompt_template_parts_required)."
     ),
     json_schema=_UPSERT_NODE_DECLARATION_JSON_SCHEMA,
     augments_on_failure=True,
@@ -584,7 +671,11 @@ _SET_METADATA_DECLARATION = ToolDeclaration(
     name="set_metadata",
     handler=_handle_set_metadata,
     kind=ToolKind.MUTATION,
-    description="Update pipeline metadata (name and description only).",
+    description=(
+        "Update pipeline metadata (name and description only). Pass null or an empty string for description "
+        "to clear it; name cannot be cleared, only replaced. Result `changed_fields` lists the fields whose value changed. "
+        "When it is empty nothing changed, and `message` says so."
+    ),
     json_schema={
         "type": "object",
         "properties": {
@@ -593,8 +684,8 @@ _SET_METADATA_DECLARATION = ToolDeclaration(
                 "description": "Partial metadata update. Only included fields are changed.",
                 "additionalProperties": False,
                 "properties": {
-                    "name": {"type": "string"},
-                    "description": {"type": "string"},
+                    "name": {"type": "string", "description": "Pipeline name. Cannot be cleared; a pipeline always has a name."},
+                    "description": {"type": ["string", "null"]},
                 },
             },
         },
@@ -672,6 +763,8 @@ def _execute_upsert_node(
 ) -> ToolResult:
     """Add or update a pipeline node."""
     validated = _validate_mutation_arguments(_UpsertNodeArgumentsModel, args, "upsert_node arguments")
+    if validated.routing_only:
+        return _execute_routing_only_upsert(validated, state)
     node_ref = f"node:{validated.id}"
     if validated.node_type == "aggregation" and (validated.output_mode is None or validated.output_mode in OutputMode):
         mode = OutputMode.TRANSFORM if validated.output_mode is None else OutputMode(validated.output_mode)
@@ -698,9 +791,10 @@ def _execute_upsert_node(
         return _saved_graph_rejection_result(
             state,
             "upsert_node replaces the node, including its plugin configuration. For an existing configured "
-            "transform, aggregation, or collector, explicitly supply plugin and complete author-owned options, "
-            "even for routing-only edits. Read get_pipeline_state(component='set_pipeline_arguments') for the "
-            "authoring payload, then resubmit the complete node.",
+            "transform, aggregation, or collector, explicitly supply plugin and complete author-owned options "
+            "(get_pipeline_state(component='set_pipeline_arguments') gives the authoring payload). To change only a "
+            "transform's input, on_success or on_error, send routing_only=true with id, node_type, input and the "
+            "routes that change; its options stay as stored.",
             error_code="argument_error",
             rejected_component=node_ref,
         )
@@ -721,6 +815,13 @@ def _execute_upsert_node(
     # Echo tolerance (elspeth-c67fbbbd83): requirement rows echoed verbatim
     # from the stored node reduce to author shells; the reconciliation pass
     # below restores the server rows. Non-matching values still reject.
+    from elspeth.web.composer.tools._common import _server_staged_requirement_boundary
+
+    node_options, review_refusal = _server_staged_requirement_boundary(
+        node_options, stored_options=existing_node.options if existing_node is not None else None, node_id=node_id
+    )
+    if review_refusal is not None:
+        return _saved_graph_rejection_result(state, review_refusal, error_code="server_owned_review_protected", rejected_component=node_ref)
     node_options, requirement_echo = _normalize_echoed_interpretation_requirements(
         node_options,
         stored_options=existing_node.options if existing_node is not None else None,
@@ -741,6 +842,27 @@ def _execute_upsert_node(
         component_id=node_id,
         existing_options=existing_node.options if existing_node is not None else None,
     )
+    # prompt_template as text with prompt_template_parts: null REPLACES the
+    # stored prompt (see _whole_prompt_text_replacement). Every refusal below
+    # still returns the untouched ``state``, and reviews reconcile against it.
+    replacement: _PromptReplacement | None = None
+    prompt_unchanged_node_ids: tuple[str, ...] = ()
+    if plugin == "llm" and existing_node is not None and existing_node.plugin == "llm":
+        # The stored prompt's own text replaces nothing, whatever the parts key says.
+        kept_options = _written_options_keeping_an_unchanged_prompt(existing_node.options, node_options, merge_patch=False)
+        if kept_options is not None:
+            node_options = kept_options
+            prompt_unchanged_node_ids = (node_id,)
+        replacement = _whole_prompt_text_replacement(existing_node.options, node_options)
+    if replacement is not None:
+        # A stored row that is already non-canonical is refused first, so the
+        # replacement can never launder a malformed row away.
+        stored_error = _composition_canonical_interpretation_requirement_error(state, tool_name="upsert_node")
+        if stored_error is not None:
+            return _saved_graph_rejection_result(
+                state, stored_error, error_code="interpretation_requirements_invalid", rejected_component=node_ref
+            )
+        node_options = _written_options_for_prompt_replacement(node_options, replacement)
     review_options = _options_with_default_llm_reviews(
         node_id=node_id,
         plugin=plugin,
@@ -749,7 +871,9 @@ def _execute_upsert_node(
     )
     if plugin == "llm":
         structured_error = _structured_prompt_template_refusal(
-            node_id, existing_node.options if existing_node is not None else {}, review_options
+            node_id,
+            replacement.base_options if replacement is not None else existing_node.options if existing_node is not None else {},
+            review_options,
         )
         if structured_error is not None:
             return _saved_graph_rejection_result(
@@ -943,6 +1067,37 @@ def _execute_upsert_node(
         message, error_code = row_union_contract_error
         return _saved_graph_rejection_result(state, message, error_code=error_code, rejected_component=node_ref)
 
+    committed = _commit_node_candidate(state, node)
+    if type(committed) is ToolResult:
+        return committed
+    new_state = cast(CompositionState, committed)
+    affected = _node_affected_ids(new_state, node_id)
+
+    echo_note = _echoed_metadata_note(requirement_echo=requirement_echo)
+    data: dict[str, JsonValue] = {}
+    if echo_note is not None:
+        data["server_owned_metadata_note"] = echo_note
+    if replacement is not None and replacement.superseded_review_ids:
+        # The replaced prompt's vague-term reviews, named so the model can tell
+        # the user which definitions no longer apply.
+        data["superseded_review_ids"] = list(replacement.superseded_review_ids)
+    if prompt_unchanged_node_ids:
+        # The write carried the stored prompt's own text without its parts, so
+        # the stored prompt structure and reviews were kept.
+        data[PROMPT_UNCHANGED_NODE_IDS_KEY] = list(prompt_unchanged_node_ids)
+        data[PROMPT_UNCHANGED_NOTE_KEY] = PROMPT_UNCHANGED_NOTE
+    return _mutation_result(new_state, affected, data=data or None)
+
+
+def _commit_node_candidate(state: CompositionState, node: NodeSpec) -> CompositionState | ToolResult:
+    """Commit one built node: the graph-mutation tail every node write shares.
+
+    ``upsert_node`` and its ``routing_only`` form both end here, so the two
+    cannot drift: sink-mirror edges follow the scalar routes, the intrinsic
+    invariants run, reviews reconcile against ``state``, and the review
+    contract is checked. A refusal is returned as a ``ToolResult`` over the
+    untouched ``state``.
+    """
     proposed_state = state.with_node(node)
     # Scalar routes committed here are the runtime authority; any visual edge
     # that mirrored the node's previous sink routes must follow in the same
@@ -973,19 +1128,166 @@ def _execute_upsert_node(
             ),
             rejected_component=None,
         )
+    return new_state
 
-    # Affected: the node itself plus nodes with edges referencing it
+
+def _node_affected_ids(state: CompositionState, node_id: str) -> tuple[str, ...]:
+    """The node itself plus every node joined to it by a drawn edge, sorted."""
     affected = {node_id}
-    for edge in new_state.edges:
+    for edge in state.edges:
         if edge.from_node == node_id or edge.to_node == node_id:
             affected.add(edge.from_node)
             affected.add(edge.to_node)
+    return tuple(sorted(affected))
 
-    echo_note = _echoed_metadata_note(requirement_echo=requirement_echo)
+
+_ROUTING_ONLY_ARGUMENT_FIELDS: Final[frozenset[str]] = frozenset({"id", "node_type", "input", "on_success", "on_error", "routing_only"})
+_REOPENED_REVIEWS_LISTED_MAX: Final[int] = 32
+# Options keys the server owns on a node: review rows, prompt parts and source
+# provenance (AUTHORING_METADATA_OPTION_KEYS), and the approval hash that every
+# tool write re-derives (None beside a file-held prompt). Everything else in
+# ``options`` was authored, and a routing-only write must leave it byte-identical.
+_ROUTING_ONLY_SERVER_OWNED_OPTION_KEYS: Final[frozenset[str]] = AUTHORING_METADATA_OPTION_KEYS | {"approved_prompt_artifact_hash"}
+
+
+class _RoutingUpdate(TypedDict):
+    id: str
+    input: str
+    on_success: str | None
+    on_error: str | None
+
+
+class _ReopenedReview(TypedDict):
+    component_id: str
+    kind: str
+    user_term: str
+
+
+class _RoutingUpdatePayload(TypedDict):
+    routing_update: _RoutingUpdate
+    options_preserved: Literal[True]
+    reopened_reviews: list[_ReopenedReview]
+    reopened_review_count: int
+
+
+def _routing_update_payload(node: NodeSpec, reopened: Sequence[InterpretationReviewSite]) -> _RoutingUpdatePayload:
+    """The routing-only receipt: the node's routes after the call and every review it re-opened."""
+    return {
+        "routing_update": {"id": node.id, "input": node.input, "on_success": node.on_success, "on_error": node.on_error},
+        "options_preserved": True,
+        "reopened_reviews": [
+            {"component_id": site.component_id, "kind": site.kind.value, "user_term": site.user_term}
+            for site in reopened[:_REOPENED_REVIEWS_LISTED_MAX]
+        ],
+        "reopened_review_count": len(reopened),
+    }
+
+
+def _authored_options_identical(before: NodeSpec, after: NodeSpec) -> bool:
+    """Exact equality of the two nodes' authored options: same keys in the same order, same JSON bytes per value."""
+    before_keys = [key for key in before.options if key not in _ROUTING_ONLY_SERVER_OWNED_OPTION_KEYS]
+    after_keys = [key for key in after.options if key not in _ROUTING_ONLY_SERVER_OWNED_OPTION_KEYS]
+    if before_keys != after_keys:
+        return False
+    return all(
+        before.options[key] is after.options[key]
+        or json.dumps(deep_thaw(before.options[key]), ensure_ascii=False) == json.dumps(deep_thaw(after.options[key]), ensure_ascii=False)
+        for key in before_keys
+    )
+
+
+def _execute_routing_only_upsert(validated: _UpsertNodeArgumentsModel, state: CompositionState) -> ToolResult:
+    """Change only ``input`` / ``on_success`` / ``on_error`` of an existing transform.
+
+    The stored node is the base: ``replace`` changes the three routing fields
+    and every other field, the options above all, is the stored object. The
+    server supplies no route; each one after the call is the model's value or
+    the stored one. The graph tail is the one ``upsert_node`` runs
+    (:func:`_commit_node_candidate`), so review reconciliation re-opens a review
+    whose fact the rewire changed, and the receipt names each review the run
+    gate now waits on that it did not wait on before. Plugin admission is not
+    re-run: it is a function of the plugin, options, node type, output mode and
+    trigger, none of which this call can change; the whole-graph validation in
+    the result still reports a rewire the step cannot accept.
+    """
+    node_id = validated.id
+    node_ref = f"node:{node_id}"
+    existing = next((node for node in state.nodes if node.id == node_id), None)
+    if existing is None:
+        return _saved_graph_rejection_result(
+            state,
+            f"Node '{node_id}' not found. routing_only=true edits an existing transform; "
+            "to add a step, call upsert_node without routing_only.",
+            error_code="node_not_found",
+            rejected_component=node_ref,
+        )
+    supplied = validated.model_fields_set
+    extra = sorted(supplied - _ROUTING_ONLY_ARGUMENT_FIELDS)
+    if extra:
+        return _saved_graph_rejection_result(
+            state,
+            f"routing_only=true changes only input, on_success and on_error. Remove {', '.join(extra)} from this call. "
+            "To change options use patch_node_options; to replace the whole step, call upsert_node without routing_only.",
+            error_code="routing_only_edit_invalid",
+            rejected_component=node_ref,
+        )
+    if validated.node_type != "transform" or existing.node_type != "transform":
+        return _saved_graph_rejection_result(
+            state,
+            f"routing_only=true edits a transform; node '{node_id}' is a {existing.node_type} "
+            f"(this call says {validated.node_type}). Rewire it with upsert_node, sending the whole step.",
+            error_code="routing_only_edit_invalid",
+            rejected_component=node_ref,
+        )
+    if "on_success" in supplied and validated.on_success is None:
+        return _saved_graph_rejection_result(
+            state,
+            f"on_success: null is not a route. Give a connection or sink name, or leave on_success out to keep '{existing.on_success}'.",
+            error_code="routing_only_edit_invalid",
+            rejected_component=node_ref,
+        )
+    if "on_error" in supplied and validated.on_error is None:
+        return _saved_graph_rejection_result(
+            state,
+            f"on_error: null is not a route. Give 'discard' or a sink name, or leave on_error out to keep '{existing.on_error}'.",
+            error_code="routing_only_edit_invalid",
+            rejected_component=node_ref,
+        )
+    on_success = validated.on_success if "on_success" in supplied else existing.on_success
+    try:
+        on_error = resolve_failure_route_choice(
+            validated.on_error,
+            supplied="on_error" in supplied,
+            field="on_error",
+            previous=existing.on_error,
+        )
+    except FailureRouteChoiceError as exc:
+        return _saved_graph_rejection_result(state, str(exc), error_code="failure_route_required", rejected_component=node_ref)
+    candidate = replace(existing, input=validated.input, on_success=on_success, on_error=on_error)
+    if candidate == existing:
+        # A repeat of the stored routes changes nothing: the same state object,
+        # so the batch records no change and no proposal.
+        return _mutation_result(state, _node_affected_ids(state, node_id), data=_routing_update_payload(existing, ()), component_echo=False)
+    committed = _commit_node_candidate(state, candidate)
+    if type(committed) is ToolResult:
+        return committed
+    new_state = cast(CompositionState, committed)
+    committed_node = next(node for node in new_state.nodes if node.id == node_id)
+    if (
+        committed_node.plugin != existing.plugin
+        or committed_node.description != existing.description
+        or not _authored_options_identical(existing, committed_node)
+    ):
+        raise AssertionError(
+            f"routing_only write on node '{node_id}' changed an authored setting — the commit tail must only reconcile server-owned keys."
+        )
+    previously_pending = frozenset(pending_execution_interpretation_sites(state))
+    reopened = tuple(site for site in pending_execution_interpretation_sites(new_state) if site not in previously_pending)
     return _mutation_result(
         new_state,
-        tuple(sorted(affected)),
-        data=None if echo_note is None else {"server_owned_metadata_note": echo_note},
+        _node_affected_ids(new_state, node_id),
+        data=_routing_update_payload(committed_node, reopened),
+        component_echo=False,
     )
 
 
@@ -1201,7 +1503,11 @@ def _splice_topology_error(
         ):
             return "splice_transform does not support gates, forks, queues, coalesces, or branched paths."
         if type(node) is NodeSpec and node.on_error not in (None, "discard"):
-            return "splice_transform does not support predecessors or successors with routed error branches."
+            return (
+                "splice_transform does not support predecessors or successors with routed error branches. "
+                "Instead, add the new step with upsert_node, then re-point the successor's input with "
+                "upsert_node with routing_only=true."
+            )
 
     if inserted is None:
         predecessor_output = predecessor.on_success
@@ -1754,13 +2060,26 @@ def _execute_set_metadata(
     state: CompositionState,
     context: ToolContext,
 ) -> ToolResult:
-    """Update pipeline metadata."""
+    """Update pipeline metadata; the receipt names the fields whose value changed.
+
+    An omitted field is unchanged and a null description clears it to the
+    empty default. Every call writes a version, as before: an edit that
+    changes nothing is still an edit, and the turn's required-control staging
+    depends on it. A patch that changes nothing says so in the receipt
+    instead of reading as a fresh change.
+    """
     del context  # unused; signature uniformity with the other handlers.
     validated = _validate_mutation_arguments(_SetMetadataArgumentsModel, args, "set_metadata arguments")
-    patch = validated.patch.model_dump(exclude_none=True)
-
+    supplied = validated.patch.model_dump(exclude_unset=True)
+    patch = {field: "" if value is None else value for field, value in supplied.items()}
+    current = {"name": state.metadata.name, "description": state.metadata.description}
+    changed_fields = [field for field in ("name", "description") if field in patch and patch[field] != current[field]]
     new_state = state.with_metadata(patch)
-    return _mutation_result(new_state, ())
+    if not changed_fields:
+        return _mutation_result(
+            new_state, (), data={"changed_fields": [], "message": "No field changed: the supplied values match the saved metadata."}
+        )
+    return _mutation_result(new_state, (), data={"changed_fields": changed_fields})
 
 
 def _node_routing_option_patch_error(patch: Mapping[str, Any], *, node_type: NodeType) -> str | None:
@@ -1770,6 +2089,13 @@ def _node_routing_option_patch_error(patch: Mapping[str, Any], *, node_type: Nod
     for key in ("on_error", "on_success", "input", "routes", "fork_to"):
         if key not in patch:
             continue
+        # A transform's three routing fields have a routing-only form that
+        # keeps its options; every other kind re-sends the whole node.
+        node_route = (
+            "upsert_node with routing_only=true (the transform's options stay as stored)"
+            if node_type == "transform"
+            else f"upsert_node with {key} as a sibling of options"
+        )
         if key == "on_error":
             if node_type == "gate":
                 return (
@@ -1779,19 +2105,16 @@ def _node_routing_option_patch_error(patch: Mapping[str, Any], *, node_type: Nod
             return (
                 "on_error is a node-level routing field, not a plugin option. "
                 "Use upsert_edge with edge_type='on_error' when routing failures to an existing sink, "
-                "or use upsert_node with on_error as a sibling of options for other routing edits."
+                f"or use {node_route} for other routing edits."
             )
         if key == "on_success":
             return (
                 "on_success is a node-level routing field, not a plugin option. "
                 "Use upsert_edge with edge_type='on_success' when routing success rows to an existing sink, "
-                "or use upsert_node with on_success as a sibling of options for other routing edits."
+                f"or use {node_route} for other routing edits."
             )
         if key == "input":
-            return (
-                "input is a node-level connection field, not a plugin option. "
-                "Use upsert_node with input as a sibling of options to change the connection this node consumes."
-            )
+            return f"input is a node-level connection field, not a plugin option. Use {node_route} to change the connection this node consumes."
         if key in {"routes", "fork_to"}:
             return (
                 f"{key} is a gate-level routing field, not a plugin option. "
@@ -1799,6 +2122,50 @@ def _node_routing_option_patch_error(patch: Mapping[str, Any], *, node_type: Nod
                 f"for sink routing, or use upsert_node with {key} as a sibling of options."
             )
     return None
+
+
+def _query_names(queries: object) -> tuple[str, ...] | None:
+    """The query names a ``queries`` option carries, in either authoring form.
+
+    A mapping is keyed by query name; a list holds entries with a ``name``. A
+    list entry without a string ``name`` names no query. ``None`` when the
+    value is neither form: its shape is the plugin schema's to refuse.
+    """
+    if isinstance(queries, Mapping):
+        return tuple(name for name in queries if isinstance(name, str))
+    if isinstance(queries, (list, tuple)):
+        return tuple(
+            entry["name"] for entry in queries if isinstance(entry, Mapping) and "name" in entry and isinstance(entry["name"], str)
+        )
+    return None
+
+
+def _queries_omitted_by_patch(stored_queries: object, patched_queries: object) -> tuple[str, ...]:
+    """Stored query names that a patch's ``queries`` value would remove without naming.
+
+    The merge is shallow: a ``queries`` value in the patch replaces the stored
+    one whole, so a patch naming one query silently dropped the rest. The caller
+    passes the two ``queries`` values only when both the patch and the node have
+    the key. ``queries: null`` is not this case: it deletes the option by name,
+    and ``None`` is neither authoring form.
+    """
+    stored = _query_names(stored_queries)
+    patched = _query_names(patched_queries)
+    if stored is None or patched is None:
+        return ()
+    return tuple(name for name in stored if name not in patched)
+
+
+def _queries_patch_omission_refusal(node_id: str, omitted: tuple[str, ...]) -> str:
+    """The repairable refusal for a ``queries`` patch that leaves stored queries out. Names are written whole."""
+    names = ", ".join(repr(name) for name in omitted)
+    which = "that query" if len(omitted) == 1 else "those queries"
+    return (
+        f"Not applied: this patch's queries value leaves out {names}, which node {node_id!r} has, and a patch replaces "
+        f"queries whole, so {which} would have been removed (queries_patch_omits_existing). Nothing was changed. "
+        "To change one query, send queries with EVERY query the node has, each complete, changing only the one you mean. "
+        "To remove a query, send the whole node with upsert_node."
+    )
 
 
 def _execute_patch_node_options(
@@ -1859,6 +2226,11 @@ def _apply_guarded_node_option_patch(
     # Echo tolerance (elspeth-c67fbbbd83): requirement rows echoed verbatim
     # from the stored node reduce to author shells; the reconciliation pass
     # below restores the server rows. Non-matching values still reject.
+    from elspeth.web.composer.tools._common import _server_staged_requirement_boundary
+
+    patch, review_refusal = _server_staged_requirement_boundary(patch, stored_options=current.options, node_id=node_id)
+    if review_refusal is not None:
+        return _saved_graph_rejection_result(state, review_refusal, error_code="server_owned_review_protected", rejected_component=node_ref)
     patch, requirement_echo = _normalize_echoed_interpretation_requirements(
         patch,
         stored_options=current.options,
@@ -1874,7 +2246,28 @@ def _apply_guarded_node_option_patch(
         return _saved_graph_rejection_result(
             state, f"Node '{node_id}': {runtime_owned_error}", error_code=error_code, rejected_component=node_ref
         )
-    structured_error = _structured_prompt_template_refusal(node_id, current.options, patch) if current.plugin == "llm" else None
+    # prompt_template as text with prompt_template_parts: null REPLACES the
+    # stored prompt (see _whole_prompt_text_replacement): the patch then merges
+    # into the stored options without the old prompt's parts and term reviews.
+    # Every refusal below still returns the untouched ``state``, and reviews
+    # reconcile against it.
+    # The stored prompt's own text replaces nothing, whatever the parts key says.
+    kept_patch = _written_options_keeping_an_unchanged_prompt(current.options, patch, merge_patch=True) if current.plugin == "llm" else None
+    prompt_unchanged_node_ids: tuple[str, ...] = ()
+    if kept_patch is not None:
+        patch = kept_patch
+        prompt_unchanged_node_ids = (node_id,)
+    replacement = _whole_prompt_text_replacement(current.options, patch) if current.plugin == "llm" else None
+    if replacement is not None:
+        # A stored row that is already non-canonical is refused first, so the
+        # replacement can never launder a malformed row away.
+        stored_error = _composition_canonical_interpretation_requirement_error(state, tool_name="patch_node_options")
+        if stored_error is not None:
+            return _saved_graph_rejection_result(
+                state, stored_error, error_code="interpretation_requirements_invalid", rejected_component=node_ref
+            )
+    base_options = replacement.base_options if replacement is not None else current.options
+    structured_error = _structured_prompt_template_refusal(node_id, base_options, patch) if current.plugin == "llm" else None
     if structured_error is not None:
         return _saved_graph_rejection_result(
             state,
@@ -1887,7 +2280,21 @@ def _apply_guarded_node_option_patch(
         component_id=node_id,
         existing_options=current.options,
     )
-    new_options: Mapping[str, Any] = _apply_merge_patch(current.options, dict(patch))
+    omitted_queries = (
+        _queries_omitted_by_patch(current.options["queries"], patch["queries"])
+        if "queries" in patch and "queries" in current.options
+        else ()
+    )
+    if omitted_queries:
+        return _saved_graph_rejection_result(
+            state,
+            _queries_patch_omission_refusal(node_id, omitted_queries),
+            error_code="queries_patch_omits_existing",
+            rejected_component=node_ref,
+        )
+    if replacement is not None:
+        patch = _written_options_for_prompt_replacement(patch, replacement)
+    new_options: Mapping[str, Any] = _apply_merge_patch(base_options, dict(patch))
     new_options = _options_with_default_llm_reviews(
         node_id=node_id,
         plugin=current.plugin,
@@ -2054,11 +2461,19 @@ def _apply_guarded_node_option_patch(
             rejected_component=None,
         )
     echo_note = _echoed_metadata_note(requirement_echo=requirement_echo)
-    return _mutation_result(
-        new_state,
-        (node_id,),
-        data=None if echo_note is None else {"server_owned_metadata_note": echo_note},
-    )
+    data: dict[str, JsonValue] = {}
+    if echo_note is not None:
+        data["server_owned_metadata_note"] = echo_note
+    if replacement is not None and replacement.superseded_review_ids:
+        # The replaced prompt's vague-term reviews, named so the model can tell
+        # the user which definitions no longer apply.
+        data["superseded_review_ids"] = list(replacement.superseded_review_ids)
+    if prompt_unchanged_node_ids:
+        # The patch carried the stored prompt's own text with a null parts key,
+        # so the stored prompt structure and reviews were kept.
+        data[PROMPT_UNCHANGED_NODE_IDS_KEY] = list(prompt_unchanged_node_ids)
+        data[PROMPT_UNCHANGED_NOTE_KEY] = PROMPT_UNCHANGED_NOTE
+    return _mutation_result(new_state, (node_id,), data=data or None)
 
 
 def _substring_refusal(state: CompositionState, message: str, code: str) -> ToolResult:
@@ -2182,6 +2597,18 @@ def _execute_change_substring(args: dict[str, object], state: CompositionState, 
     result = _apply_guarded_node_option_patch(target.node_id, patch, state, context)
     if not result.success:
         code = result.validation.errors[0].error_code if result.validation.errors else "node_options_invalid"
+        edited_bytes = _utf8_bytes(new_text)
+        edited_size = -1 if edited_bytes is None else len(edited_bytes)
+        if (
+            code == "plugin_options_invalid"
+            and target.kind == "node_option"
+            and target.option == "prompt_template"
+            and edited_size > MAX_JINJA_TEMPLATE_BYTES
+        ):
+            # The plugin checks a prompt template's size before anything else, so an
+            # edited prompt over the bound was refused for its size: say so, as the
+            # plugin did. Every other cause keeps the generic sentence.
+            return _substring_refusal(state, template_size_refusal("prompt_template", edited_size, MAX_JINJA_TEMPLATE_BYTES), code)
         return _substring_refusal(
             state, "Edited prompt did not pass node validation; inspect the node and retry.", code or "node_options_invalid"
         )
@@ -2281,7 +2708,7 @@ _CHANGE_SUBSTRING_DECLARATION = ToolDeclaration(
     name="change_substring",
     handler=_execute_change_substring,
     kind=ToolKind.MUTATION,
-    description="Change exact text in one LLM prompt target. Inspect the target hash and state ID first. Each old substring must match once, counting overlapping starts; replace_all replaces left to right without rematching inserted text. File targets are declared but not supported yet. Prompt review reopens after a change. Result `target` identifies the edited text, `changed` reports whether it differs, `replacement_count` counts replacements, `length_chars` and `size_bytes` measure the result, and `sha256` hashes it. Inspect in a later tool batch to obtain the committed revision ID.",
+    description="Change exact text in one LLM prompt target. Inspect the target hash and state ID first. Each old substring must match once, counting overlapping starts; replace_all replaces left to right without rematching inserted text. File targets are declared but not supported yet. Prompt review reopens after a change; a term whose row is still resolved kept its definition. Result `target` identifies the edited text, `changed` reports whether it differs, `replacement_count` counts replacements, `length_chars` and `size_bytes` measure the result, and `sha256` hashes it. Inspect in a later tool batch to obtain the committed revision ID.",
     json_schema={
         "type": "object",
         "properties": {
@@ -2389,11 +2816,17 @@ _PATCH_NODE_OPTIONS_DECLARATION = ToolDeclaration(
     kind=ToolKind.MUTATION,
     description="Apply a shallow merge-patch to a node's options. Use this for option-only edits. "
     "Keys in the patch overwrite existing keys. "
-    "Keys set to null are deleted. Missing keys are unchanged. "
-    "For an existing structured LLM prompt, edit prompt_template_parts and preserve interpretation_ref entries; "
-    "prompt_template is compiled from those parts. Changed prompt context requires fresh review. "
+    "Keys set to null are deleted. Top-level keys the patch does not name are unchanged; a nested value such as queries "
+    "is replaced whole, so send every query (a queries value that omits an existing query is refused; queries: null removes every query). "
+    "To change the wording of an existing structured LLM prompt, edit prompt_template_parts and preserve "
+    "interpretation_ref entries; prompt_template is compiled from those parts. "
+    "To REPLACE the whole prompt with new text, send prompt_template (the new text) with prompt_template_parts: null "
+    "and no interpretation_requirements key: the parts and every vague-term review of the old prompt are removed, "
+    "`superseded_review_ids` names the removed reviews, and the new text gets its own review card. "
+    "Changed prompt context requires fresh review. "
     "Do not use this for node routing fields such as on_success/on_error/input/routes; "
-    "use upsert_edge or upsert_node for routing edits. Gate on_error is node-level and must use upsert_node.",
+    "use upsert_edge or upsert_node (routing_only=true for a transform) for routing edits. "
+    "Gate on_error is node-level and must use upsert_node.",
     json_schema={
         "type": "object",
         "properties": {
@@ -2406,10 +2839,13 @@ _PATCH_NODE_OPTIONS_DECLARATION = ToolDeclaration(
                 "description": (
                     "Merge-patch to apply to plugin options only. "
                     "Node-level routing fields such as on_success, on_error, input, routes, "
-                    "and fork_to are siblings of options; edit them with upsert_edge or upsert_node. "
+                    "and fork_to are siblings of options; edit them with upsert_edge or upsert_node "
+                    "(routing_only=true for a transform). "
                     "For a gate, edit on_error only with upsert_node. "
-                    "If prompt_template_parts exists, edit that structure while preserving interpretation_ref entries; "
-                    "do not change only the compiled prompt_template. "
+                    "If prompt_template_parts exists, edit that structure, preserving interpretation_ref entries, to change the prompt's wording; "
+                    "a changed prompt_template sent without prompt_template_parts is refused. "
+                    "To REPLACE the whole prompt with new text, send prompt_template with prompt_template_parts: null; "
+                    "that removes the old prompt's term reviews. "
                     "A patched schema declares arriving types for consumed fields and output types for created fields. "
                     "To convert an arriving value, change the source contract (patch_source_options) or insert a type_coerce upstream; a declaration does not convert."
                     + _LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE

@@ -1,11 +1,13 @@
-import { act, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { usePluginCatalogStore } from "@/stores/pluginCatalogStore";
 import { useBlobStore } from "@/stores/blobStore";
 import { useSessionStore } from "@/stores/sessionStore";
+import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import type { BlobMetadata, CompositionState } from "@/types/api";
+import type { InterpretationEvent } from "@/types/interpretation";
 import { resetStore } from "@/test/store-helpers";
 import { expectNoIdentifiersInDefaultDom } from "@/test/defaultDomPins";
 import { OptionRows } from "./OptionRows";
@@ -31,6 +33,7 @@ beforeEach(() => {
   resetStore(usePluginCatalogStore);
   resetStore(useBlobStore);
   useSessionStore.setState({ activeSessionId: "session-1", compositionState: null });
+  useInterpretationEventsStore.setState({ pendingBySession: {} });
 });
 
 const FILE_ID = "f976fd8b-4432-4f8f-bbc3-2d8a9f2114e0";
@@ -49,6 +52,116 @@ function seedFile(overrides: Partial<BlobMetadata> = {}) {
     }],
   });
 }
+
+// The state route masks a blob-backed source's storage path with this
+// placeholder (web/composer/redaction.py); the step's blob_ref names the file.
+const MASKED_PATH = "<redacted-blob-source-path>";
+
+describe("source and sink file names", () => {
+  it.each([
+    ["source", "path"], ["source", "file"], ["sink", "path"], ["sink", "file"],
+  ] as const)("names the %s %s file from its file reference, never the placeholder or the id", (kind, field) => {
+    seedFile({ filename: "evaluation.csv" });
+    const options = { [field]: MASKED_PATH, blob_ref: FILE_ID };
+    render(<OptionRows options={options} ariaLabel="file settings" plugin={{ kind, name: "csv" }} />);
+    const region = screen.getByRole("region", { name: "file settings" });
+    expect(within(region).getByText("File: evaluation.csv")).toBeInTheDocument();
+    expect(region.textContent).not.toContain("redacted");
+    expect(region.textContent).not.toContain(FILE_ID);
+    expect(options[field]).toBe(MASKED_PATH);
+  });
+
+  it.each([
+    ["source", "inputs/evaluation.csv", "evaluation.csv"],
+    ["sink", "/private/output/final_evaluation.csv", "final_evaluation.csv"],
+    ["sink", "C:\\output\\final_evaluation.csv", "final_evaluation.csv"],
+  ] as const)("shows a %s path's file name, with the whole path one disclosure away", (kind, path, name) => {
+    const options = { path };
+    render(<OptionRows options={options} ariaLabel="file settings" plugin={{ kind, name: "csv" }} />);
+    const region = screen.getByRole("region", { name: "file settings" });
+    const shown = within(region).getByText(name);
+    expect(shown).toHaveAttribute("title", path);
+    // Two folders can hold files of the same name: the path stays reachable.
+    const full = within(region).getByText("Full path", { selector: "summary" });
+    const details = full.closest("details");
+    expect(details).not.toHaveAttribute("open");
+    expect(details?.querySelector("code")).toHaveTextContent(path);
+    // Outside the closed disclosure, only the name shows.
+    const visible = region.cloneNode(true) as HTMLElement;
+    visible.querySelectorAll("details").forEach((node) => node.remove());
+    expect(visible.textContent).not.toContain(path);
+    expect(options.path).toBe(path);
+  });
+
+  it("shows a bare file name as it is, with no disclosure", () => {
+    render(<OptionRows options={{ path: "evaluation.csv" }} ariaLabel="file settings" plugin={{ kind: "source", name: "csv" }} />);
+    expect(screen.getByText("evaluation.csv")).toBeInTheDocument();
+    expect(screen.queryByText("Full path")).not.toBeInTheDocument();
+  });
+
+  it("keeps a transform's path setting verbatim", () => {
+    render(<OptionRows options={{ path: "configured/path/value" }} ariaLabel="transform settings" plugin={{ kind: "transform", name: "custom" }} />);
+    expect(screen.getByText("configured/path/value")).toBeInTheDocument();
+  });
+
+  it("says the file reference is unavailable for a masked path with no file reference", () => {
+    render(<OptionRows options={{ path: MASKED_PATH }} ariaLabel="source settings" plugin={{ kind: "source", name: "csv" }} />);
+    const region = screen.getByRole("region", { name: "source settings" });
+    expect(within(region).getByText("File reference unavailable")).toBeInTheDocument();
+    expect(region.textContent).not.toContain("redacted");
+  });
+
+  it("reads this session's file list once when it was never read, never showing another session's name or the raw id", () => {
+    seedFile({ filename: "other-session.csv" });
+    const loadBlobs = vi.fn().mockResolvedValue(undefined);
+    useBlobStore.setState({ activeSessionId: "other-session", loadBlobs });
+    const element = <OptionRows options={{ path: MASKED_PATH, blob_ref: FILE_ID }} ariaLabel="source settings" plugin={{ kind: "source", name: "csv" }} />;
+    const view = render(element);
+    view.rerender(element);
+    view.rerender(<OptionRows options={{ path: MASKED_PATH, blob_ref: FILE_ID }} ariaLabel="source settings" plugin={{ kind: "source", name: "csv" }} />);
+    expect(loadBlobs).toHaveBeenCalledTimes(1);
+    expect(loadBlobs).toHaveBeenCalledWith("session-1");
+    const region = screen.getByRole("region", { name: "source settings" });
+    expect(screen.queryByText(/other-session.csv/)).not.toBeInTheDocument();
+    expect(within(region).getByText("Loading file name…")).toBeInTheDocument();
+    expect(region.textContent).not.toContain(FILE_ID);
+    act(() => seedFile({ filename: "this-session.csv" }));
+    expect(screen.getByText("File: this-session.csv")).toBeInTheDocument();
+    expect(loadBlobs).toHaveBeenCalledTimes(1);
+  });
+
+  it("issues one list read for two views of the same step (inspector and Spec tab)", () => {
+    const loadBlobs = vi.fn(async (sessionId: string) => { useBlobStore.getState().activateSession(sessionId); });
+    useBlobStore.setState({ activeSessionId: null, loadBlobs });
+    const props = { options: { path: MASKED_PATH, blob_ref: FILE_ID }, plugin: { kind: "source", name: "csv" } } as const;
+    render(<><OptionRows {...props} ariaLabel="inspector" /><OptionRows {...props} ariaLabel="spec" /></>);
+    expect(loadBlobs).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not read the list again when this session's list is already read and lacks the file", () => {
+    const loadBlobs = vi.fn().mockResolvedValue(undefined);
+    useBlobStore.setState({ activeSessionId: "session-1", blobs: [], isLoading: false, loadBlobs });
+    render(<OptionRows options={{ path: MASKED_PATH, blob_ref: FILE_ID }} ariaLabel="source settings" plugin={{ kind: "source", name: "csv" }} />);
+    expect(loadBlobs).not.toHaveBeenCalled();
+    expect(screen.getByText("File not in this session")).toBeInTheDocument();
+  });
+
+  it("says the name is unavailable when the list read failed, not that the file is gone", () => {
+    useBlobStore.setState({ activeSessionId: "session-1", blobs: [], isLoading: false, error: "Failed to load files.", listLoadFailed: true });
+    render(<OptionRows options={{ path: MASKED_PATH, blob_ref: FILE_ID }} ariaLabel="source settings" plugin={{ kind: "source", name: "csv" }} />);
+    expect(screen.getByText("File name unavailable")).toBeInTheDocument();
+    expect(screen.queryByText("File not in this session")).not.toBeInTheDocument();
+  });
+
+  it("writes nothing to browser storage", () => {
+    seedFile({ filename: "evaluation.csv" });
+    window.localStorage.clear();
+    window.sessionStorage.clear();
+    render(<OptionRows options={{ path: MASKED_PATH, blob_ref: FILE_ID }} ariaLabel="source settings" plugin={{ kind: "source", name: "csv" }} />);
+    expect(window.localStorage.length).toBe(0);
+    expect(window.sessionStorage.length).toBe(0);
+  });
+});
 
 describe("file-backed option values", () => {
   beforeEach(() => {
@@ -131,18 +244,57 @@ describe("file-backed option values", () => {
     expect(screen.queryByText("This file is not in this session.")).not.toBeInTheDocument();
   });
 
-  it("disables Edit with the multi-file reason while Show in files stays available", () => {
+  it("opens Edit for a file on a step that uses more than one prompt file", () => {
     seedFile();
     const options = { prompt_template: { blob_ref: FILE_ID, mode: "inline_content", sha256: FILE_HASH },
       system_prompt: { blob_ref: "other", mode: "inline_content", sha256: FILE_HASH } };
     useSessionStore.setState({ compositionState: { sources: {}, outputs: [], nodes: [{ id: "llm", plugin: "llm", options }] } as unknown as CompositionState });
     render(<OptionRows options={options} ariaLabel="inspector options" plugin={{ kind: "transform", name: "llm" }} slotActions={{ nodeId: "llm" }} />);
     const edit = screen.getByRole("button", { name: "Edit prompt.md (User prompt)" });
+    expect(edit).toHaveAttribute("aria-disabled", "false");
+    expect(edit).not.toHaveAccessibleDescription();
+    act(() => edit.click());
+    expect(useBlobStore.getState().editRequest).toMatchObject({ nodeId: "llm", fieldPath: "prompt_template" });
+  });
+
+  it("still opens Edit, with the reason beside it, when a save would be refused", () => {
+    seedFile();
+    const options = { prompt_template: { blob_ref: FILE_ID, mode: "inline_content", sha256: FILE_HASH },
+      system_prompt: { blob_ref: "other", mode: "inline_content", sha256: FILE_HASH } };
+    useSessionStore.setState({ compositionState: { sources: {}, outputs: [], nodes: [{ id: "llm", plugin: "llm", options }] } as unknown as CompositionState });
+    useInterpretationEventsStore.setState({ pendingBySession: { "session-1": {
+      card: { choice: "pending", kind: "llm_prompt_template", affected_node_id: "llm" } as InterpretationEvent } } });
+    render(<OptionRows options={options} ariaLabel="inspector options" plugin={{ kind: "transform", name: "llm" }} slotActions={{ nodeId: "llm" }} />);
+    const edit = screen.getByRole("button", { name: "Edit prompt.md (User prompt)" });
+    expect(edit).toHaveAttribute("aria-disabled", "false");
+    expect(edit).toHaveAccessibleDescription("Complete the existing node review before editing its files.");
+    act(() => edit.click());
+    expect(useBlobStore.getState().editRequest).toMatchObject({ nodeId: "llm", fieldPath: "prompt_template" });
+  });
+
+  it("keeps Edit a described no-op only when the file has no prompt text to show", () => {
+    seedFile({ status: "pending" });
+    const options = { prompt_template: { blob_ref: FILE_ID, mode: "inline_content", sha256: FILE_HASH } };
+    useSessionStore.setState({ compositionState: { sources: {}, outputs: [], nodes: [{ id: "llm", plugin: "llm", options }] } as unknown as CompositionState });
+    render(<OptionRows options={options} ariaLabel="inspector options" plugin={{ kind: "transform", name: "llm" }} slotActions={{ nodeId: "llm" }} />);
+    const edit = screen.getByRole("button", { name: "Edit prompt.md (User prompt)" });
     expect(edit).toHaveAttribute("aria-disabled", "true");
-    expect(edit).toHaveAccessibleDescription("This node uses more than one prompt file. Re-point it through the agent and approve the review card.");
-    expect(screen.getByRole("button", { name: "Show in files: prompt.md (User prompt)" })).toHaveAttribute("aria-disabled", "false");
+    expect(edit).toHaveAccessibleDescription("This file is still being processed.");
     act(() => edit.click());
     expect(useBlobStore.getState().editRequest).toBeNull();
+  });
+
+  it("gives every query row's reason its own DOM id when the rows share the node-level prompt file", () => {
+    seedFile({ status: "pending" });
+    const options = { prompt_template: { blob_ref: FILE_ID, mode: "inline_content", sha256: FILE_HASH },
+      queries: [{ name: "one" }, { name: "two" }] };
+    useSessionStore.setState({ compositionState: { sources: {}, outputs: [], nodes: [{ id: "llm", plugin: "llm", options }] } as unknown as CompositionState });
+    const { container } = render(<OptionRows options={options} ariaLabel="inspector options" plugin={{ kind: "transform", name: "llm" }} slotActions={{ nodeId: "llm" }} />);
+    const edits = screen.getAllByRole("button", { name: /^Edit prompt\.md \(User prompt, query/ });
+    expect(edits).toHaveLength(2);
+    const ids = Array.from(container.querySelectorAll("[id]"), (element) => element.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    for (const edit of edits) expect(edit).toHaveAccessibleDescription("This file is still being processed.");
   });
 
   it("shows the filename for LLM prompt roles and nested markers without exposing marker fields", () => {
@@ -526,10 +678,97 @@ describe("catalog-tier ordering (elspeth-a6ea581e8a follow-up)", () => {
 describe("llm prompt roles", () => {
   const LLM = { kind: "transform", name: "llm" } as const;
 
+  it("copies exact inline system, user, and query strings", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+    const system = "  Système\nλ  ";
+    const user = " \nUser 🐈\n ";
+    const query = "\tQuery café\n ";
+    render(<OptionRows options={{ system_prompt: system, prompt_template: user, queries: { one: { template: query } } }} ariaLabel="copy options" plugin={LLM} />);
+    fireEvent.click(screen.getByRole("button", { name: "Copy system prompt" }));
+    fireEvent.click(screen.getByRole("button", { name: "Copy prompt template for query one" }));
+    await waitFor(() => expect(writeText).toHaveBeenCalledTimes(2));
+    expect(writeText.mock.calls[0][0]).toBe(system);
+    expect(writeText.mock.calls[1][0]).toBe(query);
+    // The node-level field is shown only for a single-query step.
+    const { unmount } = render(<OptionRows options={{ prompt_template: user }} ariaLabel="single options" plugin={LLM} />);
+    fireEvent.click(screen.getByRole("button", { name: "Copy user prompt template" }));
+    await waitFor(() => expect(writeText).toHaveBeenCalledTimes(3));
+    expect(writeText.mock.calls[2][0]).toBe(user);
+    unmount();
+  });
+
+  it.each([
+    ["distinct names", [{ name: "one", template: "A" }, { name: "two", template: "B" }], ["one", "two"]],
+    ["repeated names", [{ name: "same", template: "A" }, { name: "same", template: "B" }], ["same", "same"]],
+    ["named and unnamed collision", [{ name: "#1", template: "A" }, { template: "B" }], ["#1", "#1"]],
+    ["literal position collision", [{ name: "same", template: "A" }, { name: "same", template: "B" }, { name: "same (position 1)", template: "C" }], ["same", "same", "same (position 1)"]],
+  ])("gives every list query a unique positional label for %s and copies its value", async (_case, queries, names) => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+    render(<OptionRows options={{ queries }} ariaLabel="duplicate options" plugin={LLM} />);
+    const buttons = screen.getAllByRole("button", { name: /^Copy prompt template for query / });
+    const labels = buttons.map((button) => button.getAttribute("aria-label"));
+    expect(labels).toEqual(names.map((name, index) => `Copy prompt template for query ${name} (position ${index + 1})`));
+    expect(new Set(labels).size).toBe(labels.length);
+    // Ghost compact: a 36px target (WCAG 2.5.8), not a 21px raw button.
+    buttons.forEach((button) => expect(button).toHaveClass("btn-compact", "btn-ghost"));
+    buttons.forEach((button) => fireEvent.click(button));
+    await waitFor(() => expect(writeText.mock.calls.map((call) => call[0])).toEqual(queries.map((query) => query.template)));
+  });
+
+  it("does not offer copy for file markers or missing prompts", () => {
+    render(<OptionRows options={{ system_prompt: { mode: "inline_content", blob_ref: FILE_ID }, prompt_template: "   \n" }} ariaLabel="file options" plugin={LLM} />);
+    expect(screen.queryByRole("button", { name: /^Copy / })).not.toBeInTheDocument();
+  });
+
+  it("copies the stored node template when a query uses its fallback", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+    const fallback = "  shared\nλ  ";
+    render(<OptionRows options={{ system_prompt: "system", prompt_template: fallback, queries: { one: {} } }} ariaLabel="fallback options" plugin={LLM} />);
+    fireEvent.click(screen.getByRole("button", { name: "Copy prompt template for query one" }));
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith(fallback));
+  });
+
+  it("shows failure rather than copied after clipboard rejection", async () => {
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: vi.fn().mockRejectedValue(new Error("denied")) } });
+    render(<OptionRows options={{ system_prompt: "hello" }} ariaLabel="failure options" plugin={LLM} />);
+    fireEvent.click(screen.getByRole("button", { name: "Copy system prompt" }));
+    expect(await screen.findByText("Copy failed")).toBeInTheDocument();
+    expect(screen.queryByText("Copied")).not.toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("Copy failed for system prompt");
+  });
+
+  it("announces success, resets feedback, and keeps focus on the button", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+    render(<OptionRows options={{ system_prompt: "hello" }} ariaLabel="feedback options" plugin={LLM} />);
+    const button = screen.getByRole("button", { name: "Copy system prompt" });
+    button.focus();
+    vi.useFakeTimers();
+    try {
+      await act(async () => { fireEvent.click(button); });
+      expect(button).toHaveFocus();
+      expect(button).toHaveTextContent("Copied");
+      expect(screen.getByRole("status")).toHaveTextContent("Copied system prompt");
+      act(() => { vi.advanceTimersByTime(2000); });
+      expect(button).toHaveTextContent("Copy");
+      expect(screen.getByRole("status")).toBeEmptyDOMElement();
+      expect(button).toHaveFocus();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   function roleRows(region: HTMLElement): Array<[string | null, string | null]> {
     const block = region.querySelector(".option-rows-prompt-roles") as HTMLElement;
     expect(block).not.toBeNull();
-    return Array.from(block.querySelectorAll("dt")).map((dt) => [dt.textContent, dt.nextElementSibling?.textContent ?? null]);
+    return Array.from(block.querySelectorAll("dt")).map((dt) => {
+      const value = dt.nextElementSibling?.cloneNode(true) as HTMLElement | undefined;
+      value?.querySelectorAll("button").forEach((button) => button.remove());
+      return [dt.textContent, value?.textContent ?? null];
+    });
   }
 
   it("leads with System prompt then User prompt when both are authored", () => {

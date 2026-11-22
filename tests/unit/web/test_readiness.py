@@ -21,6 +21,7 @@ from elspeth.web.readiness import (
     ReadinessCheck,
     ReadinessProbeRunner,
     ReadinessReport,
+    SchemaShapeVerdicts,
     _check_auth_mode,
     _check_blob_dir,
     _check_data_dir,
@@ -626,7 +627,7 @@ class TestReadinessDatabaseChecks:
             lambda conn: probe_connections.append(conn) or SchemaState.CURRENT,
         )
 
-        checks = _check_session_database(settings, live_engine, "external-postgresql")
+        checks = _check_session_database(settings, live_engine, "external-postgresql", schema_verdicts=SchemaShapeVerdicts())
 
         assert captured == {
             "url": raw_url,
@@ -676,7 +677,7 @@ class TestReadinessDatabaseChecks:
         monkeypatch.setattr(readiness, "create_engine", factory)
         monkeypatch.setattr(readiness, "probe_landscape_schema", lambda conn: SchemaState.CURRENT)
 
-        checks = _check_landscape_database(settings, "external-postgresql")
+        checks = _check_landscape_database(settings, "external-postgresql", schema_verdicts=SchemaShapeVerdicts())
 
         assert captured["url"] == raw_url
         assert captured["kwargs"] == {
@@ -695,7 +696,7 @@ class TestReadinessDatabaseChecks:
         monkeypatch.setattr(readiness, "create_session_engine", lambda *_a, **_kw: pytest.fail("must reuse live SQLite"))
         monkeypatch.setattr(readiness, "probe_session_schema", lambda conn: SchemaState.CURRENT)
         try:
-            checks = _check_session_database(settings, engine)
+            checks = _check_session_database(settings, engine, schema_verdicts=SchemaShapeVerdicts())
         finally:
             engine.dispose()
         assert checks[0].ok is True
@@ -704,7 +705,7 @@ class TestReadinessDatabaseChecks:
     def test_memory_sqlite_is_rejected_without_checkout(self, tmp_path: Path) -> None:
         settings = _settings_stub(tmp_path, session_db_url="sqlite:///:memory:")
         engine = _FakeEngine(dialect="sqlite", url="sqlite:///:memory:")
-        checks = _check_session_database(settings, engine)
+        checks = _check_session_database(settings, engine, schema_verdicts=SchemaShapeVerdicts())
         remedy = "in-memory SQLite is not readiness-probeable; use a file-backed session database"
         assert checks == (
             ReadinessCheck("session_db", False, remedy),
@@ -721,7 +722,7 @@ class TestReadinessDatabaseChecks:
         engine = create_session_engine(f"sqlite:///{tmp_path / 'session.db'}")
         monkeypatch.setattr(readiness, "probe_session_schema", lambda conn: state)
         try:
-            checks = _check_session_database(settings, engine)
+            checks = _check_session_database(settings, engine, schema_verdicts=SchemaShapeVerdicts())
         finally:
             engine.dispose()
         assert checks[1] == ReadinessCheck("session_schema", ok, f"schema state: {state.name}")
@@ -743,7 +744,7 @@ class TestReadinessDatabaseChecks:
         owned = _FakeEngine(connection=_FakeConnection(failure=failure))
         monkeypatch.setattr(readiness, "create_engine", lambda *_a, **_kw: owned)
         with pytest.raises(type(failure)):
-            _check_landscape_database(settings, "external-postgresql")
+            _check_landscape_database(settings, "external-postgresql", schema_verdicts=SchemaShapeVerdicts())
         assert owned.disposed is True
 
     @pytest.mark.asyncio
@@ -1064,6 +1065,8 @@ class TestReadinessAuthAndReport:
         settings = _settings_stub(tmp_path)
 
         class BrokenRunner:
+            schema_verdicts = SchemaShapeVerdicts()
+
             async def run(self, *_args: object, **_kwargs: object) -> tuple[ReadinessCheck, ...]:
                 raise RuntimeError("RAW_URL_SENTINEL /private/path")
 

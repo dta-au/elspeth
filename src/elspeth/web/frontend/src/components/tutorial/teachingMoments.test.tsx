@@ -135,6 +135,38 @@ describe("tutorial teaching moments — render at the right turn", () => {
     expect(copyButton).toHaveClass("tutorial-hash-copy");
   });
 
+  it("Turn 5 offers Retry after a failed audit-summary read and re-reads the same run", async () => {
+    vi.mocked(api.getRunAuditSummary)
+      .mockRejectedValueOnce({ status: 503, detail: "The audit story could not be read right now." })
+      .mockResolvedValueOnce({
+        source_data_hash: "abc123",
+        llm_call_count: 1,
+        run_id: "r1",
+        started_at: new Date().toISOString(),
+        plugin_versions: {},
+      } as unknown as Awaited<ReturnType<typeof api.getRunAuditSummary>>);
+    const onContinue = vi.fn();
+    render(
+      <TutorialTurn5AuditStory
+        sessionId="sess-1"
+        runId="run-1"
+        onContinue={onContinue}
+      />,
+    );
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "The audit story could not be read right now.",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(await screen.findByText("abc123")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(api.getRunAuditSummary).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(api.getRunAuditSummary).mock.calls).toEqual([
+      ["sess-1", "run-1"],
+      ["sess-1", "run-1"],
+    ]);
+    expect(api.runTutorialPipeline).not.toHaveBeenCalled();
+  });
+
   it("Turn 4 (run) renders the shield-override caveat with no shield selected", async () => {
     stubRun();
     vi.mocked(api.fetchPluginPolicy).mockResolvedValue(policyWithShield(false));

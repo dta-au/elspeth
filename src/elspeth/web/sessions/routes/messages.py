@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Annotated
 
+from fastapi import Response
+
 from elspeth.web.sessions.schemas import ComposerOperationAcceptedResponse
 
 from ._helpers import (
@@ -28,6 +30,7 @@ from ._helpers import (
 )
 from .composer.operations import admit, parse_message_body
 from .diagnostics import register_diagnostic_routes
+from .end_review_view import END_REVIEW_ROWS_OMITTED_HEADER, with_end_review_rows
 
 
 def _requests_audit_grade_messages_view(
@@ -60,12 +63,18 @@ def register_message_routes(router: APIRouter) -> None:
     async def get_messages(
         session_id: UUID,
         request: Request,
+        response: Response,
         user: Annotated[UserIdentity, Depends(require_pipeline_user)],
         limit: int = Query(100, ge=1, le=500),
         offset: int = Query(0, ge=0),
         include_llm_audit: bool = Query(
             False,
-            description="Include value-free LLM-call rows and their paired semantic planner-attempt rows.",
+            description=(
+                "Include value-free LLM-call rows, their paired semantic planner-attempt rows, and END "
+                "advisor-checkpoint pass rows (phase, pass_index, verdict, source, provider_attempts, "
+                "publication_verdict). The X-Elspeth-End-Review-Rows-Omitted header counts stored END "
+                "pass rows left out because they did not parse."
+            ),
         ),
         include_raw_content: bool = Query(False),
         include_tool_rows: bool = Query(False),
@@ -130,6 +139,12 @@ def register_message_routes(router: APIRouter) -> None:
             conversation_messages = _composer_conversation_or_llm_audit_messages(messages)
         else:
             conversation_messages = _composer_conversation_messages(messages)
+        if include_llm_audit:
+            # END advisor-checkpoint pass rows, cut down to the six fields of
+            # AdvisorEndReviewPassResponse; the header counts rows left out.
+            llm_audit_view = with_end_review_rows(messages, conversation_messages)
+            conversation_messages = list(llm_audit_view.messages)
+            response.headers[END_REVIEW_ROWS_OMITTED_HEADER] = str(llm_audit_view.end_review_rows_omitted)
         paged_messages = conversation_messages[offset : offset + limit]
         # Per-call outcome stamping (elspeth-f5e6723133): project the Tier-1
         # role="tool" rows onto the assistant envelopes so the SPA can label

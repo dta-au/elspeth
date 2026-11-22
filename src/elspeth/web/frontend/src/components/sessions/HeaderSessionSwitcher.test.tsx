@@ -312,6 +312,30 @@ describe("HeaderSessionSwitcher", () => {
     expect(screen.getByRole("menuitem", { name: /^tender review\b/i })).toBeInTheDocument();
   });
 
+  it("shows the server's reason when archive is refused with an API error", async () => {
+    const archiveSession = vi.fn().mockRejectedValue({
+      status: 409,
+      detail: "Cannot delete session while a pipeline run is active. Cancel the run first.",
+    });
+    useSessionStore.setState({
+      sessions: [
+        { id: "s1", title: "Tender review", updated_at: "2026-05-15T00:00:00Z" } as never,
+      ],
+      activeSessionId: "s1",
+      archiveSession,
+    } as never);
+
+    const user = userEvent.setup();
+    render(<HeaderSessionSwitcher />);
+    await user.click(screen.getByRole("button", { name: /tender review/i }));
+    await user.click(screen.getByRole("menuitem", { name: /^archive tender review$/i }));
+    await user.click(screen.getByRole("button", { name: /^archive$/i }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("Cancel the run first.");
+    expect(alert.textContent).not.toMatch(/please try again/i);
+  });
+
   it("uses the generic fallback when archive rejects with a non-Error value", async () => {
     // Stringly-typed rejection from an upstream layer — the inline alert
     // must NOT leak the raw value into the UI (it has no useful operator
@@ -385,6 +409,26 @@ describe("HeaderSessionSwitcher", () => {
 
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toContain("title contains forbidden character");
+  });
+
+  it("shows the server's reason when rename is refused with an API error", async () => {
+    const renameSession = vi.fn().mockRejectedValue({
+      status: 409,
+      detail: "Another change to this session is in progress. Try again shortly.",
+    });
+    useSessionStore.setState({ renameSession } as never);
+    const user = userEvent.setup();
+
+    render(<HeaderSessionSwitcher />);
+    await user.click(screen.getByRole("button", { name: /first/i }));
+    await user.click(screen.getByRole("menuitem", { name: /^rename first$/i }));
+    const input = screen.getByRole("textbox", { name: /^rename session$/i });
+    await user.clear(input);
+    await user.type(input, "Updated title");
+    await user.click(screen.getByRole("button", { name: /save session name/i }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("Another change to this session is in progress.");
   });
 
   it("uses the generic fallback when rename rejects with a non-Error value", async () => {

@@ -10,6 +10,7 @@ import {
   claimWorkspaceViewIntent,
   isCurrentWorkspaceViewIntent,
   REQUEST_RUN_EVENT,
+  TOGGLE_AUTHORING_EVENT,
   type RequestArtifactViewDetail,
 } from "@/lib/composer-events";
 import { useSessionStore } from "@/stores/sessionStore";
@@ -233,6 +234,24 @@ describe("CommandPalette commands", () => {
       expect(onFocusAuthoring).toHaveBeenCalledTimes(1);
     });
     window.removeEventListener(FOCUS_AUTHORING_EVENT, onFocusAuthoring);
+  });
+
+  it("routes Hide or show conversation through the shared toggle intent", async () => {
+    const onToggle = vi.fn();
+    window.addEventListener(TOGGLE_AUTHORING_EVENT, onToggle);
+    try {
+      render(
+        <CommandPalette isOpen onClose={vi.fn()} runAdmissionAvailable />,
+      );
+
+      fireEvent.click(screen.getByText("Hide or show conversation"));
+
+      await waitFor(() => {
+        expect(onToggle).toHaveBeenCalledTimes(1);
+      });
+    } finally {
+      window.removeEventListener(TOGGLE_AUTHORING_EVENT, onToggle);
+    }
   });
 
   it("requests the YAML artifact when the pipeline has content", async () => {

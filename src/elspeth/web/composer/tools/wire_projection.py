@@ -23,7 +23,9 @@ provider. It is derived from S once, at import, by one pure walk per
   - keywords outside ``WIRE_KEYWORD_ALLOWLIST`` move to a ledger and are
     rendered as description text from a closed template map;
   - the 6 descriptions that tell the model to *omit* a now-required key are
-    rewritten to say "pass null" (``_STRICT_DESCRIPTION_OVERRIDES``);
+    rewritten to say "pass null", and set_metadata's, which tells it to pass
+    null to clear description, is rewritten to say an empty string clears it
+    (``_STRICT_DESCRIPTION_OVERRIDES``);
   - a parameterless tool carries exactly ``{"_elspeth_no_arguments": true}``
     on the wire. Its dedicated decode node validates this framing before
     returning the empty semantic object; MCP and NONE keep ``{}``.
@@ -242,6 +244,12 @@ _STRICT_DESCRIPTION_OVERRIDES: Final[Mapping[tuple[str, str], tuple[str, str]]] 
         ("list_models", "/parameters/properties/provider/description"): (
             "Omit to get a provider summary",
             "Pass null to get a provider summary",
+        ),
+        # Strict decode turns a promoted null into an omission, so on this
+        # dialect null leaves description unchanged and only "" clears it.
+        ("set_metadata", "/description"): (
+            "Pass null or an empty string for description to clear it;",
+            "Pass an empty string for description to clear it (null leaves it unchanged);",
         ),
         ("request_interpretation_review", "/parameters/properties/kind/description"): (
             "and OMIT llm_draft — the server computes",

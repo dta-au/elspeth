@@ -1,6 +1,6 @@
 # `docs/release/` — Release Histories and Snapshots
 
-**Release metadata reviewed:** 2026-11-17 (0.8.15 unreleased candidate)
+**Release metadata reviewed:** 2026-11-21 (0.8.16 unreleased candidate)
 **Audience:** Anyone navigating to release-level documentation
 **Register:** Lightly technical / directory-index
 
@@ -8,7 +8,7 @@ This directory holds the current evaluator guides and the long-lived assurance
 narrative.
 
 The directory is intentionally small. **Current** documents are the maintained
-tier for the release currently being prepared (0.8.15). Superseded point-in-time
+tier for the release currently being prepared (0.8.16). Superseded point-in-time
 release docs and frozen historical snapshots are no longer part of the active
 public docs tree; use git history or maintainer-local archives when historical
 provenance is needed. New readers should start with the current tier below.
@@ -22,9 +22,9 @@ If you only have time for one document, pick the row that matches your role.
 | If you are… | Read first | Then |
 |---|---|---|
 | **An executive or assurance reader** evaluating the platform | [Project overview](../../README.md) | [`guarantees.md`](guarantees.md) for contractual claims |
-| **Engineering leadership** scoping or sequencing work against the platform | [`platform-architecture.md`](platform-architecture.md) | Then `/CHANGELOG.md` for release-by-release implementation detail |
+| **Engineering leadership** scoping or sequencing work against the platform | [`platform-architecture.md`](platform-architecture.md) | Then `/CHANGELOG.md` for the current release in full and a summary of each earlier one |
 | **An engineer joining the project** | [`platform-architecture.md`](platform-architecture.md) | Then [`guarantees.md`](guarantees.md) for the contracts the code must uphold |
-| **An auditor or integrator** verifying assurance claims | [`guarantees.md`](guarantees.md) (the assurance surface) | Then `/CHANGELOG.md` (RC-3+) for the line-by-line release record |
+| **An auditor or integrator** verifying assurance claims | [`guarantees.md`](guarantees.md) (the assurance surface) | Then `/CHANGELOG.md` for the current release record and earlier upgrade notes; the repository's releases and commit history hold the line-by-line record |
 | **Anyone investigating a specific historical decision or release** | The relevant commit in git history or a maintainer-local archive | The current release documents for subsequent context |
 
 ---
@@ -33,13 +33,13 @@ If you only have time for one document, pick the row that matches your role.
 
 Before diving into the documents below, know which sources they aggregate. **If a document in this directory contradicts a canonical source, the canonical source wins.**
 
-- **Per-release detailed changelogs:** [`/CHANGELOG.md`](../../CHANGELOG.md) (RC-3+) — line-by-line release records.
+- **Release changelog:** [`/CHANGELOG.md`](../../CHANGELOG.md) — the current release in full; earlier releases are summarised to their upgrade notes and breaking changes, and the repository's releases and commit history hold the full record.
 - **Architectural decisions:** [`/docs/architecture/adr/`](../architecture/adr/) — the binding ADRs.
 - **In-code architecture analyses:** [`/docs/architecture/`](../architecture/) and the layer-import graph emitted by `elspeth-lints dump-edges`.
 
 ---
 
-## Current documents (0.8.15, November 2026)
+## Current documents (0.8.16, November 2026)
 
 | Document | What it answers | Intended reader |
 |----------|-----------------|-----------------|

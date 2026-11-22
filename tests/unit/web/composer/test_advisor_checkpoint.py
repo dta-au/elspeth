@@ -51,7 +51,12 @@ from elspeth.web.composer.advisor_context import (
     advisor_checkpoint_summary_chars,
 )
 from elspeth.web.composer.advisor_decision import AdvisorBlockCause, AdvisorGatePassed, AdvisorSignoffGateFact
-from elspeth.web.composer.advisor_policy import ADVISOR_MALFORMED_USER_DETAIL, ADVISOR_UNAVAILABLE_USER_DETAIL
+from elspeth.web.composer.advisor_policy import (
+    ADVISOR_FINAL_REPLY_CONTRACT_CLAUSE,
+    ADVISOR_MALFORMED_USER_DETAIL,
+    ADVISOR_OUTPUT_CONTRACT_CLAUSE,
+    ADVISOR_UNAVAILABLE_USER_DETAIL,
+)
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.composition_completion import CompositionCompletion
 from elspeth.web.composer.invariants import InvariantError
@@ -3124,6 +3129,8 @@ async def drive_try_terminate(
     orphan_sites: tuple[tuple[str, str, InterpretationKind], ...] = (),
     use_real_orphan_gate: bool = False,
     plugin_snapshot=None,
+    turn_evidence=None,
+    advisor_review_state=None,
 ):
     """Drive ``_try_terminate_no_tools`` with the full kwarg set.
 
@@ -3220,13 +3227,17 @@ async def drive_try_terminate(
     kwargs = {}
     if deadline is not None:
         kwargs["deadline"] = deadline
+    if advisor_review_state is not None:
+        kwargs["advisor_review_state"] = advisor_review_state
     session_id = session_operation_context.fence.session_id if session_operation_context is not None else str(uuid.uuid4())
     from elspeth.web.composer.turn_effects import TurnEvidence
 
     context = session_operation_context or _compose_context(session_id)
     return await service._completion._try_terminate_no_tools(
         assistant_message=_AdmittedAssistantMessage(content=candidate),
-        turn_evidence=TurnEvidence(
+        turn_evidence=turn_evidence
+        if turn_evidence is not None
+        else TurnEvidence(
             session_id=session_id,
             session_operation_context=context,
             request_id="advisor-unit-request",
@@ -3391,7 +3402,13 @@ async def test_end_gate_publication_only_repair_does_not_require_graph_mutations
     assert len(llm_messages) == 1
     content = llm_messages[0]["content"]
     assert "A prose-only correction is valid; do not mutate the graph merely to satisfy this review." in content
-    assert "Fix the findings via tool calls." not in content
+    # The graph-repair half of the blocking output contract must not leak into
+    # publication-only repair; only the shared final-reply clause rides here.
+    graph_repair_clause = ADVISOR_OUTPUT_CONTRACT_CLAUSE.removesuffix(ADVISOR_FINAL_REPLY_CONTRACT_CLAUSE)
+    assert graph_repair_clause.strip()
+    assert graph_repair_clause != ADVISOR_OUTPUT_CONTRACT_CLAUSE
+    assert graph_repair_clause not in content
+    assert ADVISOR_FINAL_REPLY_CONTRACT_CLAUSE in content
     assert "pipeline MUTATIONS via tool calls" not in content
     assert "do not quote the fenced text" in content
     assert content.endswith("BEGIN_UNTRUSTED_ADVISOR_FINDINGS\nCorrect the unsupported completion claim.\nEND_UNTRUSTED_ADVISOR_FINDINGS")
@@ -6030,6 +6047,145 @@ async def test_early_checkpoint_does_not_carry_mutation_expectation(make_service
     assert ADVISOR_MUTATION_EXPECTATION_CLAUSE not in injected
 
 
+# ---------------------------------------------------------------------------
+# Edit battery 2026-11-21: a one-step insertion into a 27-step graph whose 12
+# LLM steps had no prompt-injection shield plugin. The END review withheld the
+# edit over that pre-existing graph-wide condition, and the repair turn then
+# changed and staged reviews on 11 LLM steps the request never named. A
+# bounded edit is judged by what the turn changed; a pre-existing condition
+# is reported, not repaired.
+# ---------------------------------------------------------------------------
+
+
+async def _captured_end_advisor_request(monkeypatch: pytest.MonkeyPatch, service, state: CompositionState) -> dict[str, Any]:
+    """Return the exact END request the provider receives for a bounded edit."""
+    captured: list[dict[str, Any]] = []
+
+    async def fake_acompletion(*, on_provider_dispatch: Callable[[], None] | None = None, **kwargs: Any) -> Any:
+        if on_provider_dispatch is not None:
+            on_provider_dispatch()
+        captured.append(kwargs)
+        return SimpleNamespace(
+            model="advisor-test-model",
+            choices=[SimpleNamespace(message=SimpleNamespace(content=_checkpoint_reply(publication_verdict="ADMIT"), tool_calls=None))],
+            usage=SimpleNamespace(prompt_tokens=10, completion_tokens=1, total_tokens=11),
+        )
+
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
+    request = "Insert a passthrough step after rate."
+    evidence = TurnEvidence(
+        session_id=None,
+        session_operation_context=None,
+        request_id="bounded-edit-scope",
+        request=request,
+        initial_state_id=None,
+        initial_state=state,
+    )
+    evidence.effects = dataclass_replace(
+        evidence.effects,
+        verification="verified",
+        latest_authored_state_hash="after-insert",
+        net_changed_fields=("nodes.tap", "nodes_order"),
+    )
+    review = evidence.review_candidate(candidate="Inserted the passthrough step.", request=request, current_state=state)
+    arguments = service._advisor_checkpoint._build_checkpoint_arguments(
+        phase="end", state=state, user_message=request, publication_review=review
+    )
+    await service._advisor_checkpoint._call_advisor_with_audit(arguments, recorder=make_recorder(), structured_output=True)
+    assert len(captured) == 1
+    return captured[0]
+
+
+def _system_text(request: dict[str, Any]) -> str:
+    content = request["messages"][0]["content"]
+    return content if type(content) is str else "".join(block["text"] for block in content)
+
+
+@pytest.mark.asyncio
+async def test_end_advisor_wire_does_not_withhold_a_bounded_edit_for_a_preexisting_condition(
+    monkeypatch: pytest.MonkeyPatch, make_service, simple_state
+) -> None:
+    request = await _captured_end_advisor_request(monkeypatch, make_service(), simple_state)
+    system = " ".join(_system_text(request).split())
+    user = request["messages"][1]["content"]
+
+    # The scope the advisor is told to use is the one the request carries.
+    assert "Judge a bounded edit by what this turn changed (saved_effects.changed_fields when supplied)" in system
+    assert '"changed_fields": ["nodes.tap", "nodes_order"]' in user
+    assert (
+        "A condition only on steps this turn did not change is pre-existing: not a blocking defect, never a reason to "
+        "WITHHOLD, and never a reason to ask for changes to steps the user did not name" in system
+    )
+    # It is reported, not dropped: CLEAN admits findings text (note stays null).
+    assert "Name it once in findings; the reply may report it." in system
+    # The base wording kept every required-control condition in scope wherever it sat in the graph.
+    assert "Still flag violations of explicit workflow requirements, required-control policy or routing contracts. " not in system
+    # The composer skill the advisor reads as binding policy carries the same scope for the shield plugin rule.
+    assert "If LLM steps the request did not name already lack the prompt-injection shield plugin, leave them unchanged" in system
+
+
+@pytest.mark.asyncio
+async def test_end_advisor_wire_still_flags_an_unshielded_llm_step_the_turn_adds(
+    monkeypatch: pytest.MonkeyPatch, make_service, simple_state
+) -> None:
+    system = " ".join(_system_text(await _captured_end_advisor_request(monkeypatch, make_service(), simple_state)).split())
+
+    assert (
+        "Still flag violations of explicit workflow requirements, required-control policy or routing contracts that this turn "
+        "introduced or touched, such as an LLM step it added, or an LLM step whose untrusted input this turn changed "
+        "(a new untrusted producer upstream of it), without a prompt-injection shield plugin or a decision on the shield "
+        "plugin recommendation." in system
+    )
+    # Edit-battery inserts put a passthrough directly in front of an LLM step: that does not change its input.
+    assert (
+        "Inserting, removing or moving a step that leaves the content reaching an LLM step unchanged "
+        "does not change that step's input." in system
+    )
+    assert (
+        "On an edit, apply it to the LLM steps the edit adds and to those whose untrusted input the edit changes; "
+        "a step inserted, removed or moved in front of an LLM step without changing the content it receives does not count." in system
+    )
+    assert "an LLM step it added or rewired" not in system and "the edit adds or rewires" not in system
+    # FLAGGED stays the blocking verdict and WITHHOLD still needs findings.
+    assert "Set verdict to FLAGGED for a concrete visible blocking defect" in system
+    assert "WITHHOLD requires nonempty findings, even with graph verdict CLEAN." in system
+
+
+def test_existing_end_schema_admits_with_findings_but_keeps_note_flagged_only() -> None:
+    """Control: the pre-existing condition rides CLEAN+ADMIT findings; no new field is needed."""
+    from elspeth.web.composer.advisor_checkpoint import _parse_advisor_checkpoint_guidance
+
+    admitted = _parse_advisor_checkpoint_guidance(
+        _checkpoint_reply(findings="Pre-existing: 11 untouched LLM steps lack the shield plugin.", publication_verdict="ADMIT"),
+        phase="end",
+    )
+    assert admitted.ok and not admitted.blocking and admitted.publication_verdict == "ADMIT"
+    assert admitted.findings_text.startswith("Pre-existing:")
+    rejected = _parse_advisor_checkpoint_guidance(
+        _checkpoint_reply(findings="x", note="Pre-existing condition.", publication_verdict="ADMIT"), phase="end"
+    )
+    assert not rejected.ok and rejected.failure_class == "malformed"
+
+
+@pytest.mark.asyncio
+async def test_end_gate_repair_message_does_not_authorize_mutating_unnamed_steps(make_service, clean_runnable_state):
+    service = make_service()
+    service._advisor_checkpoint._run_advisor_checkpoint = _AsyncRecorder(
+        return_value=AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: the new step drops a field")
+    )
+    llm_messages: list[dict[str, object]] = []
+    outcome = await drive_try_terminate(service, clean_runnable_state, advisor_checkpoint_passes_used=0, llm_messages=llm_messages)
+
+    assert outcome.action == "continue"
+    repair = " ".join(str(next(m["content"] for m in llm_messages if m["role"] == "user")).split())
+    assert "resolve applicable graph findings" not in repair
+    assert "resolve the findings on what this turn changed through pipeline MUTATIONS via tool calls" in repair
+    assert (
+        "A condition only on steps this turn did not change and the request did not name is pre-existing: "
+        "do not change those steps for it; report it once in your reply." in repair
+    )
+
+
 def _advisor_evidence_hash(state: CompositionState) -> str:
     evidence = TurnEvidence(
         session_id=None,
@@ -7067,7 +7223,7 @@ async def test_checkpoint_unrepresentable_graph_is_unavailable_without_provider_
 
     service = make_service()
 
-    def refuse(_state):
+    def refuse(_state, _prompt_files):
         raise AdvisorGraphCoverageUnavailable("Redaction made distinct authored keys ambiguous")
 
     monkeypatch.setattr("elspeth.web.composer.advisor_context.summarize_pipeline_for_advisor", refuse)

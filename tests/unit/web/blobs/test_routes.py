@@ -258,6 +258,12 @@ class TestUploadBlob:
 class TestListAndMetadata:
     """Blob listing and metadata retrieval."""
 
+    def test_session_blob_list_defaults_to_100(self, tmp_path) -> None:
+        app, _, _ = _make_app(tmp_path)
+        parameters = app.openapi()["paths"]["/api/sessions/{session_id}/blobs"]["get"]["parameters"]
+        limit = next(parameter for parameter in parameters if parameter["name"] == "limit")
+        assert limit["schema"]["default"] == 100
+
     def test_list_blobs_returns_session_blobs(self, tmp_path) -> None:
         app, _, _ = _make_app(tmp_path)
         client = TestClient(app)

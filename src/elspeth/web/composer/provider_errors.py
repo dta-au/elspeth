@@ -83,14 +83,16 @@ def _merge_reason_observations(first: _ReasonObservation, second: _ReasonObserva
     return first
 
 
-def _admit_request_rejection(exc: OpenAIBadRequestError) -> SafeRequestRejection:
+def _admit_request_rejection(exc: OpenAIBadRequestError) -> tuple[SafeRequestRejection, bool]:
     """Admit only closed codes from nominal SDK fields or buffered HTTP JSON.
 
     No message parsing, headers, parameter names, stream reads or network I/O.
     This projector discards foreign values after checking their exact safe code.
     An unread, malformed or oversized response cannot supply a reason.
     """
-    sdk_reason = _merge_reason_observations(_body_reason(exc.body, nested=False), _reason_code(exc.code))
+    sdk_body_reason = _body_reason(exc.body, nested=False)
+    sdk_code_reason = _reason_code(exc.code)
+    sdk_reason = _merge_reason_observations(sdk_body_reason, sdk_code_reason)
     response_reason = _ReasonObservation(None, "unavailable")
     if isinstance(exc.response, httpx.Response):
         try:
@@ -107,6 +109,10 @@ def _admit_request_rejection(exc: OpenAIBadRequestError) -> SafeRequestRejection
                 if error is None:
                     response_reason = _body_reason(parsed, nested=True)
     combined = _merge_reason_observations(sdk_reason, response_reason)
+    observations = (sdk_body_reason, sdk_code_reason, response_reason)
+    specific_code_seen = any(
+        observation.disposition == "retained" and observation.code != "invalid_request" for observation in observations
+    )
     source: Literal["sdk_body", "http_response", "unavailable"] = "unavailable"
     if combined.disposition != "unavailable":
         if sdk_reason.disposition not in {"absent", "unavailable"} and combined == sdk_reason:
@@ -115,7 +121,63 @@ def _admit_request_rejection(exc: OpenAIBadRequestError) -> SafeRequestRejection
             source = "http_response"
         elif combined == sdk_reason:
             source = "sdk_body"
-    return SafeRequestRejection(reason_code=combined.code, reason_disposition=combined.disposition, reason_source=source)
+    return SafeRequestRejection(
+        reason_code=combined.code, reason_disposition=combined.disposition, reason_source=source
+    ), specific_code_seen
+
+
+# Wordings by which a provider or gateway says a request was over the model's context limit, lower case.
+# Tried only on an HTTP 400 without a specific retained code, and only as a yes/no: no part of the
+# message is kept. "prompt is too long" is Anthropic's; it is unverified against any particular gateway.
+_CONTEXT_LENGTH_MESSAGE_PATTERNS: tuple[str, ...] = (
+    "prompt is too long",
+    "maximum context length",
+    "context_length_exceeded",
+    "context length exceeded",
+    "exceeds the context window",
+    "input is too long for requested model",
+)
+
+
+def _admit_context_length_evidence(
+    exc: OpenAIBadRequestError, admitted: SafeRequestRejection, *, specific_code_seen: bool
+) -> SafeRequestRejection:
+    """Recognise a context-limit rejection the structured fields did not name.
+
+    Any retained specific code takes precedence over class or message evidence;
+    absent, unavailable, foreign and generic codes remain eligible, even when
+    observations conflict. The SDK's own class is nominal evidence. The message
+    is foreign text, so it is matched against fixed wordings and then discarded.
+    """
+    if specific_code_seen:
+        return admitted
+    from litellm.exceptions import ContextWindowExceededError
+
+    source: Literal["sdk_class", "message_pattern"]
+    if isinstance(exc, ContextWindowExceededError):
+        source = "sdk_class"
+    else:
+        status_code = exc.status_code
+        if type(status_code) is not int or status_code != 400:
+            return admitted
+        message = exc.message
+        if type(message) is not str:
+            return admitted
+        lowered = message.lower()
+        if not any(pattern in lowered for pattern in _CONTEXT_LENGTH_MESSAGE_PATTERNS):
+            return admitted
+        source = "message_pattern"
+    return SafeRequestRejection(reason_code="context_length_exceeded", reason_disposition="retained", reason_source=source)
+
+
+def is_context_length_rejection(exc: BaseException | None) -> bool:
+    """Whether a provider failure is a recognised rejection of the request for exceeding the model's context limit."""
+    if exc is None:
+        return False
+    failure = classify_provider_failure(exc)
+    return (
+        failure is not None and failure.request_rejection is not None and failure.request_rejection.reason_code == "context_length_exceeded"
+    )
 
 
 def classify_provider_failure(exc: BaseException) -> ProviderFailure | None:
@@ -136,11 +198,12 @@ def classify_provider_failure(exc: BaseException) -> ProviderFailure | None:
     if isinstance(exc, AuthenticationError):
         return ProviderFailure(ComposerLLMCallStatus.AUTH_ERROR, "auth", False)
     if isinstance(exc, OpenAIBadRequestError):
+        admitted, specific_code_seen = _admit_request_rejection(exc)
         return ProviderFailure(
             ComposerLLMCallStatus.BAD_REQUEST_ERROR,
             "bad_request",
             False,
-            _admit_request_rejection(exc),
+            _admit_context_length_evidence(exc, admitted, specific_code_seen=specific_code_seen),
         )
     if isinstance(exc, APITimeoutError):
         return ProviderFailure(ComposerLLMCallStatus.TIMEOUT, "timeout", False)

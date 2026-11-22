@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, replace
-from typing import cast
+from typing import Final, cast
 
 from pydantic import JsonValue
 
@@ -16,6 +16,16 @@ from elspeth.web.composer.tools._common import ToolResult
 from elspeth.web.composer.tools._generation_responses import PREVIEW_PIPELINE_RESPONSE_CONTRACT
 from elspeth.web.composer.tools._registry import response_contract_for
 from elspeth.web.composer.tools.generation import MalformedSourceProofClaim, ProofUnavailable, _admit_source_proof_claims
+
+BOUNDED_READS_WITHOUT_VALIDATION: Final[tuple[str, ...]] = ("get_blob_content", "read_attachment")
+"""Lookups whose successful result carries no ``validation`` block.
+
+Both bound their WHOLE serialized result (a 4,096-byte page; the complete-attachment limit) and
+measure it with this module's serializer. While they carried the saved graph's validation, that
+block spent the bound: a graph with enough standing errors left no room for a single character,
+so a prompt file could not be read until an unrelated graph error was repaired. The result of a
+file read is the file's content and its paging facts; the saved graph's findings are not part of it.
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,9 +45,18 @@ class AdmittedDiscoveryResult:
             raise FrameworkBugError("Discovery response encoder produced an invalid root")
         return replace(self.result, data=wire)
 
+    def omits_validation(self) -> bool:
+        """True when this result goes out without the saved graph's ``validation`` block.
+
+        Only a success: a refusal's own entry is the answer to the call and stays.
+        """
+        return self.result.success and any(self.contract is response_contract_for(name) for name in BOUNDED_READS_WITHOUT_VALIDATION)
+
     def to_dict(self) -> dict[str, JsonValue]:
         # Build only the legacy envelope, with no traversal of original data.
         envelope = cast(dict[str, JsonValue], self.result.to_dict(include_data=False))
+        if self.omits_validation():
+            del envelope["validation"]
         if self.response is None:
             return envelope
         payload: dict[str, JsonValue] = {}

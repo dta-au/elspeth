@@ -22,11 +22,13 @@ import { useSessionStore } from "@/stores/sessionStore";
 import { useBlobStore } from "@/stores/blobStore";
 import {
   claimWorkspaceViewIntent,
+  dispatchAuthoringToggleIntent,
   isCurrentWorkspaceViewIntent,
 } from "@/lib/composer-events";
+import { AuthoringPaneToggle } from "./AuthoringPaneToggle";
 import { ComposerWorkspace } from "./ComposerWorkspace";
 import { useWorkspacePaneController } from "./WorkspacePaneContext";
-import { useCollapsedAuthoringStatus } from "./useCollapsedAuthoringStatus";
+import type { CollapsedAuthoringStatus } from "./useCollapsedAuthoringStatus";
 import { WORKSPACE_LAYOUT_STORAGE_KEY } from "./useWorkspacePaneState";
 
 class ControllableResizeObserver implements ResizeObserver {
@@ -83,21 +85,40 @@ interface WorkspaceFixtureProps {
   authoring?: ReactNode;
   artifact?: ReactNode;
   actionBar?: ReactNode;
-  collapsedStatus?: {
-    text: string;
-    tone: "neutral" | "busy" | "error";
-  };
+  collapsedStatus?: CollapsedAuthoringStatus;
+}
+
+/** The artifact host's title bar, as ArtifactWorkspace renders it: the Show
+ *  control opens the bar while the conversation is hidden. */
+function ArtifactTitleBar({ children }: { children: ReactNode }) {
+  return (
+    <>
+      <div className="artifact-workspace-toolbar">
+        <AuthoringPaneToggle placement="artifact" />
+        <h2>Pipeline</h2>
+      </div>
+      {children}
+    </>
+  );
+}
+
+function workspaceElement(props: WorkspaceFixtureProps = {}) {
+  return (
+    <ComposerWorkspace
+      authoring={props.authoring ?? <button type="button">Author control</button>}
+      artifact={
+        <ArtifactTitleBar>
+          {props.artifact ?? <button type="button">Artifact control</button>}
+        </ArtifactTitleBar>
+      }
+      actionBar={props.actionBar ?? <button type="button">Primary action</button>}
+      collapsedStatus={props.collapsedStatus}
+    />
+  );
 }
 
 function renderWorkspace(props: WorkspaceFixtureProps = {}) {
-  return render(
-    <ComposerWorkspace
-      authoring={props.authoring ?? <button type="button">Author control</button>}
-      artifact={props.artifact ?? <button type="button">Artifact control</button>}
-      actionBar={props.actionBar ?? <button type="button">Primary action</button>}
-      collapsedStatus={props.collapsedStatus}
-    />,
-  );
+  return render(workspaceElement(props));
 }
 
 function emitWidth(width: number): HTMLElement {
@@ -124,9 +145,9 @@ describe("ComposerWorkspace", () => {
     useBlobStore.getState().activateSession("session-1");
     renderWorkspace({ authoring: <button type="button" data-chat-input>Chat input</button> });
     emitWidth(1280);
-    expect(screen.getByRole("button", { name: "Restore authoring pane" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Show conversation" })).toBeInTheDocument();
     act(() => useBlobStore.getState().revealBlob("session-1", "file-1", "prompt.txt"));
-    expect(screen.queryByRole("button", { name: "Restore authoring pane" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Show conversation" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Chat input" })).not.toHaveFocus();
   });
 
@@ -169,10 +190,8 @@ describe("ComposerWorkspace", () => {
 
   it("renders the required semantic DOM order and one named pane of each kind", () => {
     renderWorkspace();
-    const root = screen.getByTestId("composer-workspace");
+    const root = emitWidth(1280);
 
-    // Task A: the pipeline-column bar follows authoring in DOM order so its
-    // first control is the next Tab stop after the conversation's last one.
     expect([...root.children].map((child) => child.getAttribute("data-workspace-part")))
       .toEqual([
         "view-tabs",
@@ -187,59 +206,43 @@ describe("ComposerWorkspace", () => {
     expect(
       screen.getAllByRole("region", { name: "Pipeline artifact", hidden: true }),
     ).toHaveLength(1);
-    const authoringRegion = screen.getByRole("region", {
-      name: "Authoring pane",
-      hidden: true,
-    });
-    const artifactRegion = screen.getByRole("region", {
-      name: "Pipeline artifact",
-      hidden: true,
-    });
-    const artifactContent = within(artifactRegion).getByText("Artifact control");
+    const authoringRegion = screen.getByRole("region", { name: "Authoring pane" });
+    const artifactRegion = screen.getByRole("region", { name: "Pipeline artifact" });
     const action = screen.getByText("Primary action");
-    const collapse = screen.getByRole("button", {
-      name: "Collapse authoring pane",
-    });
-    // Both bar occupants stay outside the pane regions, with the disclosure
-    // first in its row even though CSS places the row under the pipeline.
+    const hide = screen.getByRole("button", { name: "Hide conversation" });
+    // 2026-11-20: the Hide control opens the conversation's title bar; the
+    // bar row under the pipeline holds workflow actions only.
+    expect(authoringRegion).toContainElement(hide);
     expect(artifactRegion).not.toContainElement(action);
-    expect(authoringRegion).not.toContainElement(collapse);
     const barSlot = root.querySelector('[data-workspace-part="action-bar"]');
-    expect(barSlot).not.toBeNull();
     expect(barSlot).toContainElement(action);
-    expect(barSlot).toContainElement(collapse);
-    expect(authoringRegion.closest('[data-workspace-part="authoring"]')?.nextElementSibling)
-      .toBe(barSlot);
-    expect(barSlot?.nextElementSibling).toHaveAttribute("data-workspace-part", "separator");
-    expect(barSlot?.firstElementChild).toContainElement(collapse);
-    expect(
-      collapse.compareDocumentPosition(artifactContent) & Node.DOCUMENT_POSITION_FOLLOWING,
-    ).not.toBe(0);
-    expect(
-      collapse.compareDocumentPosition(action) & Node.DOCUMENT_POSITION_FOLLOWING,
-    ).not.toBe(0);
+    expect(barSlot).not.toContainElement(hide);
+    expect(barSlot?.querySelector("button[aria-controls]")).toBeNull();
+    expect(screen.getAllByRole("button", { name: /conversation$/ })).toEqual([hide]);
   });
 
-  it("tabs directly from the conversation's last control to the pane toggle", async () => {
+  it("puts the Hide control first in the conversation's tab order", async () => {
     const user = userEvent.setup();
     renderWorkspace({ authoring: <textarea aria-label="Message box" /> });
     emitWidth(1280);
-    screen.getByRole("textbox", { name: "Message box" }).focus();
+    document.body.focus();
 
     await user.tab();
 
-    expect(screen.getByRole("button", { name: "Collapse authoring pane" })).toHaveFocus();
+    expect(screen.getByRole("button", { name: "Hide conversation" })).toHaveFocus();
+    await user.tab();
+    expect(screen.getByRole("textbox", { name: "Message box" })).toHaveFocus();
   });
 
-  it("titles the authoring pane 'Conversation' and leaves the pane toggles in the bar row", async () => {
-    // ARGOnite: each pane is a card with a title bar. The bar carries the
-    // pane's name only; the stable toggle stays in the bar row, with its
-    // collapsed status beside it — neither moves
-    // into the title bar (design doc: pane collapse controls stay in the
-    // workspace action bar).
+  it("opens each title bar with the toggle: Hide in Conversation, Show in Pipeline", async () => {
+    // By design, the toggle sits at the left end of the title bar.
+    // Open, the Hide control is the first thing in the conversation's bar;
+    // collapsed, the Show control is the first thing in the pipeline's bar,
+    // so it stays on the same spot on screen (geometry pinned in
+    // tests/e2e/composer-workspace-geometry.spec.ts).
     const user = userEvent.setup();
     renderWorkspace();
-    const root = emitWidth(1280);
+    emitWidth(1280);
     const authoringRegion = screen.getByRole("region", { name: "Authoring pane" });
     const title = within(authoringRegion).getByRole("heading", {
       level: 2,
@@ -248,18 +251,21 @@ describe("ComposerWorkspace", () => {
     const header = title.closest("header");
     expect(header).toHaveClass("workspace-pane-header");
     expect(header?.parentElement).toBe(authoringRegion);
-    // The title bar precedes the pane body (it is not inside the tabpanel).
     expect(header?.nextElementSibling).toHaveClass("workspace-authoring-body");
 
-    const barSlot = root.querySelector('[data-workspace-part="action-bar"]');
-    const collapse = screen.getByRole("button", { name: "Collapse authoring pane" });
-    expect(barSlot).toContainElement(collapse);
-    expect(header).not.toContainElement(collapse);
+    const hide = screen.getByRole("button", { name: "Hide conversation" });
+    expect(header?.firstElementChild).toBe(hide);
+    expect(hide.nextElementSibling).toBe(title);
 
-    await user.click(collapse);
-    const restore = screen.getByRole("button", { name: "Restore authoring pane" });
-    expect(restore.closest(".workspace-collapsed-affordance")).not.toBeNull();
-    expect(restore.closest(".workspace-pane-header")).toBeNull();
+    await user.click(hide);
+    const show = screen.getByRole("button", { name: "Show conversation" });
+    const pipelineBar = show.closest(".artifact-workspace-toolbar");
+    expect(pipelineBar).not.toBeNull();
+    expect(pipelineBar?.firstElementChild).toBe(show);
+    expect(header).not.toContainElement(show);
+    expect(
+      screen.queryByRole("button", { name: "Hide conversation", hidden: true }),
+    ).toBeNull();
   });
 
   it("names the authoring title bar from authoringTitle when a host supplies one", () => {
@@ -281,44 +287,48 @@ describe("ComposerWorkspace", () => {
   });
 
   it.each([
-    // width, collapse?, narrow view, expected: toggle shown, bar shown
-    [1280, false, "compose", true, true],
-    [1280, true, "compose", true, true],
-    [959, false, "compose", true, false],
-    [959, false, "pipeline", false, true],
-    [959, true, "compose", true, false],
-    [959, true, "pipeline", false, true],
+    // width, stored collapsed?, narrow view, expected toggle, bar shown
+    [1280, false, "compose", "Hide conversation", true],
+    [1280, true, "compose", "Show conversation", true],
+    [959, false, "compose", null, false],
+    [959, false, "pipeline", null, true],
+    [959, true, "compose", null, false],
+    [959, true, "pipeline", null, true],
   ] as const)(
-    "shows the bar row's occupants by state: %ipx collapsed=%s view=%s",
-    async (width, collapsed, view, toggleShown, barShown) => {
-      // Task A: the same toggle occupies the pipeline-column row in both
-      // states; narrow Compose keeps it available alongside collapsed status.
+    "renders the toggle and the action row by state: %ipx collapsed=%s view=%s",
+    async (width, collapsed, view, toggleName, barShown) => {
+      // Under 960px the Compose / Pipeline tabs switch views, so no toggle
+      // renders and a stored collapsed preference is ignored (Compose shows
+      // the conversation). Narrow Compose has no action row at all.
+      localStorage.setItem(
+        WORKSPACE_LAYOUT_STORAGE_KEY,
+        JSON.stringify({
+          version: 1,
+          preferredAuthoringWidth: 420,
+          authoringCollapsed: collapsed,
+        }),
+      );
       const user = userEvent.setup();
-      renderWorkspace();
+      renderWorkspace({ authoring: <p>Conversation text</p> });
       const root = emitWidth(width);
-      if (collapsed) {
-        await user.click(
-          screen.getByRole("button", { name: "Collapse authoring pane" }),
-        );
-      }
       if (view === "pipeline") {
         await user.click(screen.getByRole("tab", { name: "Pipeline" }));
       }
 
-      // By attribute, not by role: the accessible-name algorithm returns ""
-      // for a node that is itself `hidden`, so a role query cannot find the
-      // control in the states where it is hidden — which are the states
-      // under test.
-      const toggle = root.querySelector(
-        `button[aria-label="${collapsed ? "Restore" : "Collapse"} authoring pane"]`,
-      );
-      expect(toggle).not.toBeNull();
-      const action = screen.getByText("Primary action");
+      const toggles = root.querySelectorAll("[data-authoring-toggle]");
+      if (toggleName === null) {
+        expect(toggles).toHaveLength(0);
+      } else {
+        expect(toggles).toHaveLength(1);
+        expect(toggles[0]).toHaveAccessibleName(toggleName);
+        expect(toggles[0].closest("[hidden], [inert]")).toBeNull();
+      }
       const barSlot = root.querySelector('[data-workspace-part="action-bar"]');
-      expect(toggle!.closest("[hidden]") === null).toBe(toggleShown);
-      expect(action.closest("[hidden]") === null).toBe(barShown);
-      expect(barSlot).not.toBeNull();
-      expect(barSlot!.hasAttribute("hidden")).toBe(!toggleShown && !barShown);
+      expect(barSlot!.hasAttribute("hidden")).toBe(!barShown);
+      if (width < 960 && view === "compose") {
+        expect(screen.getByText("Conversation text")).toBeVisible();
+        expect(root).not.toHaveAttribute("data-authoring-collapsed");
+      }
     },
   );
 
@@ -382,7 +392,7 @@ describe("ComposerWorkspace", () => {
     emitWidth(1280);
 
     expect(
-      screen.queryByRole("button", { name: "Restore authoring pane" }),
+      screen.queryByRole("button", { name: "Show conversation" }),
     ).not.toBeInTheDocument();
     expect(
       screen.getByRole("region", { name: "Authoring pane" }),
@@ -405,7 +415,7 @@ describe("ComposerWorkspace", () => {
     emitWidth(1280);
 
     expect(
-      screen.getByRole("button", { name: "Restore authoring pane" }),
+      screen.getByRole("button", { name: "Show conversation" }),
     ).toBeInTheDocument();
   });
 
@@ -557,7 +567,7 @@ describe("ComposerWorkspace", () => {
     const draft = screen.getByRole("button", { name: "Live draft" });
     const authoringLiveStatus = screen.getByRole("status");
     await user.click(
-      screen.getByRole("button", { name: "Collapse authoring pane" }),
+      screen.getByRole("button", { name: "Hide conversation" }),
     );
 
     const hiddenAuthoring = document.querySelector<HTMLElement>(
@@ -590,7 +600,7 @@ describe("ComposerWorkspace", () => {
     expect(screen.getAllByRole("status")).toEqual([projection]);
     expect(projection).toHaveTextContent("2 unread acknowledgements");
     const restore = screen.getByRole("button", {
-      name: "Restore authoring pane",
+      name: "Show conversation",
     });
     expect(restore).toHaveAccessibleDescription("2 unread acknowledgements");
     expect(restore).toHaveFocus();
@@ -598,7 +608,7 @@ describe("ComposerWorkspace", () => {
 
     await user.click(restore);
     const collapse = screen.getByRole("button", {
-      name: "Collapse authoring pane",
+      name: "Hide conversation",
     });
     expect(collapse).toHaveFocus();
     expect(document.activeElement?.closest("[hidden], [inert]")).toBeNull();
@@ -614,165 +624,223 @@ describe("ComposerWorkspace", () => {
     ).toMatchObject({ authoringCollapsed: false });
   });
 
-  it("keeps one focused toggle while its disclosure name and chevron change", async () => {
-    // 2026-08-15 UX review: the full-text secondary-chrome collapse button
-    // read as a sixth action-bar button. Both controls are now icon-only
-    // (chevrons pointing the way the pane moves), keep their full names as
-    // aria-label + title, and carry aria-expanded/aria-controls so the
-    // disclosure state is machine-readable.
+  it("moves focus to the counterpart control and flips the disclosure name and chevron", async () => {
+    // Two instances now (one per title bar), so the clicked control unmounts
+    // on every flip and focus must land on its counterpart, never on body.
     const user = userEvent.setup();
     renderWorkspace({});
     emitWidth(1280);
 
-    const collapse = screen.getByRole("button", {
-      name: "Collapse authoring pane",
-    });
-    expect(collapse).toHaveAttribute("aria-expanded", "true");
-    expect(collapse).toHaveAttribute("aria-controls", "workspace-authoring-pane");
-    expect(collapse).toHaveAttribute("title", "Collapse authoring pane");
-    expect(
-      collapse.querySelector('svg[data-icon="chevrons-left"]'),
-    ).not.toBeNull();
-    // Icon-only: the visible label is gone; the accessible name survives via
-    // aria-label (pinned by every getByRole lookup in this file).
-    expect(collapse.textContent).toBe("");
+    const hide = screen.getByRole("button", { name: "Hide conversation" });
+    expect(hide).toHaveAttribute("aria-expanded", "true");
+    expect(hide).toHaveAttribute("aria-controls", "workspace-authoring-pane");
+    expect(hide).toHaveAttribute("aria-keyshortcuts", "Control+Backslash");
+    expect(hide).toHaveAttribute("title", "Hide conversation (Ctrl+\\)");
+    expect(hide).not.toHaveAttribute("aria-describedby");
+    expect(hide.querySelector('svg[data-icon="chevrons-left"]')).not.toBeNull();
+    expect(hide.textContent).toBe("");
 
-    await user.click(collapse);
+    await user.click(hide);
 
-    const restore = screen.getByRole("button", {
-      name: "Restore authoring pane",
-    });
-    expect(restore).toBe(collapse);
-    expect(restore).toHaveFocus();
-    expect(restore).toHaveAttribute("aria-expanded", "false");
-    expect(restore).toHaveAttribute("aria-controls", "workspace-authoring-pane");
-    expect(restore).toHaveAttribute("title", "Restore authoring pane");
-    expect(
-      restore.querySelector('svg[data-icon="chevrons-right"]'),
-    ).not.toBeNull();
-    expect(restore.textContent).toBe("");
+    const show = screen.getByRole("button", { name: "Show conversation" });
+    expect(show).not.toBe(hide);
+    expect(hide.isConnected).toBe(false);
+    expect(show).toHaveFocus();
+    expect(show).toHaveAttribute("aria-expanded", "false");
+    expect(show).toHaveAttribute("aria-controls", "workspace-authoring-pane");
+    // Nothing unread and a neutral status: no badge, no status line in the
+    // tooltip.
+    expect(show).toHaveAttribute("title", "Show conversation (Ctrl+\\)");
+    expect(show.querySelector('svg[data-icon="chevrons-right"]')).not.toBeNull();
+    expect(show.querySelector(".workspace-pane-toggle-badge")).toBeNull();
     const status = screen.getByRole("status");
-    expect(restore.nextElementSibling).toBe(status);
-    expect(restore).toHaveAttribute("aria-describedby", status.id);
-    // aria-controls must reference a real element — the pane stays in the
-    // DOM (hidden) while collapsed.
+    expect(show.nextElementSibling).toBe(status);
+    expect(status).toHaveClass("visually-hidden");
+    expect(show).toHaveAttribute("aria-describedby", status.id);
     expect(document.getElementById("workspace-authoring-pane")).not.toBeNull();
 
-    await user.click(restore);
+    await user.click(show);
 
-    expect(screen.getByRole("button", { name: "Collapse authoring pane" })).toBe(collapse);
-    expect(collapse).toHaveFocus();
-    expect(collapse).toHaveAttribute("aria-expanded", "true");
-    expect(collapse).not.toHaveAttribute("aria-describedby");
-    expect(collapse.querySelector('svg[data-icon="chevrons-left"]')).not.toBeNull();
+    const hideAgain = screen.getByRole("button", { name: "Hide conversation" });
+    expect(hideAgain).toHaveFocus();
+    expect(hideAgain).toHaveAttribute("aria-expanded", "true");
+    expect(screen.queryByRole("status")).toBeNull();
   });
 
-  it("renders an App-owned collapsed projection inside the pane provider and resets it on restore", async () => {
+  it("toggles on Ctrl+\\ and keeps focus where it was when that stays visible", async () => {
+    const user = userEvent.setup();
+    renderWorkspace({ authoring: <textarea data-chat-input aria-label="Chat input" /> });
+    const root = emitWidth(1280);
+    const artifactControl = screen.getByRole("button", { name: "Artifact control" });
+    artifactControl.focus();
+
+    act(() => dispatchAuthoringToggleIntent());
+    expect(root).toHaveAttribute("data-authoring-collapsed", "true");
+    expect(artifactControl).toHaveFocus();
+
+    act(() => dispatchAuthoringToggleIntent());
+    expect(root).not.toHaveAttribute("data-authoring-collapsed");
+    expect(artifactControl).toHaveFocus();
+
+    // From inside the conversation, hiding it rescues focus to Show.
+    const input = screen.getByRole("textbox", { name: "Chat input" });
+    await user.click(input);
+    act(() => dispatchAuthoringToggleIntent());
+    expect(screen.getByRole("button", { name: "Show conversation" })).toHaveFocus();
+  });
+
+  it("switches the narrow views on Ctrl+\\, focusing the selected tab", () => {
+    renderWorkspace();
+    emitWidth(720);
+    act(() => dispatchAuthoringToggleIntent());
+    expect(screen.getByRole("tab", { name: "Pipeline" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("tab", { name: "Pipeline" })).toHaveFocus();
+    act(() => dispatchAuthoringToggleIntent());
+    expect(screen.getByRole("tab", { name: "Compose" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("tab", { name: "Compose" })).toHaveFocus();
+    expect(screen.getByTestId("composer-workspace")).not.toHaveAttribute(
+      "data-authoring-collapsed",
+    );
+  });
+
+  it("names the toggle after a host's authoringTitle", async () => {
+    const user = userEvent.setup();
+    render(
+      <ComposerWorkspace
+        authoring={<p>Run output</p>}
+        artifact={<ArtifactTitleBar>{null}</ArtifactTitleBar>}
+        actionBar={null}
+        authoringTitle="Run results"
+      />,
+    );
+    emitWidth(1280);
+    await user.click(screen.getByRole("button", { name: "Hide run results" }));
+    expect(screen.getByRole("button", { name: "Show run results" })).toHaveFocus();
+  });
+
+  it("projects the live status from the session store and resets it on restore", async () => {
     const user = userEvent.setup();
     // compositionStateLoaded models a hydrated session: the unread
     // projection deliberately ignores deltas measured against a
-    // pre-hydration (empty) store, so a live-update fixture must mark the
-    // history as loaded the way selectSession's fetch does.
+    // pre-hydration (empty) store.
     useSessionStore.setState({
       activeSessionId: "session-1",
       messages: [],
       compositionStateLoaded: true,
+      isComposing: false,
+      error: null,
     });
 
-    function ContextStatus() {
-      const { state } = useWorkspacePaneController();
-      const status = useCollapsedAuthoringStatus({
-        activeSessionId: "session-1",
-        authoringCollapsed: state.authoringCollapsed,
-      });
-      return <span data-tone={status.tone}>{status.text}</span>;
-    }
-
-    renderWorkspace({ collapsedStatus: <ContextStatus /> as never });
+    renderWorkspace();
     emitWidth(1280);
-    await user.click(
-      screen.getByRole("button", { name: "Collapse authoring pane" }),
-    );
+    await user.click(screen.getByRole("button", { name: "Hide conversation" }));
     act(() =>
       useSessionStore.setState({
-        messages: [{ id: "message-1", role: "assistant" } as never],
+        messages: [
+          { id: "message-1", role: "assistant" } as never,
+          { id: "message-2", role: "assistant" } as never,
+        ],
       }),
     );
-    expect(screen.getByRole("status")).toHaveTextContent("1 new message");
+    const show = screen.getByRole("button", { name: "Show conversation" });
+    expect(screen.getByRole("status")).toHaveTextContent("2 new messages");
+    expect(show).toHaveAccessibleDescription("2 new messages");
+    expect(show).toHaveAttribute(
+      "title",
+      "Show conversation (Ctrl+\\)\n2 new messages",
+    );
+    const badge = show.querySelector(".workspace-pane-toggle-badge--count");
+    expect(badge).toHaveTextContent("2");
+    expect(badge).toHaveAttribute("aria-hidden", "true");
+    // The accessible name stays the label; the count is not read twice.
+    expect(show).toHaveAccessibleName("Show conversation");
 
-    await user.click(
-      screen.getByRole("button", { name: "Restore authoring pane" }),
-    );
-    await user.click(
-      screen.getByRole("button", { name: "Collapse authoring pane" }),
-    );
+    await user.click(show);
+    await user.click(screen.getByRole("button", { name: "Hide conversation" }));
     expect(screen.getByRole("status")).toHaveTextContent(
       "Authoring pane collapsed",
     );
+    expect(
+      screen
+        .getByRole("button", { name: "Show conversation" })
+        .querySelector(".workspace-pane-toggle-badge"),
+    ).toBeNull();
   });
 
-  it("maps App-owned ReactNode tones onto the collapsed affordance border", () => {
+  it.each([
+    [1, "1"],
+    [9, "9"],
+    [12, "9+"],
+  ])("caps the unread badge: %i reads %s", async (count, text) => {
+    const user = userEvent.setup();
+    renderWorkspace({
+      collapsedStatus: { text: `${count} new messages`, tone: "busy", unreadCount: count },
+    });
+    emitWidth(1280);
+    await user.click(screen.getByRole("button", { name: "Hide conversation" }));
+    const show = screen.getByRole("button", { name: "Show conversation" });
+    expect(show.querySelector(".workspace-pane-toggle-badge--count")).toHaveTextContent(
+      new RegExp(`^${text.replace("+", "\\+")}$`),
+    );
+    expect(show.querySelector(".workspace-pane-toggle-badge--dot")).toBeNull();
+  });
+
+  it.each([
+    ["Waiting for ELSPETH", "busy", "busy"],
+    ["Authoring failed", "error", "error"],
+    ["New response available", "neutral", null],
+  ] as const)("projects collapsed status updates: %s", async (text, tone, dot) => {
+    const user = userEvent.setup();
+    const view = renderWorkspace({ collapsedStatus: { text, tone } });
+    emitWidth(1280);
+    await user.click(screen.getByRole("button", { name: "Hide conversation" }));
+
+    const show = screen.getByRole("button", { name: "Show conversation" });
+    const status = screen.getByRole("status");
+    expect(status).toHaveTextContent(text);
+    expect(status).toHaveAttribute("data-tone", tone);
+    const dotBadge = show.querySelector(".workspace-pane-toggle-badge--dot");
+    const alertBadge = show.querySelector(".workspace-pane-toggle-badge--alert");
+    // Shape and glyph, not colour alone: busy is a bare dot, error a "!" pill.
+    const badge = dot === "error" ? alertBadge : dotBadge;
+    if (dot === null) {
+      expect(dotBadge).toBeNull();
+      expect(alertBadge).toBeNull();
+      expect(show).toHaveAttribute("title", "Show conversation (Ctrl+\\)");
+    } else {
+      expect(badge).toHaveAttribute("data-tone", dot);
+      expect(badge).toHaveAttribute("aria-hidden", "true");
+      expect(badge).toHaveTextContent(dot === "error" ? /^!$/ : /^$/);
+      expect(dot === "error" ? dotBadge : alertBadge).toBeNull();
+      expect(show).toHaveAttribute("title", `Show conversation (Ctrl+\\)\n${text}`);
+    }
+
+    view.rerender(
+      workspaceElement({ collapsedStatus: { text: `${text} updated`, tone } }),
+    );
+    expect(screen.getByRole("status")).toHaveTextContent(`${text} updated`);
+    expect(
+      screen.getByRole("button", { name: "Show conversation" }),
+    ).toHaveAccessibleDescription(`${text} updated`);
+  });
+
+  it("maps the badge tones onto distinct tokens", () => {
     const css = readFileSync(
       join(process.cwd(), "src/components/workspace/workspace.css"),
       "utf8",
     );
-
-    // elspeth-7161879770: "busy" and "warning" shared the amber border, so an
-    // in-flight readiness check was indistinguishable from a real warning.
-    // Assert the two tones resolve to DIFFERENT tokens rather than pinning
-    // busy's hue by name — the point of the split is that the three tones stay
-    // mutually distinguishable, wherever the palette moves next. The rule
-    // pinned here is the production form (:has() reaching the App-owned
-    // status span — the wrapper's own data-tone only exists for the
-    // {text, tone} projection shape) applied to the RESTORE BUTTON's border:
-    // on desktop the collapsed status text is sr-only and the banner box is
-    // stripped, so the button border is the only visible tone signal
-    // (operator decision 2026-08-15).
-    const toneBorder = (tone: string): string => {
+    const dotFill = (selector: string): string => {
       const rule = new RegExp(
-        `\\.workspace-collapsed-affordance:has\\(\\.workspace-collapsed-status\\[data-tone="${tone}"\\]\\) \\.workspace-restore-control \\{\\n  border-color: ([^;]+);\\n\\}`,
+        `^${selector.replace(/[.[\]="-]/g, "\\$&")} \\{[^}]*background-color: ([^;]+);`,
+        "m",
       ).exec(css);
-      if (rule === null) {
-        throw new Error(`No collapsed-affordance rule for tone ${tone}`);
-      }
+      if (rule === null) throw new Error(`No rule for ${selector}`);
       return rule[1];
     };
-
-    const tones = ["busy", "error"].map(toneBorder);
-    expect(new Set(tones).size).toBe(tones.length);
-    expect(toneBorder("busy")).not.toContain("--color-warning");
-    expect(toneBorder("error")).toBe("var(--color-error, currentcolor)");
-  });
-
-  it.each([
-    ["Waiting for ELSPETH", "busy"],
-    ["Proposal review pending", "busy"],
-    ["Authoring failed", "error"],
-    ["New response available", "neutral"],
-  ] as const)("projects collapsed status updates: %s", async (text, tone) => {
-    const user = userEvent.setup();
-    const view = renderWorkspace({ collapsedStatus: { text, tone } });
-    emitWidth(1280);
-    await user.click(
-      screen.getByRole("button", { name: "Collapse authoring pane" }),
-    );
-
-    const status = screen.getByRole("status");
-    expect(status).toHaveTextContent(text);
-    expect(status.closest("[data-tone]")).toHaveAttribute("data-tone", tone);
-
-    view.rerender(
-      <ComposerWorkspace
-        authoring={<button type="button">Author control</button>}
-        artifact={<button type="button">Artifact control</button>}
-        actionBar={<button type="button">Primary action</button>}
-        collapsedStatus={{ text: `${text} updated`, tone }}
-      />,
-    );
-    expect(screen.getByRole("status")).toHaveTextContent(`${text} updated`);
-    expect(
-      screen.getByRole("button", { name: "Restore authoring pane" }),
-    ).toHaveAccessibleDescription(`${text} updated`);
+    // busy and error must stay distinguishable (elspeth-7161879770 lineage).
+    expect(dotFill(".workspace-pane-toggle-badge--dot")).toBe("var(--color-info)");
+    expect(dotFill(".workspace-pane-toggle-badge--alert")).toBe("var(--color-error)");
+    expect(dotFill(".workspace-pane-toggle-badge--count")).toBe("var(--color-info)");
   });
 
   it("preserves authoring and artifact subtree identity across layout changes", async () => {
@@ -793,10 +861,10 @@ describe("ComposerWorkspace", () => {
     });
     emitWidth(1280);
     await user.click(
-      screen.getByRole("button", { name: "Collapse authoring pane" }),
+      screen.getByRole("button", { name: "Hide conversation" }),
     );
     await user.click(
-      screen.getByRole("button", { name: "Restore authoring pane" }),
+      screen.getByRole("button", { name: "Show conversation" }),
     );
     emitWidth(959);
     await user.click(screen.getByRole("tab", { name: "Pipeline" }));
@@ -898,41 +966,48 @@ describe("ComposerWorkspace", () => {
     expect(document.activeElement?.closest("[hidden], [inert]")).toBeNull();
   });
 
-  it("keeps a visible Restore target focused when collapsed Compose enters narrow mode", async () => {
+  it("moves focus from a focused Show control to the Compose tab when the layout goes narrow", async () => {
+    // Under 960px the toggle is not rendered and the stored collapsed
+    // preference is ignored, so Compose shows the conversation; focus must
+    // not fall to the document body with the control.
     const user = userEvent.setup();
     renderWorkspace();
     emitWidth(1280);
-    await user.click(
-      screen.getByRole("button", { name: "Collapse authoring pane" }),
-    );
-    const restore = screen.getByRole("button", {
-      name: "Restore authoring pane",
-    });
-    restore.focus();
+    await user.click(screen.getByRole("button", { name: "Hide conversation" }));
+    const show = screen.getByRole("button", { name: "Show conversation" });
+    expect(show).toHaveFocus();
 
     emitWidth(959);
 
-    expect(screen.getByRole("tab", { name: "Compose" })).toBeVisible();
-    expect(restore).toHaveFocus();
-    expect(document.activeElement?.closest("[hidden], [inert]")).toBeNull();
+    expect(show.isConnected).toBe(false);
+    expect(screen.getByRole("tab", { name: "Compose" })).toHaveFocus();
+    expect(screen.getByRole("region", { name: "Authoring pane" })).toBeVisible();
+
+    // Back on a wide layout the stored preference applies again.
+    emitWidth(1280);
+    expect(screen.getByRole("button", { name: "Show conversation" })).toBeInTheDocument();
   });
 
   it.each([false, true])(
-    "repairs toggle focus when retained narrow Pipeline hides it, collapsed=%s",
+    "repairs toggle focus when retained narrow Pipeline returns, collapsed=%s",
     async (collapsed) => {
       const user = userEvent.setup();
       renderWorkspace();
       emitWidth(720);
       await user.click(screen.getByRole("tab", { name: "Pipeline" }));
       emitWidth(1280);
-      const toggle = screen.getByRole("button", { name: "Collapse authoring pane" });
-      if (collapsed) await user.click(toggle);
+      if (collapsed) {
+        await user.click(screen.getByRole("button", { name: "Hide conversation" }));
+      }
+      const toggle = screen.getByRole("button", {
+        name: collapsed ? "Show conversation" : "Hide conversation",
+      });
       toggle.focus();
       expect(toggle).toHaveFocus();
 
       emitWidth(720);
 
-      expect(toggle.closest("[hidden]")).not.toBeNull();
+      expect(toggle.isConnected).toBe(false);
       expect(screen.getByRole("tab", { name: "Pipeline" })).toHaveFocus();
       expect(document.activeElement?.closest("[hidden], [inert]")).toBeNull();
     },
@@ -951,56 +1026,18 @@ describe("ComposerWorkspace", () => {
     expect(document.activeElement?.closest("[hidden], [inert]")).toBeNull();
   });
 
-  it("keeps the narrow collapsed affordance in the bar directly after authoring", async () => {
-    const user = userEvent.setup();
-    renderWorkspace({
-      collapsedStatus: { text: "Authoring paused", tone: "busy" },
-    });
-    const root = emitWidth(320);
-    await user.click(
-      screen.getByRole("button", { name: "Collapse authoring pane" }),
-    );
-
-    const tablist = screen.getByRole("tablist", { name: "Workspace view" });
-    const restore = screen.getByRole("button", {
-      name: "Restore authoring pane",
-    });
-    const authoringSlot = root.querySelector(
-      '[data-workspace-part="authoring"]',
-    );
-    expect(authoringSlot).not.toBeNull();
-    const barSlot = authoringSlot?.nextElementSibling;
-    expect(barSlot).toHaveAttribute("data-workspace-part", "action-bar");
-    expect(barSlot).toContainElement(restore);
-    expect(authoringSlot).not.toContainElement(restore);
-    expect(tablist).not.toContainElement(restore);
-    expect(restore.nextElementSibling).toBe(screen.getByRole("status"));
-    expect(
-      tablist.compareDocumentPosition(authoringSlot as Node) &
-        Node.DOCUMENT_POSITION_FOLLOWING,
-    ).not.toBe(0);
-  });
-
-  it("keeps the collapsed toggle in the same content-sized bar flow without an overlay reservation", () => {
+  it("keeps the action row free of pane controls and overlay reservations", () => {
     const css = readFileSync(
       join(process.cwd(), "src/components/workspace/workspace.css"),
       "utf8",
     );
-    // Task A: collapse changes neither the row tracks nor the toggle's flow.
     expect(css).not.toMatch(
       /data-authoring-collapsed="true"\]:not\(\[data-layout-mode="narrow"\]\)\s*\{[^}]*grid-template-rows/s,
     );
-    expect(css).toMatch(
-      /^\.workspace-pane-controls\s*\{[^}]*margin:\s*var\(--workspace-bar-inset\) 0;/ms,
-    );
-    expect(css).not.toMatch(
-      /^\.workspace-(?:pane-controls|collapsed-affordance)\s*\{[^}]*(?:z-index|position):/ms,
-    );
     expect(css).not.toMatch(/^\.workspace-action-bar\s*\{[^}]*(?:z-index|position):/ms);
     expect(css).not.toContain("--z-panel-controls-raised");
-    expect(css).not.toMatch(
-      /data-authoring-collapsed="true"\]:not\(\[data-layout-mode="narrow"\]\)\s+\.workspace-action-bar\s*\{[^}]*padding-left:/s,
-    );
+    expect(css).not.toContain("workspace-pane-controls");
+    expect(css).not.toContain("workspace-collapsed-affordance");
     expect(css).toMatch(
       /^\.workspace-action-bar-slot\s*\{[^}]*display:\s*flex;[^}]*align-items:\s*center;/ms,
     );
@@ -1032,6 +1069,29 @@ describe("ComposerWorkspace", () => {
     expect(observations[observations.length - 1]).toBe("graph");
   });
 
+  it("brings the graph tab back when a prompt edit is requested from another artifact tab", () => {
+    // The file manager's "Edit prompt" only sends the request; the inspector
+    // that hosts the editor lives on the graph tab, so the workspace must show it.
+    function ActiveTabProbe() {
+      const controller = useWorkspacePaneController();
+      return (
+        <button type="button" onClick={() => controller.actions.selectArtifactTab("run")}>
+          Active tab: {controller.state.activeArtifactTab}
+        </button>
+      );
+    }
+    useSessionStore.setState({ activeSessionId: "session-1" });
+    useBlobStore.getState().activateSession("session-1");
+    renderWorkspace({ artifact: <ActiveTabProbe /> });
+    emitWidth(1280);
+    fireEvent.click(screen.getByRole("button", { name: "Active tab: graph" }));
+    expect(screen.getByRole("button", { name: "Active tab: run" })).toBeInTheDocument();
+    act(() => useBlobStore.getState().requestPromptEdit("llm", "prompt_template"));
+    expect(screen.getByRole("button", { name: "Active tab: graph" })).toBeInTheDocument();
+    // The request is left for the inspector's editor to consume.
+    expect(useBlobStore.getState().editRequest).toMatchObject({ nodeId: "llm", fieldPath: "prompt_template" });
+  });
+
   it("lets an artifact intent reveal the narrow Pipeline view", () => {
     function ArtifactIntent() {
       const controller = useWorkspacePaneController();
@@ -1057,20 +1117,29 @@ describe("ComposerWorkspace", () => {
     "restores collapsed authoring before focusing chat at %ipx",
     async (width) => {
       const user = userEvent.setup();
+      localStorage.setItem(
+        WORKSPACE_LAYOUT_STORAGE_KEY,
+        JSON.stringify({
+          version: 1,
+          preferredAuthoringWidth: 420,
+          authoringCollapsed: true,
+        }),
+      );
       renderWorkspace({
         authoring: <textarea data-chat-input aria-label="Chat input" />,
       });
-      const root = emitWidth(width);
-      await user.click(
-        screen.getByRole("button", { name: "Collapse authoring pane" }),
-      );
+      emitWidth(width);
       if (width < 960) {
         await user.click(screen.getByRole("tab", { name: "Pipeline" }));
       }
 
       act(() => window.dispatchEvent(new Event("elspeth:focus-authoring")));
 
-      expect(root).not.toHaveAttribute("data-authoring-collapsed");
+      // Ctrl+/ clears the stored preference too, so the next wide layout
+      // shows the conversation.
+      expect(
+        JSON.parse(localStorage.getItem(WORKSPACE_LAYOUT_STORAGE_KEY) ?? "null"),
+      ).toMatchObject({ authoringCollapsed: false });
       if (width < 960) {
         expect(screen.getByRole("tab", { name: "Compose" })).toHaveAttribute(
           "aria-selected",
@@ -1078,6 +1147,10 @@ describe("ComposerWorkspace", () => {
         );
       }
       expect(screen.getByRole("textbox", { name: "Chat input" })).toHaveFocus();
+      emitWidth(1280);
+      expect(screen.getByTestId("composer-workspace")).not.toHaveAttribute(
+        "data-authoring-collapsed",
+      );
     },
   );
 
@@ -1104,13 +1177,13 @@ describe("ComposerWorkspace", () => {
 
     const beforeCollapse = claimWorkspaceViewIntent();
     await user.click(
-      screen.getByRole("button", { name: "Collapse authoring pane" }),
+      screen.getByRole("button", { name: "Hide conversation" }),
     );
     expect(isCurrentWorkspaceViewIntent(beforeCollapse)).toBe(false);
 
     const beforeRestore = claimWorkspaceViewIntent();
     await user.click(
-      screen.getByRole("button", { name: "Restore authoring pane" }),
+      screen.getByRole("button", { name: "Show conversation" }),
     );
     expect(isCurrentWorkspaceViewIntent(beforeRestore)).toBe(false);
   });

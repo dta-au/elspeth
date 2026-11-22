@@ -114,7 +114,11 @@ test.describe("composer reflow geometry (elspeth-7aa9787996)", () => {
     });
   }
 
-  test("skip link preserves the live session and a collapsed narrow Pipeline view", async ({
+  // Under 960px there is no hide/show toggle; the Compose / Pipeline tabs
+  // switch views. A collapsed preference stored on a wide window is ignored
+  // there, so Compose never opens empty, and it is kept for the next wide
+  // layout (5349e38d9).
+  test("skip link preserves the live session and the narrow Pipeline view under a stored collapsed preference", async ({
     page,
   }) => {
     await page.setViewportSize({ width: 900, height: 720 });
@@ -134,7 +138,9 @@ test.describe("composer reflow geometry (elspeth-7aa9787996)", () => {
       await composer.goto(sessionId);
       const workspace = composer.workspace();
       await expect(workspace).toHaveAttribute("data-layout-mode", "narrow");
-      await expect(workspace).toHaveAttribute("data-authoring-collapsed", "true");
+      await expect(workspace).not.toHaveAttribute("data-authoring-collapsed");
+      await expect(composer.composeViewTab()).toHaveAttribute("aria-selected", "true");
+      await expect(composer.authoringPane()).toBeVisible();
       const pipelineTab = composer.pipelineViewTab();
       await pipelineTab.click();
       await expect(pipelineTab).toHaveAttribute("aria-selected", "true");
@@ -156,7 +162,15 @@ test.describe("composer reflow geometry (elspeth-7aa9787996)", () => {
       await expect(page).toHaveURL(new RegExp(`#/${sessionId}$`));
       await expect(sessionSwitcher).toBeVisible();
       await expect(pipelineTab).toHaveAttribute("aria-selected", "true");
+      await expect(workspace).not.toHaveAttribute("data-authoring-collapsed");
+
+      // The stored preference survives the narrow layout and applies again
+      // once the window is wide.
+      await page.setViewportSize({ width: 1280, height: 720 });
+      await expect(workspace).toHaveAttribute("data-layout-mode", "desktop");
       await expect(workspace).toHaveAttribute("data-authoring-collapsed", "true");
+      await expect(composer.authoringPane()).toBeHidden();
+      await expect(composer.restoreAuthoring()).toBeVisible();
     } finally {
       await deleteWorkspaceScenario(page, sessionId);
     }

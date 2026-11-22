@@ -40,6 +40,7 @@ from elspeth.web.sessions.models import (
     token_usage_ledger_table,
 )
 from tests.helpers.composer_operations import message_body, submit_and_settle
+from tests.helpers.prompt_guard_audit import assert_prompt_guard_wire_payload
 from tests.integration.web.composer.test_freeform_pipeline_planner import _routing_terminal_response
 from tests.unit.web.sessions.test_routes import _make_app
 from tests.unit.web.sessions.test_run_composer_turn import _TestSnapshotFactory
@@ -112,12 +113,13 @@ async def test_referential_planner_threshold_retirement_preserves_first_candidat
     settings = app.state.settings
     shield_payloads = []
     guard_bindings = []
+    inspected_documents = []
     events = []
 
     def shield_response(request):
         assert request.url.host == "st02-shield.example.test"
         payload = json.loads(request.content)
-        assert payload["userPrompt"] == _CURRENT_REQUEST
+        assert_prompt_guard_wire_payload(payload, user_prompt=_CURRENT_REQUEST)
         shield_payloads.append(payload)
         return httpx.Response(
             200,
@@ -136,11 +138,17 @@ async def test_referential_planner_threshold_retirement_preserves_first_candidat
 
         async def inspect(request):
             # Forward to the actual Azure adapter; this observer supplies no verdict.
-            assert any(prior_request in document for document in request.documents)
-            guard_bindings.append(request.request_hash)
+            # One check sends the user prompt and its new documents in separate
+            # calls under one request hash; record one guard event per check.
+            if request.documents:
+                inspected_documents.extend(request.documents)
+            else:
+                assert request.user_prompt == _CURRENT_REQUEST
             decision = await real_inspect(request)
             assert decision.disposition == "allow"
-            events.append("guard")
+            if not guard_bindings or guard_bindings[-1] != request.request_hash:
+                guard_bindings.append(request.request_hash)
+                events.append("guard")
             return decision
 
         monkeypatch.setattr(client, "inspect", inspect)
@@ -238,6 +246,7 @@ async def test_referential_planner_threshold_retirement_preserves_first_candidat
         assert len(checks) == ordinal + 1
         assert checks[-1]["mode"] == "required" and checks[-1]["disposition"] == "allow"
         assert checks[-1]["role"] == "composer" and checks[-1]["request_hash"] == guard_bindings[-1]
+        assert any(prior_request in document for document in inspected_documents)
         assert checks[-1]["operation_id"] == pending.operation_id == custody.context.fence.operation_id
         assert checks[-1]["operation_epoch"] == pending.operation_epoch == custody.context.fence.operation_epoch
         assert pending.identity_id == "alice" and pending.session_id == str(session.id)

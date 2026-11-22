@@ -300,7 +300,7 @@ from elspeth.web.sessions.prompt_file_approval import (
     PromptFileApprovalRequest,
     PromptFileApprovalStale,
     assert_prompt_file_approvals,
-    record_prompt_file_approval,
+    record_prompt_file_card_approvals,
 )
 from elspeth.web.sessions.prompt_file_review import (
     PromptFileReviewStale,
@@ -373,6 +373,7 @@ from elspeth.web.sessions.protocol import (
     PipelineProposalRejectionReason,
     PipelineProposalSettlementResult,
     PreparedInterpretationEventDraft,
+    PromptFileTooLargeError,
     PromptReviewAnchorRequiredError,
     PromptReviewAnchorUnexpectedError,
     PromptReviewSnapshotMissingError,
@@ -949,8 +950,32 @@ class SessionServiceImpl:
         *,
         session_id: UUID,
         anchor_id: UUID,
+        graph_review: Literal["projected", "stored"],
     ) -> tuple[CompositionStateRecord | None, CompositionStateRecord | None]:
-        """Capture a short read-only state view before blob custody acquisition."""
+        """Capture a short read-only (anchor, live) state view before blob custody acquisition.
+
+        The pair is the expectation a caller compares, under the SESSIONS
+        lock, with the rows it then reads, so the blob snapshot and the
+        validation built from this view are proved to come from the locked
+        rows. ``graph_review`` has no default: each caller must name the kind
+        of record its locked re-read produces, or the comparison fails by
+        construction.
+
+        * ``"stored"`` returns the raw immutable rows. The pending-review
+          create path compares with the coordination repository's
+          ``_verified_state`` reads, which never project a committed graph
+          review.
+        * ``"projected"`` returns the effective records (stored row plus any
+          committed graph review projected onto ``composer_meta`` and
+          ``review_projection``). The resolve path compares with its own
+          ``_effective_state_record_on_connection`` reads under the lock.
+
+        Either kind selects the same inline blobs: ``_inline_preflight_config``
+        reads only ``sources``, ``nodes`` and ``outputs``, which the
+        projection never changes.
+        """
+        if graph_review not in ("projected", "stored"):
+            raise ValueError(f"graph_review must be 'projected' or 'stored', got {graph_review!r}")
         sid = str(session_id)
 
         def _read() -> tuple[CompositionStateRecord | None, CompositionStateRecord | None]:
@@ -966,6 +991,11 @@ class SessionServiceImpl:
                     .order_by(desc(composition_states_table.c.version))
                     .limit(1)
                 ).one_or_none()
+                if graph_review == "stored":
+                    return (
+                        self._row_to_state_record(anchor_row) if anchor_row is not None else None,
+                        self._row_to_state_record(live_row) if live_row is not None else None,
+                    )
                 return (
                     self._effective_state_record_on_connection(conn, anchor_row) if anchor_row is not None else None,
                     self._effective_state_record_on_connection(conn, live_row) if live_row is not None else None,
@@ -4885,17 +4915,58 @@ class SessionServiceImpl:
         state: CompositionStateData | None,
         actor: str,
         session_operation_context: SessionOperationContext,
+        prepared_interpretations: tuple[PreparedInterpretationEventDraft, ...] = (),
     ) -> CompositionProposalRecord:
-        """Accept one ordinary proposal and its optional new state atomically."""
+        """Accept one ordinary proposal, its optional new state and that state's review cards atomically.
+
+        ``prepared_interpretations`` is the review cohort of the NEW state.
+        Its cards are written by the standalone event writer, under this
+        accept's transaction, after the state row they bind to. A storage
+        failure or an unexpected writer refusal therefore rolls back the
+        state, the proposal's terminal event and every earlier card: the
+        proposal stays pending and can be accepted again.
+
+        Two writer refusals leave one card out and keep the accept, exactly
+        as the post-commit surfacer treats them after an auto-commit
+        (``composer/interpretation_surfacing.py``): a prompt file over an
+        inline cap, for which no card is owed because it can never run, and
+        any refusal of a card that is not a prompt review. The writer raises
+        both before its first write for that card, so nothing partial is
+        left. Either site stays fail-closed at the run-time gate. Each card
+        left out is logged once, after the commit, with the same line the
+        post-commit surfacer writes (``composer_interpretation.surface_skipped``):
+        identifiers and the exception class only, never the refusal message,
+        which embeds the user term.
+        """
         if expected_current_state_id is not None and type(expected_current_state_id) is not UUID:
             raise TypeError("expected_current_state_id must be an exact UUID or None")
         if state is not None and type(state) is not CompositionStateData:
             raise TypeError("state must be an exact CompositionStateData or None")
+        if type(prepared_interpretations) is not tuple or any(
+            type(draft) is not PreparedInterpretationEventDraft for draft in prepared_interpretations
+        ):
+            raise TypeError("prepared_interpretations must be an exact tuple of PreparedInterpretationEventDraft")
+        if prepared_interpretations and state is None:
+            raise ValueError("review cards require the new state they bind to")
         sid = str(session_id)
         pid = str(proposal_id)
         event_id = str(uuid.uuid4())
+        state_id: UUID | None = None
+        prepared_events: list[_PreparedPendingInterpretation] = []
+        if state is not None:
+            state_id = uuid.uuid4()
+            prepared_events = await self._prepare_pending_interpretation_cohort(
+                session_id=session_id,
+                state_id=state_id,
+                state=state,
+                interpretations=prepared_interpretations,
+                session_operation_context=session_operation_context,
+                created_at=self._now(),
+            )
+        skipped_cards: list[tuple[str, InterpretationKind, str]] = []
 
         def _sync() -> CompositionProposalRecord:
+            skipped_cards.clear()
             with (
                 self._session_process_locked_begin(sid) as conn,
                 self._session_write_lock(conn, sid),
@@ -4906,15 +4977,57 @@ class SessionServiceImpl:
                     expected_kind=SessionOperationKind.PROPOSAL,
                 ) as transaction,
             ):
-                return transaction.composer.accept_pending_ordinary_proposal(
+                accepted = transaction.composer.accept_pending_ordinary_proposal(
                     proposal_id=pid,
                     event_id=event_id,
                     expected_current_state_id=expected_current_state_id,
                     state=state,
                     actor=actor,
+                    state_id=state_id,
                 )
+                if prepared_events:
+                    # Same PROPOSAL authority and connection as the state
+                    # insert above: the cards commit with the head or not at all.
+                    interpretation_state = _RepositoryMutationState(
+                        conn,
+                        session_id=sid,
+                        database_now=database_now(conn),
+                        operation_context=session_operation_context,
+                    )
+                    try:
+                        interpretation_mutations = _RepositoryInterpretationMutations(interpretation_state)
+                        for prepared_event in prepared_events:
+                            try:
+                                interpretation_mutations.create_or_reconcile_pending(prepared_event.command, prepared_event.validator)
+                            except InterpretationResolveError as refusal:
+                                if (
+                                    prepared_event.command.kind is InterpretationKind.LLM_PROMPT_TEMPLATE
+                                    and type(refusal) is not PromptFileTooLargeError
+                                ):
+                                    raise
+                                skipped_cards.append(
+                                    (prepared_event.command.affected_node_id, prepared_event.command.kind, type(refusal).__name__)
+                                )
+                    finally:
+                        interpretation_state._close()
+                return accepted
 
-        return cast(CompositionProposalRecord, await self._run_sync(_sync))
+        committed = cast(CompositionProposalRecord, await self._run_sync(_sync))
+        # Diagnostic of a skipped write, not audit: the head's review debt is
+        # the durable record and the run-time gate still refuses the site.
+        # Logged only once the accept has committed, so a rolled-back accept
+        # never reports a skip that did not happen.
+        for affected_node_id, kind, error_class in skipped_cards:
+            self._log.warning(
+                "composer_interpretation.surface_skipped",
+                session_id=sid,
+                composition_state_id=str(state_id),
+                affected_node_id=affected_node_id,
+                kind=kind.value,
+                repair_mode=False,
+                error_class=error_class,
+            )
+        return committed
 
     async def has_applied_blob_proposal_effect(
         self,
@@ -5090,7 +5203,16 @@ class SessionServiceImpl:
             expected_anchor: CompositionStateRecord | None = None
             expected_live: CompositionStateRecord | None = None
             if proposed_state is None:
-                expected_anchor, expected_live = await self._preflight_state_pair(session_id=session_id, anchor_id=composition_state_id)
+                # STORED, not projected: the coordination repository plans
+                # against raw locked rows (``_verified_state``), and
+                # ``assert_source_state`` compares this pair with them by
+                # strict equality. A projected pair differs by construction
+                # once a committed graph review is bound to the anchor or live
+                # state, which refused every reconcile of a file-held prompt
+                # review after a no-edit turn's END review (HTTP 500).
+                expected_anchor, expected_live = await self._preflight_state_pair(
+                    session_id=session_id, anchor_id=composition_state_id, graph_review="stored"
+                )
                 snapshot_config = self._inline_preflight_config(expected_live) if expected_live is not None else None
             else:
                 snapshot_config = self._inline_preflight_config(proposed_state)
@@ -5248,9 +5370,13 @@ class SessionServiceImpl:
         expected_live: CompositionStateRecord | None = None
         inline_blob_snapshot: SessionInlineBlobSnapshot | None = None
         if preflight_event is not None and preflight_event.composition_state_id is not None:
+            # PROJECTED: the locked re-read below builds both records with
+            # ``_effective_state_record_on_connection`` and compares them with
+            # this pair by strict equality.
             expected_anchor, expected_live = await self._preflight_state_pair(
                 session_id=session_id,
                 anchor_id=UUID(preflight_event.composition_state_id),
+                graph_review="projected",
             )
             if expected_live is not None:
                 inline_blob_snapshot = await self._prepare_inline_blob_snapshot(
@@ -5474,9 +5600,13 @@ class SessionServiceImpl:
                             raise PromptFileReviewStale(node_id=event_row.affected_node_id) from exc
                         if file_snapshot is None:
                             raise PromptFileApprovalStale()
-                        for binding in file_snapshot.bindings:
-                            approval = record_prompt_file_approval(
-                                conn,
+                        # One pass for the whole card: the node, its snapshot
+                        # (every file's bytes) and the card are verified once;
+                        # each binding's blob row, marker and snapshot entry per
+                        # binding. Per-binding re-resolution was O(N^2) here.
+                        record_prompt_file_card_approvals(
+                            conn,
+                            [
                                 PromptFileApprovalRequest(
                                     session_id=session_id,
                                     node_id=event_row.affected_node_id,
@@ -5485,11 +5615,12 @@ class SessionServiceImpl:
                                     content_sha256=binding.content_sha256,
                                     actor_user_id=principal_user_id,
                                     trigger=PromptApprovalTrigger.CARD,
-                                ),
-                                now=now,
-                            )
-                            if approval.event_id != event_id:
-                                raise PromptFileApprovalStale()
+                                )
+                                for binding in file_snapshot.bindings
+                            ],
+                            now=now,
+                            expected_event_id=event_id,
+                        )
                     # Skeleton the user actually reviewed (the surfacing state's
                     # node). The acceptance gate compares this to the live
                     # skeleton so a sibling vague_term baked between surfacing and
@@ -6605,28 +6736,24 @@ class SessionServiceImpl:
             ),
         )
 
-    async def save_composition_state_with_interpretations(
+    async def _prepare_pending_interpretation_cohort(
         self,
-        session_id: UUID,
-        state: CompositionStateData,
         *,
-        provenance: CompositionStateProvenance,
+        session_id: UUID,
+        state_id: UUID,
+        state: CompositionStateData,
         interpretations: tuple[PreparedInterpretationEventDraft, ...],
         session_operation_context: SessionOperationContext,
-    ) -> CompositionStateRecord:
-        """Commit one imported state and its review-event cohort atomically.
+        created_at: datetime,
+    ) -> list[_PreparedPendingInterpretation]:
+        """Prepare one new state's review cards before its write transaction.
 
-        The prepared writer closures reuse the exact standalone event-writer
-        boundary, but execute under the state insert's transaction.  Any
-        writer rejection or storage failure therefore rolls back the state and
-        every earlier event in the cohort.  Opt-out auto-resolution may append
-        derived versions in the same transaction; return that final head.
+        Each package is the standalone event writer's own command and
+        validator, bound to ``state_id`` before that row exists. Everything
+        slow (principal, plugin snapshot, inline file bytes) is read here,
+        outside the session lock; the caller then runs the packages on the
+        connection that inserts the state.
         """
-        if type(interpretations) is not tuple or any(type(draft) is not PreparedInterpretationEventDraft for draft in interpretations):
-            raise TypeError("interpretations must be an exact tuple of PreparedInterpretationEventDraft")
-        sid = str(session_id)
-        state_id = uuid.uuid4()
-        now = self._now()
         prepared_events: list[_PreparedPendingInterpretation] = []
         publication: _PendingInterpretationPublication | None = None
         for index, draft in enumerate(interpretations):
@@ -6653,15 +6780,47 @@ class SessionServiceImpl:
                 # list_interpretation_events orders by created_at then id.
                 # Preserve the generic surfacer's deterministic call order
                 # without depending on random event UUID ordering.
-                created_at=now + timedelta(microseconds=index),
+                created_at=created_at + timedelta(microseconds=index),
                 _event_id=draft.event_id,
                 _prepare_only=True,
                 proposed_state=state,
                 _publication=publication,
             )
             if type(prepared) is not _PreparedPendingInterpretation:
-                raise AuditIntegrityError("imported interpretation preparation did not return an exact package")
+                raise AuditIntegrityError("interpretation cohort preparation did not return an exact package")
             prepared_events.append(prepared)
+        return prepared_events
+
+    async def save_composition_state_with_interpretations(
+        self,
+        session_id: UUID,
+        state: CompositionStateData,
+        *,
+        provenance: CompositionStateProvenance,
+        interpretations: tuple[PreparedInterpretationEventDraft, ...],
+        session_operation_context: SessionOperationContext,
+    ) -> CompositionStateRecord:
+        """Commit one imported state and its review-event cohort atomically.
+
+        The prepared writer closures reuse the exact standalone event-writer
+        boundary, but execute under the state insert's transaction.  Any
+        writer rejection or storage failure therefore rolls back the state and
+        every earlier event in the cohort.  Opt-out auto-resolution may append
+        derived versions in the same transaction; return that final head.
+        """
+        if type(interpretations) is not tuple or any(type(draft) is not PreparedInterpretationEventDraft for draft in interpretations):
+            raise TypeError("interpretations must be an exact tuple of PreparedInterpretationEventDraft")
+        sid = str(session_id)
+        state_id = uuid.uuid4()
+        now = self._now()
+        prepared_events = await self._prepare_pending_interpretation_cohort(
+            session_id=session_id,
+            state_id=state_id,
+            state=state,
+            interpretations=interpretations,
+            session_operation_context=session_operation_context,
+            created_at=now,
+        )
 
         def _sync() -> CompositionStateRecord:
             with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):

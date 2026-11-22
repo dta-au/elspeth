@@ -792,3 +792,124 @@ def test_admission_and_read_require_invoked_helper_body(module_factory: Callable
             _model_for_handler(handler(module))
         assert not evidence
         assert any("deferred" in finding for finding in unresolved)
+
+
+_CUSTODY_PRELUDE = (
+    "from elspeth.web.composer.tools.sessions import _custody_arguments\n"
+    "class Model(BaseModel):\n    first: str\n"
+    "def sink(payload):\n    return payload\n"
+)
+
+
+def test_read_named_custody_copy_is_classified_not_scanned(module_factory: Callable[[str, str], ModuleType]) -> None:
+    from scripts.cicd.composer_wire_census import _reads_for_handler
+
+    module = module_factory(
+        "read_custody_named",
+        _CUSTODY_PRELUDE + "def arbitrary_name(arguments):\n    first = arguments['first']\n"
+        "    custody = _custody_arguments(arguments, None)\n    return sink(custody), first\n",
+    )
+    evidence, _, unresolved = _reads_for_handler(handler(module))
+    assert {item.field for item in evidence} == {"first"}
+    assert not unresolved
+
+
+# Each of three direct-path custody copies, plus
+# whole-input forwards into anything that is not the one named custody function,
+# must stay unresolved with its own message. A walker entry widened to a name,
+# a body shape or a general whole-input helper turns one of these green.
+@pytest.mark.parametrize(
+    "module_body,reason",
+    [
+        pytest.param(
+            "def arbitrary_name(arguments):\n    custody_args = dict(arguments)\n"
+            "    custody_args['source'] = {'blob_id': 'stored'}\n    return sink(custody_args)\n",
+            "input binding rebound or mutated: custody_args",
+            id="attempt-1-copy-then-item-assignment",
+        ),
+        pytest.param(
+            "def build(arguments, prepared):\n    return {**arguments, 'source': {'blob_id': prepared}}\n"
+            "def arbitrary_name(arguments):\n    return sink(build(arguments, None))\n",
+            "unsupported whole-input construction",
+            id="attempt-2-unpacking-builder",
+        ),
+        pytest.param(
+            "def build(arguments, prepared):\n    return dict(arguments, source={'blob_id': prepared})\n"
+            "def arbitrary_name(arguments):\n    return sink(build(arguments, None))\n",
+            "unsupported callable receiving input provenance",
+            id="attempt-3-dict-keyword-builder",
+        ),
+        pytest.param(
+            "def _custody_arguments(arguments, prepared_inline_blob):\n"
+            "    return dict(arguments, source={'blob_id': prepared_inline_blob})\n"
+            "def arbitrary_name(arguments):\n    return sink(_custody_arguments(arguments, None))\n",
+            "unsupported callable receiving input provenance",
+            id="same-name-impostor",
+        ),
+        pytest.param(
+            "def arbitrary_name(arguments):\n    return sink(_custody_arguments(arguments, arguments))\n",
+            "unsupported custody argument forwarding",
+            id="named-function-given-input-twice",
+        ),
+        pytest.param(
+            "def arbitrary_name(arguments):\n    return sink(_custody_arguments(arguments=arguments, prepared_inline_blob=None))\n",
+            "unsupported custody argument forwarding",
+            id="named-function-by-keyword",
+        ),
+        pytest.param(
+            "def arbitrary_name(arguments):\n    return sink(_custody_arguments(Model.model_validate(arguments), None))\n",
+            "unsupported custody argument forwarding",
+            id="named-function-given-admitted-model",
+        ),
+    ],
+)
+def test_read_custody_classification_refuses_everything_else(
+    module_factory: Callable[[str, str], ModuleType], module_body: str, reason: str
+) -> None:
+    from scripts.cicd.composer_wire_census import _reads_for_handler
+
+    module = module_factory("read_custody_refused", _CUSTODY_PRELUDE + module_body)
+    evidence, _, unresolved = _reads_for_handler(handler(module))
+    assert not evidence
+    assert any(finding.endswith(f": {reason}") for finding in unresolved), unresolved
+
+
+def test_read_set_pipeline_direct_path_fields_are_read_in_candidate_builder() -> None:
+    from scripts.cicd import composer_wire_census as census
+
+    # MEASURED on base 019a98e15: the set_pipeline READ set, all extracted in
+    # build_set_pipeline_candidate. The inline prompt limit adds no top-level key
+    # (its prompt fields live in nodes[].options), so the set is unchanged.
+    base_read = frozenset({"edges", "metadata", "nodes", "outputs", "source", "sources"})
+    builder = "elspeth.web.composer.tools.sessions.build_set_pipeline_candidate"
+    direct_path = "elspeth.web.composer.tools.sessions._execute_set_pipeline"
+    row = census.census_read_wire()["set_pipeline"]
+    assert not row.unresolved, row.unresolved
+    assert row.read == base_read == row.shipped
+    for field in base_read:
+        sites = [item for item in row.extractions if item.field == field]
+        assert any(item.site.rsplit(":", 1)[0] == builder and direct_path in item.callers for item in sites), (field, sites)
+    assert not any("_custody_arguments" in item.site for item in [*row.extractions, *row.presence])
+
+
+def test_read_named_custody_copy_reads_only_the_source_it_rewrites() -> None:
+    """The census does not scan the named copy, so its body may read nothing else."""
+    import ast
+    import inspect
+    import textwrap
+
+    from elspeth.web.composer.tools.sessions import _custody_arguments
+
+    function = ast.parse(textwrap.dedent(inspect.getsource(_custody_arguments))).body[0]
+    assert isinstance(function, ast.FunctionDef)
+    # The body only: the signature's type annotations are subscripts too.
+    tree = ast.Module(body=function.body, type_ignores=[])
+    keys = {node.slice.value for node in ast.walk(tree) if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant)}
+    non_literal_subscripts = [
+        node for node in ast.walk(tree) if isinstance(node, ast.Subscript) and not isinstance(node.slice, ast.Constant)
+    ]
+    attribute_calls = {node.func.attr for node in ast.walk(tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)}
+
+    assert keys == {"source", "inline_blob", "blob_id"}
+    assert non_literal_subscripts == []
+    assert attribute_calls == set()

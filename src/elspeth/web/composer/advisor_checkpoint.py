@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -13,6 +14,7 @@ from typing import TYPE_CHECKING, Any, Final, Literal, cast
 from openai import OpenAIError
 from pydantic import ValidationError as PydanticValidationError
 
+from elspeth.contracts.blobs import BlobServiceProtocol
 from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.composer_progress import ComposerProgressSink
@@ -26,6 +28,7 @@ from elspeth.contracts.prompt_guard import (
 )
 from elspeth.contracts.provider_rejection import SafeRequestRejection
 from elspeth.contracts.session_operation import SessionOperationContext
+from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.composer import advisor_context as _advisor_context
 from elspeth.web.composer import advisor_policy as _advisor_policy
 from elspeth.web.composer import provider_gateway
@@ -56,12 +59,26 @@ from elspeth.web.composer.advisor_output import (
     parse_advisor_checkpoint_response,
     sanitize_advisor_note,
 )
+from elspeth.web.composer.advisor_prompt_files import (
+    UNREAD_PROMPT_FILES,
+    AdvisorPromptFile,
+    AdvisorPromptFiles,
+    PromptFileKey,
+    read_advisor_prompt_files,
+)
 from elspeth.web.composer.advisor_request import build_advisor_request_options
-from elspeth.web.composer.advisor_transcript import AdvisorTranscriptOwner, AdvisorVisibleTranscript
+from elspeth.web.composer.advisor_transcript import (
+    AdvisorAnchorCall,
+    AdvisorPromptEstimate,
+    AdvisorTranscriptOwner,
+    AdvisorVisibleTranscript,
+    estimate_advisor_prompt_tokens,
+)
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.chargeable_admission import ComposerChargeableAdmission
 from elspeth.web.composer.invariants import InvariantError
 from elspeth.web.composer.llm_response_parsing import (
+    _hash_and_measure_request,
     attach_llm_calls,
     build_llm_call_record,
     safe_response_model,
@@ -90,7 +107,7 @@ from elspeth.web.composer.progress import advisor_checkpoint_progress_event, emi
 from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused, build_prompt_guard_mount
 from elspeth.web.composer.protocol import ComposerResult, ComposerSettings, ToolArgumentError
 from elspeth.web.composer.provider_context import capture_provider_context
-from elspeth.web.composer.provider_errors import ProviderRequestFailure, classify_provider_failure
+from elspeth.web.composer.provider_errors import ProviderRequestFailure, classify_provider_failure, is_context_length_rejection
 from elspeth.web.composer.provider_gateway import (
     _capture_composer_llm_completion_fields,
     _MalformedLLMResponseError,
@@ -120,6 +137,8 @@ if TYPE_CHECKING:
 
 _ADVISOR_RECENT_ERRORS_MAX_ITEMS: Final[int] = 5
 _ADVISOR_LIST_ITEM_MAX_CHARS: Final[int] = 2_000
+# Session operations whose read prompt-file facts are kept (most recent first out).
+_PROMPT_FILE_CACHE_OPERATIONS: Final[int] = 32
 
 
 def _compose_deadline_time() -> float:
@@ -242,8 +261,14 @@ class AdvisorCheckpointOwner:
         sessions_service: SessionServiceProtocol | None,
         chargeable_admission: ComposerChargeableAdmission,
         prompt_guard_mount: PromptGuardMount | None = None,
+        blob_service: BlobServiceProtocol | None = None,
     ) -> None:
         self._settings = settings
+        self._blob_service = blob_service
+        # Read file-held prompt facts, per session operation (one compose
+        # turn): a key selects exact bytes by digest, so a successful read
+        # stays true for the operation. Unavailable facts are read again.
+        self._prompt_file_cache: OrderedDict[SessionOperationContext, dict[PromptFileKey, AdvisorPromptFile]] = OrderedDict()
         self._composer_skill_text = composer_skill_text
         self._advisor_endpoint_base_url = advisor_endpoint_base_url
         self._advisor_endpoint_api_key = advisor_endpoint_api_key
@@ -257,6 +282,42 @@ class AdvisorCheckpointOwner:
         if self._sessions_service is None:
             raise RuntimeError("sessions_service not wired")
         return self._sessions_service
+
+    async def _advisor_prompt_files(
+        self, state: CompositionState, session_operation_context: SessionOperationContext | None
+    ) -> AdvisorPromptFiles:
+        """Facts (and, for files not recorded as the user's own writing, text) of every file-held prompt in ``state``.
+
+        Read in a worker thread under the caller's own session fence, before
+        any evidence is rendered, so the renderers stay pure. Each
+        ``(blob, digest, encoding)`` is read once per session operation.
+        Without a blob service or an operation context nothing can be read
+        and every file is stated as ``unavailable:no_reader``.
+        """
+        if self._blob_service is None or session_operation_context is None:
+            return UNREAD_PROMPT_FILES
+        keys = _advisor_context.advisor_prompt_file_keys(state)
+        if not keys:
+            return AdvisorPromptFiles(read=True)
+        if session_operation_context in self._prompt_file_cache:
+            self._prompt_file_cache.move_to_end(session_operation_context)
+        else:
+            self._prompt_file_cache[session_operation_context] = {}
+            while len(self._prompt_file_cache) > _PROMPT_FILE_CACHE_OPERATIONS:
+                self._prompt_file_cache.popitem(last=False)
+        cached = self._prompt_file_cache[session_operation_context]
+        missing = sorted(key for key in keys if key not in cached)
+        if missing:
+            fresh = await run_sync_in_worker(
+                read_advisor_prompt_files, missing, blob_service=self._blob_service, context=session_operation_context
+            )
+            for key, prompt_file in fresh.files.items():
+                if prompt_file.unavailable is None:
+                    cached[key] = prompt_file
+            files = {**{key: cached[key] for key in keys if key in cached}, **fresh.files}
+        else:
+            files = {key: cached[key] for key in keys}
+        return AdvisorPromptFiles(files=files, read=True)
 
     def _validate_advisor_arguments(self, arguments: dict[str, Any]) -> RequestAdvisorHintArgumentsModel | AdvisorArgumentRejection:
         """Admit complete public input before advisor budget or provider effects.
@@ -319,6 +380,7 @@ class AdvisorCheckpointOwner:
         abandonment_context: AdvisorAbandonmentReview | None = None,
         advisor_transcript: AdvisorVisibleTranscript | None = None,
         current_state: CompositionState | None = None,
+        session_operation_context: SessionOperationContext | None = None,
     ) -> _AdvisorCallOutcome:
         """Classify an advisor call without suppressing controlled-code faults.
 
@@ -354,6 +416,7 @@ class AdvisorCheckpointOwner:
                     current_state,
                     internal_request,
                     self._settings.composer_advisor_max_prompt_tokens * _advisor_context.ADVISOR_CHARS_PER_TOKEN,
+                    await self._advisor_prompt_files(current_state, session_operation_context),
                 )
                 internal_request["schema_excerpt"] = "".join(part.text for part in summary.values)
                 internal_request["_elspeth_advisor_summary_parts"] = summary
@@ -475,13 +538,11 @@ class AdvisorCheckpointOwner:
         # Checkpoint builders retain the complete required graph and fit only
         # optional additions. The public hint's allowance is not a graph cap.
 
+        # The user message's guard parts are rendered once, below, for the
+        # request actually sent; nothing before that reads them.
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_msg, PROMPT_GUARD_TRUST_KEY: PromptGuardTrust.INSTRUCTION},
-            {
-                "role": "user",
-                "content": user_msg,
-                PROMPT_GUARD_CONTENT_PARTS_KEY: _advisor_context.advisor_user_content_parts(arguments),
-            },
+            {"role": "user", "content": user_msg},
         ]
         if abandonment_review:
             review = arguments["abandonment_context"]
@@ -493,6 +554,45 @@ class AdvisorCheckpointOwner:
                 {"type": "text", "text": self._composer_skill_text, "cache_control": {"type": "ephemeral"}},
                 {"type": "text", "text": trigger_instructions},
             ]
+        # The visible transcript is the only part of an Advisor request that
+        # grows with the session: its earlier turns go by age, on every request
+        # (see ``AdvisorVisibleTranscript.by_age``). Every binding was taken on
+        # the complete transcript before this point; the request sent states
+        # what it leaves out. With no earlier turn nothing changes.
+        transcript = _advisor_context.advisor_request_transcript(arguments)
+        if transcript is not None:
+            unshaped = arguments
+
+            def bound(shaped: AdvisorVisibleTranscript) -> tuple[str, object]:
+                # Where this request carries its transcript: its publication review, or its own argument.
+                if "publication_review" in unshaped:
+                    return "publication_review", replace(unshaped["publication_review"], transcript=shaped)
+                return "advisor_transcript", shaped
+
+            def rendered(shaped: AdvisorVisibleTranscript) -> str:
+                key, value = bound(shaped)
+                return _advisor_context.build_advisor_user_message({**unshaped, key: value})
+
+            sent_transcript = self._advisor_transcript_by_age(
+                transcript,
+                render=rendered,
+                # Every message but the user message is fixed; sized once, as the call record sizes it.
+                fixed_bytes=_hash_and_measure_request(
+                    detach_prompt_guard_evidence([message for index, message in enumerate(messages) if index != 1]).messages, None
+                )[2].total_bytes,
+                recorder=recorder,
+            )
+            if sent_transcript is not transcript:
+                key, value = bound(sent_transcript)
+                arguments = {**unshaped, key: value}
+                user_msg = _advisor_context.build_advisor_user_message(arguments)
+        # Rendering the parts grows with the transcript: it runs in the worker
+        # pool so the event loop stays free for lease renewal and polls.
+        messages[1] = {
+            "role": "user",
+            "content": user_msg,
+            PROMPT_GUARD_CONTENT_PARTS_KEY: await run_sync_in_worker(_advisor_context.advisor_user_content_parts, arguments),
+        }
 
         started_at = datetime.now(UTC)
         started_ns = time.monotonic_ns()
@@ -609,7 +709,8 @@ class AdvisorCheckpointOwner:
             failure = classify_provider_failure(exc)
             status = failure.audit_status if failure is not None else ComposerLLMCallStatus.API_ERROR
             error_class = type(exc).__name__
-            error_message = type(exc).__name__
+            # As the provider gateway records it: a context-length rejection is named.
+            error_message = "context_length_exceeded" if is_context_length_rejection(exc) else error_class
             raise
         except _MalformedLLMResponseError as exc:
             status = ComposerLLMCallStatus.MALFORMED_RESPONSE
@@ -657,6 +758,7 @@ class AdvisorCheckpointOwner:
                             response_metadata=response_metadata,
                             error_class=error_class,
                             error_message=error_message,
+                            max_completion_tokens_requested=max_completion,
                             credential_surface="composer_advisor_response",
                             provider_custody=provider_custody,
                             private_request=private_request,
@@ -677,6 +779,70 @@ class AdvisorCheckpointOwner:
         if type(provider_owner) is not ProviderInvocationOwner or provider_owner.service is not self._require_sessions_service():
             raise AuditIntegrityError("Advisor invocation owner belongs to another exact service")
         return provider_owner.mint(ProviderInvocationFamily.ADVISOR)
+
+    def _advisor_transcript_by_age(
+        self,
+        transcript: AdvisorVisibleTranscript,
+        *,
+        render: Callable[[AdvisorVisibleTranscript], str],
+        fixed_bytes: int,
+        recorder: BufferingRecorder | None,
+    ) -> AdvisorVisibleTranscript:
+        """The transcript to send: earlier turns by age, priced; under pressure fewer.
+
+        ``render`` gives the user message a transcript would be sent in;
+        ``fixed_bytes`` sizes every other message. Together they measure the
+        request as the call record will (``request_byte_split.total_bytes`` of
+        the detached messages), priced against the earlier calls of this
+        session and the live calls of this turn
+        (:func:`estimate_advisor_prompt_tokens`). Only an estimate anchored on
+        a real call leaves more out when it is over
+        ``composer_context_max_prompt_tokens``: then the oldest older requests
+        go first, then the oldest whole turns, until it fits. The estimate decides only what is left out, never whether
+        the request goes: a request still over the limit with nothing left to
+        leave out is sent, and the provider judges its own limit. A transcript
+        shaped by age records the estimate, its source, the limit and whether
+        the estimate is over it (``over_estimate``) in its own payload, which
+        the retained request keeps. With no earlier turn the transcript is
+        returned unchanged, unless its estimate is over the limit: then it
+        carries the same record.
+        """
+        limit = self._settings.composer_context_max_prompt_tokens
+        this_turn = tuple(AdvisorAnchorCall.from_call(call) for call in recorder.llm_calls) if recorder is not None else ()
+
+        def priced(shaped: AdvisorVisibleTranscript) -> AdvisorPromptEstimate:
+            return estimate_advisor_prompt_tokens(
+                request_bytes=fixed_bytes + len(render(shaped).encode("utf-8")),
+                advisor_model=self._settings.composer_advisor_model,
+                earlier=transcript.anchor_calls,
+                this_turn=this_turn,
+            )
+
+        shaped = transcript.by_age()
+        estimate = priced(shaped)
+        counts = shaped.history_by_age
+        if estimate.anchored and estimate.tokens > limit and counts is not None:
+            # Leaving out one more request or turn only ever shrinks the request,
+            # so the fewest steps that fit are found by bisection.
+            older = counts.request_only
+
+            def step(index: int) -> AdvisorVisibleTranscript:
+                return transcript.by_age(older_left_out=min(index, older), whole_left_out=max(0, index - older))
+
+            low, high = 1, older + counts.whole
+            shaped = step(high)
+            estimate = priced(shaped)
+            while low < high and estimate.tokens <= limit:
+                middle = (low + high) // 2
+                candidate = step(middle)
+                candidate_estimate = priced(candidate)
+                if candidate_estimate.tokens <= limit:
+                    shaped, estimate, high = candidate, candidate_estimate, middle
+                else:
+                    low = middle + 1
+        if shaped is transcript and estimate.tokens <= limit:
+            return transcript
+        return shaped.with_prompt_estimate(estimate, limit_tokens=limit)
 
     @quota_provider_calls
     async def _call_advisor_with_audit_legacy(
@@ -739,6 +905,7 @@ class AdvisorCheckpointOwner:
         advisor_review_state: _AdvisorReviewState | None = None,
         publication_review: AdvisorPublicationReview | None = None,
         advisor_transcript: AdvisorVisibleTranscript | None = None,
+        prompt_files: AdvisorPromptFiles = UNREAD_PROMPT_FILES,
     ) -> dict[str, Any]:
         """Synthesize the (Tier-1, trusted) advisor ``arguments`` for a checkpoint.
 
@@ -756,7 +923,7 @@ class AdvisorCheckpointOwner:
         request, so its separate fallback is omitted rather than duplicated.
         Required request text is not part of the optional graph-prose allowance.
         """
-        pipeline_summary = _advisor_context.summarize_pipeline_for_advisor(state)
+        pipeline_summary = _advisor_context.summarize_pipeline_for_advisor(state, prompt_files)
         if publication_review is None and advisor_transcript is None and user_message is not None:
             advisor_transcript = AdvisorTranscriptOwner(request=user_message).snapshot()
         # Identity covers complete evidence, before optional prose fitting.
@@ -776,7 +943,7 @@ class AdvisorCheckpointOwner:
             }
             if advisor_transcript is not None:
                 early_arguments["advisor_transcript"] = advisor_transcript
-            summary_parts = _advisor_context.fit_advisor_checkpoint_summary(state, early_arguments, char_cap)
+            summary_parts = _advisor_context.fit_advisor_checkpoint_summary(state, early_arguments, char_cap, prompt_files)
             early_arguments["schema_excerpt"] = "".join(part.text for part in summary_parts.values)
             early_arguments["_elspeth_advisor_summary_parts"] = summary_parts
             return early_arguments
@@ -851,7 +1018,7 @@ class AdvisorCheckpointOwner:
             end_arguments["advisor_transcript"] = advisor_transcript
         elif user_message is not None and user_message.strip():
             end_arguments["user_message"] = user_message
-        summary_parts = _advisor_context.fit_advisor_checkpoint_summary(state, end_arguments, char_cap)
+        summary_parts = _advisor_context.fit_advisor_checkpoint_summary(state, end_arguments, char_cap, prompt_files)
         end_arguments["schema_excerpt"] = "".join(part.text for part in summary_parts.values)
         end_arguments["_elspeth_advisor_summary_parts"] = summary_parts
         return end_arguments
@@ -1332,6 +1499,7 @@ class AdvisorCheckpointOwner:
             )
 
         await emit_progress(progress, advisor_checkpoint_progress_event(phase))
+        prompt_files = await self._advisor_prompt_files(state, session_operation_context)
         try:
             arguments = self._build_checkpoint_arguments(
                 phase=phase,
@@ -1340,6 +1508,7 @@ class AdvisorCheckpointOwner:
                 advisor_review_state=advisor_review_state,
                 publication_review=publication_review,
                 advisor_transcript=advisor_transcript,
+                prompt_files=prompt_files,
             )
         except _advisor_context.AdvisorGraphCoverageUnavailable:
             return graph_coverage_withheld()
@@ -1352,6 +1521,26 @@ class AdvisorCheckpointOwner:
         last_request_failure: ProviderRequestFailure | None = None
         call_arguments: dict[str, Any] = arguments
         format_reprompt_pending = False
+        # The cap a reply of the last attempt ran out of before its verdict
+        # (finish reason ``length``), read from that attempt's call record.
+        last_cut_off_cap: int | None = None
+
+        def cut_off_cap(attempt_call_offset: int) -> int | None:
+            for call in recorder.llm_calls[attempt_call_offset:] if recorder is not None else ():
+                if call.finish_reason == "length":
+                    if call.max_completion_tokens_requested is None:
+                        raise AuditIntegrityError("Advisor call record lacks the completion cap it sent")
+                    return call.max_completion_tokens_requested
+            return None
+
+        def malformed_detail() -> str:
+            if last_cut_off_cap is None:
+                return _advisor_policy.ADVISOR_MALFORMED_USER_DETAIL
+            return _advisor_policy.advisor_reply_cut_off_detail(
+                cap=last_cut_off_cap,
+                planner_cap_applied=continuation_budget is not None
+                and continuation_budget.policy.max_completion_tokens < self._settings.composer_advisor_max_completion_tokens,
+            )
 
         def provider_dispatched() -> None:
             nonlocal provider_attempts, format_reprompt_sent
@@ -1367,7 +1556,7 @@ class AdvisorCheckpointOwner:
                 # The format instruction can change rendered budget overhead.
                 # Refit the same complete saved graph, never a fitted prefix.
                 try:
-                    summary_parts = _advisor_context.fit_advisor_checkpoint_summary(state, call_arguments, char_cap)
+                    summary_parts = _advisor_context.fit_advisor_checkpoint_summary(state, call_arguments, char_cap, prompt_files)
                 except _advisor_context.AdvisorGraphCoverageUnavailable:
                     return graph_coverage_withheld()
                 call_arguments = {
@@ -1423,6 +1612,7 @@ class AdvisorCheckpointOwner:
                     return continuation_withheld()
                 last_exc = exc
                 last_response_unparseable = False
+                last_cut_off_cap = cut_off_cap(attempt_call_offset)
                 # Empty text is malformed schema evidence; absent/non-text
                 # content supplies no schema observation. The call boundary
                 # preserves this distinction without carrying provider text.
@@ -1442,6 +1632,7 @@ class AdvisorCheckpointOwner:
                 # Retain exceptions only to classify the final outcome.
                 last_exc = exc
                 last_response_unparseable = False
+                last_cut_off_cap = None
                 call_arguments = arguments
                 format_reprompt_pending = False
                 failure = classify_provider_failure(exc)
@@ -1476,6 +1667,7 @@ class AdvisorCheckpointOwner:
             # channel, no second prompt path).
             last_exc = None
             last_response_unparseable = True
+            last_cut_off_cap = cut_off_cap(attempt_call_offset)
             call_arguments = _advisor_policy.advisor_arguments_with_format_reprompt(
                 arguments, schema_valid=verdict.response_schema_valid is True
             )
@@ -1489,7 +1681,7 @@ class AdvisorCheckpointOwner:
                     ok=False,
                     blocking=False,
                     failure_class="malformed",
-                    findings_text=_advisor_policy.ADVISOR_MALFORMED_USER_DETAIL,
+                    findings_text=malformed_detail(),
                 ),
                 source="model",
             )
@@ -1509,11 +1701,7 @@ class AdvisorCheckpointOwner:
         findings_text = (
             last_request_failure.details.explanation
             if last_request_failure is not None
-            else (
-                _advisor_policy.ADVISOR_UNAVAILABLE_USER_DETAIL
-                if failure_class == "unavailable"
-                else _advisor_policy.ADVISOR_MALFORMED_USER_DETAIL
-            )
+            else (_advisor_policy.ADVISOR_UNAVAILABLE_USER_DETAIL if failure_class == "unavailable" else malformed_detail())
         )
         return await completed(
             AdvisorCheckpointVerdict(

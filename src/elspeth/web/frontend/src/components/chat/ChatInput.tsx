@@ -10,7 +10,7 @@ import {
 } from "react";
 import { Button, Icon, Input } from "@/components/ui";
 import { useSessionStore } from "@/stores/sessionStore";
-import { useBlobStore } from "@/stores/blobStore";
+import { uploadRefusalMessage, useBlobStore } from "@/stores/blobStore";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import { PREFILL_CHAT_INPUT_EVENT } from "@/components/catalog/PluginCard";
 import {
@@ -201,6 +201,8 @@ export function ChatInput({
     ? (v: string) => controlledOnChange?.(v)
     : setInternalText;
   const [uploadStatus, setUploadStatus] = useState<string | null>(null);
+  // The file being uploaded from this control, while the upload is in flight.
+  const [uploadingName, setUploadingName] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   // Rare-action overflow ("More"): the file-manager toggle and secrets entry
   // fold behind one trigger so the textarea keeps a usable width in the
@@ -323,6 +325,10 @@ export function ChatInput({
   ]);
 
   function handleKeyDown(e: KeyboardEvent<HTMLTextAreaElement>) {
+    // An Enter that confirms an input-method candidate is not a send.
+    // keyCode 229 covers browsers (Safari) that report the confirming
+    // keydown after composition has already ended.
+    if (e.nativeEvent.isComposing || e.keyCode === 229) return;
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       handleSend();
@@ -337,6 +343,7 @@ export function ChatInput({
     const uploadSessionId = activeSessionId;
     const input = e.target;
     setUploadStatus(null);
+    setUploadingName(file.name);
     let rejectionAccepted: boolean | null = null;
     try {
       const blob = await uploadBlob(uploadSessionId, file, {
@@ -360,16 +367,18 @@ export function ChatInput({
       } else {
         setInternalText(newText);
       }
-    } catch {
+    } catch (err) {
       const accepted =
         rejectionAccepted ??
         onBlobUploadRejected?.(uploadRequestId, uploadSessionId) ??
         true;
       if (accepted) {
-        // The mapped detail is shown in the blob store / blob manager.
-        setUploadStatus("Upload failed. Check the file manager for details.");
+        // The reason is shown here: opening the file manager reloads the
+        // list, which clears the store's copy of it.
+        setUploadStatus(uploadRefusalMessage(err));
       }
     } finally {
+      setUploadingName(null);
       // Reset the file input so the same file can be re-selected
       input.value = "";
     }
@@ -388,6 +397,11 @@ export function ChatInput({
       {uploadStatus && (
         <div role="alert" className="chat-input-upload-alert">
           {uploadStatus}
+        </div>
+      )}
+      {uploadingName !== null && (
+        <div role="status" className="chat-input-upload-status">
+          Uploading {uploadingName}…
         </div>
       )}
       {/* Bootstrap gate reason. Two states share this slot (both keep Send
@@ -426,7 +440,7 @@ export function ChatInput({
             <Button
               variant="bare"
               onClick={() => fileInputRef.current?.click()}
-              disabled={!activeSessionId}
+              disabled={!activeSessionId || uploadingName !== null}
               className="chat-input-icon-btn chat-input-upload-btn"
               title="Upload file"
               aria-label="Upload file"

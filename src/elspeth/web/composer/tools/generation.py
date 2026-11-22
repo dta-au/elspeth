@@ -330,7 +330,8 @@ _GET_PLUGIN_SCHEMA_DECLARATION = ToolDeclaration(
     kind=ToolKind.DISCOVERY,
     description=(
         "Get the full configuration schema for a plugin. Result `data` carries `name`, `plugin_type`, "
-        "`description`, `json_schema`, `knob_schema`, `composer_hints`, `secret_requirements`, and "
+        "`description`, `json_schema`, `knob_schema`, `usage_when_not_to_use` (the plugin's own stated "
+        "prohibition, binding on selection; null when it states none), `composer_hints`, `secret_requirements`, and "
         "`web_config_authority` (`user_configurable` — author raw `options` directly; "
         "`user_configurable_with_policy` — author raw `options` the same way; `operator_profiled` — do not "
         "author raw options, author `options.profile` instead)."
@@ -1172,7 +1173,12 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     (
         r"vague_term_query_override|Pending vague_term review is bypassed by a query template",
         "A query on the node has its own template, so the node-level reviewed slot would not reach it.",
-        "Remove the per-query template(s) or move the reviewed term to a node whose queries all use the node-level template.",
+        "Remove the per-query template(s) or move the reviewed term to a node whose queries all use the node-level template. "
+        "A patch replaces queries whole, so restate every query when removing a template. A whole-pipeline rewrite "
+        "(set_pipeline) without the query's own template is accepted. If a review card for the term was already raised, "
+        "the user can approve it. Only if a file is meant to be the prompt for every query on the node, bind it to the "
+        "node's prompt_template with wire_blob_inline_ref; that replaces the whole node-level prompt and retires its term "
+        "reviews. A refusal from wire_blob_inline_ref lists its own repairs; follow those.",
     ),
     (
         r"vague_term_unwired|Pending vague_term review is not wired for resolution",
@@ -1262,8 +1268,8 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     ),
     (
         r"duplicate_connection_consumer|Duplicate consumer for connection",
-        "Two different nodes read the same connection as their input; every connection has exactly one consumer.",
-        "Give each consumer its own input connection (fan out with a gate fork_to if both need the same rows).",
+        "Two or more nodes read the same connection as their input; every connection has exactly one consumer.",
+        "Give each consumer its own input connection (fan out with a gate fork_to if they need the same rows).",
     ),
     (
         r"connection_sink_name_overlap|Connection names overlap with sink names|collides with a sink of the same name",
@@ -1580,6 +1586,11 @@ def _direct_plugin_policy_guidance() -> tuple[DirectValidationGuidance, ...]:
 
 _DIRECT_VALIDATION_GUIDANCE: Final = (
     DirectValidationGuidance(
+        "inline_prompt_too_long",
+        "New or changed inline LLM prompt text exceeds 100 words or 1,000 prose characters.",
+        "Put the complete text in a UTF-8 text file and bind the file. In set_pipeline, use an inline_blob member at the prompt field.",
+    ),
+    DirectValidationGuidance(
         "edge_not_found",
         "The requested edge is not present in the saved composition. No removal was applied.",
         "Inspect the current edges and retry the intended exact edge ID. Preserve unrelated nodes, routes and edges; do not remove a different edge to silence this refusal.",
@@ -1600,10 +1611,22 @@ _DIRECT_VALIDATION_GUIDANCE: Final = (
         "Match the actual producer type or convert upstream on a field every arriving row carries. A type_coerce input declares the old arriving type; its conversion determines the output type consumed downstream. A declaration alone does not convert a value.",
     ),
     DirectValidationGuidance(
+        "queries_patch_omits_existing",
+        "A patch_node_options patch sent a queries value without a query the node already has. "
+        "A patch replaces queries whole, so that query would have been removed.",
+        "To change one query, restate every query the node has in the patch, each complete. "
+        "To remove a query, send the whole node with upsert_node.",
+    ),
+    DirectValidationGuidance(
         "quarantine_unknown_output",
         "The source on_validation_failure names an output that is not declared.",
         "Declare the intended quarantine output and reference its name in on_validation_failure, "
         "or choose 'discard' only if discarding invalid source rows is intended.",
+    ),
+    DirectValidationGuidance(
+        "server_owned_review_protected",
+        "A change would have removed, cleared or replaced a review the server staged on a node. Only the user resolves it, on its card.",
+        "Re-send the node without interpretation_requirements (the review is kept), keep its node type and plugin, and do not remove the node while the review is pending.",
     ),
     # elspeth-d2e3f29d10: the aggregation error edge is wired, so a ghost
     # aggregation on_error sink is refused by the DAG builder too.
@@ -1658,7 +1681,12 @@ _DIRECT_VALIDATION_GUIDANCE: Final = (
     DirectValidationGuidance(
         "node_routing_patch_invalid",
         "The options patch contains node routing fields, which are not plugin options.",
-        "Use upsert_node to edit input, on_success, on_error, routes or fork_to while retaining the intended node options. Preserve the user's failure choice; gates use on_error only for their supported error route.",
+        "Use upsert_node with routing_only=true to change a transform's input, on_success or on_error without its options; for routes, fork_to or any other kind, send the whole node with upsert_node. Preserve the user's failure choice; gates use on_error only for their supported error route.",
+    ),
+    DirectValidationGuidance(
+        "routing_only_edit_invalid",
+        "A routing-only upsert_node carried a field it does not change, a null route, or a node that is not a transform.",
+        "Send id, node_type 'transform', input and only the routes that change. Use patch_node_options for options; send the whole step with upsert_node for anything else.",
     ),
     DirectValidationGuidance(
         "splice_ids_not_distinct",
@@ -1866,9 +1894,12 @@ _DIRECT_VALIDATION_GUIDANCE: Final = (
     ),
     DirectValidationGuidance(
         "BLOB_QUOTA_EXCEEDED",
-        "The inline source could not acquire blob storage within this session's quota. The replacement was not applied.",
-        "Retain the intended source data. Reuse an appropriate ready artifact or resolve the session storage limit before "
-        "retrying; do not silently drop rows to make the artifact smaller.",
+        "The call needed more stored content than a limit allows, and the message names which: an inline file over the "
+        "per-file limit, the call's inline files over the pipeline total for file-held text, or the session's blob "
+        "storage quota. The change was not applied.",
+        "For a file or pipeline-total limit, shorten or remove the files the message names. For the session quota, reuse "
+        "an appropriate ready artifact or resolve the session storage limit before retrying. Do not silently drop rows "
+        "or text to make it fit.",
     ),
     DirectValidationGuidance(
         "source_blob_identity_invalid",
@@ -2345,7 +2376,8 @@ def _execute_get_plugin_assistance(
 
     * ``issue_code is None`` (or absent) — discovery-time guidance. The
       plugin returns a one-line ``summary`` and ``composer_hints``
-      (same surface that list_* and get_plugin_schema already carry).
+      (same surface that list_sources, list_sinks and get_plugin_schema
+      already carry; the list_transforms index does not).
       ``examples`` may also be populated here — it is plugin-defined,
       not exclusive to failure mode (e.g. ``llm`` publishes a worked
       ``queries`` exemplar in discovery mode).
@@ -2419,7 +2451,7 @@ _GET_PLUGIN_ASSISTANCE_DECLARATION = ToolDeclaration(
         "Two modes by ``issue_code``:\n"
         "  * Omit ``issue_code`` (or pass null) to get discovery-time guidance "
         "    — a `summary` of the plugin and its `composer_hints`. (The same hints "
-        "    are also carried on list_sources / list_transforms / list_sinks / "
+        "    are also carried on list_sources / list_sinks / "
         "    get_plugin_schema responses; this tool is the explicit path.) `examples` "
         "    may also be populated in this mode — it is plugin-defined, not exclusive "
         "    to failure mode.\n"

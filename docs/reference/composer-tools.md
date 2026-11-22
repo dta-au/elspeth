@@ -60,6 +60,29 @@ argument check does not certify a response.
 
 ## Discovery Tools
 
+### `get_pipeline_state`
+
+Read the current graph, or set `since_start=true` to receive net field changes
+from the graph at the start of this turn. Changes use component identities as
+keys and report component ordering separately. `since_start` cannot be combined
+with `component` and requires a turn-start baseline.
+
+An oversized whole-graph read returns a structural `view` without option values
+or descriptions; large `since_start` reads retain exact values in `view="changes"`.
+Supply
+`field_path` as a JSON pointer to select an exact value. A page contains
+`content`, `encoding`, `offset_chars`, `total_chars`, `next_offset_chars`, and
+`sha256`; pass `next_offset_chars` as the next offset and `sha256` as
+`expected_sha256`. A continuation with a missing or mismatched hash is refused.
+Each response discloses at most 32,768 bytes. A structural view or partial page
+does not claim complete graph coverage.
+For a node, use `/input` or `/options/system_prompt`; for an output, use
+`/options/<key>`. Full diagnostic reads include `inspection`; the
+`set_pipeline_arguments` authoring document does not. Call `preview_pipeline`
+to inspect validation when state inspection diagnostics exceed the budget.
+
+---
+
 ### `list_sources`
 
 List available source plugins with their full catalog summaries.
@@ -74,11 +97,11 @@ List available source plugins with their full catalog summaries.
 
 ### `list_transforms`
 
-List available transform plugins with their full catalog summaries.
+List available transform plugins as a selection index.
 
 **Parameters:** None
 
-**Returns:** Array of full `PluginSummary` entries — `name`, `description`, `config_fields` (name, type, required, description, default per option), usage guidance, `composer_hints`, and `secret_requirements` — plus a `prohibited` array naming any transform banned from the web authoring surface, with its closed reason. `get_plugin_schema` is needed only for enum values, nested option shapes, or the raw JSON schema.
+**Returns:** `available`, one entry per transform carrying only `name`, `description`, `capability_tags`, `web_config_authority` and `policy_capabilities` (`capability`, `control_role`, `blocks_positive_detection`); a `prohibited` array naming any transform banned from the web authoring surface, with its closed reason; and `details_tool` (`"get_plugin_schema"`). No configuration is listed: call `get_plugin_schema` for a chosen plugin's options and `get_plugin_assistance` for its guidance.
 
 **When to use:** When exploring what processing steps are available — field mapping, LLM classification, content safety, RAG retrieval, etc.
 
@@ -105,7 +128,7 @@ Get the full configuration schema for a specific plugin.
 | `plugin_type` | string | **Yes** | `"source"`, `"transform"`, or `"sink"` |
 | `name` | string | **Yes** | Plugin name (e.g. `"csv"`, `"llm"`, `"database"`) |
 
-**Returns:** Full JSON Schema for the plugin's `options` configuration — field names, types, defaults, enums, and descriptions.
+**Returns:** Full JSON Schema for the plugin's `options` configuration — field names, types, defaults, enums, and descriptions — plus `usage_when_not_to_use`, the plugin's own stated prohibition (null when it states none). The discovery digest points an omitted transform prohibition here.
 
 **When to use:** Before configuring any plugin. The schema is the source of truth for what options a plugin accepts. Do not guess option names — always check the schema first.
 
@@ -234,6 +257,7 @@ row unions, queues, or collectors.
 | `id` | string | **Yes** | Unique node identifier (e.g. `"classifier"`, `"quality_gate"`) |
 | `node_type` | string | **Yes** | `transform`, `gate`, `aggregation`, `coalesce`, `row_union`, `queue`, or `collector` |
 | `input` | string | **Yes** | Input connection name (must match an upstream `on_success`) |
+| `routing_only` | boolean | No | Default `false`. `true` changes only `input`, `on_success` and `on_error` of an existing transform; see below. |
 | `plugin` | string | No | Plugin name. Required for transforms, aggregations, and collectors. Null for gates, coalesces, row unions, and queues. |
 | `on_success` | string | No | Output connection name. Required for transforms, row unions, and collectors. Null for gates and queues. |
 | `on_error` | string | For new transforms/aggregations | Explicit `"discard"` or an eligible named route. An update may omit it to preserve the same node kind's choice. New gates omit it for fail-fast; gate updates preserve an omitted prior choice and clear to fail-fast with null. Collectors reject this field because failures are whole-group verdicts. |
@@ -250,6 +274,8 @@ row unions, queues, or collectors.
 | `scope_policy` | string | No | Group arrival policy, `"require_all"` or `"best_effort"` (collectors only) — **required for collectors**, there is no default |
 
 **Behaviour:** If a node with the given `id` already exists, it is replaced. The `id` must be unique across all node types.
+
+**Routing-only edits.** With `routing_only: true` the call rewires an existing transform without re-sending it: send `id`, `node_type` (`"transform"`), `input` (the current one when it does not change) and only the routes that change. The stored plugin, options (a file-held prompt included), description and every route left out are kept; every authored option stays byte-identical. Any other field, an explicit `null` route, an unknown node or a node that is not a transform is refused (`routing_only_edit_invalid`, or `node_not_found`). Plugin admission is not re-run, because nothing it checks can change; the result's whole-graph `validation` reports a rewire the step cannot accept. Review reconciliation runs as for any node write: a prompt-shield review of a downstream LLM step, or the disclosure of an auto-wired control that is itself re-pointed, re-opens when the rewire changes the fact it binds. The result carries no `applied_component`; its `data` is `routing_update` (`id`, `input`, `on_success`, `on_error`), `options_preserved: true`, `reopened_reviews` (up to 32 entries of `component_id`, `kind`, `user_term`, each a review the run now waits on that it did not wait on before) and `reopened_review_count` (all of them). The server-derived `approved_prompt_artifact_hash` follows the rule every tool write follows: beside a file-held prompt it is re-derived as `null`.
 
 **Node type specifics:**
 
@@ -388,7 +414,9 @@ Apply a shallow merge-patch to a node's options.
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `node_id` | string | **Yes** | ID of the node to patch |
-| `patch` | object | **Yes** | Merge-patch (same semantics as `patch_source_options`) |
+| `patch` | object | **Yes** | Merge-patch (same semantics as `patch_source_options`). The merge is shallow: a nested value such as `queries` is replaced whole, so send every query; a `queries` value that omits an existing query is refused (`queries_patch_omits_existing`), and `queries: null` removes every query. |
+
+**Replacing an LLM prompt with new text.** A patch that carries `prompt_template` as text together with `prompt_template_parts: null` replaces the node's whole prompt, whatever was there. A structured prompt's `prompt_template_parts` and every vague-term review of the old text (pending or accepted) are removed, the result names them in `superseded_review_ids`, and the new text gets its own pending `llm_prompt_template` review card; nothing approved for the old prompt approves the new one. Other reviews on the node (model choice, pipeline decisions) are kept. Leave `interpretation_requirements` out of the patch; sent as `null` it is refused. Text exactly equal to the node's existing prompt (the stored text, or the text `get_pipeline_state` returns for it; the same characters, whitespace and line endings included) never changes the prompt's structure or reviews, with or without the `prompt_template_parts` key and in all three tools; the result names each such node in `prompt_unchanged_node_ids`, and never also in `superseded_review_ids`. `upsert_node` and `set_pipeline` accept the explicit pair in a node's `options`, and refuse a changed `prompt_template` on a structured prompt without `prompt_template_parts: null` (`prompt_template_parts_required`), because a whole node re-sent with stale text must not flatten a reviewed prompt. A file marker is never accepted this way: bind a file with `wire_blob_inline_ref`.
 
 ---
 
@@ -441,7 +469,7 @@ List uploaded/created files (blobs) in this session with metadata.
 
 **Parameters:** None
 
-**Returns:** Array of blob records with ID, filename, MIME type, size, and creation time.
+**Returns:** Array of blob records with ID, filename, MIME type, size, and creation time. At most the 50 newest files are listed. When the session holds more, the result carries a `post_call_hints` entry that starts `Incomplete list:` and gives the number of older files not listed. An unlisted file still works by its ID.
 
 ---
 
@@ -451,7 +479,7 @@ List ready blobs using the inline-content authoring visibility shape.
 
 **Parameters:** None
 
-**Returns:** `{blobs: [...]}` descriptors with `blob_id`, `mime_type`, `size_bytes`, `content_hash`, and `filename`. Content bytes, previews, storage paths, and source descriptions are not returned.
+**Returns:** `{blobs: [...]}` descriptors with `blob_id`, `mime_type`, `size_bytes`, `content_hash`, and `filename`. Content bytes, previews, storage paths, and source descriptions are not returned. At most the 50 newest ready files are listed. When the session holds more, the result carries a `post_call_hints` entry that starts `Incomplete list:` and gives the number of older ready files not listed. An unlisted file still works by its ID.
 
 ---
 
@@ -480,6 +508,8 @@ and `total_chars`, half-open `[start_char, end_char)` range, `truncated`, and
 `next_offset_chars`, plus blob identity and recorded origin metadata. Each page
 preserves original Unicode code points. The complete serialized JSON tool
 response, including metadata and escaping, is bounded to 4,096 UTF-8 bytes.
+A successful page carries no `validation` block, so the saved pipeline's
+findings never reduce how much content a page holds.
 
 Continue with `offset_chars` set to the returned `next_offset_chars` and
 `expected_content_hash` set to the returned `content_hash`. A changed content
@@ -517,8 +547,31 @@ Wire a ready blob into a plugin option as audited inline content.
 | `encoding` | string | No | One of `utf-8`, `utf-8-sig`, `utf-16`, or `latin-1`; defaults to `utf-8` |
 
 **When to use:** When a long-form config field, such as an LLM prompt template or SQL query, should be supplied from a session blob without exposing the bytes to the composer LLM. The tool pins `sha256` from blob metadata. A user-created or agent-authored UTF-8 text file may bind to `llm` `prompt_template`, `system_prompt`, or one `queries.<name>.template` / `queries.<index>.template` scalar. Binding opens a mandatory card with the full file text. The user approves it before validation or Run admits the file. A content change or re-point opens a new card and requires another approval. The server checks current file bytes again at run admission and records their hash in Landscape.
-Binary MIME, `model`, whole `queries`, malformed markers, and structured prompts with `prompt_template_parts` are refused. Edit structured prompt text parts in place with `change_substring` or `patch_node_options`, preserving `interpretation_ref` entries. Switching a structured prompt to a file is not supported in this release, and neither is substring editing inside a file.
-The session owner can edit a bound prompt file in the graph node inspector; Save records approval of the saved bytes and does not raise a separate card. The save refuses files also used outside a prompt (`prompt_file_mixed_use`), files bound to more than one prompt (`prompt_file_shared_binding`, so a save never approves a prompt the user is not looking at), and prompts that read the file with an encoding other than UTF-8 (`prompt_file_encoding_unsupported`). The editor edits a prompt file only when it is the node's sole file-backed prompt; otherwise `prompt_file_node_multi_binding` asks the user to re-point through the agent and approve the card. If a pending card covers inline prompt text, `prompt_file_review_pending_inline` asks the user to approve the card first; `prompt_file_binding_changed` asks the user to reload after a re-point.
+Binary MIME, `model`, whole `queries` and malformed markers are refused. `wire_blob_inline_ref` onto `prompt_template` replaces the whole prompt, including a structured one: its `prompt_template_parts` and every vague-term review of the old text (pending or accepted) are removed, and the file gets its own review card, which supersedes them. Onto `system_prompt` or one query template it replaces only that text and removes no term review. A query template is refused with `vague_term_query_override` while the node-level prompt has a pending term review; approve that review first, then wire again. Bind the file to `prompt_template` instead only if it is meant to be the prompt for every query: that replaces the whole node-level prompt and retires its term reviews. To keep a structured prompt, edit its text parts in place with `change_substring` or `patch_node_options`, preserving `interpretation_ref` entries; the prompt review card reopens, and a term whose row is still `resolved` kept its definition. To replace it with new text rather than a file, see `patch_node_options`. A file marker written straight onto a structured prompt by `patch_node_options`, `upsert_node`, `set_pipeline` or imported YAML is refused (`prompt_template_parts_required`) and the refusal points at `wire_blob_inline_ref`. Substring editing inside a file is not supported in this release.
+YAML import (`POST /api/sessions/{id}/state/yaml`) imports nothing when a prompt file's review card cannot be prepared. `malformed_inline_blob_content` (400, the validation code, here raised before anything is saved) names the option fields whose `blob_ref` mapping is not a complete file marker: at most five field paths, each shown whole with characters outside letters, digits and `_ . : -` shown as `?`, then the exact count of the rest (import again after fixing those to see the next); values are never echoed. `import_prompt_file_unverified` (409) means a referenced prompt file is missing, not ready, or differs from the `sha256` in the YAML; it names the file-backed prompt fields of the first step that could not be verified: remove the reference and import again, then attach the file in the session, or bind it by id in `inline_blob_bindings`. A source bound by `source_blob_ids` stores `path` and `blob_ref` without `mode`; that is a source binding, not a file marker.
+The session owner can edit a bound prompt file in the graph node inspector; Save records that the user saved these bytes for this step, carries the approval of the step's other prompt files, and does not raise a separate card. The save refuses files also used outside a prompt (`prompt_file_mixed_use`), files bound to more than one prompt (`prompt_file_shared_binding`, so a save never approves a prompt the user is not looking at), and prompts that read the file with an encoding other than UTF-8 (`prompt_file_encoding_unsupported`). A node may use several prompt files; each is edited and saved on its own, and the save re-records the approval of the node's other prompt files with their unchanged bytes. Every prompt file on the node must already be approved (`prompt_file_stale` otherwise). If a pending card covers other prompt content on the node, the user must approve the card first: `prompt_file_review_pending_inline` for inline prompt text, `prompt_file_review_pending` for another prompt file; `prompt_file_binding_changed` asks the user to reload after a re-point.
+
+---
+
+### `report_composer_bug`
+
+Record a suspected mismatch between the composer's guidance (the skill or a tool description) and what a tool call actually did.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `summary` | string | **Yes** | One-line summary, 1–240 characters |
+| `expected_behavior` | string | **Yes** | What the skill or tool description says should happen, 1–4,000 characters |
+| `observed_behavior` | string | **Yes** | What the tool call actually did, with any error described in the model's own words, 1–4,000 characters |
+| `guidance_reference` | string | No | The skill section or tool description being contradicted, 1–1,000 characters |
+| `related_tool` | string | No | Name of the composer tool involved: a lowercase letter, then lowercase letters, digits or `_`; at most 100 characters |
+
+**Returns:** `blob_id`, `filename` and `status` (always `suspected_unverified`). The report prose is not echoed in the result.
+
+**Where the text is kept:** the prose fields are redacted only from the assistant message's tool-call record, which keeps a length placeholder for each. As for every tool, the full arguments are also kept in the tool message's visible tool event (`received_arguments`) and in the audit message, and the visible event feeds the advisor transcript. The report file holds the text as well.
+
+**Behaviour:** Saves one JSON file (`application/json`, named `composer-bug-report-<uuid>.json`) in the session's files, created by the assistant with the usual composer provenance. The file holds `report_type` `suspected_composer_bug`, `status` `suspected_unverified`, the time of the report, the observations as supplied, and the context that produced them: session, state id and version, user message, composer model, version and provider, skill hash and tool-arguments hash. The pipeline state is returned unchanged; nothing is repaired or verified. Blank, over-length, mistyped or extra fields are refused. The field limits count characters; the saved file, written as UTF-8 JSON, is limited to 16,384 bytes, so long text in several fields can reach the file limit before the field limits (ordinary ASCII at every field limit takes about 10 KB, and one behaviour field at its limit fits in two- or three-byte text but not in four-byte text such as emoji). A refused report writes nothing. A session keeps at most 20 reports; past that the call fails with a message telling the model to stop reporting and continue the task, and nothing is written. The session file quota applies. Credential-shaped text in any argument ends the whole turn (the composer request is refused, as for every tool call), so the model is told to describe error messages in its own words and never paste tokens, keys, passwords or connection strings. Like other changes, a successful report in a tool batch blocks a later `inspect_prompt_targets` in the same batch, so the description asks for reports after reads. Like `create_blob`, it runs immediately when the session requires approval for changes, because it only adds a file; `update_blob` and `delete_blob` still need approval.
+
+**When to use:** Once per distinct mismatch, then continue the user's task.
 
 ---
 
@@ -579,7 +632,7 @@ twin all derive from, and this section is pinned to it by
     "is_valid": true,
     "errors": [],
     "warnings": [
-      {"component": "source", "message": "Source schema mode is 'observed' — consider 'fixed'", "severity": "low", "error_code": "source_schema_mode_observed"}
+      {"component": "source", "message": "Source schema mode is 'observed' — consider 'fixed'", "severity": "low"}
     ],
     "suggestions": [],
     "semantic_contracts": [],
@@ -597,7 +650,7 @@ Always present:
 | Field | Description |
 |-------|-------------|
 | `success` | Whether the tool call succeeded |
-| `validation` | Whole-document validation after this change: `is_valid`, `errors` / `warnings` / `suggestions` (entries with `component`, `message`, `severity`, `error_code`, `rejected_component` when the rejection is about one component (`source` / `source:<name>` / `node:<id>` / `output:<name>`) and absent when it is about the whole candidate, and, when the code carries facts, a `contract`, `row_union_schema`, or `coalesce_union_type` block), `semantic_contracts` (one check per producer, consumer and required field), `graph_repair_suggestions` (a ready `tool_sequence` for a duplicate-consumer repair) |
+| `validation` | Whole-document validation after this change: `is_valid`, `errors` / `warnings` / `suggestions` (entries with `component`, `message`, `severity`, `error_code` when the entry has one, `rejected_component` when the rejection is about one component (`source` / `source:<name>` / `node:<id>` / `output:<name>`) and absent when it is about the whole candidate, and, when the code carries facts, a `contract`, `row_union_schema`, or `coalesce_union_type` block), `semantic_contracts` (one check per producer, consumer and required field), `graph_repair_suggestions` (the facts of a duplicate consumer: the connection and the steps reading it; no repair is proposed). Absent on a successful `get_blob_content` or `read_attachment`. |
 | `affected_nodes` | Component ids the call touched |
 | `version` | Pipeline state version (increments on each mutation) |
 

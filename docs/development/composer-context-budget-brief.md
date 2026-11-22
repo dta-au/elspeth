@@ -13,10 +13,45 @@ built for 0.8.13. Before each compose-loop and planner provider call (the
 escape hatch included), a pure budgeter in
 `src/elspeth/web/composer/context_budget.py` sheds context to fit two
 ceilings, records what it shed on the call record (`context_budget`), or
-refuses with `context_budget_exceeded` before any provider call. Advisor and
-review calls are not yet budgeted: they still carry the whole session
-transcript and can be rejected by the gateway for size, which leaves the
-advisor unavailable for that turn.
+refuses with `context_budget_exceeded` before any provider call.
+
+Advisor requests (hints, the EARLY/END checkpoints, abandonment review) show
+the earlier turns of their visible transcript by age, on every request,
+whatever its size (`AdvisorVisibleTranscript.by_age` in
+`src/elspeth/web/composer/advisor_transcript.py`, applied once in
+`AdvisorCheckpointOwner._call_advisor_with_audit_body`). A turn starts at each
+human request. This turn goes whole. The previous three turns go as the
+request and the reply the user was shown (the turn's last published composer
+reply, prose only). Older turns go as the request only, newest first, as one
+unbroken run within 8,000 tokens at 3.0 bytes per token; a request over 2,000
+characters goes as its first 1,500 and last 500 characters with one fixed mark
+between and a server-written `shortened` field. Tool calls, tool results, call
+metadata and backend events of earlier turns are never sent. The sent
+transcript carries the counts (`earlier_turns_shown_by_age`), one availability
+gap per kind of omission, and a header stating the counts. With no earlier
+turn the request is unchanged.
+
+The request is then priced (`estimate_advisor_prompt_tokens`), measured as the
+call record measures it (`request_byte_split.total_bytes`): from the newest
+successful earlier call with the Advisor's model and no tools (its prompt
+tokens plus added bytes at 3.0, or scaled down) that is at least half the
+request's size (a smaller one, such as an auto-title call, is passed over),
+else from this turn's
+budgeted compose-loop call (its bytes per token), else at 3.0 bytes per token.
+Only an estimate from a real call can leave more out: when it is over
+`composer_context_max_prompt_tokens`, older requests go, oldest first, then the
+previous three turns, oldest first. The estimate decides what is left out,
+never whether the request goes: a checkpoint or hint still over the limit with
+nothing left to leave out is sent, as the compose loop and the planner send
+(`on_over_estimate="send"`), and the provider judges its own limit. The sent
+transcript records the estimate, its source, the limit and `over_estimate`
+(`request_size`, beside the counts of a transcript shaped by age, or at the top
+of a first-turn transcript whose estimate is over the limit). The byte ceiling
+is not applied. A request the provider rejects for length ends as a
+`context_length_exceeded` request rejection, whose blocker suggests a new
+session or a shorter request. Publication, abandonment and repair bindings are
+taken on the complete transcript before the reduction. The Advisor call record
+carries no `context_budget`, so it never becomes the compose loop's shed state.
 
 Settings (`WebSettings`, `src/elspeth/web/config.py`):
 
@@ -27,11 +62,16 @@ Settings (`WebSettings`, `src/elspeth/web/config.py`):
 | `composer_context_shed_to` | `ELSPETH_WEB__COMPOSER_CONTEXT_SHED_TO` | `0.60` |
 | `composer_planner_max_request_bytes` | `ELSPETH_WEB__COMPOSER_PLANNER_MAX_REQUEST_BYTES` | 960 KiB (was 2 MiB); now also bounds the compose loop |
 
-Shed order, oldest first within each: tool-result bodies from earlier round
-trips of the current turn (replaced by a fixed stub), prior assistant prose,
-escape-hatch transcript events, prior user requests. Both ceilings are judged
-on the request as sent (canonical JSON of its messages and tools, so
-tool-call arguments and thinking blocks count; they are never shed). Tokens
+Only earlier turns are shed. Shed order, oldest first within each: prior
+assistant prose, escape-hatch transcript events of earlier turns, prior user
+requests. Nothing from the turn in progress is shed, stubbed or truncated: its
+request, every tool round of the turn (not only the latest) and the
+escape-hatch transcript's events of this turn are always sent whole. With
+every earlier turn left out, a request still over the token setting is sent
+and recorded `over_estimate`; one over the byte maximum is refused. Both
+ceilings are judged on the request as sent (canonical JSON of its messages
+and tools, so tool-call arguments and thinking blocks count; they are never
+shed). Tokens
 use the newest usable same-model, same-dialect provider count in the exchange:
 `min(wire bytes - authored bytes + ceil(authored bytes / 3), anchor tokens + wire bytes - shared protected bytes)`
 when an anchor is usable; without one, only the first arm applies. Authored
@@ -48,7 +88,7 @@ Not done: the Phase 1 records investigation below, and its acceptance
 evidence (replaying the affected users' failing sessions through the new
 policy), were not carried out. The design bounds the four growth paths its
 spec lists instead of the one a records investigation might single out; the
-advisor's transcript is a fifth and is not bounded. No live
+advisor's transcript, a fifth, is bounded separately (above). No live
 provider run has exercised the budget.
 
 ---

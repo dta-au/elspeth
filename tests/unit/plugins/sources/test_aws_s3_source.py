@@ -771,7 +771,7 @@ class TestAWSS3SourceRegistrationAndParsing:
         yaml_generator = MagicMock(spec=YamlGenerator)
         yaml_generator.generate_yaml.return_value = "sources: {}\nsinks: {}\n"
         with (
-            patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as load_settings,
+            patch("elspeth.web.execution.validation.load_settings_from_config_dict") as load_settings,
             patch("elspeth.web.execution.validation.instantiate_runtime_plugins") as instantiate,
         ):
             catalog = create_catalog_service()
@@ -839,7 +839,7 @@ class TestAWSS3SourceRegistrationAndParsing:
         )
         yaml_generator = MagicMock(spec=YamlGenerator)
         yaml_generator.generate_yaml.return_value = "sources: {}\nsinks: {}\n"
-        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string", side_effect=ValueError("stop")):
+        with patch("elspeth.web.execution.validation.load_settings_from_config_dict", side_effect=ValueError("stop")):
             result = validate_pipeline_for_trained_operator(state, settings, yaml_generator)
         check = next(check for check in result.checks if check.name == "aws_s3_endpoint_url_policy")
         assert check.passed is True

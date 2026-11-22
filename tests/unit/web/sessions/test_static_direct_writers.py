@@ -1602,6 +1602,18 @@ _REVIEWED_ALLOWLIST: tuple[ReviewedWriter, ...] = (
         ),
     ),
     ReviewedWriter(
+        path="tests/unit/web/composer/test_wire_query_template_pending_term.py",
+        enclosing_symbol="env",
+        table="chat_messages",
+        operation="sqlalchemy_table_insert",
+        purpose=(
+            "query-template wire fixture: seeds the route-level user message "
+            "that blob provenance requires before the production tool handlers "
+            "and session service wire a prompt file. The fixture owns the "
+            "in-memory SQLite engine."
+        ),
+    ),
+    ReviewedWriter(
         path="tests/unit/web/composer/test_agent_tooling.py",
         enclosing_symbol="_insert_user_message",
         table="chat_messages",
@@ -2561,6 +2573,19 @@ _TEST_FIXTURE_REVIEWED_WRITERS: tuple[ReviewedWriter, ...] = (
             "written via `from sqlalchemy import insert as _insert` (line 7054). "
             "Invisible to this gate until the callable was resolved from imports "
             "rather than matched by spelling — the one live writer that widening surfaced."
+        ),
+    ),
+    ReviewedWriter(
+        path="tests/unit/web/composer/test_removed_repair_fields_not_emitted.py",
+        enclosing_symbol="test_old_stored_tool_row_is_excluded_from_provider_history",
+        table="chat_messages",
+        operation="sqlalchemy_insert_call",
+        count=2,
+        purpose=(
+            "replay fixture: seeds one assistant row and one tool row in the repair-suggestion "
+            "shape an earlier release stored. The production write path cannot store that "
+            "shape (its typed redaction refuses it), so a raw insert is the only way to "
+            "prove an older stored turn still replays."
         ),
     ),
 )

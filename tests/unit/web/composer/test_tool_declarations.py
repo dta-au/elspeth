@@ -266,6 +266,7 @@ class TestStep2RegistryAggregation:
         declared = {d.name for d in _REGISTERED_TOOLS if d.kind is ToolKind.BLOB_MUTATION}
         expected = {
             "create_blob",
+            "report_composer_bug",
             "update_blob",
             "delete_blob",
             "set_source_from_blob",
@@ -310,8 +311,8 @@ class TestStep3DiscoveryTierMigration:
                 "The result's `prohibited` array names any source categorically banned from "
                 "the web authoring surface by security policy, with its closed reason and "
                 "explanation — cite it when a user asks why a specific plugin is unavailable. "
-                "Call get_plugin_schema only for enum values, nested option shapes, or the "
-                "raw JSON schema; this listing already answers ordinary configuration questions."
+                "The request's `authoring_aids.discovery_digest` is the plugin index: call this listing "
+                "only for a fact it lacks. get_plugin_schema gives a chosen plugin's option contract."
             ),
             "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
         }
@@ -326,22 +327,25 @@ class TestStep3DiscoveryTierMigration:
         assert self._get("list_transforms") == {
             "name": "list_transforms",
             "description": (
-                "List available transform plugins. Each entry carries its full `config_fields` "
-                "(name, type, required, description, default per option), usage guidance, "
-                "`composer_hints`, and `secret_requirements` — not just a name and blurb. "
+                "List available transform plugins as a selection index: each entry carries only `name`, "
+                "`description`, `capability_tags`, `web_config_authority` and `policy_capabilities` "
+                "(`capability`, `control_role`, `blocks_positive_detection`), with no configuration. "
+                "Use `details_tool` (get_plugin_schema) for one plugin's configuration and "
+                "get_plugin_assistance for its guidance. "
                 "The result's `prohibited` array names any transform categorically banned from "
-                "the web authoring surface by security policy, with its closed reason and "
-                "explanation — cite it when a user asks why a specific plugin is unavailable. "
-                "Call get_plugin_schema only for enum values, nested option shapes, or the "
-                "raw JSON schema; this listing already answers ordinary configuration questions."
+                "the web authoring surface by security policy, with its closed `reason` and "
+                "`explanation` — cite it when a user asks why a specific plugin is unavailable. "
+                "The request's `authoring_aids.discovery_digest` is the plugin index: call this listing "
+                "only for a fact it lacks."
             ),
             "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
         }
 
-    def test_list_transforms_description_states_config_fields_not_name_and_summary(self) -> None:
+    def test_list_transforms_description_states_an_index_without_configuration(self) -> None:
         description = self._get("list_transforms")["description"]
-        assert "config_fields" in description
-        assert "with name and summary" not in description
+        assert "selection index" in description
+        assert "config_fields" not in description
+        assert "`details_tool` (get_plugin_schema)" in description
 
     def test_list_sinks(self) -> None:
         assert self._get("list_sinks") == {
@@ -353,8 +357,8 @@ class TestStep3DiscoveryTierMigration:
                 "The result's `prohibited` array names any sink categorically banned from "
                 "the web authoring surface by security policy, with its closed reason and "
                 "explanation — cite it when a user asks why a specific plugin is unavailable. "
-                "Call get_plugin_schema only for enum values, nested option shapes, or the "
-                "raw JSON schema; this listing already answers ordinary configuration questions."
+                "The request's `authoring_aids.discovery_digest` is the plugin index: call this listing "
+                "only for a fact it lacks. get_plugin_schema gives a chosen plugin's option contract."
             ),
             "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
         }
@@ -369,7 +373,8 @@ class TestStep3DiscoveryTierMigration:
             "name": "get_plugin_schema",
             "description": (
                 "Get the full configuration schema for a plugin. Result `data` carries `name`, `plugin_type`, "
-                "`description`, `json_schema`, `knob_schema`, `composer_hints`, `secret_requirements`, and "
+                "`description`, `json_schema`, `knob_schema`, `usage_when_not_to_use` (the plugin's own stated "
+                "prohibition, binding on selection; null when it states none), `composer_hints`, `secret_requirements`, and "
                 "`web_config_authority` (`user_configurable` — author raw `options` directly; "
                 "`user_configurable_with_policy` — author raw `options` the same way; `operator_profiled` — do not "
                 "author raw options, author `options.profile` instead)."
@@ -427,7 +432,7 @@ class TestStep3DiscoveryTierMigration:
                 "Two modes by ``issue_code``:\n"
                 "  * Omit ``issue_code`` (or pass null) to get discovery-time guidance "
                 "    — a `summary` of the plugin and its `composer_hints`. (The same hints "
-                "    are also carried on list_sources / list_transforms / list_sinks / "
+                "    are also carried on list_sources / list_sinks / "
                 "    get_plugin_schema responses; this tool is the explicit path.) `examples` "
                 "    may also be populated in this mode — it is plugin-defined, not exclusive "
                 "    to failure mode.\n"
@@ -519,24 +524,34 @@ class TestStep3DiscoveryTierMigration:
     def test_get_pipeline_state(self) -> None:
         assert self._get("get_pipeline_state") == {
             "name": "get_pipeline_state",
-            "description": "Inspect the full current pipeline state including all "
-            "options for source, nodes, and outputs. When a mutation result carries "
-            "an applied_component field, that field is already the post-change state "
-            "of everything that mutation touched — read it there, and call this tool "
-            "for what it does not cover: a component the change did not touch, or "
-            "the whole document. A node or output request returns just `node` or "
-            '`output`; `component="source"` returns the `sources` map; '
-            "`set_pipeline_arguments` returns the flat pipeline document. For the web "
-            'set_pipeline tool, put that document inside {"pipeline": <document>}; do not '
-            "send its source/nodes/edges/outputs fields at the top level. A "
-            "full-state read (no component, or an alias) returns the whole document "
-            "with an `inspection` block: `requested_component` (what you asked for), "
-            "`resolved_component` (always `full` here — the request matched a "
-            "full-state alias), and `accepted_full_state_aliases` (the exact strings "
-            "that do).",
+            "description": "Inspect graph or since_start changes. Oversized whole-graph reads return a structural `view`; "
+            "pages carry exact `content`, `encoding`, `field_path`, `offset_chars`, `total_chars`, `next_offset_chars` and `sha256`. "
+            "Use field_path for exact values; pass the hash to continue. "
+            "Changes give `baseline_kind`, `from_version`, `projection`, and `changes` with `operation`, `path`, optional `value`. "
+            'For the web set_pipeline tool, put the flat `set_pipeline_arguments` document inside {"pipeline": <document>}; do not send its source/nodes/edges/outputs fields at the top level. '
+            "Full diagnostic reads include `inspection`: `requested_component`, `resolved_component` and `accepted_full_state_aliases`.",
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "field_path": {
+                        "type": "string",
+                        "maxLength": 512,
+                        "description": "Exact JSON pointer: node /input or /options/system_prompt; output /options/<key>. Wrapper /node/input works. Source /sources/<name>/on_success or /on_success. Empty reads bounded pages.",
+                    },
+                    "offset_chars": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Page `offset_chars` (default 0) within `total_chars`. Follow `next_offset_chars`; supply the returned `sha256` as expected_sha256.",
+                    },
+                    "expected_sha256": {
+                        "type": "string",
+                        "pattern": "^[0-9a-f]{64}$",
+                        "description": "Content identity returned by the previous page; required when offset_chars is greater than zero.",
+                    },
+                    "since_start": {
+                        "type": "boolean",
+                        "description": "Return `changes` from `baseline_kind` request_start and `from_version`: each `operation` has a `path` and optional `value`. The `projection` keys components by ID. Do not combine with component; default false.",
+                    },
                     "component": {
                         "type": "string",
                         "description": (
@@ -544,6 +559,8 @@ class TestStep3DiscoveryTierMigration:
                             "Accepted full-state aliases: omit component, pass 'full', 'all', 'pipeline', "
                             "or pass the empty string. Use 'set_pipeline_arguments' for the flat authoring document; "
                             'the web set_pipeline call requires {"pipeline": <document>}. '
+                            "That document is refused when a source bound with set_source_from_blob is named other than 'source' "
+                            "or sits beside other sources; then read the node or output by its id instead. "
                             "Ordinary inspection output is diagnostic only."
                         ),
                     },
@@ -711,7 +728,11 @@ class TestStep3MutationTierMigration:
     def test_set_metadata(self) -> None:
         assert self._get("set_metadata") == {
             "name": "set_metadata",
-            "description": "Update pipeline metadata (name and description only).",
+            "description": (
+                "Update pipeline metadata (name and description only). Pass null or an empty string for description "
+                "to clear it; name cannot be cleared, only replaced. Result `changed_fields` lists the fields whose "
+                "value changed. When it is empty nothing changed, and `message` says so."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -720,8 +741,8 @@ class TestStep3MutationTierMigration:
                         "description": "Partial metadata update. Only included fields are changed.",
                         "additionalProperties": False,
                         "properties": {
-                            "name": {"type": "string"},
-                            "description": {"type": "string"},
+                            "name": {"type": "string", "description": "Pipeline name. Cannot be cleared; a pipeline always has a name."},
+                            "description": {"type": ["string", "null"]},
                         },
                     },
                 },
@@ -859,12 +880,12 @@ class TestStep3MutationTierMigration:
         assert "Preserve existing components when extending a saved draft" in skill
         assert "use a full replacement only when you can supply the exact current bindings and the requested complete state" in skill
         assert "Make an option-only edit to an existing node | `patch_node_options`" in skill
-        assert "Add or rewire a node in an existing pipeline, when neither narrower row above fits | `upsert_node` / `upsert_edge`" in skill
+        assert "Add or rewire a node in an existing pipeline, when no narrower row above fits | `upsert_node` / `upsert_edge`" in skill
         assert (
             "Follow focused repair diagnostics without discarding already verified components or narrowing the requested final topology"
             in skill
         )
-        assert "For edits to an existing pipeline, continue to choose the narrowest supported tool" in skill
+        assert "On a pipeline that already exists, edit with the narrow tools" in skill
 
     def test_upsert_node_required(self) -> None:
         defn = self._get("upsert_node")
@@ -917,7 +938,9 @@ class TestStep3BlobDiscoveryTierMigration:
             "name": "list_blobs",
             "description": (
                 "List uploaded/created files (blobs) in this session with metadata: each entry carries `id`, `filename`, "
-                "`mime_type`, `size_bytes`, `status`, `created_by`, and `creation_modality`."
+                "`mime_type`, `size_bytes`, `status`, `created_by`, and `creation_modality`. Lists at most the 50 newest "
+                "files; when more exist, a `post_call_hints` entry starting `Incomplete list:` says how many are not listed. "
+                "An unlisted file still works by its id; no tool finds a file by name."
             ),
             "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
         }
@@ -928,7 +951,9 @@ class TestStep3BlobDiscoveryTierMigration:
             "description": (
                 "List ready blobs available for audited inline-content authoring. "
                 "Returns a `blobs` list whose entries carry only `blob_id`, `mime_type`, `size_bytes`, `content_hash`, "
-                "and `filename`; never content bytes."
+                "and `filename`; never content bytes. Lists at most the 50 newest ready files; when more exist, a "
+                "`post_call_hints` entry starting `Incomplete list:` says how many are not listed. An unlisted file still "
+                "works by its id; no tool finds a file by name."
             ),
             "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
         }
@@ -1050,8 +1075,12 @@ class TestStep3BlobDiscoveryTierMigration:
                 "Only inline-text MIME is accepted; upload or create a plain-text .txt or .md file for a prompt. "
                 "A user-created or agent-authored UTF-8 prompt file opens a mandatory full-content llm_prompt_template review card; changes require review again. "
                 "Only prompt_template, system_prompt, and individual query templates accept prompt files, never model or whole queries. "
-                "A structured prompt with prompt_template_parts cannot be replaced by a file in this release; edit its text parts with change_substring or patch_node_options on prompt_template_parts, preserving interpretation_ref entries. "
-                "Returns the `field_path` that was wired."
+                "Wiring a file onto prompt_template REPLACES the whole prompt, whatever was there: prompt_template_parts and every vague-term review of the old text (pending or accepted) are removed, and the file gets its own review card. "
+                "Wiring a file onto system_prompt or one query template replaces only that text and removes no term review. "
+                "A query template is refused (vague_term_query_override) while the node-level prompt has a pending term review: "
+                "have the user approve that review first, then wire again. Bind the file to prompt_template instead only if it is "
+                "meant to be the prompt for every query: that replaces the whole node-level prompt and retires its term reviews. "
+                "Returns the `field_path` that was wired, plus `superseded_review_ids` when the file superseded reviews of the old prompt."
             ),
             "parameters": {
                 "type": "object",

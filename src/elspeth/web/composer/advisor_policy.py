@@ -11,6 +11,7 @@ from collections.abc import Mapping, Sequence
 from types import MappingProxyType
 from typing import Any, Final, Literal
 
+from elspeth.contracts.composer_progress import CONTEXT_BUDGET_REFUSAL_DETAIL
 from elspeth.contracts.provider_rejection import SafeRequestRejection
 from elspeth.web.composer import no_tool_policy as _no_tool_policy
 from elspeth.web.composer.state import CompositionState
@@ -63,6 +64,25 @@ ADVISOR_UNAVAILABLE_USER_DETAIL: Final[str] = "advisor model was unavailable"
 # SDK text, exception class name, message, URL, or credential — the raw exception
 # is classified only into ``AdvisorCheckpointVerdict.failure_class`` (P5.3/D13).
 ADVISOR_MALFORMED_USER_DETAIL: Final[str] = "advisor response was malformed"
+
+
+def advisor_reply_cut_off_detail(*, cap: int, planner_cap_applied: bool) -> str:
+    """Fixed detail for a reply that stopped at its completion cap before a verdict.
+
+    The cause stays ``malformed``; this names the cap that was sent and the
+    setting that sets it, so the operator raises the cap rather than blaming
+    the model. A planner-continuation review is sent the smaller of the
+    advisor cap and the planner's, and then names both settings.
+    """
+    setting = (
+        "composer_advisor_max_completion_tokens, limited here by composer_planner_max_completion_tokens"
+        if planner_cap_applied
+        else "composer_advisor_max_completion_tokens"
+    )
+    return (
+        f"the advisor's reply ran out of room before a verdict: it stopped at the completion cap of {cap:,} tokens that "
+        f"was sent ({setting}), which the model's reasoning shares. Raise that setting to give the review more room."
+    )
 
 
 # elspeth-032ec69c41 (ruling 2026-09-22): one fixed backend sentence per closed
@@ -266,10 +286,12 @@ _ADVISOR_FINDINGS_UNTRUSTED_END: Final[str] = "END_UNTRUSTED_ADVISOR_FINDINGS"
 ADVISOR_FINAL_REPLY_CONTRACT_CLAUSE: Final[str] = (
     "The end user has not read these findings: write your final reply to stand on its own and do not quote the fenced text."
 )
-ADVISOR_OUTPUT_CONTRACT_CLAUSE: Final[str] = "Fix the findings via tool calls. " + ADVISOR_FINAL_REPLY_CONTRACT_CLAUSE
+ADVISOR_OUTPUT_CONTRACT_CLAUSE: Final[str] = (
+    "Fix applicable findings via tools, or explain evidence that no edit is needed. " + ADVISOR_FINAL_REPLY_CONTRACT_CLAUSE
+)
 
 # elspeth-71617f1d21: the END-gate repair-continue message must state that
-# MUTATIONS are expected. In session 2e0c8ea3 both advisor repair turns were
+# MUTATIONS are expected for actual graph defects. In an observed session both advisor repair turns were
 # spent entirely on get_pipeline_state lookups — the injection carried only
 # the output-contract clause, and nothing said a read-only turn is a wasted
 # pass. END-gate only: the EARLY advisory injection deliberately keeps its
@@ -278,12 +300,19 @@ ADVISOR_OUTPUT_CONTRACT_CLAUSE: Final[str] = "Fix the findings via tool calls. "
 # A user-requested explanation or pause remains conversational. Suspected
 # inability to finish an authorized build uses the structured advisor decision;
 # a large remaining graph must not become a self-selected checkpoint.
+# The findings to resolve are those on what this turn changed: an edit battery
+# turned a one-step insertion into 22 calls on 11 unnamed LLM steps because a
+# pre-existing graph-wide condition counted as "applicable" (2026-11-21).
 # Trailing space is load-bearing: the two clauses concatenate.
 ADVISOR_MUTATION_EXPECTATION_CLAUSE: Final[str] = (
-    "If the user's active request authorizes changes, resolve graph findings through pipeline MUTATIONS via tool calls "
-    "(e.g. patch_node_options, upsert_node, patch_source_options, "
-    "patch_output_options). Re-reading state (get_pipeline_state) or other "
-    "lookup-only calls is not a fix, though they can supply evidence. If the user asks for explanation or says not to make changes, "
+    "If the user's active request authorizes changes, resolve the findings on what this turn changed through pipeline MUTATIONS "
+    "via tool calls (e.g. patch_node_options, upsert_node, patch_source_options, "
+    "patch_output_options). A condition only on steps this turn did not change and the request did not name is "
+    "pre-existing: do not change those steps for it; report it once in your reply. Re-reading state (get_pipeline_state) or other "
+    "lookup-only calls is not a fix, though they can supply evidence. If a finding contradicts supplied evidence or binding contracts, "
+    "state that evidence in a reply that stands on its own for the user; do not change correct content or make no-op edits "
+    "to obtain another pass. "
+    "If the user asks for explanation or says not to make changes, "
     "answer that request without changing the pipeline; the advisor block still prevents completion. "
     "For a specific missing decision or suspected technical inability, call request_advisor_hint alone "
     "with trigger=cannot_complete and the observed evidence. On CONTINUE, take the supported next action; "
@@ -500,9 +529,15 @@ def advisor_signoff_blocked_wording(
             if request_rejection is not None
             else SafeRequestRejection(reason_code=None, reason_disposition="unavailable", reason_source="unavailable")
         )
+        # A request too large for the model's context: the recourse is the
+        # context budget's own (a new session or a shorter request). The
+        # suggestion is stored on the blocker but never matched against stored
+        # text; only its length is bounded (advisor_audit).
         return (
             rejection.public_detail,
-            "An unchanged rejected request will not be retried automatically. Review the rejection reason before sending another message.",
+            CONTEXT_BUDGET_REFUSAL_DETAIL
+            if rejection.reason_code == "context_length_exceeded"
+            else "An unchanged rejected request will not be retried automatically. Review the rejection reason before sending another message.",
         )
     if reason == "unavailable":
         return (

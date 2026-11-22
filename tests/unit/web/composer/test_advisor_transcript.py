@@ -423,12 +423,15 @@ def _transcript_with_history():
     return owner.snapshot().with_request_reference("initial_planner_request.intent")
 
 
-def test_every_event_but_the_current_request_reference_is_sheddable():
+def test_only_events_of_earlier_turns_are_sheddable():
+    # Was: every event but the current request's reference, the turn's own tool traffic included.
     transcript = _transcript_with_history()
     events = json.loads(transcript.provider_json)["events"]
 
     assert len(events) == 5 and events[2]["content_ref"] == "initial_planner_request.intent"
-    assert transcript.sheddable_event_indices() == (0, 1, 3, 4)
+    # Events 3 and 4 are this turn's tool call and result; they are never sheddable.
+    assert [event["source"] for event in events[3:]] == ["current_request", "current_request"]
+    assert transcript.sheddable_event_indices() == (0, 1)
 
 
 def _legacy_invocation(call_id: str, arguments: dict, result: dict) -> dict:
@@ -548,19 +551,22 @@ def test_without_events_drops_exactly_the_named_events_and_discloses_the_omissio
     assert reduced.semantic_binding == transcript.semantic_binding
     assert reduced.request == transcript.request
     # Reducing a reduced transcript records the gap once.
-    again = json.loads(reduced.without_events(frozenset({1})).provider_json)
+    again = json.loads(transcript.without_events(frozenset({0})).without_events(frozenset({0})).provider_json)
     assert again["availability_gaps"].count(CONTEXT_BUDGET_TRANSCRIPT_OMISSION_GAP) == 1
-    assert again["events"] == [original["events"][2], original["events"][4]]
+    assert again["events"] == original["events"][2:]
 
 
-def test_without_events_keeps_the_current_request_reference_and_events_after_it():
+def test_without_events_keeps_the_current_request_reference_and_every_event_after_it():
+    # Was: an event after the reference (this turn's tool call) could be dropped too.
     transcript = _transcript_with_history()
     original = json.loads(transcript.provider_json)["events"]
 
-    reduced = json.loads(transcript.without_events(frozenset({0, 1, 3})).provider_json)["events"]
+    reduced = json.loads(transcript.without_events(frozenset({0, 1})).provider_json)["events"]
 
-    assert reduced == [original[2], original[4]]
+    assert reduced == original[2:]
     assert reduced[0]["content_ref"] == "initial_planner_request.intent"
+    with pytest.raises(ValueError, match="sheddable"):
+        transcript.without_events(frozenset({0, 1, 3}))
 
 
 def test_without_no_events_is_the_same_transcript():
@@ -569,7 +575,7 @@ def test_without_no_events_is_the_same_transcript():
     assert transcript.without_events(frozenset()) is transcript
 
 
-@pytest.mark.parametrize("indices", [frozenset({2}), frozenset({0, 2}), frozenset({5}), frozenset({-1})])
+@pytest.mark.parametrize("indices", [frozenset({2}), frozenset({0, 2}), frozenset({3}), frozenset({0, 4}), frozenset({5}), frozenset({-1})])
 def test_without_events_refuses_the_current_request_and_indices_it_does_not_hold(indices):
     transcript = _transcript_with_history()
 

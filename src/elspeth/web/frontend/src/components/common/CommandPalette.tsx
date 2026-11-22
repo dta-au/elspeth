@@ -23,6 +23,7 @@ import {
   REQUEST_RUN_EVENT,
   claimWorkspaceViewIntent,
   dispatchClaimedAuthoringFocusIntent,
+  dispatchClaimedAuthoringToggleIntent,
   dispatchClaimedArtifactViewIntent,
 } from "@/lib/composer-events";
 
@@ -145,6 +146,24 @@ export function CommandPalette({
         onClose();
         queueMicrotask(() => {
           dispatchClaimedAuthoringFocusIntent(intent);
+        });
+      },
+    });
+
+    cmds.push({
+      id: "toggle-conversation",
+      // A true toggle, matching Ctrl+\: hides an open conversation, shows a
+      // hidden one (narrow layouts switch between Compose and Pipeline).
+      // commandRegister.test.tsx pins word-for-word agreement with the
+      // shortcuts sheet's Ctrl+\ entry.
+      title: "Hide or show conversation",
+      category: "navigation",
+      shortcut: "Ctrl+\\",
+      action: () => {
+        const intent = claimWorkspaceViewIntent();
+        onClose();
+        queueMicrotask(() => {
+          dispatchClaimedAuthoringToggleIntent(intent);
         });
       },
     });

@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.14+](https://img.shields.io/badge/python-3.14+-blue.svg)](https://www.python.org/downloads/)
-![Status: 0.8.15](https://img.shields.io/badge/status-0.8.15-green.svg)
+![Status: 0.8.16](https://img.shields.io/badge/status-0.8.16-green.svg)
 
 ELSPETH builds, validates, runs, and audits data and LLM workflows whose
 outputs need to be reviewed and explained. You can author a pipeline in
@@ -100,178 +100,139 @@ ELSPETH supports audit export and optional signing. The
 [export settings and limits](docs/reference/configuration.md#export-settings)
 describe what is exported and how to configure it.
 
-## What changed in 0.8.15
+## What changed in 0.8.16
 
-0.8.15 carries executor hot-path fixes, Web Composer fixes and a
-release-pipeline repair. See the [release notes](CHANGELOG.md), which also
-record earlier releases. It supersedes 0.8.14, which was tagged but never
-published as a release or version-tagged image, so the 0.8.14 changes below
-ship for the first time here: upgrading from 0.8.13 or earlier means moving to
-Python 3.14, and the 0.8.14 upgrade actions apply.
+0.8.16 carries Web Composer fixes for large pipelines and for prompts held in
+files, bounded advisor and prompt-guard requests, and less redundant per-row
+engine work. See the [release notes](CHANGELOG.md), which also record earlier
+releases.
 
-A run interrupted before upgrading cannot be resumed after it; finish or re-run
-interrupted runs first. Session epoch 79 replaces session epoch 78 and
-Landscape epoch 51 replaces epoch 50: file-backed LLM prompts are reviewed,
-admitted only on the approved bytes, and the run records the hash of the prompt
-file it read. The session store adds `prompt_review_snapshots` and
-`prompt_file_approvals`, and the Landscape store adds `run_prompt_inputs`; the
-tables are additive. Preserve epoch 78 session stores and epoch 50 Landscape
+Long inline prompts belong in files: a Composer edit that adds or changes an
+inline LLM prompt over 100 words or 1,000 characters is refused, and the
+composer puts the text in a file instead. One prompt template may hold up to
+64 KiB and a pipeline up to 4 MiB of text in attached files. A composer request
+that fits the configured request size is always sent, and advisor and
+prompt-guard requests no longer grow with the session.
+
+Session epoch 79 and Landscape epoch 51 are unchanged from 0.8.15; this release
+adds no schema-epoch cutover, and existing 0.8.15 session and Landscape stores
+open unchanged. A web run admitted under 0.8.15 does not resume, because the
+plugin policy hash changes: finish interrupted web runs before upgrading, or
+run them again afterwards. Upgrading from 0.8.14 or earlier means applying the 0.8.15
+upgrade notes first: preserve epoch 78 session stores and epoch 50 Landscape
 stores, which startup refuses to open; use a separately provisioned epoch 79
 session store and epoch 51 Landscape store, and keep old workers isolated from
 the new stores. The 0.8.10 cutover guidance below continues to apply to older
 stores. Backwards compatibility is permitted and considered from 0.8.5 within
 explicitly supported boundaries.
 This release authorizes no in-place migration, reset or downgrade. Package
-metadata is 0.8.15; the package version alone does not establish qualification
+metadata is 0.8.16; the package version alone does not establish qualification
 or image publication. Automatic image publication from main is held; verify
 the release tag and image digest before installing a published image.
 
-## Previously in 0.8.14
+## Upgrading from earlier releases
 
-0.8.14 moves ELSPETH to Python 3.14.
-
-Python 3.14 is now required for `elspeth`, `elspeth-lints` and the LLM gateway;
-3.12 and 3.13 are no longer supported or tested. Locked dependency versions are
-unchanged. The release image carries its own CPython 3.14.5 under `/opt/python`
-on a distroless `cc-debian13` base, so it has no `/usr/bin/python3`, and the
-gateway image is `python:3.14-alpine`. Behaviour that changed under the new
-interpreter is corrected: strict JSON parsing bounds nesting explicitly, the
-runtime-validation manifest again records helper dependencies, and asyncio
-diagnostics that carry an exception are logged as the exception class and code
-location only.
-
-Three things need action when upgrading. Startup refuses `JSON_LOGS=true`,
-because LiteLLM's JSON-logs mode logs unhandled exception messages verbatim;
-unset it. The runtime-validation manifest hash changes with the interpreter, so
-a run checkpointed under 3.13 refuses to resume under 3.14 and a web approval
-recorded under 3.13 no longer matches: drain in-flight runs and pending
-approvals before upgrading. CI runs one Python 3.14 lane, so required
-status-check names change and the repository ruleset must be updated to match.
-
-The Web Composer remediation starts in this release. A reply the completion
-review withholds is shown as a system notice and never re-enters the
-conversation as the model's words. The version menu shows the newest 50 versions
-and marks validated milestones, `diff_pipeline` compares against the last
-validated state, and credential-shaped model reasoning is withheld instead of
-failing the turn. `batch_stats`, `batch_replicate` and `batch_experiment_compare`
-are available on every install, which changes the plugin policy hash: web runs
-admitted before the upgrade refuse to resume. A Web Composer graph that feeds
-`report_assemble` straight into a `text` sink is now refused; insert
-`line_explode`. Cancelling a shared-pipeline import or library fork no longer
-leaves an empty session, share tokens are decoded strictly, and `elspeth purge`
-can no longer delete a live share's data: new shares are stored under `shares/`
-in the payload store, links created earlier keep working but remain
-purge-exposed, and `purge --payload-dir` must never point at `shares/`.
-
-0.8.14 changed no schema epoch.
-
-## Previously in 0.8.13
-
-0.8.13 adds the Composer context budget. See the [release notes](CHANGELOG.md).
-
-Long Composer sessions used to grow until the server or the model gateway
-rejected a request for size. Before each compose-loop and planner model call,
-the server now removes older context in a fixed order until the request fits an
-operator-set prompt-token cap and a request-byte ceiling: earlier tool results
-in the turn, then earlier assistant prose, then escape-hatch transcript events,
-then the oldest earlier user requests. The system skill, catalog, tool
-definitions, current request, pipeline state and latest tool round trip are
-never removed. What was removed is recorded on each call's audit record, and
-the user is told when earlier conversation is no longer visible to the
-Composer. A request that cannot fit is refused before any model call, with a
-named cause and the recourse (start a new session, or shorten the request).
-
-Two configuration changes are breaking. `ELSPETH_WEB__COMPOSER_CONTEXT_MAX_PROMPT_TOKENS`
-is required and has no default: the web server does not start without it. Set
-it to the prompt-token limit of the model gateway in front of the Composer. The
-default of `ELSPETH_WEB__COMPOSER_PLANNER_MAX_REQUEST_BYTES` drops from 2 MiB
-to 960 KiB and now also bounds the compose loop.
-
-The budget does not bound every Composer request. Advisor and review calls are
-not yet covered ([#364](https://github.com/dta-au/elspeth/issues/364)), token
-counts are estimated from request bytes rather than a tokenizer, and a request
-the provider still rejects for context length is not retried.
-
-Session epoch 78 and Landscape epoch 50 are unchanged from the previous
-release; this release adds no schema-epoch cutover, so existing session and
-Landscape stores need no action. The 0.8.10 cutover guidance below continues to
-apply to older stores. Backwards compatibility is permitted and considered from 0.8.5 within
-explicitly supported boundaries. This release authorizes no in-place migration,
+Apply each release's upgrade actions in order, oldest first. This section
+holds only what an operator must do or know; the [release notes](CHANGELOG.md)
+carry each release's full upgrade notes, and the
+[deployment runbooks](docs/runbooks/index.md) cover the procedures. Backwards
+compatibility is permitted and considered from 0.8.5 within explicitly
+supported boundaries. None of these releases authorizes an in-place migration,
 reset or downgrade.
 
-## Previously in 0.8.12
+### 0.8.15
 
-0.8.12 is the Composer tool remediation. See the [release notes](CHANGELOG.md).
+It superseded 0.8.14, which was tagged but never published as a release or
+version-tagged image, so the 0.8.14 changes shipped for the first time there:
+upgrading from 0.8.13 or earlier means moving to Python 3.14, and the 0.8.14
+upgrade actions apply.
 
-Under explicit approval, one composition proposal is pending at a time: a
-response carrying more than one mutation is refused whole, and a mutation is
-refused while a proposal is pending, with guidance to the model. This contains
-the defect rather than redesigning it; auto-commit sessions and blob-only
-proposals are not covered. Refusals and no-ops go back to the model as tool
-feedback instead of an approval card. `diff_pipeline` answers in freeform
-sessions, transforms can be spliced into planner-built pipelines, an oversized
-blob read is reported as a size refusal, and contradictory Composer skill text
-was corrected in place without restructuring it.
+- A run interrupted before upgrading to 0.8.15 cannot be resumed after it;
+  finish or re-run interrupted runs first.
+- Session epoch 79 replaced session epoch 78 and Landscape epoch 51 replaced
+  epoch 50. The session store added `prompt_review_snapshots` and
+  `prompt_file_approvals`, and the Landscape store added `run_prompt_inputs`.
+  Startup refuses the older stores; preserve them and use separately
+  provisioned new ones.
+- API clients that approve prompt review cards must send `reviewed_anchor`.
 
-MCP file paths are confined to the configured data directory, and the
-standalone MCP server runs under a supervisor that settles its child process on
-shutdown, failed start and parent death. Creating Landscape tables on PostgreSQL
-no longer breaks a later SQLite initialization in the same process.
+### 0.8.14
 
-The web interface takes the ARGOnite look in light and dark themes. A new
-`file_inject` transform attaches the content of a file to each row; in the
-Composer it accepts only a file the user uploaded. Langfuse moves to 5.2.0 and
-the OpenTelemetry packages to 1.45.2, which clears the remaining Python
-dependency advisories; Langfuse tracing now needs Langfuse Cloud or a
-self-hosted server at 4.59.0 or later.
+0.8.14 moves ELSPETH to Python 3.14. It changed no schema epoch.
 
-Session epoch 78 and Landscape epoch 50 are unchanged from the previous
-release; this release adds no schema-epoch cutover, so existing session and
-Landscape stores need no action. The 0.8.10 cutover guidance below continues to
-apply to older stores. Backwards compatibility is permitted and considered from 0.8.5 within
-explicitly supported boundaries. This release authorizes no in-place migration,
-reset or downgrade.
+- Python 3.14 is now required for `elspeth`, `elspeth-lints` and the LLM
+  gateway; 3.12 and 3.13 are no longer supported or tested. The release image
+  carries its own CPython under `/opt/python`, so it has no
+  `/usr/bin/python3`.
+- Startup refuses `JSON_LOGS=true`; unset it.
+- The runtime-validation manifest hash changes with the interpreter, so a run
+  checkpointed under 3.13 refuses to resume under 3.14 and a web approval
+  recorded under 3.13 no longer matches: drain in-flight runs and pending
+  approvals before upgrading. Web runs admitted before the upgrade also refuse
+  to resume, because the plugin policy hash changes.
+- A Web Composer graph that feeds `report_assemble` straight into a `text`
+  sink is refused; insert `line_explode`.
+- New shares are stored under `shares/` in the payload store. Links created
+  earlier keep working but remain purge-exposed, and `purge --payload-dir`
+  must never point at `shares/`. Library entries published earlier must be
+  republished before they can be forked.
+- CI runs one Python 3.14 lane, so required status-check names change and the
+  repository ruleset must be updated to match.
+- Many plugin configurations and inputs that used to load are now refused, and
+  some outputs and error shapes change; check the 0.8.14 upgrade notes against
+  your pipelines.
 
-## Previously in 0.8.10
+### 0.8.13
 
-0.8.10 carries the Composer performance remediation. Proposals, the
-`set_pipeline` schema and fixed tool definitions are verified once; restored
-states keep their identity through review projection, reconciliation and commit
-binding; plugin summaries, proposal lists and review cards read once per
-request; advisory validation shares a brief memo that durable review records
-never read; and operation streams authorize on one connection. Every LLM call
-row records the byte size of each request component. Approval binding shares
-the cached runtime manifest with run start, and the transform executor reads
-the recorded input hash. Outputs, hashes and decisions are byte-identical to
-0.8.9. See the [release notes](CHANGELOG.md).
+0.8.13 adds the Composer context budget. Two configuration changes are
+breaking:
 
-Composer and advisor models must be reasoning models: a reasoning hint is sent
-on every composer-plane call, `ELSPETH_WEB__COMPOSER_*_REASONING_EFFORT=none`
-is refused at startup, and gateway adapters must declare the `reasoning`
-capability to serve the Composer. The frontend holds Run while a session
-operation is still in flight, and `.env` discovery starts from the working
-directory.
+- `ELSPETH_WEB__COMPOSER_CONTEXT_MAX_PROMPT_TOKENS` is required and has no
+  default: the web server does not start without it. Set it to the
+  prompt-token limit of the model gateway in front of the Composer.
+- The default of `ELSPETH_WEB__COMPOSER_PLANNER_MAX_REQUEST_BYTES` drops from
+  2 MiB to 960 KiB and now also bounds the compose loop.
 
-Session epoch 78 replaces session epoch 77 and retains its committed graph-review
-authority while strengthening quota custody and shared rate-limit policy binding.
-Landscape epoch 50 replaces epoch 49 and records durable provider-attempt identity
-on run calls. Both epochs are unchanged from 0.8.9, so an existing epoch 78 session
-store and epoch 50 Landscape store need no action. Preserve epoch 75, both epoch 76
-session-store contracts, epoch 77 session stores and epoch 49 Landscape stores; use
-a separately provisioned epoch 78 session store and epoch 50 Landscape store. Keep
-old workers isolated from the new stores. Compatible stores still require exact
-schema admission; unsupported stores are preserved and refused before incompatible
-writes. Backwards compatibility is permitted and considered from 0.8.5 within
-explicitly supported boundaries. This release authorizes no in-place migration,
-reset or downgrade.
+### 0.8.12
 
-Quota API quantities now use decimal strings for exact signed-64-bit values;
-older numeric clients must adapt their response parsing. Proxy deployments must
-explicitly configure `ELSPETH_WEB__TRUSTED_PROXY_HOSTS` with their actual numeric
-forwarding peers; the default trusts no forwarding headers.
+0.8.12 is the Composer tool remediation.
 
-See the [release notes](CHANGELOG.md) and [deployment runbooks](docs/runbooks/index.md)
-before upgrading.
+- MCP file paths are confined to the configured data directory.
+- Langfuse tracing now needs Langfuse Cloud or a self-hosted server at 4.59.0
+  or later.
+- Under explicit approval, one composition proposal is pending at a time: a
+  response carrying more than one mutation is refused whole.
+
+### 0.8.10
+
+0.8.10 carries the Composer performance remediation; its schema epochs are
+those of 0.8.9.
+
+- Composer and advisor models must be reasoning models:
+  `ELSPETH_WEB__COMPOSER_*_REASONING_EFFORT=none` is refused at startup, and
+  gateway adapters must declare the `reasoning` capability to serve the
+  Composer. `.env` discovery starts from the working directory.
+- Session epoch 78 replaces session epoch 77 and retains its committed
+  graph-review authority while strengthening quota custody and shared
+  rate-limit policy binding. Landscape epoch 50 replaces epoch 49 and records
+  durable provider-attempt identity on run calls. Preserve epoch 75, both
+  epoch 76 session-store contracts, epoch 77 session stores and epoch 49
+  Landscape stores; use a separately provisioned epoch 78 session store and
+  epoch 50 Landscape store. Keep old workers isolated from the new stores.
+  Compatible stores still require exact schema admission; unsupported stores
+  are preserved and refused before incompatible writes.
+- Quota API quantities now use decimal strings for exact signed-64-bit values;
+  older numeric clients must adapt their response parsing.
+- Proxy deployments must explicitly configure
+  `ELSPETH_WEB__TRUSTED_PROXY_HOSTS` with their actual numeric forwarding
+  peers; the default trusts no forwarding headers.
+
+### 0.8.1 and earlier
+
+Upgrading to 0.8.0 and to 0.8.1 was a paired session and Landscape database
+cutover with no in-place migration; see those releases' notes. Stores older
+than the current epochs are refused at startup: preserve them and provision
+new ones.
 
 ## Recovery and deployment
 

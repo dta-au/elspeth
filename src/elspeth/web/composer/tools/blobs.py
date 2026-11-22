@@ -7,7 +7,7 @@ Hosts:
   ``_handle_list_blobs`` / ``_handle_get_blob_metadata``.
 - Quota policy (``_BLOB_QUOTA_BYTES``).
 - Storage primitives (``_prepare_blob_create`` / ``_persist_prepared_blob_create`` /
-  ``_sync_get_blob`` / ``_sync_list_blobs`` / ``_check_blob_quota``).
+  ``_sync_get_blob`` / ``_sync_read_blob_list`` / ``_check_blob_quota``).
 - Blob DTOs (``BlobToolRecord`` / ``BlobCreatePayload`` / ``_PreparedBlobCreate``).
 - Shared public-service custody, recovery, and exact operation authority for
   content reads and mutations.
@@ -24,11 +24,11 @@ helpers here resolve those names via their local module namespace.
 from __future__ import annotations
 
 import hmac
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Literal, NotRequired, TypedDict, cast
+from typing import Any, Final, Literal, NotRequired, TypedDict, TypeGuard, cast
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
@@ -45,12 +45,15 @@ from elspeth.contracts.blobs_inline import (
     is_widened_blob_ref,
 )
 from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
+from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.credential_material import DEFAULT_CREDENTIAL_TRAVERSAL_POLICY
 from elspeth.contracts.enums import CreationModality, is_llm_authored_creation_modality
 from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
-from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.core.templates import MAX_JINJA_TEMPLATE_BYTES, template_size_refusal
+from elspeth.web.blobs.prompt_editor import is_template_binding_path
 from elspeth.web.blobs.protocol import (
     AllowedMimeType,
     BlobActiveRunError,
@@ -120,6 +123,8 @@ from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
     PROMPT_TEMPLATE_PARTS_KEY,
     reconcile_authoritative_reviews,
+    serialize_authoring_review_options,
+    vague_term_wiring_count,
 )
 from elspeth.web.provider_config_policy import web_aws_s3_endpoint_url_policy_error
 from elspeth.web.resource_identity import canonical_resource_uuid
@@ -533,45 +538,110 @@ _BLOB_ID_UUID_ERROR = (
 )
 
 
-def _sync_list_blobs(engine: Engine, session_id: str) -> list[BlobInventoryPayload]:
-    """Synchronous blob listing for use in the tool executor thread."""
+# Both model-facing listings show at most this many files, newest first. The
+# bound is deliberate: the session quota limits bytes, not file count, so an
+# uncapped listing has no ceiling on what it puts in front of the model. A
+# capped listing must say so: see ``_blob_list_incomplete_hint``.
+_BLOB_LIST_LIMIT: Final[int] = 50
+
+# Fixed lead-in of the one hint that marks a listing as incomplete. It is the
+# marker: ``blob_list_is_incomplete`` and the planner recognise the hint by it
+# alone, so the wording after it can change without touching either.
+_BLOB_LIST_INCOMPLETE_PREFIX: Final[str] = "Incomplete list: "
+
+
+def _blob_list_incomplete_hint(*, total: int, ready_only: bool) -> str:
+    """Say plainly what a capped listing left out and how to reach it.
+
+    Built from the server's own count only: no file name or other stored text.
+    """
+    kind = "ready files" if ready_only else "files"
+    return (
+        f"{_BLOB_LIST_INCOMPLETE_PREFIX}the {_BLOB_LIST_LIMIT} newest of {total} {kind} in this session are shown; "
+        f"{total - _BLOB_LIST_LIMIT} older {kind} are not listed. A file that is not listed still exists and still works "
+        "by its id. No tool finds a file by name. If you already have its id, use it. Otherwise do not conclude the "
+        "file is absent and do not create a replacement: tell the user it is outside the 50 newest files you can see "
+        "and ask for its id; a data file they can instead select as the pipeline input from their file list. Only if "
+        "neither is possible, ask them to upload it again."
+    )
+
+
+def blob_list_is_incomplete(result: ToolResult) -> bool:
+    """Return whether a file-listing result carries the incomplete-list marker."""
+    return any(hint.startswith(_BLOB_LIST_INCOMPLETE_PREFIX) for hint in result.post_call_hints)
+
+
+@dataclass(frozen=True, slots=True)
+class _BlobListRead:
+    """One capped listing read: the records shown and what the same statement counted.
+
+    The count travels with the records, so no caller can take the page without
+    the answer to whether it is the whole listing.
+    """
+
+    records: tuple[BlobToolRecord, ...]
+    matching_total: int
+    ready_only: bool
+
+    @property
+    def incomplete_hint(self) -> str | None:
+        """The hint to send with this page, or ``None`` when it shows every matching file."""
+        if self.matching_total <= len(self.records):
+            return None
+        return _blob_list_incomplete_hint(total=self.matching_total, ready_only=self.ready_only)
+
+
+def _sync_read_blob_list(engine: Engine, session_id: str, *, ready_only: bool) -> _BlobListRead:
+    """Read one capped listing, newest first, and the uncapped match count, in one statement.
+
+    The count is a window over the listing statement itself, so the page and
+    the number reported beside it come from one read and cannot disagree.
+    ``id`` breaks ``created_at`` ties, so which files fall inside the cap does
+    not depend on database row order.
+    """
+    query = select(blobs_table, func.count().over().label("matching_total")).where(blobs_table.c.session_id == session_id)
+    if ready_only:
+        query = query.where(blobs_table.c.status == "ready")
     with engine.connect() as conn:
-        rows = conn.execute(
-            select(blobs_table).where(blobs_table.c.session_id == session_id).order_by(blobs_table.c.created_at.desc()).limit(50)
-        ).fetchall()
-        return [
-            {
-                "id": blob["id"],
-                "filename": blob["filename"],
-                "mime_type": blob["mime_type"],
-                "size_bytes": blob["size_bytes"],
-                "created_by": blob["created_by"],
-                # Paired with created_by so the inventory answers "who
-                # authored these bytes" at the same depth as the read-back
-                # path (get_blob_content). created_by alone cannot: the
-                # composer writes created_by="assistant" both for content it
-                # generated and for content copied verbatim from the user.
-                "creation_modality": blob["creation_modality"],
-                "status": blob["status"],
-            }
-            for blob in (_blob_row_to_tool_dict(row) for row in rows)
-        ]
+        rows = conn.execute(query.order_by(blobs_table.c.created_at.desc(), blobs_table.c.id.asc()).limit(_BLOB_LIST_LIMIT)).fetchall()
+    records = tuple(_blob_row_to_tool_dict(row) for row in rows)
+    matching_total: int = rows[0].matching_total if rows else 0
+    return _BlobListRead(records=records, matching_total=matching_total, ready_only=ready_only)
 
 
-def _sync_list_ready_blob_inline_descriptors(engine: Engine, session_id: str) -> list[BlobInlineDescriptor]:
-    """Return H4 visibility descriptors for ready session blobs."""
-    with engine.connect() as conn:
-        rows = conn.execute(
-            select(blobs_table)
-            .where(blobs_table.c.session_id == session_id)
-            .where(blobs_table.c.status == "ready")
-            .order_by(blobs_table.c.created_at.desc())
-            .limit(50)
-        ).fetchall()
+def _with_blob_list_completeness(result: ToolResult, listing: _BlobListRead) -> ToolResult:
+    """Attach the incomplete-list hint when the read counted more files than it shows."""
+    hint = listing.incomplete_hint
+    if hint is None:
+        return result
+    return replace(result, post_call_hints=(*result.post_call_hints, hint))
 
+
+def _blob_inventory_entries(records: Sequence[BlobToolRecord]) -> list[BlobInventoryPayload]:
+    """Project listed records to the ``list_blobs`` inventory shape."""
+    return [
+        {
+            "id": blob["id"],
+            "filename": blob["filename"],
+            "mime_type": blob["mime_type"],
+            "size_bytes": blob["size_bytes"],
+            "created_by": blob["created_by"],
+            # Paired with created_by so the inventory answers "who
+            # authored these bytes" at the same depth as the read-back
+            # path (get_blob_content). created_by alone cannot: the
+            # composer writes created_by="assistant" both for content it
+            # generated and for content copied verbatim from the user.
+            "creation_modality": blob["creation_modality"],
+            "status": blob["status"],
+        }
+        for blob in records
+    ]
+
+
+def _blob_inline_descriptors(records: Sequence[BlobToolRecord]) -> list[BlobInlineDescriptor]:
+    """Project listed ready records to the H4 inline-content visibility descriptors."""
     descriptors: list[BlobInlineDescriptor] = []
-    for row in rows:
-        blob = _blob_row_to_tool_dict(row)
+    for blob in records:
         if blob["content_hash"] is None:
             raise AuditIntegrityError(f"Ready blob '{blob['id']}' has null content_hash; cannot list for inline_content authoring")
         descriptors.append(
@@ -596,11 +666,12 @@ def _handle_list_blobs(
     session_id = context.session_id
     if session_engine is None or session_id is None:
         return _failure_result(state, "Blob tools require session context.")
-    blobs = _sync_list_blobs(session_engine, session_id)
+    listing = _sync_read_blob_list(session_engine, session_id, ready_only=False)
+    blobs = _blob_inventory_entries(listing.records)
     refusal = _credential_safe_blob_discovery_result(state, blobs, surface="composer_blob_metadata")
     if refusal is not None:
         return refusal
-    return _discovery_result(state, blobs)
+    return _with_blob_list_completeness(_discovery_result(state, blobs), listing)
 
 
 _LIST_BLOBS_DECLARATION = ToolDeclaration(
@@ -610,7 +681,9 @@ _LIST_BLOBS_DECLARATION = ToolDeclaration(
     response_contract=_BLOB_INVENTORY_RESPONSE,
     description=(
         "List uploaded/created files (blobs) in this session with metadata: each entry carries `id`, `filename`, "
-        "`mime_type`, `size_bytes`, `status`, `created_by`, and `creation_modality`."
+        "`mime_type`, `size_bytes`, `status`, `created_by`, and `creation_modality`. Lists at most the 50 newest "
+        "files; when more exist, a `post_call_hints` entry starting `Incomplete list:` says how many are not listed. "
+        "An unlisted file still works by its id; no tool finds a file by name."
     ),
     json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
 )
@@ -632,7 +705,8 @@ def _handle_list_composer_blobs(
     session_id = context.session_id
     if session_engine is None or session_id is None:
         return _failure_result(state, "Blob tools require session context.")
-    payload = {"blobs": _sync_list_ready_blob_inline_descriptors(session_engine, session_id)}
+    listing = _sync_read_blob_list(session_engine, session_id, ready_only=True)
+    payload = {"blobs": _blob_inline_descriptors(listing.records)}
     refusal = _credential_safe_blob_discovery_result(
         state,
         payload,
@@ -640,7 +714,7 @@ def _handle_list_composer_blobs(
     )
     if refusal is not None:
         return refusal
-    return _discovery_result(state, payload)
+    return _with_blob_list_completeness(_discovery_result(state, payload), listing)
 
 
 _LIST_COMPOSER_BLOBS_DECLARATION = ToolDeclaration(
@@ -651,7 +725,9 @@ _LIST_COMPOSER_BLOBS_DECLARATION = ToolDeclaration(
     description=(
         "List ready blobs available for audited inline-content authoring. "
         "Returns a `blobs` list whose entries carry only `blob_id`, `mime_type`, `size_bytes`, `content_hash`, "
-        "and `filename`; never content bytes."
+        "and `filename`; never content bytes. Lists at most the 50 newest ready files; when more exist, a "
+        "`post_call_hints` entry starting `Incomplete list:` says how many are not listed. An unlisted file still "
+        "works by its id; no tool finds a file by name."
     ),
     json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
 )
@@ -1149,26 +1225,275 @@ def _file_inject_wired_marker_error(state: CompositionState, field_path: str) ->
     return None
 
 
+def _is_vague_term_requirement(row: object) -> TypeGuard[Mapping[str, JsonValue]]:
+    return isinstance(row, Mapping) and row.get("kind", InterpretationKind.VAGUE_TERM.value) == InterpretationKind.VAGUE_TERM.value
+
+
+def _vague_term_requirement_ids(options: Mapping[str, JsonValue]) -> tuple[str, ...]:
+    """Ids of the vague-term requirements a replacement of the prompt supersedes."""
+    requirements = options.get(INTERPRETATION_REQUIREMENTS_KEY)
+    if not isinstance(requirements, (list, tuple)):
+        return ()
+    return tuple(str(row["id"]) for row in requirements if isinstance(row, Mapping) and _is_vague_term_requirement(row) and "id" in row)
+
+
+def _options_for_prompt_replacement(options: Mapping[str, JsonValue]) -> Mapping[str, JsonValue]:
+    """Options with the prompt_template's own review state removed, ready for a new prompt.
+
+    The one strip every whole-prompt replacement uses, whether the new prompt
+    is a file (``wire_blob_inline_ref``) or new text (``patch_node_options``,
+    ``upsert_node``, ``set_pipeline``). Replacing the prompt takes everything
+    that reviewed the old text with it: ``prompt_template_parts`` and every
+    vague-term requirement (pending or resolved, slotted or not), because each
+    one defines a term of the text being replaced. The single card left is the
+    new prompt's own, re-derived by ``_options_with_default_prompt_template_review``.
+    Other kinds (model choice, pipeline decisions) are not about the prompt
+    text and are kept.
+    """
+    remaining: dict[str, JsonValue] = {key: value for key, value in options.items() if key != PROMPT_TEMPLATE_PARTS_KEY}
+    requirements = options.get(INTERPRETATION_REQUIREMENTS_KEY)
+    if isinstance(requirements, (list, tuple)):
+        kept = [row for row in requirements if not _is_vague_term_requirement(row)]
+        if kept:
+            remaining[INTERPRETATION_REQUIREMENTS_KEY] = kept
+        else:
+            remaining.pop(INTERPRETATION_REQUIREMENTS_KEY, None)
+    return remaining
+
+
+@dataclass(frozen=True, slots=True)
+class _PromptReplacement:
+    """One llm node's stored options with the replaced prompt's review state removed."""
+
+    base_options: Mapping[str, JsonValue]
+    superseded_review_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "base_options")
+
+
+def _prompt_replacement(stored_options: Mapping[str, JsonValue]) -> _PromptReplacement:
+    """The replacement every whole-prompt writer applies to the node it names."""
+    return _PromptReplacement(
+        base_options=_options_for_prompt_replacement(stored_options),
+        superseded_review_ids=_vague_term_requirement_ids(stored_options),
+    )
+
+
+def _whole_prompt_text_replacement(
+    stored_options: Mapping[str, JsonValue],
+    written: Mapping[str, JsonValue],
+) -> _PromptReplacement | None:
+    """Decide whether a write to an llm node replaces its whole prompt with text.
+
+    The signal is explicit and belongs to the model: ``prompt_template`` is a
+    plain string AND ``prompt_template_parts`` is present as ``null``. A file
+    marker never qualifies (binding a file is ``wire_blob_inline_ref``), and
+    ``prompt_template_parts: null`` alone replaces nothing. The server removes
+    only the review state of the text the model replaced; it writes no prompt
+    text, parts or requirement content of its own (by design, replacing A
+    with B does not depend on what A was).
+
+    Returns ``None`` when the write is not that signal or the stored prompt
+    carries nothing to supersede, so an ordinary write keeps its ordinary path.
+    """
+    prompt = written["prompt_template"] if "prompt_template" in written else None
+    if type(prompt) is not str:
+        return None
+    if PROMPT_TEMPLATE_PARTS_KEY not in written or written[PROMPT_TEMPLATE_PARTS_KEY] is not None:
+        return None
+    stored_parts = stored_options[PROMPT_TEMPLATE_PARTS_KEY] if PROMPT_TEMPLATE_PARTS_KEY in stored_options else None
+    replacement = _prompt_replacement(stored_options)
+    if stored_parts is None and not replacement.superseded_review_ids:
+        return None
+    return replacement
+
+
+def _written_options_for_prompt_replacement(
+    written: Mapping[str, JsonValue],
+    replacement: _PromptReplacement,
+) -> Mapping[str, JsonValue]:
+    """The model's write without the replace signal's null key or the old prompt's rows.
+
+    The skill tells the model to carry a node's requirement rows on every
+    write, so a replace call routinely echoes the rows it supersedes. Those are
+    dropped by id; every other row the model sent stays for admission and
+    reconciliation to judge. Call after the rows have been canonicalized, which
+    is what gives an echoed shell its stored id.
+    """
+    remaining: dict[str, JsonValue] = {key: value for key, value in written.items() if key != PROMPT_TEMPLATE_PARTS_KEY}
+    requirements = written[INTERPRETATION_REQUIREMENTS_KEY] if INTERPRETATION_REQUIREMENTS_KEY in written else None
+    if isinstance(requirements, (list, tuple)):
+        superseded = frozenset(replacement.superseded_review_ids)
+        remaining[INTERPRETATION_REQUIREMENTS_KEY] = [
+            row for row in requirements if not (_is_vague_term_requirement(row) and "id" in row and str(row["id"]) in superseded)
+        ]
+    return remaining
+
+
+# Result keys for a write that carried a node's existing prompt text. One
+# constant each, so the names and the sentence change in one place.
+PROMPT_UNCHANGED_NODE_IDS_KEY: Final = "prompt_unchanged_node_ids"
+PROMPT_UNCHANGED_NOTE_KEY: Final = "prompt_unchanged_note"
+PROMPT_UNCHANGED_NOTE: Final = (
+    "Each node in prompt_unchanged_node_ids was sent its existing prompt text: its prompt, term definitions and "
+    "approvals are unchanged. To replace it, send different text with prompt_template_parts: null."
+)
+
+
+def _texts_of_the_stored_prompt(stored_options: Mapping[str, JsonValue]) -> frozenset[str]:
+    """The two renderings the server hands out for a node's stored prompt.
+
+    The stored compiled ``prompt_template`` (what the turn context shows) and
+    the authoring export's ``prompt_template`` (what
+    ``get_pipeline_state(component="set_pipeline_arguments")`` returns, with
+    its placeholder words at each term slot). The export text comes from the
+    export's own serializer, so the two cannot drift.
+    """
+    texts: set[str] = set()
+    stored_prompt = stored_options["prompt_template"] if "prompt_template" in stored_options else None
+    if type(stored_prompt) is str:
+        texts.add(stored_prompt)
+    try:
+        exported = serialize_authoring_review_options(stored_options)
+    except ValueError:
+        # Stored options the export itself cannot serialize have no export text.
+        return frozenset(texts)
+    exported_prompt = exported["prompt_template"] if "prompt_template" in exported else None
+    if type(exported_prompt) is str:
+        texts.add(exported_prompt)
+    return frozenset(texts)
+
+
+def _written_options_keeping_an_unchanged_prompt(
+    stored_options: Mapping[str, JsonValue],
+    written: Mapping[str, JsonValue],
+    *,
+    merge_patch: bool,
+) -> Mapping[str, JsonValue] | None:
+    """The write with the stored structured prompt kept, when it re-sends that prompt's own text.
+
+    Text equal to a rendering the server hands out for the stored prompt (see
+    ``_texts_of_the_stored_prompt``) never changes the prompt's structure or
+    reviews, whatever the write says about ``prompt_template_parts`` (null, or
+    no key at all): identical text replaces nothing. Equal means the same
+    string; a re-typed prompt that differs by one space is a change.
+
+    A merge patch loses its ``prompt_template`` and its null parts key, so the
+    stored prompt is not touched and the export's placeholder words are never
+    written. A whole-node write gets the stored text and parts back, and the
+    stored requirement rows when it sent no ``interpretation_requirements`` key
+    at all; rows it did send are judged as on any write that keeps the prompt.
+    Nothing here is authored: every value restored is the node's own stored
+    value. Stored rows are restored in no other case.
+
+    Returns ``None`` for every other write, including one that sends
+    ``prompt_template_parts`` itself.
+    """
+    stored_parts = stored_options[PROMPT_TEMPLATE_PARTS_KEY] if PROMPT_TEMPLATE_PARTS_KEY in stored_options else None
+    if stored_parts is None:
+        return None
+    if PROMPT_TEMPLATE_PARTS_KEY in written and written[PROMPT_TEMPLATE_PARTS_KEY] is not None:
+        return None
+    prompt = written["prompt_template"] if "prompt_template" in written else None
+    if type(prompt) is not str or prompt not in _texts_of_the_stored_prompt(stored_options):
+        return None
+    kept: dict[str, JsonValue] = {key: value for key, value in written.items() if key not in ("prompt_template", PROMPT_TEMPLATE_PARTS_KEY)}
+    if merge_patch:
+        return kept
+    kept["prompt_template"] = stored_options["prompt_template"]
+    kept[PROMPT_TEMPLATE_PARTS_KEY] = deep_thaw(stored_parts)
+    if INTERPRETATION_REQUIREMENTS_KEY not in written:
+        stored_rows = stored_options[INTERPRETATION_REQUIREMENTS_KEY] if INTERPRETATION_REQUIREMENTS_KEY in stored_options else None
+        if isinstance(stored_rows, (list, tuple)):
+            kept[INTERPRETATION_REQUIREMENTS_KEY] = [deep_thaw(row) for row in stored_rows]
+    return kept
+
+
+def _pending_terms_stranded_by_query_file(
+    before: Mapping[str, JsonValue],
+    after: Mapping[str, JsonValue],
+) -> tuple[tuple[str, str], ...]:
+    """Pending vague-term reviews a query-template file would leave unresolvable.
+
+    ``(requirement id, user term)`` for each pending vague-term row the
+    node-level prompt could resolve before the wire and cannot after it.
+    ``vague_term_wiring_count`` is the one resolvability contract, the same one
+    the node-authoring doors apply through ``composition_review_contract_error``:
+    once a query has its own template, no pending term on the node is wired.
+    Comparing before with after keeps a node that was already stranded from
+    refusing a wire that did not strand it.
+    """
+    requirements = after.get(INTERPRETATION_REQUIREMENTS_KEY)
+    if not isinstance(requirements, (list, tuple)):
+        return ()
+    stranded: list[tuple[str, str]] = []
+    for row in requirements:
+        if not isinstance(row, Mapping) or not _is_vague_term_requirement(row) or row["status"] != "pending":
+            continue
+        user_term = str(row["user_term"])
+        if vague_term_wiring_count(before, user_term=user_term) == 1 and vague_term_wiring_count(after, user_term=user_term) != 1:
+            stranded.append((str(row["id"]), user_term))
+    return tuple(stranded)
+
+
+def _query_file_stranded_term_refusal(node_id: str, option_path: str, stranded: tuple[tuple[str, str], ...]) -> str:
+    """The repairable refusal for a query-template file that would strand pending term reviews.
+
+    Ids, the field path and the query name are written in full: the planner
+    sends them back. The term is echoed as the other doors echo it
+    (``unwired_vague_term_error``), unshortened. The text carries the code
+    literal so that ``explain_validation_error`` given this message finds the
+    code's guidance.
+    """
+    terms = ", ".join(repr(user_term) for _requirement_id, user_term in stranded)
+    pending = ", ".join(f"requirement {requirement_id!r} (term {user_term!r})" for requirement_id, user_term in stranded)
+    return (
+        f"Binding a file to {option_path} would leave the pending review of {terms} unresolvable: that query would get "
+        f"its own prompt and stop using the node-level prompt of node {node_id!r}, where the term is reviewed "
+        "(vague_term_query_override). Nothing was changed. "
+        f"(a) Ask the user to approve every pending term review on node {node_id!r}: {pending}. Then call "
+        "wire_blob_inline_ref again with the same field_path; an accepted term stays in the node-level prompt for the "
+        "queries that still use it. "
+        "Only if the file is meant to be the prompt for EVERY query on this node: "
+        f"(b) bind it to node:{node_id}.options.prompt_template instead; that replaces the whole node-level prompt "
+        "and retires its term reviews."
+    )
+
+
 def _structured_prompt_template_refusal(
     node_id: str,
     current_options: Mapping[str, JsonValue],
     patch: Mapping[str, JsonValue],
 ) -> str | None:
     """Shared structured-prompt guard for option patches and file binding."""
-    parts = patch[PROMPT_TEMPLATE_PARTS_KEY] if PROMPT_TEMPLATE_PARTS_KEY in patch else current_options.get(PROMPT_TEMPLATE_PARTS_KEY)
-    if parts is None or "prompt_template" not in patch:
+    if "prompt_template" not in patch:
         return None
     candidate = patch["prompt_template"]
-    if is_widened_blob_ref(deep_thaw(candidate)) is not None:
+    current_parts = current_options[PROMPT_TEMPLATE_PARTS_KEY] if PROMPT_TEMPLATE_PARTS_KEY in current_options else None
+    parts = patch[PROMPT_TEMPLATE_PARTS_KEY] if PROMPT_TEMPLATE_PARTS_KEY in patch else current_parts
+    # The marker branch reads the STORED parts as well as the written ones: a
+    # write that nulls prompt_template_parts in the same call must not carry a
+    # file marker past this guard. Only wire_blob_inline_ref binds a file.
+    if (parts is not None or current_parts is not None) and is_widened_blob_ref(deep_thaw(candidate)) is not None:
         return (
-            f"Node '{node_id}' has a structured prompt with interpretation slots. A file cannot replace a structured prompt yet. "
-            "Edit its text parts in place with change_substring or patch_node_options on prompt_template_parts, "
-            "preserving interpretation_ref entries. Switching a structured prompt to a file is not supported in this release."
+            f"Node '{node_id}' has a structured prompt with interpretation slots, and this path cannot put a file on it. "
+            f"To replace the whole prompt with a file, call wire_blob_inline_ref on node:{node_id}.options.prompt_template: "
+            "it removes the structured parts and the old prompt's term reviews, and the file gets its own review card. "
+            "To keep the structured prompt, edit its text parts in place with change_substring or patch_node_options on "
+            "prompt_template_parts, preserving interpretation_ref entries."
         )
+    if parts is None:
+        return None
     if candidate != current_options.get("prompt_template") and PROMPT_TEMPLATE_PARTS_KEY not in patch:
         return (
-            f"Node '{node_id}': edit prompt_template_parts to change this structured prompt, "
-            "preserving its interpretation_ref entries; prompt_template is compiled from those parts."
+            f"Node '{node_id}' has a structured prompt, and this call sends different prompt_template text without "
+            "prompt_template_parts. Nothing was changed. If you are NOT replacing this prompt (for example the node was "
+            "re-sent while changing something else), make the other change with a narrower tool that leaves this node "
+            "alone, or send the node whole and unedited as get_pipeline_state(component='set_pipeline_arguments') returns "
+            "it. Only to REPLACE the whole prompt with new text, send prompt_template together with "
+            "prompt_template_parts: null; the old prompt's term reviews are removed and the new text gets its own review "
+            "card. prompt_template is compiled from prompt_template_parts and their interpretation_ref entries."
         )
     return None
 
@@ -1218,6 +1543,11 @@ def _execute_wire_blob_inline_ref(
         return _failure_result(state, f"Invalid field_path for inline blob ref: {exc}", error_code="inline_blob_field_path_invalid")
 
     node_id = ref.field_path.partition(".options.")[0].removeprefix("node:")
+    # The state the marker is written into. It differs from ``state`` only when
+    # the file replaces a structured prompt; every refusal below still returns
+    # the untouched ``state``, and reviews reconcile against it.
+    apply_state = state
+    superseded_review_ids: tuple[str, ...] = ()
     if ref.field_path.startswith("node:"):
         node = next((item for item in state.nodes if item.id == node_id), None)
         if node is not None and node.plugin == "llm":
@@ -1233,15 +1563,34 @@ def _execute_wire_blob_inline_ref(
                     "File-backed LLM prompts bind only to prompt_template, system_prompt, or a query template.",
                     error_code="inline_blob_field_path_invalid",
                 )
-            structured_error = (
-                _structured_prompt_template_refusal(
-                    node_id, node.options, {"prompt_template": {"blob_ref": str(blob_id), "mode": "inline_content", "sha256": pinned_hash}}
+            # A template position parses the file as Jinja, which refuses text over
+            # the template bound at every run; refuse the binding now, from the
+            # recorded size (the UTF-8 file's bytes are the template's bytes), so
+            # the user is never asked to approve a card for a binding that cannot
+            # run. system_prompt is plain text and is not bounded here.
+            scalar = llm_prompt_file_scalar_field(ref.field_path)
+            if scalar is not None and is_template_binding_path(scalar[1]) and blob["size_bytes"] > MAX_JINJA_TEMPLATE_BYTES:
+                return _failure_result(
+                    state,
+                    template_size_refusal(f"{scalar[1]} on step {node_id}", blob["size_bytes"], MAX_JINJA_TEMPLATE_BYTES),
+                    error_code="plugin_options_invalid",
                 )
-                if ref.field_path == f"node:{node_id}.options.prompt_template"
-                else None
-            )
-            if structured_error is not None:
-                return _failure_result(state, structured_error, error_code="prompt_template_parts_required")
+            if ref.field_path == f"node:{node_id}.options.prompt_template":
+                # Binding a file REPLACES the prompt, whatever form it had, and
+                # supersedes every card that reviewed the old text: the file's
+                # own review card is the one review of the new prompt
+                # (by design). A state whose requirements are
+                # already non-canonical is refused first, so the replacement
+                # can never launder a malformed row away.
+                stored_error = _composition_canonical_interpretation_requirement_error(state, tool_name="wire_blob_inline_ref")
+                if stored_error is not None:
+                    return _failure_result(state, stored_error, error_code="interpretation_requirements_invalid")
+                replacement = _prompt_replacement(node.options)
+                superseded_review_ids = replacement.superseded_review_ids
+                apply_state = replace(
+                    state,
+                    nodes=tuple(replace(item, options=replacement.base_options) if item.id == node_id else item for item in state.nodes),
+                )
 
     prompt_surface_error = _llm_authored_prompt_surface_error(
         state,
@@ -1270,7 +1619,7 @@ def _execute_wire_blob_inline_ref(
         marker["encoding"] = encoding
 
     try:
-        new_state = _apply_inline_blob_marker(state, ref.field_path, marker)
+        new_state = _apply_inline_blob_marker(apply_state, ref.field_path, marker)
     except ValueError as exc:
         return _failure_result(state, str(exc), error_code="inline_blob_field_path_invalid")
     if llm_prompt_file_scalar_field(ref.field_path) is not None:
@@ -1330,7 +1679,28 @@ def _execute_wire_blob_inline_ref(
             canonical_error,
             error_code="interpretation_requirements_invalid",
         )
-    return _mutation_result(reconciled, _affected_component_for_inline_field_path(ref.field_path), data={"field_path": ref.field_path})
+    query_file = llm_prompt_file_scalar_field(ref.field_path)
+    if query_file is not None and query_file[1].startswith("queries."):
+        # A file on one query's template gives that query its own prompt. The
+        # node-authoring doors refuse that beside a pending node-level term
+        # review (vague_term_query_override); this door wrote it, leaving a
+        # review nothing could resolve and every later node edit refused.
+        wired_before = next((item for item in state.nodes if item.id == node_id and item.plugin == "llm"), None)
+        if wired_before is not None:
+            wired_after = next(item for item in reconciled.nodes if item.id == node_id)
+            stranded = _pending_terms_stranded_by_query_file(wired_before.options, wired_after.options)
+            if stranded:
+                return _failure_result(
+                    state,
+                    _query_file_stranded_term_refusal(node_id, query_file[1], stranded),
+                    error_code="vague_term_query_override",
+                )
+    data: dict[str, JsonValue] = {"field_path": ref.field_path}
+    if superseded_review_ids:
+        # The replaced prompt's vague-term reviews, named so the model can tell
+        # the user which definitions no longer apply.
+        data["superseded_review_ids"] = list(superseded_review_ids)
+    return _mutation_result(reconciled, _affected_component_for_inline_field_path(ref.field_path), data=data)
 
 
 _WIRE_BLOB_INLINE_REF_DECLARATION = ToolDeclaration(
@@ -1343,8 +1713,12 @@ _WIRE_BLOB_INLINE_REF_DECLARATION = ToolDeclaration(
         "Only inline-text MIME is accepted; upload or create a plain-text .txt or .md file for a prompt. "
         "A user-created or agent-authored UTF-8 prompt file opens a mandatory full-content llm_prompt_template review card; changes require review again. "
         "Only prompt_template, system_prompt, and individual query templates accept prompt files, never model or whole queries. "
-        "A structured prompt with prompt_template_parts cannot be replaced by a file in this release; edit its text parts with change_substring or patch_node_options on prompt_template_parts, preserving interpretation_ref entries. "
-        "Returns the `field_path` that was wired."
+        "Wiring a file onto prompt_template REPLACES the whole prompt, whatever was there: prompt_template_parts and every vague-term review of the old text (pending or accepted) are removed, and the file gets its own review card. "
+        "Wiring a file onto system_prompt or one query template replaces only that text and removes no term review. "
+        "A query template is refused (vague_term_query_override) while the node-level prompt has a pending term review: "
+        "have the user approve that review first, then wire again. Bind the file to prompt_template instead only if it is "
+        "meant to be the prompt for every query: that replaces the whole node-level prompt and retires its term reviews. "
+        "Returns the `field_path` that was wired, plus `superseded_review_ids` when the file superseded reviews of the old prompt."
     ),
     json_schema={
         "type": "object",

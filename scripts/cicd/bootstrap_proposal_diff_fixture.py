@@ -280,6 +280,11 @@ CASES: tuple[tuple[str, str, dict[str, Any]], ...] = (
         },
     ),
     (
+        "upsert_node_routing_only",
+        "upsert_node",
+        {"id": "extract", "node_type": "transform", "input": "rows", "on_error": "results", "routing_only": True},
+    ),
+    (
         "set_output_with_options",
         "set_output",
         {"sink_name": "errors", "plugin": "csv", "options": {"path": "errors.csv"}},

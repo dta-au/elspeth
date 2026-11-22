@@ -198,8 +198,8 @@ _LIST_SOURCES_DECLARATION = ToolDeclaration(
         "The result's `prohibited` array names any source categorically banned from "
         "the web authoring surface by security policy, with its closed reason and "
         "explanation — cite it when a user asks why a specific plugin is unavailable. "
-        "Call get_plugin_schema only for enum values, nested option shapes, or the "
-        "raw JSON schema; this listing already answers ordinary configuration questions."
+        "The request's `authoring_aids.discovery_digest` is the plugin index: call this listing "
+        "only for a fact it lacks. get_plugin_schema gives a chosen plugin's option contract."
     ),
     json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
     cacheable=True,
@@ -1199,6 +1199,13 @@ def _execute_set_source(
     return _mutation_result(new_state, affected, data=data)
 
 
+def _kept_description_hints(source_name: str, source: SourceSpec) -> tuple[str, ...]:
+    """One fact line when a rebind kept the source's stored description; its text is never quoted."""
+    if source.description is None:
+        return ()
+    return (f"Source '{source_name}' kept its stored description; it may still describe the earlier file.",)
+
+
 def _execute_set_source_from_blob(
     arguments: dict[str, Any],
     state: CompositionState,
@@ -1321,11 +1328,13 @@ def _execute_set_source_from_blob(
             state, endpoint_policy_error, error_code="aws_s3_endpoint_url_not_allowed", rejected_component=_source_component_id(source_name)
         )
 
+    # The tool takes no description, so a rebind keeps the stored one.
     source = SourceSpec(
         plugin=resolved.plugin,
         on_success=validated.on_success,
         options=resolved.options,
         on_validation_failure=on_vf,
+        description=state.sources[source_name].description if source_name in state.sources else None,
     )
     proposed_state = state.with_named_source(source_name, source)
     try:
@@ -1339,7 +1348,12 @@ def _execute_set_source_from_blob(
         )
     echo_note = _echoed_metadata_note(requirement_echo=requirement_echo, authoring_echo=authoring_echo)
     data = {"server_owned_metadata_note": echo_note} if echo_note is not None else {}
-    return _mutation_result(new_state, (_source_component_id(source_name),), data={**data, "source_blob": resolved.payload})
+    return _mutation_result(
+        new_state,
+        (_source_component_id(source_name),),
+        data={**data, "source_blob": resolved.payload},
+        post_call_hints=_kept_description_hints(source_name, source),
+    )
 
 
 def _resolve_source_blobs(
@@ -1600,11 +1614,13 @@ def _execute_set_source_from_blobs(
         return resolved
     merged_options, payloads = resolved
 
+    # The tool takes no description, so a rebind keeps the stored one.
     source = SourceSpec(
         plugin="blob_rows",
         on_success=validated.on_success,
         options=merged_options,
         on_validation_failure=on_vf,
+        description=state.sources[source_name].description if source_name in state.sources else None,
     )
     proposed_state = state.with_named_source(source_name, source)
     try:
@@ -1622,6 +1638,7 @@ def _execute_set_source_from_blobs(
         new_state,
         (_source_component_id(source_name),),
         data={**data, "source_blobs": list(payloads)},
+        post_call_hints=_kept_description_hints(source_name, source),
     )
 
 
@@ -2278,17 +2295,19 @@ def _handle_patch_source_options(
     result = _execute_patch_source_options(arguments, state, context)
     if not result.success:
         return result
-    source_name = PatchSourceOptionsArgumentsModel.model_validate(arguments).source_name
+    validated = PatchSourceOptionsArgumentsModel.model_validate(arguments)
+    source_name = validated.source_name
     if source_name not in result.updated_state.sources:
         return result
     source = result.updated_state.sources[source_name]
+    # Hints speak only about the option keys this patch touched.
     return _attach_post_call_hints(
         result,
         context.catalog,
         plugin_type="source",
         tool_name="patch_source_options",
         plugin_name=source.plugin,
-        config_snapshot=source.options,
+        config_snapshot={key: source.options[key] for key in validated.patch if key in source.options},
     )
 
 

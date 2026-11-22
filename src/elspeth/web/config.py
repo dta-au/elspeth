@@ -353,6 +353,16 @@ class WebSettings(BaseModel):
     composer_seed: int | None = None
     # Tests/offline development can disable the real provider boot probe.
     composer_boot_probe_enabled: bool = True
+    # Within one compose call, hand back a validation verdict already computed
+    # for the same state object instead of recomputing it: the runtime
+    # preflight of a blob-bearing state and the policy view's authoring
+    # validation. Before every runtime-preflight reuse the blob records, the
+    # stored files' stat (size, mtime, ctime, inode) and the user's secret
+    # inventory are read again and must be unchanged; a state that wires a
+    # secret is never reused; any mutation-kind tool call ends every reuse.
+    # Set ELSPETH_WEB__COMPOSER_VALIDATION_REUSE_ENABLED=false and restart to
+    # turn reuse off. Read once when the composer service is built.
+    composer_validation_reuse_enabled: bool = True
     composer_strict_tools: StrictToolsSetting = Field(
         default="preferred",
         description=(
@@ -371,7 +381,10 @@ class WebSettings(BaseModel):
     composer_max_tool_calls_per_turn: int = Field(default=16, ge=1)
     # Context budget: the operator's gateway prompt-token limit has no safe
     # default, so it is required. The budgeter sheds history above
-    # ``shed_above`` of this cap down to ``shed_to`` of it.
+    # ``shed_above`` of this cap down to ``shed_to`` of it. Only earlier
+    # turns are shed. A request still estimated over this cap with no history
+    # left is sent, Advisor checkpoints included: the estimate is not the
+    # model's limit, and only the request byte maximum refuses.
     composer_context_max_prompt_tokens: int = Field(..., strict=True, ge=1)
     composer_context_shed_above: float = Field(default=0.85, strict=True, gt=0, le=1)
     composer_context_shed_to: float = Field(default=0.60, strict=True, gt=0, lt=1)
@@ -510,11 +523,18 @@ class WebSettings(BaseModel):
             "This is not a measured provider-token or context-window limit."
         ),
     )
-    # 8192 (was 1500): with advisor reasoning enabled the thinking budget
-    # shares max_tokens, and Anthropic thinking has a 1024-token floor that
-    # must fit inside it — 1500 left medium effort illegal or starved.
-    composer_advisor_max_completion_tokens: int = Field(default=8192, ge=1)
-    composer_advisor_timeout_seconds: float = Field(default=60.0, gt=0)
+    # The advisor's EARLY/END checkpoint reviews a whole build: the saved
+    # graph, the turn's evidence and any pending reviews. Reasoning tokens are
+    # drawn from the same completion cap as the verdict, so a reply that
+    # reasons at length can stop at the cap (finish_reason "length") before
+    # it states a verdict. 8192 did that on 16 of 61 calls on graphs with
+    # pending reviews (0.8.16 battery, medium effort), hence 16384. The
+    # timeout is raised with it (60 -> 180 s) so a longer reply has time to
+    # arrive; each call still waits at most min(this, turn time left). A
+    # value above the model's own output limit may be refused by the
+    # provider, and startup cannot detect that.
+    composer_advisor_max_completion_tokens: int = Field(default=16_384, ge=1)
+    composer_advisor_timeout_seconds: float = Field(default=180.0, gt=0)
     # Phase 5b Task 5 — interpretation-event rate limits (F-30/F-31).
     #
     # Both limits are read at compose-loop initialisation and passed to

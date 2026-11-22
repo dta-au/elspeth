@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import stat
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -29,9 +29,11 @@ from elspeth.web.sessions.models import (
     sessions_table,
 )
 from elspeth.web.sessions.prompt_file_review import (
+    PromptFileBinding,
     PromptFileReviewStale,
     PromptReviewSnapshot,
     _surface_slots,
+    prompt_file_binding_paths,
     resolve_prompt_review_snapshot,
 )
 from elspeth.web.sessions.protocol import CompositionStateRecord
@@ -74,6 +76,14 @@ class PromptFileApprovalStale(PromptFileReviewStale):
     """A binding, byte version, event or snapshot changed before approval."""
 
     error_code = "prompt_file_approval_stale"
+
+
+class PromptFileUnreadable(PromptFileApprovalStale):
+    """A prompt file on the node is missing, not ready, not UTF-8 text, or not the bytes its marker pins."""
+
+
+class PromptFileReviewCardOwed(PromptFileApprovalStale):
+    """The node's prompt review is pending in the state, but its card has not been issued yet."""
 
 
 def _read_custody_bytes(record: BlobRecord) -> bytes:
@@ -249,10 +259,10 @@ def record_prompt_file_approval(
             raise PromptFileApprovalStale()
     if request.trigger is PromptApprovalTrigger.EDITOR_SAVE:
         # A save is approval only of the bytes the editor showed. With a card
-        # pending, any other inline prompt text or a pending vague-term
-        # requirement on this node is unreviewed, so the save must not retire
-        # the card. Checked here, in the caller's transaction, so this writer
-        # fails closed whatever its caller checked beforehand.
+        # pending, any other prompt slot (inline text or another file) or a
+        # pending vague-term requirement on this node is unreviewed, so the
+        # save must not retire the card. Checked here, in the caller's
+        # transaction, so this writer fails closed whatever its caller checked.
         pending_card = conn.execute(
             select(interpretation_events_table.c.id)
             .where(
@@ -266,7 +276,7 @@ def record_prompt_file_approval(
         if pending_card is not None:
             requirements = options["interpretation_requirements"] if "interpretation_requirements" in options else ()
             if any(requirement["status"] == "pending" and requirement["kind"] == "vague_term" for requirement in requirements) or any(
-                path != request.field_path and type(value) is str for path, value in _surface_slots(options)
+                path != request.field_path and value is not None for path, value in _surface_slots(options)
             ):
                 raise PromptFileApprovalStale()
     approval_id = uuid4()
@@ -315,6 +325,147 @@ def record_prompt_file_approval(
     )
 
 
+def _require_ready_blob_row(conn: Connection, request: PromptFileApprovalRequest) -> None:
+    record = _blob_record(conn, request.session_id, request.blob_id)
+    if record.status != "ready" or record.content_hash != request.content_sha256:
+        raise PromptFileApprovalStale()
+
+
+def _require_marker_matches(marker: WidenedBlobRefShape, request: PromptFileApprovalRequest) -> None:
+    # ``marker`` is ``_binding_marker(options, request.field_path)``, already parsed.
+    if marker.blob_id != request.blob_id or marker.sha256 != request.content_sha256:
+        raise PromptFileApprovalStale()
+
+
+def _require_snapshot_binding(bindings_by_path: Mapping[str, PromptFileBinding], request: PromptFileApprovalRequest) -> None:
+    selected = bindings_by_path[request.field_path] if request.field_path in bindings_by_path else None
+    if selected is None or selected.blob_id != request.blob_id or selected.content_sha256 != request.content_sha256:
+        raise PromptFileApprovalStale()
+
+
+def record_prompt_file_card_approvals(
+    conn: Connection,
+    requests: Sequence[PromptFileApprovalRequest],
+    *,
+    now: datetime,
+    expected_event_id: UUID,
+) -> tuple[PromptFileApprovalRecord, ...]:
+    """Record one card's approvals for every file binding of its node, in one pass.
+
+    This writes the rows that calling :func:`record_prompt_file_approval` with
+    the CARD trigger once per request would write, in the same order, and
+    refuses wherever that loop refused, with the same error. It runs in the
+    caller's open transaction under the caller's session lock.
+
+    The first request runs every check of the per-binding writer in that
+    writer's order. The session owner, the node's options, the resolved
+    snapshot (every bound blob's row and bytes), the pending event and the
+    stored card snapshot are then reused for the remaining requests instead of
+    being read again: all requests share one session, node, actor and the
+    CARD trigger, the only statements between two requests are inserts into
+    ``prompt_file_approvals`` (which none of those checks read), and the
+    caller's session write lock keeps other writers out for the whole
+    transaction. Each request's own blob row, its marker in the options and
+    its binding in the snapshot are still checked per request. Re-resolving
+    the snapshot per binding made one card O(N^2) blob reads under the session
+    lock, long enough at a few hundred files to lose the operation's lease.
+
+    ``expected_event_id`` is the card being resolved; every row must name it,
+    checked after each insert exactly where the per-binding loop checked it.
+    """
+    if type(now) is not datetime or any(type(request) is not PromptFileApprovalRequest for request in requests):
+        raise TypeError("prompt-file approval requires an owned request and datetime")
+    if requests and any(
+        request.trigger is not PromptApprovalTrigger.CARD
+        or (request.session_id, request.node_id, request.actor_user_id)
+        != (requests[0].session_id, requests[0].node_id, requests[0].actor_user_id)
+        for request in requests
+    ):
+        raise TypeError("prompt-file card approvals must share one session, node and actor, with the CARD trigger")
+    if not requests:
+        return ()
+    # The first request: every check of the per-binding writer, in its order.
+    first = requests[0]
+    owner = conn.execute(select(sessions_table.c.user_id).where(sessions_table.c.id == str(first.session_id))).scalar_one_or_none()
+    if owner != first.actor_user_id:
+        raise PromptFileApprovalStale()
+    _require_ready_blob_row(conn, first)
+    options = _current_node_options(conn, first)
+    _require_marker_matches(_binding_marker(options, first.field_path), first)
+    snapshot = _current_snapshot(conn, first, options)
+    bindings_by_path: dict[str, PromptFileBinding] = {}
+    for binding in snapshot.bindings:
+        # First match wins, as the per-binding writer's ``next(...)`` scan did.
+        if binding.field_path not in bindings_by_path:
+            bindings_by_path[binding.field_path] = binding
+    _require_snapshot_binding(bindings_by_path, first)
+    event = conn.execute(
+        select(interpretation_events_table.c.id)
+        .where(
+            interpretation_events_table.c.session_id == str(first.session_id),
+            interpretation_events_table.c.affected_node_id == first.node_id,
+            interpretation_events_table.c.kind == "llm_prompt_template",
+            interpretation_events_table.c.choice == "pending",
+        )
+        .order_by(interpretation_events_table.c.created_at.desc())
+        .limit(1)
+    ).one_or_none()
+    if event is None:
+        raise PromptFileApprovalStale()
+    stored = conn.execute(
+        select(prompt_review_snapshots_table.c.anchor, prompt_review_snapshots_table.c.snapshot_json).where(
+            prompt_review_snapshots_table.c.event_id == event.id,
+            prompt_review_snapshots_table.c.session_id == str(first.session_id),
+        )
+    ).one_or_none()
+    if stored is None or stored.anchor != snapshot.anchor or stable_hash(stored.snapshot_json) != stable_hash(snapshot.payload()):
+        raise PromptFileApprovalStale()
+    event_id = UUID(event.id)
+    records: list[PromptFileApprovalRecord] = []
+    for index, request in enumerate(requests):
+        if index > 0:
+            # Every later request: its own row, marker and snapshot entry, in the same order.
+            _require_ready_blob_row(conn, request)
+            _require_marker_matches(_binding_marker(options, request.field_path), request)
+            _require_snapshot_binding(bindings_by_path, request)
+        approval_id = uuid4()
+        conn.execute(
+            insert(prompt_file_approvals_table).values(
+                id=str(approval_id),
+                session_id=str(request.session_id),
+                node_id=request.node_id,
+                field_path=request.field_path,
+                blob_id=str(request.blob_id),
+                content_sha256=request.content_sha256,
+                review_anchor=snapshot.anchor,
+                effective_artifact_hash=snapshot.effective_artifact_hash,
+                event_id=str(event_id),
+                actor_user_id=request.actor_user_id,
+                trigger=request.trigger.value,
+                approved_at=now,
+            )
+        )
+        records.append(
+            PromptFileApprovalRecord(
+                id=approval_id,
+                session_id=request.session_id,
+                node_id=request.node_id,
+                field_path=request.field_path,
+                blob_id=request.blob_id,
+                content_sha256=request.content_sha256,
+                review_anchor=snapshot.anchor,
+                effective_artifact_hash=snapshot.effective_artifact_hash,
+                event_id=event_id,
+                actor_user_id=request.actor_user_id,
+                trigger=request.trigger,
+                approved_at=now,
+            )
+        )
+        if event_id != expected_event_id:
+            raise PromptFileApprovalStale()
+    return tuple(records)
+
+
 def assert_prompt_file_approvals(conn: Connection, snapshot: PromptReviewSnapshot) -> None:
     """Require current approved evidence for every binding in a live snapshot."""
     pending = conn.execute(
@@ -357,16 +508,28 @@ def _latest_approvals_attest(conn: Connection, snapshot: PromptReviewSnapshot) -
     return True
 
 
-def assert_latest_prompt_file_approvals_attest_surface(conn: Connection, *, state: CompositionStateRecord, node_id: str) -> None:
+def assert_latest_prompt_file_approvals_attest_surface(
+    conn: Connection, *, state: CompositionStateRecord, node_id: str
+) -> PromptReviewSnapshot | None:
     """Require a node's latest prompt-file approvals to still attest its current prompt surface.
 
     The editor save checks this on the pre-save head when no review card is
     pending: a save may extend an approval only to the file on screen, never
-    to other prompt text (an inline query template, a system prompt) that
-    changed after the node was last approved. A node with no file approval
-    yet has nothing to compare, so a first save is not refused here. Raises
-    :class:`PromptFileApprovalStale` when an approval no longer attests the
-    surface or the custody snapshot cannot be read.
+    to other prompt text (an inline query template, a system prompt) or to
+    another prompt file that changed after the node was last approved.
+
+    Returns the attested pre-save snapshot, which the save re-checks inside
+    its transaction before it carries the approval of the node's other files
+    forward. A node with ONE file-backed prompt and no file approval yet has
+    nothing to compare, so its first save is not refused here and ``None`` is
+    returned. A node with several file-backed prompts gets no such pass: the
+    editor shows one file, so every other file must already hold an approval
+    that attests this surface. Raises :class:`PromptFileApprovalStale` when
+    an approval is missing or no longer attests the surface. Two subclasses
+    name the causes a user recovers from differently:
+    :class:`PromptFileUnreadable` when the custody snapshot cannot be read, and
+    :class:`PromptFileReviewCardOwed` when the state already holds a pending
+    prompt review whose card the next surfacing pass will issue.
     """
     session_id = state.session_id
     options = next(node["options"] for node in state.nodes or () if node["id"] == node_id)
@@ -375,8 +538,8 @@ def assert_latest_prompt_file_approvals_attest_surface(conn: Connection, *, stat
         .where(prompt_file_approvals_table.c.session_id == str(session_id), prompt_file_approvals_table.c.node_id == node_id)
         .limit(1)
     ).scalar_one_or_none()
-    if approved_before is None:
-        return
+    if approved_before is None and len(prompt_file_binding_paths(options)) <= 1:
+        return None
     records: dict[UUID, tuple[BlobRecord, bytes]] = {}
 
     def read_blob(blob_id: UUID) -> tuple[BlobRecord, bytes]:
@@ -388,6 +551,84 @@ def assert_latest_prompt_file_approvals_attest_surface(conn: Connection, *, stat
     try:
         snapshot = resolve_prompt_review_snapshot(session_id=session_id, node_id=node_id, options=options, read_blob=read_blob)
     except (KeyError, TypeError, ValueError) as exc:
-        raise PromptFileApprovalStale() from exc
+        raise PromptFileUnreadable() from exc
     if snapshot is None or not _latest_approvals_attest(conn, snapshot):
+        requirements = options["interpretation_requirements"] if "interpretation_requirements" in options else ()
+        if any(requirement["kind"] == "llm_prompt_template" and requirement["status"] == "pending" for requirement in requirements):
+            raise PromptFileReviewCardOwed()
+        raise PromptFileApprovalStale()
+    return snapshot
+
+
+class PromptFileReviewCardPending(PromptFileApprovalStale):
+    """A pending prompt card covers prompt content the file editor did not show."""
+
+    def __init__(self, *, only_inline_text: bool) -> None:
+        super().__init__()
+        # True when every unseen slot is inline text; False when another prompt file is among them.
+        self.only_inline_text = only_inline_text
+
+
+def editor_save_settles_pending_card(conn: Connection, *, state: CompositionStateRecord, node_id: str, field_path: str) -> bool:
+    """Whether a prompt card is pending on the node and this save may settle it.
+
+    The editor shows one file. With a card pending, the save stands in for the
+    card only when that file is the node's whole prompt surface. Any other
+    prompt slot, inline text or another file, is content the user has not seen
+    here, so the save is refused (:class:`PromptFileReviewCardPending`) and the
+    card stays pending. The same rule guards ``record_prompt_file_approval``.
+    Returns ``False`` when no card is pending.
+    """
+    pending_card = conn.execute(
+        select(interpretation_events_table.c.id)
+        .where(
+            interpretation_events_table.c.session_id == str(state.session_id),
+            interpretation_events_table.c.affected_node_id == node_id,
+            interpretation_events_table.c.kind == "llm_prompt_template",
+            interpretation_events_table.c.choice == "pending",
+        )
+        .limit(1)
+    ).scalar_one_or_none()
+    if pending_card is None:
+        return False
+    options = next(node["options"] for node in state.nodes or () if node["id"] == node_id)
+    unseen = [value for path, value in _surface_slots(options) if path != field_path and value is not None]
+    if unseen:
+        raise PromptFileReviewCardPending(only_inline_text=all(type(value) is str for value in unseen))
+    return True
+
+
+def assert_editor_save_may_carry_approvals(
+    conn: Connection,
+    *,
+    prior: PromptReviewSnapshot | None,
+    saved: PromptReviewSnapshot,
+    saved_blob_id: UUID,
+) -> None:
+    """Before an editor save writes approvals, prove the node's other files may keep theirs.
+
+    A save changes the node's review anchor, so every file binding of the node
+    needs an approval row under the post-save snapshot ``saved``. The file on
+    screen is approved by the user's save. Each other file is carried forward:
+    it is re-recorded with the bytes it already had. That is sound only when,
+    in this same transaction and before any new row, no card is pending and
+    the pre-save snapshot ``prior`` was fully attested, and each carried
+    binding is the same file and bytes ``prior`` attested.
+
+    ``prior`` is ``None`` only for a node whose sole file is the one saved
+    (a pending card the save settles, or a first save); there is then nothing
+    to carry and nothing further to check here.
+    """
+    carried = {
+        (binding.field_path, binding.blob_id, binding.content_sha256) for binding in saved.bindings if binding.blob_id != saved_blob_id
+    }
+    if prior is None:
+        if carried:
+            raise PromptFileApprovalStale()
+        return
+    try:
+        assert_prompt_file_approvals(conn, prior)
+    except PromptFileReviewStale as exc:
+        raise PromptFileApprovalStale() from exc
+    if not carried <= {(binding.field_path, binding.blob_id, binding.content_sha256) for binding in prior.bindings}:
         raise PromptFileApprovalStale()

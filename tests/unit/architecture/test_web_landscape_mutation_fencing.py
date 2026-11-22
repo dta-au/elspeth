@@ -5855,8 +5855,8 @@ _reserve_CANCEL_ROUTE_PATH = "src/elspeth/web/sessions/routes/composer/operation
 _reserve_CANCEL_ROUTE_SHA256 = "084791796bc88481d879d0a09b7ab43e8f483c378d56cff6bc46d9e075c8a4e6"
 _reserve_CANCEL_CONSUMERS = {
     "src/elspeth/web/composer_watch_reads.py": "099b7e92f3617d5d9f39b479c1f21f229375e24e20208d294c822d7099cf6e3f",
-    "src/elspeth/web/sessions/composer_turn.py": "cfc7cf22db60d8c2a430ca5ae96f1c6d6860388bc56319fe788c62493cc1d311",
-    "src/elspeth/web/sessions/composer_async_worker.py": "863285bd0bc2ffb3c7002738834c09e892b479b2b11dd3dff062fe91ea905a2a",
+    "src/elspeth/web/sessions/composer_turn.py": "06da1fb618ac26fc7f46d3c83cf65bcb6ac295379d43e4910159349e3cfa201c",
+    "src/elspeth/web/sessions/composer_async_worker.py": "d7dba5e6b9f8ff9101f9b70aaad33f634625593d66f4233d8470bb092732c98f",
 }
 
 
@@ -9875,7 +9875,7 @@ def _reserve_sink_effect_disjoint_receipts(units):
         (
             "src/elspeth/engine/executors/sink_effects.py",
             "SinkEffectCoordinator",
-            "e02b95605111afa607819b7a84b05bbe3481df8586d0a5577e8081e63fcda8c3",
+            "e52c26d3d24ea19cd357e3f24e10493187b99fdcf501d2d7d5037052c78f0a3a",
         ),
     )
     indexed = {unit.path: unit for unit in units}
@@ -10341,7 +10341,7 @@ def _reserve_sink_effect_disjoint_receipts(units):
         (
             "src/elspeth/web/coordination/lifecycle.py",
             "SessionOperationLease",
-            "3d9707116754760383df627a49291c0a361f50771f0ab1d1fde711882500849e",
+            "97aac55a5b91d92528d14f07b54e9a95691e1aa8a9000b758adfff0f8c6b52af",
         ),
         (
             "src/elspeth/web/coordination/lifecycle.py",

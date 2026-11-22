@@ -14,7 +14,7 @@ import { readFileSync } from "node:fs";
 
 import { useRef, useState, type RefObject } from "react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, act, waitFor } from "@testing-library/react";
+import { render, screen, act, waitFor, fireEvent } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { ChatInput } from "./ChatInput";
 import {
@@ -435,9 +435,7 @@ describe("ChatInput upload identity", () => {
       rejectUpload(new Error("late upload failure"));
     });
     await waitFor(() => expect(onBlobUploadRejected).toHaveBeenCalledOnce());
-    expect(
-      screen.queryByText("Upload failed. Check the file manager for details."),
-    ).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
   it("shows a current upload failure accepted by its owner fence", async () => {
@@ -464,9 +462,66 @@ describe("ChatInput upload identity", () => {
     );
 
     await waitFor(() => expect(onBlobUploadRejected).toHaveBeenCalledOnce());
-    expect(
-      screen.getByText("Upload failed. Check the file manager for details."),
-    ).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Upload failed. Please try again.",
+    );
+    expect(screen.queryByText(/file manager/i)).not.toBeInTheDocument();
+  });
+
+  it.each([
+    [{ status: 415, detail: "Unsupported Media Type" }, "Unsupported file type. Please use CSV, JSON, JSONL, or plain text."],
+    [{ status: 413, detail: "Payload Too Large" }, "File exceeds the maximum upload size."],
+  ])("shows the upload refusal reason beside the chat upload control (%o)", async (refusal, reason) => {
+    useSessionStore.setState({ activeSessionId: "session-current" });
+    useBlobStore.setState({ uploadBlob: vi.fn().mockRejectedValue(refusal) });
+
+    render(
+      <ChatInput
+        onSend={vi.fn()}
+        disabled={false}
+        inputRef={{ current: null } as RefObject<HTMLTextAreaElement>}
+      />,
+    );
+    const fileInput = document.querySelector<HTMLInputElement>(
+      'input[type="file"]',
+    );
+    expect(fileInput).not.toBeNull();
+    await userEvent.upload(
+      fileInput!,
+      new File(["id\n1\n"], "current.csv", { type: "text/csv" }),
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(reason);
+  });
+
+  it("shows an upload in progress beside the input until it settles", async () => {
+    let finishUpload: (reason: unknown) => void = () => undefined;
+    useSessionStore.setState({ activeSessionId: "session-current" });
+    useBlobStore.setState({
+      uploadBlob: vi.fn().mockReturnValue(new Promise<BlobMetadata>((_resolve, reject) => { finishUpload = reject; })),
+    });
+
+    render(
+      <ChatInput
+        onSend={vi.fn()}
+        disabled={false}
+        inputRef={{ current: null } as RefObject<HTMLTextAreaElement>}
+      />,
+    );
+    const fileInput = document.querySelector<HTMLInputElement>(
+      'input[type="file"]',
+    );
+    expect(fileInput).not.toBeNull();
+    await userEvent.upload(
+      fileInput!,
+      new File(["id\n1\n"], "slow.csv", { type: "text/csv" }),
+    );
+
+    expect(screen.getByRole("status")).toHaveTextContent("Uploading slow.csv…");
+    expect(screen.getByRole("button", { name: "Upload file" })).toBeDisabled();
+    await act(async () => { finishUpload({ status: 503, detail: "unavailable" }); });
+    expect(screen.queryByText("Uploading slow.csv…")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Upload file" })).toBeEnabled();
   });
 });
 
@@ -917,6 +972,23 @@ describe("ChatInput — compose timeout readiness gate (bootstrap race)", () => 
     expect(screen.queryByText(/loading this session/i)).toBeNull();
 
     await user.keyboard("{Enter}");
+    expect(onSend).toHaveBeenCalledWith("build a pipeline");
+  });
+
+  it.each([
+    ["isComposing", { isComposing: true }],
+    ["keyCode 229", { keyCode: 229 }],
+  ])("does not send on an Enter that confirms an input-method candidate (%s)", async (_label, composing) => {
+    const onSend = vi.fn();
+    renderInput(onSend);
+    const textarea = screen.getByLabelText(/message input/i);
+    await userEvent.setup().type(textarea, "build a pipeline");
+
+    fireEvent.keyDown(textarea, { key: "Enter", ...composing });
+
+    expect(onSend).not.toHaveBeenCalled();
+    expect(textarea).toHaveValue("build a pipeline");
+    fireEvent.keyDown(textarea, { key: "Enter" });
     expect(onSend).toHaveBeenCalledWith("build a pipeline");
   });
 

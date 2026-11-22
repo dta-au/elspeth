@@ -22,6 +22,17 @@ import type { Session } from "@/types/index";
 
 const MENU_ID = "header-session-switcher-menu";
 
+/** The failure's own message: an Error's, or an API refusal's public detail
+ *  (API errors are plain `{status, detail}` objects, not Errors). */
+function failureDetail(err: unknown): string | null {
+  if (err instanceof Error) return err.message || null;
+  if (typeof err === "object" && err !== null && "status" in err && typeof err.status === "number"
+    && "detail" in err && typeof err.detail === "string" && err.detail.trim().length > 0) {
+    return err.detail.trim();
+  }
+  return null;
+}
+
 export function HeaderSessionSwitcher(): JSX.Element {
   const sessions = useSessionStore((s) => s.sessions);
   const activeSessionId = useSessionStore((s) => s.activeSessionId);
@@ -141,7 +152,7 @@ export function HeaderSessionSwitcher(): JSX.Element {
       // when the rejection is an Error, fall back to a friendly message
       // otherwise.  Inline rather than relying on the composer-level
       // error region so the alert is co-located with the rename form.
-      const detail = err instanceof Error && err.message ? err.message : null;
+      const detail = failureDetail(err);
       setRenameError(
         detail !== null
           ? `Could not rename session: ${detail}`
@@ -165,7 +176,7 @@ export function HeaderSessionSwitcher(): JSX.Element {
       // auditable system shouldn't drop the actual failure reason.  Fall
       // back to a friendly message when the rejection isn't an Error
       // (e.g. a string thrown manually somewhere in the call chain).
-      const detail = err instanceof Error && err.message ? err.message : null;
+      const detail = failureDetail(err);
       setArchiveError(detail !== null ? `Could not archive session: ${detail}` : "Could not archive session. Please try again.");
     }
   }, [archiveSession, archiveTarget, closeAndReturnFocus]);

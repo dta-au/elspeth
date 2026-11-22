@@ -14,6 +14,7 @@ from elspeth.contracts.blobs_inline import (
     INLINE_BLOB_NOT_TEXT_REPAIR,
     BlobInlineRef,
     ContentEncoding,
+    inline_blob_total_refusal,
     is_widened_blob_ref,
 )
 from elspeth.contracts.composer_interpretation import InterpretationSurfaceOrigin
@@ -81,12 +82,19 @@ from elspeth.web.paths import (
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
 from elspeth.web.secrets.ref_policy import allowed_secret_ref_fields
-from elspeth.web.sessions.inline_blob_preflight import InlinePreflightState, prepare_session_inline_blob_snapshot
+from elspeth.web.sessions.inline_blob_preflight import (
+    InlinePreflightState,
+    inline_blob_refs,
+    malformed_inline_blob_marker_paths,
+    prepare_session_inline_blob_snapshot,
+)
 from elspeth.web.sessions.operation_receipts import operation_receipt_response_hash
+from elspeth.web.sessions.prompt_file_review import PromptFileReviewStale, prompt_file_binding_paths
 from elspeth.web.sessions.protocol import (
     CompositionStateRecord,
     OperationReceiptResult,
     OperationReceiptSettlementConflictError,
+    PromptFileTooLargeError,
     SessionRecord,
     StateRevertReceiptResult,
 )
@@ -1428,6 +1436,14 @@ async def seed_state_from_runtime_yaml(
                 data_dir=str(request.app.state.settings.data_dir),
                 session_id=session.id,
             )
+            # The bindings above add file markers and paths the scan before them
+            # did not see. Scan the state as it will be stored, so the import
+            # never saves a state the read side then refuses to open.
+            require_no_credential_material_in_state(
+                imported_state,
+                surface="composer_yaml_import",
+                env_ref_names=env_ref_names,
+            )
             _reject_redacted_sources_without_rebind(imported_state, yaml_text=body.yaml)
             _reject_unbound_blob_storage_sources(
                 imported_state,
@@ -1517,16 +1533,181 @@ async def seed_state_from_runtime_yaml(
                 state_data,
                 composer_meta=merge_composer_meta_updates(state_data.composer_meta, seed_meta_updates),
             )
-            response_state = await service.save_composition_state_with_interpretations(
-                session.id,
-                state_data,
-                provenance="session_seed",
-                interpretations=interpretation_drafts,
-                session_operation_context=lease.context,
-            )
+            try:
+                response_state = await service.save_composition_state_with_interpretations(
+                    session.id,
+                    state_data,
+                    provenance="session_seed",
+                    interpretations=interpretation_drafts,
+                    session_operation_context=lease.context,
+                )
+            except PromptFileReviewStale as exc:
+                raise _import_prompt_file_review_refusal(imported_state, node_id=exc.node_id) from exc
+            except PromptFileTooLargeError as exc:
+                raise await _import_prompt_file_too_large_refusal(
+                    imported_state,
+                    exc,
+                    request=request,
+                    session_id=session.id,
+                    session_operation_context=lease.context,
+                ) from exc
             return _state_response(response_state, policy_catalog=catalog)
     finally:
         await lease.close()
+
+
+# The validation code for a malformed marker (``<category>_inline_blob_content``), reused: same cause,
+# reported here before anything is saved. ``inline_blob_not_text`` is reused by this route the same way.
+IMPORT_MALFORMED_INLINE_BLOB_CODE = "malformed_inline_blob_content"
+IMPORT_PROMPT_FILE_UNVERIFIED = "import_prompt_file_unverified"
+
+
+_REFUSAL_FIELD_PATH_LIMIT = 5
+_REFUSAL_FIELD_PATH_UNSAFE = re.compile(r"[^A-Za-z0-9_.:-]")
+
+
+def _bounded_field_path_list(field_paths: tuple[str, ...]) -> str:
+    """Render field paths for a refusal message: a fixed number of them, each whole.
+
+    At most ``_REFUSAL_FIELD_PATH_LIMIT`` paths are shown, followed by the
+    exact count of the rest; importing again after fixing those shown lists
+    the next ones. A path is never cut, because the user has to find it in
+    their YAML: its length is bounded only by the request that carried it.
+    Every character outside letters, digits and ``_ . : -`` becomes ``?``, so
+    a name can neither break the sentence nor carry markup, whitespace or
+    control characters into it.
+    """
+    shown = [_REFUSAL_FIELD_PATH_UNSAFE.sub("?", field_path) for field_path in field_paths[:_REFUSAL_FIELD_PATH_LIMIT]]
+    rendered = ", ".join(shown)
+    remaining = len(field_paths) - len(shown)
+    return f"{rendered} and {remaining} more" if remaining else rendered
+
+
+def _prompt_file_field_paths(state: CompositionState, node_id: str | None) -> tuple[str, ...]:
+    """The file-backed prompt fields of the node the card writer refused, as field paths."""
+    if node_id is None:
+        return ()
+    return tuple(
+        f"node:{node.id}.options.{path}"
+        for node in state.nodes
+        if node.id == node_id
+        for path in prompt_file_binding_paths(deep_thaw(node.options))
+    )
+
+
+def _import_prompt_file_review_refusal(state: CompositionState, *, node_id: str | None) -> HTTPException:
+    """Say why an imported prompt file's review card could not be written.
+
+    The card writer refuses a file-backed prompt it holds no verified bytes
+    for with ``PromptFileReviewStale``, the class an approval uses for "this
+    file changed since it was reviewed; review it again". Nothing has been
+    reviewed during an import, so that instruction names no step the user can
+    take, and uncaught it was a 500. Each cause is reported under a code that
+    names it, never as ``prompt_file_review_stale``. The whole import rolls
+    back either way: the state and its review cards commit together.
+
+    Malformed reference (400): some ``blob_ref`` mapping in the YAML is not a
+    complete file marker, so no file in the state could be read. The field
+    paths are named; values are not echoed. A path is built from names the
+    YAML's author chose (node ids, source and sink names, option keys), so
+    the list is bounded by :func:`_bounded_field_path_list`.
+
+    Unverified file (409): every marker is well-formed, but a prompt file's
+    stored contents did not match its marker or could not be read back. The
+    card writer stops at the first node it cannot verify and names it
+    (``node_id``); that node's file-backed prompt fields are listed. Which of
+    them failed, and whether a later node would also fail, is not known here
+    without reading the files again, and the message says so.
+    """
+    malformed = malformed_inline_blob_marker_paths(InlinePreflightState.from_composition_state(state))
+    if malformed:
+        return HTTPException(
+            status_code=400,
+            detail={
+                "error_code": IMPORT_MALFORMED_INLINE_BLOB_CODE,
+                "message": (
+                    "Imported YAML holds a file reference that is not a complete file marker at: "
+                    f"{_bounded_field_path_list(malformed)}. "
+                    "Nothing was imported. A file reference inside options needs blob_ref, mode: inline_content and the "
+                    "file's sha256; or remove it from the YAML, import again and attach the file in this session."
+                ),
+            },
+        )
+    unverified = _prompt_file_field_paths(state, node_id)
+    where = f" at: {_bounded_field_path_list(unverified)}" if unverified else ""
+    return HTTPException(
+        status_code=409,
+        detail={
+            "error_code": IMPORT_PROMPT_FILE_UNVERIFIED,
+            "message": (
+                f"Imported YAML binds a prompt file that could not be verified against its reference{where} (a file is "
+                "missing, not ready, or its contents differ from the sha256 in the YAML), so its review could not be "
+                "prepared. Later steps were not checked. Nothing was imported. Remove that file reference from the "
+                "YAML and import again, then attach the file to the prompt in this session. An API caller can "
+                "instead bind the file by id in inline_blob_bindings."
+            ),
+        },
+    )
+
+
+async def _import_prompt_file_too_large_refusal(
+    state: CompositionState,
+    exc: PromptFileTooLargeError,
+    *,
+    request: Request,
+    session_id: UUID,
+    session_operation_context: SessionOperationContext,
+) -> HTTPException:
+    """Refuse an import whose prompt file is over an inline size cap (413), never a 500.
+
+    The card writer cannot prepare a review for a prompt file no run could
+    use, and the state and its cards commit together, so nothing is
+    imported. The code is the card writer's own (``prompt_file_too_large``,
+    as the prompt-file save route reports it). For the pipeline total the
+    message gives the figures every other site gives: the total of the
+    imported state's file-held text, counted once per binding, the cap and
+    the number of bindings, read from this session's blob records. If a
+    bound file cannot be read here the figures are not known, and the
+    message names the cap alone.
+    """
+    message = f"{exc} Nothing was imported."
+    if exc.aggregate:
+        figures = await _imported_inline_text_total(
+            state, request=request, session_id=session_id, session_operation_context=session_operation_context
+        )
+        if figures is not None:
+            total, bindings = figures
+            message = f"{inline_blob_total_refusal(total, exc.limit_bytes, bindings)} Nothing was imported."
+    return HTTPException(status_code=413, detail={"error_code": exc.error_code, "message": message})
+
+
+async def _imported_inline_text_total(
+    state: CompositionState,
+    *,
+    request: Request,
+    session_id: UUID,
+    session_operation_context: SessionOperationContext,
+) -> tuple[int, int] | None:
+    """``(total bytes, bindings)`` of the state's file-held text, per binding; None if a file cannot be read."""
+    refs = inline_blob_refs(InlinePreflightState.from_composition_state(state))
+    blob_service: BlobServiceProtocol | None = request.app.state.blob_service
+    if not refs or blob_service is None:
+        return None
+    sizes: dict[UUID, int] = {}
+    total = 0
+    bindings = 0
+    for ref in refs:
+        if ref.blob_id not in sizes:
+            try:
+                record = await blob_service.get_blob(ref.blob_id, session_operation_context=session_operation_context)
+            except BlobNotFoundError:
+                return None
+            if record.session_id != session_id:
+                return None
+            sizes[ref.blob_id] = record.size_bytes
+        total += sizes[ref.blob_id]
+        bindings += 1
+    return total, bindings
 
 
 def _reject_file_inject_content_not_uploaded(state: CompositionState) -> None:

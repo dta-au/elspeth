@@ -13,7 +13,7 @@ For a new production host, use
 
 - The checkout path, service user, environment file, Unix socket, and Caddy
   routes in the installed unit already match this host.
-- Python 3.12 or newer and `uv` are installed.
+- Python 3.14 or newer and `uv` are installed.
 - Node.js 24 and npm 11 are installed.
 - `elspeth-web.service` and Caddy are already installed and enabled.
 - The untracked environment file referenced by the service contains the

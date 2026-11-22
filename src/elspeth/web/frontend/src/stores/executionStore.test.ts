@@ -484,6 +484,19 @@ describe("executionStore.execute", () => {
     expect(state.error).toBe("A run is already in progress for this pipeline.");
   });
 
+  it("does not point a transport failure at the run results panel", async () => {
+    const { executePipeline } = await import("@/api/client");
+    vi.mocked(executePipeline).mockRejectedValue(new TypeError("Failed to fetch"));
+
+    expect(await useExecutionStore.getState().execute("session-1")).toBeNull();
+    const state = useExecutionStore.getState();
+    expect(state.error).toBe(
+      "Could not confirm whether the run started. Check Run history before you run it again.",
+    );
+    expect(state.activeRunId).toBeNull();
+    expect(state.isExecuting).toBe(false);
+  });
+
   it.each([
     ["approval_required", "Approval is required before this pipeline can run."],
     ["approval_binding_mismatch", "The approval no longer matches this pipeline. Request a new approval."],
@@ -582,6 +595,23 @@ describe("executionStore failed run events", () => {
     const ticketProvider = (connectToRun as ReturnType<typeof vi.fn>).mock.calls[0][1] as () => Promise<string>;
     await expect(ticketProvider()).resolves.toBe("opaque-ws-ticket");
     expect(createRunWebSocketTicket).toHaveBeenCalledWith("run-1");
+  });
+
+  it("signs out with the expiry reason when the run socket closes for authentication", async () => {
+    const { useAuthStore } = await import("./authStore");
+    const logout = vi.fn().mockResolvedValue(undefined);
+    const realLogout = useAuthStore.getState().logout;
+    useAuthStore.setState({ logout });
+    try {
+      (connectToRun as ReturnType<typeof vi.fn>).mockReturnValue({ close: vi.fn() });
+      useExecutionStore.setState({ activeRunId: "run-1" });
+      useExecutionStore.getState().connectWebSocket("run-1");
+      const handlers = (connectToRun as ReturnType<typeof vi.fn>).mock.calls[0][2];
+      handlers.onAuthFailure();
+      expect(logout).toHaveBeenCalledWith({ expired: true });
+    } finally {
+      useAuthStore.setState({ logout: realLogout });
+    }
   });
 
   it("preserves terminal failed event detail in progress and run list", () => {

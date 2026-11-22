@@ -67,6 +67,7 @@ docs-archive/
 .claude/worktrees/
 .claude/plans/
 .claude/lanes/
+.claude/projects/
 # lane-manager per-lane state — working state, never public.
 .lanes/
 # orchestrator control plane: lane locks, step log, model observations.

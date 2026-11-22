@@ -9,6 +9,7 @@ from elspeth.contracts.aws_s3 import S3ProfiledAuditIdentities
 from elspeth.contracts.aws_textract import TextractProfiledAuditIdentities
 from elspeth.contracts.secrets import SecretScope
 from elspeth.web.composer.state import CompositionState
+from elspeth.web.execution._rendered_pipeline_yaml import RenderedPipelineYaml
 from elspeth.web.execution.schemas import (
     SemanticEdgeContractResponse,
     ValidationCheck,
@@ -204,7 +205,7 @@ class MaterializedYaml:
 
     authored: AuthoredValidatedState
     materialized_state: CompositionState
-    pipeline_yaml: str
+    pipeline: RenderedPipelineYaml
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "authored", _snapshot_authored_evidence(self.authored))
@@ -226,7 +227,7 @@ def _snapshot_materialized_evidence(materialized: MaterializedYaml) -> Materiali
     return MaterializedYaml(
         authored=materialized.authored,
         materialized_state=materialized.materialized_state,
-        pipeline_yaml=materialized.pipeline_yaml,
+        pipeline=materialized.pipeline,
     )
 
 

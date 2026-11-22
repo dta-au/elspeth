@@ -26,7 +26,7 @@ GRAMMARS = {
 # resolve_interpretation_event gains the keyword-only ``reviewed_anchor``
 # (16e9add9d); the three terminal SQL bodies and their supplier grammars
 # remain unchanged above.
-NAMESPACE_GRAMMAR = "8fe0ab50cf5edc4d90679ed63297de7bc92abcfa6fa13e685cea747688d039db"
+NAMESPACE_GRAMMAR = "752b0d380f1c0dc30501066c15d804e3ecd74c8eadae534cc2daaee0532a381a"
 MASK = inspect.CO_GENERATOR | inspect.CO_COROUTINE | inspect.CO_ASYNC_GENERATOR | inspect.CO_ITERABLE_COROUTINE
 SUPPLIERS = (
     ("RequiredWorkCoordinator", "elspeth.web.required_work", REQUIRED),

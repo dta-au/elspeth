@@ -207,6 +207,10 @@ def test_azure_ai_search_web_summary_schema_and_digest_use_operator_profile() ->
     assert schema.json_schema["properties"]["profile"]["enum"] == ["policies"]
     assert schema.json_schema["properties"]["index"]["enum"] == ["approved-documents"]
     assert "operator-private-marker" not in schema.model_dump_json()
+    # The profiled prohibition is one text on both discovery surfaces.
+    assert summary.usage_when_not_to_use is not None
+    assert "usage_when_not_to_use" in schema.model_dump()
+    assert schema.model_dump()["usage_when_not_to_use"] == summary.usage_when_not_to_use
     digest_entry = next(item for item in discovery_digest(view)["transforms"] if item["name"] == "azure_ai_search")
     assert digest_entry["profile_aliases"] == ["policies"]
     assert {"profile", "index"} <= set(digest_entry["required_options"])
@@ -341,6 +345,8 @@ def test_s3_source_web_discovery_and_assistance_expose_only_profile_safe_authori
 
     schema = view.get_schema("source", "aws_s3")
     assert schema.json_schema["properties"]["profile"]["enum"] == ["demo-input"]
+    assert "usage_when_not_to_use" in schema.model_dump()
+    assert schema.model_dump()["usage_when_not_to_use"] == summary.usage_when_not_to_use
     digest_entry = next(item for item in discovery_digest(view)["sources"] if item["name"] == "aws_s3")
     assert digest_entry["profile_aliases"] == ["demo-input"]
     assert {"profile", "key", "schema"} <= set(digest_entry["required_options"])

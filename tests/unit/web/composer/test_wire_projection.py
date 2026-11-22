@@ -5,7 +5,7 @@ W is derived from it once, at import, per ``ToolContractDialect``:
 
 * ``none`` is S exactly (plus the set_pipeline ``{"pipeline": ...}``
   envelope), with no ``strict`` key anywhere;
-* ``openai_strict`` makes every S-optional property of the 34 strict-capable
+* ``openai_strict`` makes every S-optional property of the 35 strict-capable
   tools required and nullable (decode strips the ``null``), moves keywords
   outside the wire allowlist into a ledger rendered as description text, and
   rewrites the 6 omission instructions into "pass null" wording.
@@ -103,6 +103,7 @@ _STRICT_CAPABLE: frozenset[str] = frozenset(
         "update_blob",
         "delete_blob",
         "wire_blob_inline_ref",
+        "report_composer_bug",
         "list_sources",
         "clear_source",
         "inspect_source",
@@ -147,7 +148,7 @@ _OPTION_TOOLS: frozenset[str] = frozenset(
     }
 )
 
-# The 17 promoted positions: S-optional properties of the 34.
+# The 23 promoted positions: S-optional properties of the 35.
 _PROMOTED: frozenset[tuple[str, tuple[str, ...]]] = frozenset(
     {
         ("get_blob_content", ("offset_chars",)),
@@ -155,9 +156,15 @@ _PROMOTED: frozenset[tuple[str, tuple[str, ...]]] = frozenset(
         ("read_attachment", ("expected_content_hash",)),
         ("create_blob", ("description",)),
         ("wire_blob_inline_ref", ("encoding",)),
+        ("report_composer_bug", ("guidance_reference",)),
+        ("report_composer_bug", ("related_tool",)),
         ("clear_source", ("source_name",)),
         ("inspect_source", ("encoding",)),
         ("get_pipeline_state", ("component",)),
+        ("get_pipeline_state", ("since_start",)),
+        ("get_pipeline_state", ("field_path",)),
+        ("get_pipeline_state", ("offset_chars",)),
+        ("get_pipeline_state", ("expected_sha256",)),
         ("get_plugin_assistance", ("issue_code",)),
         ("list_models", ("provider",)),
         ("list_models", ("limit",)),
@@ -170,7 +177,7 @@ _PROMOTED: frozenset[tuple[str, tuple[str, ...]]] = frozenset(
     }
 )
 
-# The five promoted positions whose flat S already accepts ``null``.
+# The six promoted positions whose flat S already accepts ``null``.
 _ALREADY_NULLABLE: frozenset[tuple[str, tuple[str, ...]]] = frozenset(
     {
         ("get_blob_content", ("expected_content_hash",)),
@@ -178,6 +185,7 @@ _ALREADY_NULLABLE: frozenset[tuple[str, tuple[str, ...]]] = frozenset(
         ("inspect_source", ("encoding",)),
         ("get_plugin_assistance", ("issue_code",)),
         ("upsert_edge", ("label",)),
+        ("set_metadata", ("patch", "description")),
     }
 )
 
@@ -189,15 +197,25 @@ _UPSERT_EDGE_EXAMPLE: dict[str, Any] = {
     "label": "LLM failures",
 }
 
-# The 18 ledger entries on the 34: (tool, JSON pointer of the owner node, keyword, value).
+# The 28 ledger entries on the 35: (tool, JSON pointer of the owner node, keyword, value).
 _LEDGER: frozenset[tuple[str, str, str, Any]] = frozenset(
     {
+        ("get_pipeline_state", "/properties/field_path", "maxLength", 512),
         ("get_blob_content", "/properties/offset_chars", "default", 0),
         ("clear_source", "/properties/source_name", "minLength", 1),
         ("clear_source", "/properties/source_name", "default", "source"),
         ("inspect_source", "/properties/encoding", "minLength", 1),
         ("inspect_source", "/properties/encoding", "maxLength", 128),
         ("wire_blob_inline_ref", "/properties/encoding", "default", "utf-8"),
+        ("report_composer_bug", "/properties/summary", "minLength", 1),
+        ("report_composer_bug", "/properties/summary", "maxLength", 240),
+        ("report_composer_bug", "/properties/expected_behavior", "minLength", 1),
+        ("report_composer_bug", "/properties/expected_behavior", "maxLength", 4000),
+        ("report_composer_bug", "/properties/observed_behavior", "minLength", 1),
+        ("report_composer_bug", "/properties/observed_behavior", "maxLength", 4000),
+        ("report_composer_bug", "/properties/guidance_reference", "minLength", 1),
+        ("report_composer_bug", "/properties/guidance_reference", "maxLength", 1000),
+        ("report_composer_bug", "/properties/related_tool", "maxLength", 100),
         ("list_models", "/properties/limit", "default", 50),
         ("upsert_edge", "", "examples", json.dumps([_UPSERT_EDGE_EXAMPLE], sort_keys=True)),
         ("request_advisor_hint", "/properties/problem_summary", "maxLength", 2000),
@@ -222,6 +240,15 @@ _LEDGER_SENTENCES: frozenset[tuple[str, str, str]] = frozenset(
         ("inspect_source", "/properties/encoding", "At least 1 character."),
         ("inspect_source", "/properties/encoding", "At most 128 characters."),
         ("wire_blob_inline_ref", "/properties/encoding", 'Pass null to use the default ("utf-8").'),
+        ("report_composer_bug", "/properties/summary", "At least 1 character."),
+        ("report_composer_bug", "/properties/summary", "At most 240 characters."),
+        ("report_composer_bug", "/properties/expected_behavior", "At least 1 character."),
+        ("report_composer_bug", "/properties/expected_behavior", "At most 4000 characters."),
+        ("report_composer_bug", "/properties/observed_behavior", "At least 1 character."),
+        ("report_composer_bug", "/properties/observed_behavior", "At most 4000 characters."),
+        ("report_composer_bug", "/properties/guidance_reference", "At least 1 character."),
+        ("report_composer_bug", "/properties/guidance_reference", "At most 1000 characters."),
+        ("report_composer_bug", "/properties/related_tool", "At most 100 characters."),
         ("list_models", "/properties/limit", "Pass null to use the default (50)."),
         ("request_advisor_hint", "/properties/problem_summary", "At most 2000 characters."),
         ("request_advisor_hint", "/properties/recent_errors", "Each item has at most 2000 characters."),
@@ -332,11 +359,11 @@ def test_option_tools_keep_their_none_parameters_on_openai_strict() -> None:
 # ---------------------------------------------------------------- promotion
 
 
-def test_strip_null_paths_are_exactly_the_17_promoted_positions() -> None:
+def test_strip_null_paths_are_exactly_the_23_promoted_positions() -> None:
     strict = _WIRE_TOOL_DEFS[STRICT]
     got = {(name, node.path) for name, tool in strict.items() for node in tool.decode_plan if type(node) is StripNull}
     assert got == _PROMOTED
-    assert len(got) == 17
+    assert len(got) == 23
     for name, tool in strict.items():
         assert tool.promoted_paths == frozenset(path for tool_name, path in _PROMOTED if tool_name == name)
     for tool in _WIRE_TOOL_DEFS[NONE].values():
@@ -344,9 +371,9 @@ def test_strip_null_paths_are_exactly_the_17_promoted_positions() -> None:
         assert not any(type(node) is StripNull for node in tool.decode_plan)
 
 
-def test_flat_s_rejects_null_at_the_12_omission_only_positions() -> None:
-    assert len(_ALREADY_NULLABLE) == 5
-    assert len(_PROMOTED - _ALREADY_NULLABLE) == 12
+def test_flat_s_rejects_null_at_the_17_omission_only_positions() -> None:
+    assert len(_ALREADY_NULLABLE) == 6
+    assert len(_PROMOTED - _ALREADY_NULLABLE) == 17
     definitions = {definition["name"]: definition["parameters"] for definition in _definitions()}
     for name, path in _PROMOTED:
         flat = _property_node(definitions[name], path)
@@ -429,7 +456,7 @@ def test_no_omission_instruction_in_any_strict_capable_w() -> None:
             assert not omission_instruction_matches(text), (name, text)
 
 
-def test_the_six_overrides_say_pass_null() -> None:
+def test_the_seven_overrides_say_what_null_means() -> None:
     functions = _functions(STRICT)
     assert "Pass null to get a provider summary" in functions["list_models"]["parameters"]["properties"]["provider"]["description"]
     assert "pass null for component" in functions["get_pipeline_state"]["parameters"]["properties"]["component"]["description"]
@@ -442,7 +469,8 @@ def test_the_six_overrides_say_pass_null() -> None:
     assert "pass null for llm_draft — the server computes the demanded field set" in review["kind"]["description"]
     assert review["llm_draft"]["description"].startswith("Pass null for llm_draft when the review site already carries")
     assert "if provided it must byte-match the staged draft" in review["llm_draft"]["description"]
-    assert len(_STRICT_DESCRIPTION_OVERRIDES) == 6
+    assert "Pass an empty string for description to clear it (null leaves it unchanged);" in functions["set_metadata"]["description"]
+    assert len(_STRICT_DESCRIPTION_OVERRIDES) == 7
 
 
 def test_none_descriptions_are_unchanged() -> None:
@@ -499,7 +527,7 @@ def test_unknown_keyword_fails_closed() -> None:
         _build(definitions)
 
 
-def test_ledger_is_exactly_the_18_entries() -> None:
+def test_ledger_is_exactly_the_28_entries() -> None:
     got = set()
     for name, tool in _WIRE_TOOL_DEFS[STRICT].items():
         for entry in tool.ledger:
@@ -507,7 +535,7 @@ def test_ledger_is_exactly_the_18_entries() -> None:
             value = json.dumps(deep_thaw(entry.value), sort_keys=True) if entry.keyword == "examples" else entry.value
             got.add((name, entry.path, entry.keyword, value))
     assert got == _LEDGER
-    assert len(got) == 18
+    assert len(got) == 28
     assert all(tool.ledger == () for tool in _WIRE_TOOL_DEFS[NONE].values())
 
 
@@ -560,7 +588,7 @@ def test_limits_fail_closed_when_lowered_below_the_measured_value(limit_field: s
 
 
 def test_limits_report_counts_the_strict_tools() -> None:
-    assert wire_limits_report(STRICT).strict_tool_count == 34
+    assert wire_limits_report(STRICT).strict_tool_count == 35
     assert wire_limits_report(NONE).strict_tool_count == 0
 
 
@@ -604,7 +632,7 @@ def test_wire_tool_definitions_returns_fresh_isolated_copies() -> None:
 # ---------------------------------------------------------------- stamping
 
 
-def test_openai_strict_stamps_true_on_the_34_and_false_on_the_11() -> None:
+def test_openai_strict_stamps_true_on_the_35_and_false_on_the_11() -> None:
     for tool in wire_tool_definitions(STRICT):
         function = tool["function"]
         assert function["strict"] is (function["name"] in _STRICT_CAPABLE), function["name"]

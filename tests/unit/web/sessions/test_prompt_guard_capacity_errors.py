@@ -218,8 +218,10 @@ async def test_unconfigured_debug_capacity_preserves_complete_model_wire_and_aud
     [
         ("user_unit", True, "debug-when-unconfigured", 422, "prompt_guard_unsupported_input", "unsupported_input", 0),
         ("user_unit", True, "required", 422, "prompt_guard_unsupported_input", "unsupported_input", 0),
-        ("unavailable", True, "required", 503, "prompt_guard_unavailable", "service_error", 1),
-        ("blocked", True, "debug-when-unconfigured", 422, "prompt_guard_blocked", "policy_blocked", 1),
+        # The user prompt and the documents are inspected in separate calls;
+        # both are submitted before the first refusal is returned.
+        ("unavailable", True, "required", 503, "prompt_guard_unavailable", "service_error", 2),
+        ("blocked", True, "debug-when-unconfigured", 422, "prompt_guard_blocked", "policy_blocked", 2),
     ],
     ids=["configured-debug", "local-required", "azure-unavailable", "azure-blocked"],
 )
