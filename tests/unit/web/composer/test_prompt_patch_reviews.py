@@ -986,8 +986,10 @@ def test_node_sent_back_exactly_as_exported_keeps_an_amended_definition(writer: 
     args, error = _serialize_set_pipeline_arguments(state)
     assert error is None and args is not None
     exported_rows = args["nodes"][0]["options"]["interpretation_requirements"]
-    # Read shells only: three or four fields, no id, status or accepted value.
-    assert sorted(len(row) for row in exported_rows) == [3, 3, 3, 4]
+    # Read shells only: three or four fields, no id, status or accepted value. A parts step's
+    # prompt review is not offered at all (test_read_drops_prompt_review_row.py).
+    assert sorted(len(row) for row in exported_rows) == [3, 3, 4]
+    assert "llm_prompt_template" not in {row["kind"] for row in exported_rows}
     exported_category = next(row for row in exported_rows if row["user_term"] == "category")
     assert exported_category["draft"] == category["draft"] and "accepted_value" not in exported_category
 
