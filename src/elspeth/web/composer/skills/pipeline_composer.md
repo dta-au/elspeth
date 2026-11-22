@@ -630,15 +630,16 @@ listed; repair the listed ones and resubmit.
 ### On success
 
 <!-- taught:begin envelope * applied_component; envelope * validation_delta; envelope * post_call_hints; echo * applied_component.source; echo * applied_component.sources; echo * applied_component.nodes; echo * applied_component.outputs; echo * applied_component.edges; delta * validation_delta.new_errors; delta * validation_delta.resolved_errors; delta * validation_delta.new_warnings; delta * validation_delta.resolved_warnings -->
-A successful incremental mutation carries `applied_component` (`source`,
+A successful incremental mutation usually carries `applied_component` (`source`,
 `sources`, `nodes`, `outputs`, `edges` as stored) and `validation_delta`
 (`new_errors`, `resolved_errors`, `new_warnings`, `resolved_warnings`, each a
 list of the entries described above); read the delta to choose the next
 repair and never re-read state to confirm the echo. `post_call_hints` are
-advisory next-step notes from the plugin or the server. Two entries are not
+advisory next-step notes from the plugin or the server. Three entries are not
 advice and are recognised by their wording: one that starts `Incomplete list:`
-means the list you just received is partial, and one that says the pipeline is
-unchanged means the call was a no-op.
+means the list you just received is partial, one that says the pipeline is
+unchanged means the call was a no-op, and one that says the echo is omitted for
+this graph means the result has no `applied_component` (rule 5).
 <!-- taught:end -->
 
 <!-- taught:begin tool-data patch_node_options data.server_owned_metadata_note; tool-data patch_source_options data.server_owned_metadata_note; tool-data set_pipeline data.server_owned_metadata_note; tool-data set_source data.server_owned_metadata_note; tool-data set_source_from_blob data.server_owned_metadata_note; tool-data set_source_from_blobs data.server_owned_metadata_note; tool-data upsert_node data.server_owned_metadata_note -->
