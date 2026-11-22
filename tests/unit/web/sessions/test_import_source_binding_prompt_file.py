@@ -134,7 +134,7 @@ class _Env:
         return sorted((row.node_id, row.field_path, row.trigger) for row in rows)
 
 
-# ── The import request shapes of the rehearsal (README "Rehearsal 3") ────────
+# ── The import request shapes ────────────────────────────────────────────────
 #
 # A: one prompt file + source_blob_ids, no sink binding.   V2: A plus a sink binding.
 # D: one prompt file + a sink binding, no source binding.

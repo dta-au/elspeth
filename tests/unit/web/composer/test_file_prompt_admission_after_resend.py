@@ -224,7 +224,7 @@ async def _bound_file_prompt(service: SessionServiceImpl, env: dict[str, Any], t
     # that stages its llm_model_choice review. wire_blob_inline_ref alone
     # stages only the prompt review, and the hand-built fixture node carries
     # no rows, so without this step the model card is never opened and every
-    # run is refused for it (the earlier harness's "never admitted").
+    # run is refused for it.
     placed = _placed_state(env, tmp_path)
     authored = _tool(env, "upsert_node", _resend_arguments(env, "upsert_node", placed), placed)
     assert authored.success, authored.to_dict()
@@ -428,8 +428,7 @@ async def test_control_card_resolution_is_what_writes_the_file_approval(blob_env
 # ---------------------------------------------------------------------------
 # The same question on the landed execution harness, with the REAL preflight.
 #
-# Started from the other builder's probe
-# (.claude/lanes/s17/text-replace/admission/test_probe_file_prompt_admission.py). Changed:
+# Adapted from an earlier admission probe. Changed:
 # * The source and sink are placed under the execution service's own data
 #   directory, so its real ``validate_state`` (``_authoritative_state_preflight``:
 #   validate_pipeline, then ``_assert_state_prompt_file_approvals``, then proof
@@ -631,7 +630,7 @@ def test_landed_harness_changed_file_bytes_are_refused_by_the_file_gate(
 def test_landed_harness_unapproved_file_is_refused_by_preflight_and_file_gate(
     tmp_path: Path, execution_fixture: ExecutionTestCustody
 ) -> None:
-    """Control (c): the other builder's unapproved head, checked at each gate to name which one refuses."""
+    """Control (c): an unapproved head, checked at each gate to name which one refuses."""
     approved = landed._approved_session(tmp_path, "card")
     harness = landed._harness(tmp_path, execution_fixture)
     try:

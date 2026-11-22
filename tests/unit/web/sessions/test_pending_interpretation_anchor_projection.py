@@ -561,13 +561,10 @@ async def test_resolve_with_committed_graph_review_compares_projected_records(st
 
 # --- Fork: the composer's backend surfacing must open a card for every open prompt-review site on the fork head ---
 #
-# Live report (session 17, 2026-11-21): after a fork and a recompose, the fork head ended
-# ``interpretation_review_pending`` with no card to resolve. Measured cause: that run's sink paths resolved
-# outside the allowed directories, so the no-tool finalize returned at its runtime-findings early return
-# before surfacing (setup confound, identical on both trees). These tests pin the half that IS ours: on a
-# fork made through the real route (blob copy and custody rewrite included), the surfacing entry the
+# After a fork and a recompose, the fork head must carry a pending card for every open prompt-review site.
+# On a fork made through the real route (blob copy and custody rewrite included), the surfacing entry the
 # finalize calls writes one pending card per open site, and still does after a committed graph review is
-# bound to the fork head (the shape the stored/projected fix was for).
+# bound to the fork head.
 
 FORK_CSV_TEXT = "text\nhello\n"
 

@@ -608,7 +608,7 @@ def test_on_a_step_above_the_echo_cap_the_receipt_is_still_the_whole_report() ->
     assert _authored(_node(result.updated_state, "llm_00").options) == _authored(_node(state, "llm_00").options)
 
 
-# ── T7: the S1 repair over auto-wired shields (either S1 ruling is measured) ─
+# ── T7: the S1 repair over auto-wired shields (either outcome is measured) ───
 
 
 def _s1_state(tmp_path: Path) -> tuple[CompositionState, PolicyCatalogView, PluginAvailabilitySnapshot]:

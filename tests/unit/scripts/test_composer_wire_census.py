@@ -814,7 +814,7 @@ def test_read_named_custody_copy_is_classified_not_scanned(module_factory: Calla
     assert not unresolved
 
 
-# Each of the lead's three measured attempts at the direct-path custody copy, plus
+# Each of three direct-path custody copies, plus
 # whole-input forwards into anything that is not the one named custody function,
 # must stay unresolved with its own message. A walker entry widened to a name,
 # a body shape or a general whole-input helper turns one of these green.

@@ -291,7 +291,7 @@ ADVISOR_OUTPUT_CONTRACT_CLAUSE: Final[str] = (
 )
 
 # elspeth-71617f1d21: the END-gate repair-continue message must state that
-# MUTATIONS are expected for actual graph defects. In session 2e0c8ea3 both advisor repair turns were
+# MUTATIONS are expected for actual graph defects. In an observed session both advisor repair turns were
 # spent entirely on get_pipeline_state lookups — the injection carried only
 # the output-contract clause, and nothing said a read-only turn is a wasted
 # pass. END-gate only: the EARLY advisory injection deliberately keeps its

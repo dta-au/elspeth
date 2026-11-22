@@ -1739,13 +1739,9 @@ class ReportComposerBugArgumentsModel(BaseModel):
 
     The report prose may quote tool errors or document text, so every prose
     field is :class:`Sensitive`: the assistant row's ``chat_messages.tool_calls``
-    keeps a length-disclosing placeholder. The redaction does not reach the
-    other copies every tool's arguments have: the full text is also kept in
-    the session report file, in the tool row's visible tool event
-    (``received_arguments``) and in the audit row, and the visible event feeds
-    the advisor transcript. ``related_tool`` is limited to a tool-name
-    spelling and is kept in the clear so the call history shows which tool
-    was reported.
+    keeps a length-disclosing placeholder. The session report file keeps the
+    full text. ``related_tool`` is limited to a tool-name spelling and is
+    kept in the clear so the call history shows which tool was reported.
     """
 
     summary: _ReportProse = Field(min_length=1, max_length=REPORT_SUMMARY_MAX_CHARS)
