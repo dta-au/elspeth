@@ -3571,9 +3571,16 @@ async def run_tool_batch(
         except ComposerRuntimePreflightError as preflight_exc:
             # A successful mutation may precede its structural preflight.
             # Preserve that new state instead of recapturing the old loop state.
+            # A preflight of a state that is not the loop state (the
+            # request-start baseline ``diff_pipeline`` checks) carries no
+            # state of its own; the loop state then holds every mutation an
+            # earlier call applied, as it does for a plugin crash below.
+            preserved_state = preflight_exc.partial_state
+            if preserved_state is None and state.version > initial_version:
+                preserved_state = state
             raise ComposerRuntimePreflightError(
                 original_exc=preflight_exc.original_exc,
-                partial_state=preflight_exc.partial_state,
+                partial_state=preserved_state,
                 tool_invocations=recorder.invocations,
                 llm_calls=recorder.llm_calls,
                 failed_turn=preflight_exc.failed_turn,
