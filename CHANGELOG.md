@@ -270,6 +270,35 @@ Behaviour you will see:
   source and output), the reply no longer says the composer failed to build
   and asks you to retry. It says the pipeline is empty and needs a source and
   an output.
+- Moving a pipeline source onto another uploaded file no longer erases the
+  source's description. The composer is told the description was kept, so it
+  no longer reports the source as otherwise unchanged when that description
+  may name the earlier file.
+- When the composer sends a malformed content hash to a file-reading tool, for
+  example the text "null" instead of an empty value, the refusal says what to
+  send instead of only "Validation failed".
+- A reference-table lookup step with a required option left out (such as its
+  table or key field) reports the option as required instead of as the wrong
+  type.
+- The composer's guidance says how to create a reference-table lookup step
+  with its uploaded table in one call, and how to replace a table that was
+  written in as text.
+- When an edit's result cannot show the stored component (for example, on a
+  pipeline whose uploaded-file source has its own name), the result says so in
+  one line and names how to read it, instead of leaving it out silently. The
+  composer is also told when the exact pipeline-authoring document cannot be
+  produced for the current graph.
+- The composer's output tool states that an output may be fed by any route
+  that sends rows to it, including a step's error route.
+- The composer's guidance states when a step cannot be inserted between two
+  others in one call (either neighbour has its own error route), and the
+  refusal says how to make the same insertion in two steps.
+- The composer no longer brings up the suspected-bug reports it files for the
+  maintainers. If you ask about a report file it says plainly what it is, and
+  it still tells you when something it said earlier turns out to be wrong.
+- These guidance and tool-text additions cost about 530 estimated tokens on
+  every composer request (skill +946 bytes, tool text +648 bytes), so on very
+  large turns history shedding starts correspondingly earlier.
 - `upsert_node` accepts `routing_only=true` to rewire a step without re-sending
   it. It changes only an existing transform's `input`, `on_success` and
   `on_error` and keeps its plugin, options (file-held prompts included) and
