@@ -22,7 +22,10 @@ true, and every difference from the previous graph must be accounted for: by
 an expectation, by the edit's ``may_change`` prefixes or ``edges_touching``
 components, or as a field the server itself writes (review requirement rows,
 approval hashes, source authoring marks, auto-wired required controls),
-which are allowed by name and reported as server-written.
+which are allowed by name and reported as server-written. One more change
+is allowed and reported (``own_description_corrected``): the turn rewriting
+the existing description of a component an expectation's pointer targets,
+so a description that names a fact the edit changed can stay true.
 
 Expectation forms (exactly one operator key each):
 
@@ -1003,6 +1006,47 @@ def new_component_notes(edit: Mapping[str, Any], before: Mapping[str, Any], afte
         placed = "path" in rules and "ends_with" in rules["path"] and "path" in item["options"]
         if placed and item["options"]["path"] != rules["path"]["ends_with"]:
             notes.append(f"new_output_path_placed:{pointer}/options/path")
+    return notes
+
+
+_POINTER_OPERATORS = ("equals", "ends_with", "present", "absent", "restored", "text", "bound")
+
+
+def targeted_components(edit: Mapping[str, Any]) -> set[tuple[str, str]]:
+    """The ``(collection, id)`` of each existing component an expectation's own pointer points inside.
+
+    Only an expectation pointer below a component counts (``/outputs/x/options/path`` targets output
+    ``x``). A chain, a new or renamed step, ``may_change``, ``edges_touching`` and the node whose card the
+    edit approves do not make a component a target.
+    """
+    found: set[tuple[str, str]] = set()
+    for expectation in edit["expect"]:
+        operator = next(key for key in OPERATORS if key in expectation)
+        if operator not in _POINTER_OPERATORS:
+            continue
+        parts = _segments(expectation[operator])
+        if len(parts) >= 3 and parts[0] in ("sources", "nodes", "outputs"):
+            found.add((parts[0], parts[1]))
+    return found
+
+
+def own_description_corrections(edit: Mapping[str, Any], before: Mapping[str, Any], after: Mapping[str, Any]) -> list[str]:
+    """``own_description_corrected:PTR`` for each target whose existing description the turn rewrote.
+
+    A target is a component the edit changes (:func:`targeted_components`). When the turn rewrites that
+    component's own description, from one text to another, the change is allowed and reported here, never
+    hidden: changing a fact a description states (an output's file name) and keeping the description true
+    is the right result. A description added where there was none, or removed, is not a correction and
+    stays an unrelated change; so does any other component's description, the pipeline metadata, and
+    every option and route.
+    """
+    notes: list[str] = []
+    for collection, name in sorted(targeted_components(edit)):
+        if name not in before[collection] or name not in after[collection]:
+            continue
+        old, new = before[collection][name]["description"], after[collection][name]["description"]
+        if not _empty(old) and not _empty(new) and old != new:
+            notes.append(f"own_description_corrected:/{collection}/{escape(name)}/description")
     return notes
 
 

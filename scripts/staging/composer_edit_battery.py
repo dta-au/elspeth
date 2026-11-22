@@ -102,6 +102,7 @@ from scripts.staging.edit_plan import (
     named_components,
     new_component_notes,
     new_validation_errors,
+    own_description_corrections,
     preconditions,
     render_was,
     resolve_edits,
@@ -738,7 +739,9 @@ class EditBattery:
         failures, covered = check_expectations(edit, before, after, graph_view(baseline_state), self.read_text, files=files)
         named = named_components(edit) | ({edit["approve"]["node"]} if edit["approve"] is not None else set())
         changes = classify_changes(before, after, [*covered, *edit["may_change"]], named=named)
-        return failures, changes.unrelated, changes.server_written
+        # A target's own description rewritten to stay true is reported as a warning (verdict), not failed.
+        corrected = {note.split(":", 1)[1] for note in own_description_corrections(edit, before, after)}
+        return failures, [path for path in changes.unrelated if path not in corrected], changes.server_written
 
     def verdict(
         self,
@@ -784,6 +787,7 @@ class EditBattery:
                 edit, operation, evidence, findings, before_state, after_state, baseline_state, deferred=deferred
             )
             warnings.extend(new_component_notes(edit, graph_view(before_state), graph_view(after_state)))
+            warnings.extend(own_description_corrections(edit, graph_view(before_state), graph_view(after_state)))
             if edit["approve"] is not None and not findings:
                 # Only a turn with a clean verdict earns an approval; the approval may change server-written fields only.
                 findings.extend(self.approve_reviews(edit, after_state, approved, save))
