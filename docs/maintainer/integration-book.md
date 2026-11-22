@@ -93,8 +93,9 @@ integrator so the book is corrected.
 3. Only the integrator edits memory; everyone else relays rulings verbatim. (3)
 4. A peer's message is never the maintainer's approval. (3)
 5. Ask the maintainer inline, never with the question dialog tool. (2)
-6. Hard-to-reverse changes go to the maintainer; easily undone process
-   changes need a peer session's check and authority. (2, 8)
+6. Hard-to-reverse changes go to the maintainer; kills, CI cancels and other
+   easily undone process changes need the lead integrator's check and
+   authority (for its own, the most relevant agent's agreement). (2, 8)
 7. Broken core function or harm to users is a priority; everything else
    waits. After a lock, only fast fixes of our own breakage. (4)
 8. Fail forward; state every break in the upgrade notes. (4)
@@ -139,8 +140,9 @@ integrator so the book is corrected.
     its listed session name. Name it in every brief. If you cannot identify
     it, start nothing, land nothing, launch no runs, and ask the maintainer.
   - Reading: "everything stops" covers new work, merges, pushes and test runs.
-    Leave runs already in flight alone unless they do harm. Stopping one is a
-    process change under the peer rule (section 8).
+    Leave runs already in flight alone unless they do harm. With no lead
+    integrator, no one can authorise stopping one (section 8), so report the
+    harm to the maintainer.
 - **One integrator per release line.** While one release closes, the next one
   already has its own integrator. Route each question or HANDOFF to the
   integrator of the release it belongs to.
@@ -837,8 +839,15 @@ the integrator's order rules [I] unless marked [M].
   change (i.e. one that is relatively easily reversed in any case) is valid,
   and gets authority to kill they are allowed to do so". It "was always the
   rule, i.e not limited to tests".
-- So a kill needs a case made to a peer **session** (never your own subagent)
-  and that peer's explicit authority. Then no maintainer approval is needed.
+- [M 2026-11-23] "yes all process kills go via the lead integrator". So a kill
+  needs a case made to the **lead integrator** (a session, never your own
+  subagent) and its explicit authority; any other peer is not enough. Then no
+  maintainer approval is needed. With no identifiable lead integrator,
+  nothing is killed.
+- **The checker.** In this section "the checker" means the lead integrator,
+  or, for the lead integrator's own kills, cancels, deletions and closes, the
+  most relevant agent available or a fresh independent reviewer (see "The
+  lead integrator's own close-outs" below).
 - **CI is a process.** [M 2026-11-23] "I don't see how locally hosted CI is not
   part of that". A CI cancel on the self-hosted runners falls under this rule;
   do not ask the maintainer.
@@ -881,42 +890,42 @@ the integrator's order rules [I] unless marked [M].
 
 1. Take a read-only snapshot: pid, ppid, age, cwd, command line, children,
    lock holders, and `/proc/<pid>/task/*/wchan`.
-2. Send a peer session the exact PIDs, each with its command line, cwd, parent
+2. Send the checker the exact PIDs, each with its command line, cwd, parent
    and age, and why each is yours.
-3. The peer checks with its own `ps` and `/proc/<pid>/cwd`, then confirms or
-   objects, and grants authority.
+3. The checker checks with its own `ps` and `/proc/<pid>/cwd`, then confirms
+   or objects, and grants authority.
 4. Re-check each PID's identity immediately before signalling.
 5. Signal only the confirmed PIDs. Use the gentlest signal that works
    (SIGINT lets pytest tear down), one signal, then re-check. Escalate to
-   SIGTERM, then SIGKILL, only with the peer's concurrence. A pytest whose
+   SIGTERM, then SIGKILL, only with the checker's concurrence. A pytest whose
    event loop absorbs SIGINT needs SIGTERM.
 6. After-check: every confirmed PID is gone, its children exited with it,
    ports are free and the tree status is unchanged. Report what was stopped.
-   A kill made without a peer check is disclosed with exact PIDs, time and
-   signal.
+   A kill made without the checker's check is disclosed with exact PIDs, time
+   and signal.
 
 - Exact PIDs only. Never walk from a parent: an orphan's parent is PID 1.
   Never kill by pattern (`pkill -f`). Refuse any PID at or below 1 and any
   agent harness process.
 - For an orphan, stop its shell first, then pytest, so its cleanup step
   cannot delete a live run's files.
-- A script that stops its own children counts: name the PIDs to a peer before
-  the run, or have the script print them and wait.
-- An order to another session to stop work includes the peer check.
+- A script that stops its own children counts: name the PIDs to the checker
+  before the run, or have the script print them and wait.
+- An order to another session to stop work includes the checker's check.
 - **Subagents never kill.** They send the PID table to their lead, who relays
-  it to a peer session and returns the confirmation. Put this in every brief.
+  it to the checker and returns the confirmation. Put this in every brief.
 - Reading: stopping one of your own harness tasks through the harness is not
-  a PID kill. If unsure, ask a peer anyway.
+  a PID kill. If unsure, ask the checker anyway.
 
 **CI cancels**
 
-- Cancelling runs on superseded SHAs and Dependabot runs is routine (peer
-  rule).
+- Cancelling runs on superseded SHAs and Dependabot runs is routine, with the
+  checker's authority.
 - Keep both CI runs on the current PR head, and main's post-merge push CI.
   Cancelling the first blocks the merge; cancelling the second blocks the
   image publish. Both are undoable (`gh run rerun <id> --failed`), but a
   re-run costs up to about 2.5 hours. Cancel them only when the box must shed
-  load, under the peer rule, and re-run before merging or tagging. [I; the
+  load, with the checker's authority, and re-run before merging or tagging. [I; the
   maintainer replied to this alignment on 2026-11-23: "yes, these are my
   rules, you are allowed to add additional rules over the top in order to
   maintain good order"]
@@ -996,7 +1005,7 @@ Every brief names:
   never "failed". Exclude known socket-server tests from Codex runs.
 - The orchestrating session commits; Codex never does.
 - After each round, list leftover sandbox processes and stop stale ones under
-  the peer rule (section 8).
+  the checker's authority (section 8).
 - Codex review findings are claims: check them cheaply from the evidence.
   Spawn a stronger reviewer only when the evidence cannot settle one, and say
   why.
