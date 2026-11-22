@@ -256,8 +256,9 @@ All new fields default to current behaviour. Persisted data is unchanged in stag
 ### 8.7 Outcome of the technical review of §8.6 (2026-11-23)
 A systems-thinking and solution-architecture review found four of the five items to be technical,
 settled by the system's own contracts rather than by policy:
-1. Quota semantics: technical. A design that needs no schema change is being prepared; one residual
-   question goes to the maintainer with it.
+1. Quota semantics: technical. A design that needs no schema change is being prepared. Ruled
+   2026-11-23: calls in flight settle against the quota as they already do within one run; no
+   per-call reserve setting.
 2. Durable "pending until sent" is not buffering. A row waiting for its sink is a non-terminal
    state, the run cannot complete with it outstanding, and the row's outcome is recorded only with
    the sink's confirmation (ADR-019). The long-life-save contract will say: a row waiting for its
@@ -271,8 +272,8 @@ settled by the system's own contracts rather than by policy:
 The review also found: the quota coupling (A1) affects concurrent composer users today, not only
 concurrent runs; every run LLM call uses the shared session database pool (admit and settle), so
 pool load scales with LLM calls rather than runs; and the proposed fair-admission defaults in §8.2
-(per-user cap 1, queue cap 32) would be new refusals at the default of 1, so they either default to
-off or are stated as a design change.
+(per-user cap 1, queue cap 32) would be new refusals at the default of 1. Ruled 2026-11-23: both
+default to off; at the default, runs stay first-come first-served as today.
 
 ## Limits of this research
 - Nothing was executed except the QueuePool default probe and greps.
