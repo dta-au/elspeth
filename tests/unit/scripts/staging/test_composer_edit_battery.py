@@ -621,6 +621,60 @@ def test_an_unrelated_change_in_the_same_turn_fails_the_edit(tmp_path: Path) -> 
     assert result["findings"] == ["unrelated_change:/nodes/audit_copy/description"]
 
 
+def described_classify() -> State:
+    state = baseline()
+    node(state, "classify")["description"] = "Classifies each row with the default max_tokens."
+    return state
+
+
+def test_the_targets_own_description_kept_true_passes_and_is_reported(tmp_path: Path) -> None:
+    composer = FakeComposer()
+
+    def kept_true(state: State) -> None:
+        node(state, "classify")["description"] = "Classifies each row with max_tokens 777."
+
+    composer.extra = {3: kept_true}
+    run, _, _ = make(tmp_path, composer, state=described_classify())
+    run.run()
+    result = saved(run)["results"][2]
+    assert result["passed"] is True
+    assert result["findings"] == []
+    assert "own_description_corrected:/nodes/classify/description" in result["warnings"]
+
+
+def test_beside_a_corrected_target_description_another_components_description_or_a_target_option_still_fails(
+    tmp_path: Path,
+) -> None:
+    composer = FakeComposer()
+
+    def drift(state: State) -> None:
+        node(state, "classify")["description"] = "Classifies each row with max_tokens 777."
+        node(state, "audit_copy")["description"] = "Rewritten beside the edit."
+        node(state, "classify")["options"]["temperature"] = 0.5
+
+    composer.extra = {3: drift}
+    run, _, _ = make(tmp_path, composer, state=described_classify())
+    run.run()
+    result = saved(run)["results"][2]
+    assert result["passed"] is False
+    assert result["findings"] == [
+        "unrelated_change:/nodes/audit_copy/description",
+        "unrelated_change:/nodes/classify/options/temperature",
+    ]
+
+
+def test_a_description_added_to_a_target_that_had_none_is_still_unrelated(tmp_path: Path) -> None:
+    composer = FakeComposer()
+
+    def added(state: State) -> None:
+        node(state, "classify")["description"] = "A description the step did not have."
+
+    composer.extra = {3: added}
+    run, _, _ = make(tmp_path, composer)
+    run.run()
+    assert saved(run)["results"][2]["findings"] == ["unrelated_change:/nodes/classify/description"]
+
+
 def test_an_unrelated_edge_change_fails_the_edit_even_beside_a_routing_edit(tmp_path: Path) -> None:
     composer = FakeComposer()
 
