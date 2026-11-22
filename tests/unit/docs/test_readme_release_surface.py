@@ -61,7 +61,8 @@ def test_readme_operational_cutover_states_the_live_schema_epochs() -> None:
 
     assert f"Session epoch {SESSION_SCHEMA_EPOCH} and Landscape epoch {SQLITE_SCHEMA_EPOCH} are unchanged from 0.8.15" in text
     assert "this release adds no schema-epoch cutover" in text
-    assert "existing 0.8.15 session and Landscape stores need no action" in text
+    assert "existing 0.8.15 session and Landscape stores open unchanged" in text
+    assert "A web run admitted under 0.8.15 does not resume" in text
     assert "Upgrading from 0.8.14 or earlier means applying the 0.8.15 upgrade notes first" in text
     assert "preserve epoch 78 session stores and epoch 50 Landscape stores, which startup refuses" in text
     assert (

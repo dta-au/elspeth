@@ -8,7 +8,7 @@ The full history is in the repository's releases and commit history.
 
 ---
 
-## 0.8.16 - 2026-11-21
+## 0.8.16 - 2026-11-22
 
 Web Composer fixes for large pipelines, long sessions and prompts held in
 files, bounded advisor and prompt-guard requests, less redundant per-row engine
@@ -35,11 +35,24 @@ Schema and stored data:
   always empty in new records. Records written by 0.8.15 still load.
 - Advisor call records now fill `max_completion_tokens_requested` with the
   completion cap that was sent (it was null on advisor rows). No field is
-  added.
+  added to the advisor call record.
 - Prompt-guard audit records are written at `schema_version` 2, with
   `units_scanned` and `units_reused`. Version 1 records still load.
+- Composer guidance and tool text grew by about 21 KB over 0.8.15 (skill
+  +12,786 bytes, tool definitions about +8,500 bytes), about 7,000 estimated
+  tokens on every composer request, so on very large turns history shedding
+  starts correspondingly earlier. `composer_skill_hash` changes with the
+  skill text; it is a provenance field on review rows and gates nothing.
 
 Behaviour you will see:
+
+- **Web runs admitted under 0.8.15 do not resume.** The `reference_join`
+  plugin changed, and every web deployment authorizes it, so the compiled
+  plugin policy hash changes. A web run admitted under 0.8.15 is refused on
+  resume as `POLICY_CHANGED` (`admitted_policy_changed`): finish interrupted
+  web runs before upgrading, or run them again afterwards. A run approval is
+  bound to the policy hash, so one recorded under 0.8.15 must be given again.
+  The stores themselves open unchanged.
 
 - **Long inline prompts belong in files.** A Composer edit that adds or changes
   an inline LLM prompt (`system_prompt`, `prompt_template` or a query
@@ -89,9 +102,12 @@ Behaviour you will see:
   content is over the byte maximum is refused rather than cut. A compose
   request the gateway or model rejects as too long is sent once more with
   every earlier turn left out. If that is rejected too, or there was no
-  earlier turn to leave out, the turn reaches the user as a size refusal, not
-  as a provider outage; a planner request rejected as too long is refused
-  that way at once.
+  earlier turn to leave out, the turn reaches the user as the size refusal
+  `context_budget_exceeded`, not as a provider outage; a planner request
+  rejected as too long is refused that way at once. This replaces the 0.8.13
+  behaviour: tool results of the turn in progress are no longer shed, a
+  request over the token estimate is no longer refused, advisor requests are
+  now bounded, and a provider context-length rejection is retried once.
 - **Advisor requests are bounded by age, not stopped by size.** The advisor
   now sees earlier turns by age within a fixed budget; when a review's size
   estimate is over `composer_context_max_prompt_tokens`, older turns are left
@@ -295,9 +311,6 @@ Behaviour you will see:
 - The composer no longer brings up the suspected-bug reports it files for the
   maintainers. If you ask about a report file it says plainly what it is, and
   it still tells you when something it said earlier turns out to be wrong.
-- These guidance and tool-text additions cost about 530 estimated tokens on
-  every composer request (skill +946 bytes, tool text +648 bytes), so on very
-  large turns history shedding starts correspondingly earlier.
 - `upsert_node` accepts `routing_only=true` to rewire a step without re-sending
   it. It changes only an existing transform's `input`, `on_success` and
   `on_error` and keeps its plugin, options (file-held prompts included) and
@@ -611,6 +624,8 @@ Behaviour you will see:
 - The battery's judge accepts an edit that keeps the edited component's own
   description true, reporting the rewrite as `own_description_corrected`
   instead of failing the edit.
+
+### Publication and acceptance
 
 Automatic image publication from main remains held. The 0.8.16 tag and
 container publication follow successful required checks and the protected
