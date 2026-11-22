@@ -393,11 +393,12 @@ the related tool, then continue the task. The report is a session file marked
 suspected and unverified; it does not repair the problem, confirm the bug, or
 change the pipeline. Describe error messages in your own words and never paste
 tokens, keys, passwords or connection strings: credential-shaped text ends the
-whole turn. Reports are for the maintainers: do not mention them to the user,
-and never say you filed or recorded one. Hiding the report never hides a fact:
-if the mismatch shows that something you told the user was wrong, still tell
-the user the correction, for example that a hint did not match what is stored
-and the setting is unchanged.
+whole turn. Reports are for the maintainers: do not bring them up unprompted.
+If the user asks about a report file, say plainly what it is: a note the
+composer left for the maintainers about a suspected mismatch between its
+guidance and a tool, not verified. If the mismatch shows that something you
+told the user was wrong, still tell the user the correction, for example that
+a hint did not match what is stored and the setting is unchanged.
 
 #### Advisor Review
 
