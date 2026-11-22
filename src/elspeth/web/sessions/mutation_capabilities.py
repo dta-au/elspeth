@@ -394,8 +394,15 @@ class _SessionComposerMutations:
         expected_current_state_id: UUID | None,
         state: CompositionStateData | None,
         actor: str,
+        state_id: UUID | None = None,
     ) -> CompositionProposalRecord:
-        """Atomically bind one ordinary proposal to its accepted state."""
+        """Atomically bind one ordinary proposal to its accepted state.
+
+        ``state_id`` names the new state's row in advance, so the caller can
+        bind review cards to it and write them in this same transaction.
+        """
+        if state_id is not None and state is None:
+            raise ValueError("a preallocated state id requires the new state it names")
         service, connection, session_id, _now = self.__state._require_exact()
         proposal_row = connection.execute(
             select(composition_proposals_table)
@@ -477,6 +484,7 @@ class _SessionComposerMutations:
                 provenance="tool_call",
                 created_at=transaction_time,
                 session_operation_context=session_context,
+                state_id=state_id,
             )
 
         connection.execute(

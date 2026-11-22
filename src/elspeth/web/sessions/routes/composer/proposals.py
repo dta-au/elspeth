@@ -768,6 +768,18 @@ async def accept_composition_proposal(
                 )
                 cancellation_deferred = cancellation_deferred or was_cancelled
 
+            # The accepted state can owe interpretation reviews that the
+            # planner's own tool call wrote into it. Freeze the cards the
+            # auto-commit surfacer would write for it, so the accept below
+            # commits the head and its cards in one transaction. This records
+            # review rows only: it authors no pipeline structure and calls no
+            # provider. Only a NEW state has a cohort; the blob-store-only
+            # arms above bind the proposal to a state already saved.
+            prepared_interpretations = (
+                request.app.state.interpretation_surfacing.prepare_surfaceable_pending_interpretation_reviews(result.updated_state)
+                if result.updated_state.version != current_state.version
+                else ()
+            )
             try:
                 committed, was_cancelled = await _await_with_deferred_cancellation(
                     service.accept_composition_proposal(
@@ -777,6 +789,7 @@ async def accept_composition_proposal(
                         state=accepted_state,
                         actor=f"user:{user.user_id}",
                         session_operation_context=lease.context,
+                        prepared_interpretations=prepared_interpretations,
                     )
                 )
                 cancellation_deferred = cancellation_deferred or was_cancelled

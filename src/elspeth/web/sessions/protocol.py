@@ -2901,6 +2901,7 @@ class SessionServiceProtocol(Protocol):
         state: CompositionStateData | None,
         actor: str,
         session_operation_context: SessionOperationContext,
+        prepared_interpretations: tuple[PreparedInterpretationEventDraft, ...] = (),
     ) -> CompositionProposalRecord: ...
 
     async def has_applied_blob_proposal_effect(
