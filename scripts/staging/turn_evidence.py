@@ -36,6 +36,12 @@ interval.
 * ``server_ms_outside_provider_and_tools`` -- ``span_ms`` less the union of
   provider and tool intervals; null whenever either is unknown.
 
+``completion_tokens`` is the sum of the calls' ``completion_tokens`` (the
+provider's output tokens), null unless every call carries an integer count;
+``calls_without_completion_tokens`` counts the calls that do not, and
+``completion_tokens_by_model`` splits the counted tokens by the model each
+call requested (the planner's and the advisor's models apart).
+
 Per call, ``calls`` keeps only the sanitised fields in :data:`CALL_FIELDS`
 (usage, latency, finish reason, model labels, cost) plus
 ``request_byte_split`` (message, tools and total bytes) and the numeric
@@ -222,6 +228,17 @@ def _timed_invocation(entry: Mapping[str, Any]) -> tuple[JsonObject, tuple[datet
     return record, interval
 
 
+def _completion_tokens_by_model(calls: Sequence[Mapping[str, Any]]) -> dict[str, int]:
+    """Output tokens by the model each call requested (planner and advisor apart); a call without a count or a safe label is left out."""
+    totals: dict[str, int] = {}
+    for call in calls:
+        model = safe_value(call["model_requested"]) if "model_requested" in call else None
+        count = call["completion_tokens"] if "completion_tokens" in call else None
+        if type(model) is str and type(count) is int:
+            totals[model] = totals[model] + count if model in totals else count
+    return dict(sorted(totals.items()))
+
+
 def turn_evidence(rows: Sequence[Mapping[str, Any]], operation_id: str, *, shed_before: Sequence[int] | None) -> JsonObject:
     """Provider, tool, time and shedding figures for one operation's rows."""
     own = operation_rows(rows, operation_id)
@@ -273,6 +290,7 @@ def turn_evidence(rows: Sequence[Mapping[str, Any]], operation_id: str, *, shed_
     if span is not None and busy is not None and tools_complete:
         occupied = busy_ms([*intervals, *tool_intervals])
         outside = span - occupied if span >= occupied else None
+    completions = [call["completion_tokens"] for call in calls if "completion_tokens" in call and type(call["completion_tokens"]) is int]
     budgets = [call["context_budget"] for call in calls if "context_budget" in call and call["context_budget"] is not None]
     shed_after = shed_state(own)
     newly_shed = sorted(set(shed_after) - set(shed_before or [])) if shed_after is not None else []
@@ -290,6 +308,10 @@ def turn_evidence(rows: Sequence[Mapping[str, Any]], operation_id: str, *, shed_
         "provider_latency_ms_sum": sum(latencies) if len(latencies) == len(calls) else None,
         "provider_latency_ms_max": max(latencies) if latencies else None,
         "provider_call_over_300_seconds": any(value > LONG_PROVIDER_CALL_MS for value in latencies),
+        # Output tokens of the turn's provider calls: the sum when every call carries a count, else None.
+        "completion_tokens": sum(completions) if len(completions) == len(calls) else None,
+        "calls_without_completion_tokens": len(calls) - len(completions),
+        "completion_tokens_by_model": _completion_tokens_by_model(calls),
         "server_ms": span - busy if span is not None and busy is not None and span >= busy else None,
         "tool_timings": tool_timings,
         "tool_timings_complete": tools_complete,

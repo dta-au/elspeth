@@ -291,3 +291,40 @@ def test_a_tool_call_without_a_timed_record_leaves_tool_time_unknown_rather_than
     assert evidence["tool_busy_ms"] is None
     assert evidence["server_ms_outside_provider_and_tools"] is None
     assert evidence["server_ms"] == 7000
+
+
+def test_a_turns_output_tokens_are_the_sum_of_its_calls_completion_tokens() -> None:
+    first = call("2026-01-01T00:00:01+00:00", "2026-01-01T00:00:02+00:00", 1000)
+    second = call("2026-01-01T00:00:03+00:00", "2026-01-01T00:00:04+00:00", 1000)
+    first["call"]["completion_tokens"] = 1200
+    second["call"]["completion_tokens"] = 34
+    evidence = turn_evidence(rows(first, second), OP, shed_before=None)
+    assert evidence["completion_tokens"] == 1234
+    assert evidence["calls_without_completion_tokens"] == 0
+    # Each call's own count is still kept in ``calls``.
+    assert [item["completion_tokens"] for item in evidence["calls"]] == [1200, 34]
+
+
+def test_a_call_without_a_completion_count_leaves_the_turns_output_tokens_unknown_rather_than_short() -> None:
+    first = call("2026-01-01T00:00:01+00:00", "2026-01-01T00:00:02+00:00", 1000)
+    second = call("2026-01-01T00:00:03+00:00", "2026-01-01T00:00:04+00:00", 1000, status="error")
+    first["call"]["completion_tokens"] = 1200
+    second["call"]["completion_tokens"] = None
+    evidence = turn_evidence(rows(first, second), OP, shed_before=None)
+    assert evidence["completion_tokens"] is None
+    assert evidence["calls_without_completion_tokens"] == 1
+    assert turn_evidence(rows(), OP, shed_before=None)["completion_tokens"] == 0
+
+
+def test_a_turns_output_tokens_are_split_by_the_model_each_call_requested() -> None:
+    planner = call("2026-01-01T00:00:01+00:00", "2026-01-01T00:00:02+00:00", 1000)
+    advisor = call("2026-01-01T00:00:03+00:00", "2026-01-01T00:00:04+00:00", 1000)
+    again = call("2026-01-01T00:00:05+00:00", "2026-01-01T00:00:06+00:00", 1000)
+    unsafe = call("2026-01-01T00:00:07+00:00", "2026-01-01T00:00:08+00:00", 1000)
+    for row, model, count in ((planner, "openai/gpt-5.5", 300), (advisor, "anthropic/claude-sonnet-4-6", 40), (again, "openai/gpt-5.5", 5)):
+        row["call"]["model_requested"], row["call"]["completion_tokens"] = model, count
+    # A model label that is not a safe token (a URL) is not kept, so its tokens are in the total only.
+    unsafe["call"]["model_requested"], unsafe["call"]["completion_tokens"] = "https://models.invalid/x", 7
+    evidence = turn_evidence(rows(planner, advisor, again, unsafe), OP, shed_before=None)
+    assert evidence["completion_tokens"] == 352
+    assert evidence["completion_tokens_by_model"] == {"anthropic/claude-sonnet-4-6": 40, "openai/gpt-5.5": 305}
