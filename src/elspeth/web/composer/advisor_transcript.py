@@ -11,6 +11,7 @@ import json
 import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Final, Literal, cast, final, get_args
 from uuid import UUID
 
@@ -226,16 +227,6 @@ class AdvisorTranscriptHistory:
                 raise
             row = row_being_read[0]
             raise AuditIntegrityError(f"{exc} (stored row id={row.id}, sequence_no={row.sequence_no}, role={row.role})") from exc
-        except (TypeError, AttributeError) as exc:
-            # A stored envelope whose shape is so wrong that reading it fails
-            # before any check can refuse it (an entry that is not an object).
-            if not row_being_read:
-                raise
-            row = row_being_read[0]
-            raise AuditIntegrityError(
-                f"Stored history row is malformed: reading it raised {type(exc).__name__} "
-                f"(stored row id={row.id}, sequence_no={row.sequence_no}, role={row.role})"
-            ) from exc
 
     @classmethod
     def _from_records(
@@ -269,6 +260,10 @@ class AdvisorTranscriptHistory:
                 if row.role != "user" or row.writer_principal not in {"route_user_message", "session_fork"} or row.content != request:
                     raise AuditIntegrityError("Advisor current request lacks authenticated human provenance")
                 found_current = True
+            if any(type(envelope) not in (dict, MappingProxyType) for envelope in row.tool_calls or ()):
+                # Every reader below inspects an entry's keys; one that is not
+                # an object cannot be inspected, so it is refused here.
+                raise AuditIntegrityError("Stored tool_calls entry is not an object")
             control = replay_composer_control_message(
                 stored_role=row.role,
                 writer_principal=row.writer_principal,

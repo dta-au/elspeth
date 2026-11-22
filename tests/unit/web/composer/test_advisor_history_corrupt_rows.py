@@ -110,20 +110,14 @@ def test_a_corrupt_stored_row_stops_the_turn_and_the_error_names_the_row(corrupt
     assert str(bad_row.id) in str(refused.value)
 
 
-@pytest.mark.parametrize(
-    ("entry", "original_error"),
-    [(None, TypeError), (7, TypeError), ("not an object", AttributeError), ([], AttributeError)],
-    ids=["null", "number", "text", "list"],
-)
-def test_a_stored_tool_call_entry_that_is_not_an_object_is_refused_as_an_integrity_fault_naming_the_row(
-    entry: Any, original_error: type[Exception]
-) -> None:
-    """The entry cannot even be inspected, so no check gets to refuse it; the turn must still stop as an integrity fault."""
+@pytest.mark.parametrize("entry", [None, 7, "not an object", []], ids=["null", "number", "text", "list"])
+def test_a_stored_tool_call_entry_that_is_not_an_object_is_refused_as_an_integrity_fault_naming_the_row(entry: Any) -> None:
+    """The entry cannot be inspected at all, so it is refused before any reader touches it."""
     session_id = uuid4()
     bad_row = _stored_row(session_id, "tool", "{}", sequence_no=1, tool_call_id="call-1", tool_calls=[entry])
     current = _current(session_id)
 
-    with pytest.raises(AuditIntegrityError) as refused:
+    with pytest.raises(AuditIntegrityError, match="tool_calls entry is not an object") as refused:
         AdvisorTranscriptHistory.from_records(
             session_id=str(session_id),
             actor_user_id="actor",
@@ -133,7 +127,27 @@ def test_a_stored_tool_call_entry_that_is_not_an_object_is_refused_as_an_integri
         )
 
     assert str(bad_row.id) in str(refused.value)
-    assert type(refused.value.__cause__) is original_error
+
+
+def test_a_programming_error_while_reading_a_well_formed_row_is_not_reported_as_a_corrupt_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only a stored row's own shape is an integrity fault. A bug in the reader must surface as itself."""
+    session_id = uuid4()
+    earlier = _stored_row(session_id, "user", "An earlier request", sequence_no=1)
+    current = _current(session_id)
+
+    def broken_reader(**_kwargs: Any) -> Any:
+        raise TypeError("a defect in the reader, not in the row")
+
+    monkeypatch.setattr("elspeth.web.composer.advisor_transcript.replay_composer_control_message", broken_reader)
+
+    with pytest.raises(TypeError, match="a defect in the reader"):
+        AdvisorTranscriptHistory.from_records(
+            session_id=str(session_id),
+            actor_user_id="actor",
+            current_request_id=str(current.id),
+            request="Continue",
+            records=[earlier, current],
+        )
 
 
 def test_a_history_without_the_current_request_is_refused_without_blaming_a_row() -> None:
