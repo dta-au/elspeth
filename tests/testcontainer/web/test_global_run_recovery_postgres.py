@@ -145,6 +145,34 @@ async def test_recovery_requires_both_fence_and_membership_expiry_and_has_one_wi
 
 
 @pytest.mark.asyncio
+async def test_a_run_whose_lease_ran_out_unreleased_is_offered_to_recovery_only_once_its_owner_process_is_gone(deployment) -> None:
+    """The recovery sweep's own candidate list, for a run thread that ended after its lease lapsed.
+
+    Its release is refused then, so the fence stays unreleased. While the
+    owning process still renews its membership, no sweep in any process is
+    offered the run; once that membership has lapsed, the next sweep is.
+    """
+    first_engine, _second_engine, first, second = deployment
+    _register_live_instance(first_engine, first.session_operation_owner_instance_id)
+    run, _context = await _create_running_run(first, first_engine)
+    _expire_fence(first_engine, run.session_id)
+
+    # The database is shared by this file's tests, so each reading asks about this run only.
+    async def offered(service: SessionServiceImpl) -> bool:
+        return run.id in [record.id for record in await service.list_recoverable_run_records()]
+
+    while_the_owner_lives = {"to the owner's own sweep": await offered(first), "to another process's sweep": await offered(second)}
+    _expire_instance(first_engine, first.session_operation_owner_instance_id)
+    after_the_owner_is_gone = await offered(second)
+
+    assert while_the_owner_lives == {"to the owner's own sweep": False, "to another process's sweep": False}
+    assert after_the_owner_is_gone
+    assert (await second.get_run(run.id)).status == "running"
+    # Settle the run so that the tests after this one start with nothing to recover.
+    await second.cancel_all_orphaned_run_records(max_age_seconds=0, reason="recovered")
+
+
+@pytest.mark.asyncio
 async def test_expired_fence_with_missing_membership_fails_closed(deployment) -> None:
     first_engine, _second_engine, first, second = deployment
     run, _context = await _create_running_run(first, first_engine)
