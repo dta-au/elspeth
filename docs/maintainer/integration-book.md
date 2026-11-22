@@ -871,7 +871,8 @@ the integrator's order rules [I] unless marked [M].
   report each tip hash.
 - **Hard to reverse stays with the maintainer:** deleting data or volumes,
   deleting unmerged or dirty work, deleting an unmerged published remote
-  branch, wiping shared state, and anything the peer is unsure of.
+  branch, wiping shared state, and anything the lead integrator, or for its
+  own close-outs the agent reviewing them, is unsure of.
 - Why: a parent-PID walk once sent SIGTERM to every session on the box. Single
   sessions have also misattributed runs and mistaken their own `pgrep` shell
   for a new run. The safeguard is the second pair of eyes.
