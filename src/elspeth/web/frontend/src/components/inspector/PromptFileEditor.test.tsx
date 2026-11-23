@@ -4,6 +4,7 @@ import { fetchCompositionState, listBlobs, readPromptFileText, savePromptFile } 
 import { BlobListTruncatedError } from "@/api/blobListing";
 import { makeSessionBlobs } from "@/test/blobListRouteDouble";
 import { useBlobStore } from "@/stores/blobStore";
+import { usePromptDraftStore } from "@/stores/promptDraftStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import type { BlobMetadata } from "@/types/api";
 import type { CompositionState } from "@/types/api";
@@ -60,6 +61,29 @@ it.each([
   expect(screen.getByRole("note")).toHaveTextContent("File names are unavailable.");
   expect(screen.queryByText("This file is not in this session.")).not.toBeInTheDocument();
   expect(screen.queryByText("Read only")).not.toBeInTheDocument();
+});
+
+it("blocks saving an unsaved draft while checking files in the session", async () => {
+  const blobId = "blob-1";
+  const baseSha256 = "a".repeat(64);
+  const baseText = "first line\n  second line\n";
+  const slot = { sessionId: "session-1", nodeId: "first", fieldPath: "prompt_template" };
+  const options = { prompt_template: { mode: "inline_content", blob_ref: blobId, sha256: baseSha256 } };
+  useSessionStore.setState({
+    compositionState: { sources: {}, outputs: [], nodes: [{ id: slot.nodeId, plugin: "llm", options }] } as unknown as CompositionState,
+  });
+  useBlobStore.setState({ activeSessionId: slot.sessionId, blobs: [], isLoading: true, editRequest: null });
+  usePromptDraftStore.getState().edit(slot, { blobId, baseSha256, baseText }, "my draft");
+
+  await act(async () => {
+    render(<PromptFileEditors nodeId={slot.nodeId} options={options} />);
+  });
+
+  expect(screen.getByRole("textbox", { name: /Edit prompt file/ })).toHaveValue("my draft");
+  expect(screen.getByRole("note")).toHaveTextContent("Checking files in this session.");
+  expect(screen.queryByText("Read only")).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+  expect(screen.queryByText("This file is not in this session.")).not.toBeInTheDocument();
 });
 
 it("starts collapsed and opens the requested slot with keyboard focus", async () => {

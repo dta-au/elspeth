@@ -122,7 +122,7 @@ describe("BlobManager selected-node highlighting", () => {
     expect(screen.queryByText(/No files yet/)).not.toBeInTheDocument();
   });
 
-  it("omits a reveal-miss claim when the requested file falls outside a truncated list", async () => {
+  it("focuses the unavailable file status when a reveal misses over a truncated list", async () => {
     const listedBlob = makeBlob({ id: "one", filename: "system.txt" });
     const omittedBlob = makeBlob({ id: "two", filename: "user.txt" });
     const truncation = new BlobListTruncatedError([listedBlob]);
@@ -137,6 +137,9 @@ describe("BlobManager selected-node highlighting", () => {
     render(<BlobManager onUseAsInput={vi.fn()} />);
 
     expect(await screen.findByRole("alert")).toHaveTextContent(truncation.message);
+    const status = screen.getByRole("status");
+    expect(status).toHaveTextContent(/^File name unavailable$/);
+    expect(document.activeElement).toBe(status);
     expect(screen.queryByText(/is no longer in this session/)).not.toBeInTheDocument();
   });
 

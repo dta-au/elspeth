@@ -66,7 +66,7 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
   const bannerMessages = blobBannerMessages(error, listError);
   const revealRequest = useBlobStore((s) => s.revealRequest);
   const focusedBlobId = useBlobStore((s) => s.focusedBlobId);
-  const [missingRevealName, setMissingRevealName] = useState<string | null>(null);
+  const [revealMissMessage, setRevealMissMessage] = useState<string | null>(null);
   const statusRef = useRef<HTMLParagraphElement>(null);
   const previousSelectedNode = useRef(selectedNodeId);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -112,7 +112,7 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
     if (previousSelectedNode.current !== selectedNodeId) {
       previousSelectedNode.current = selectedNodeId;
       useBlobStore.setState({ focusedBlobId: null });
-      setMissingRevealName(null);
+      setRevealMissMessage(null);
     }
   }, [selectedNodeId]);
 
@@ -147,13 +147,13 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
       return;
     }
     if (row) {
-      setMissingRevealName(null);
+      setRevealMissMessage(null);
       row.scrollIntoView?.({ block: "nearest" });
       row.focus({ preventScroll: true });
     } else {
-      setMissingRevealName(listComplete ? revealRequest.filename : null);
+      setRevealMissMessage(listComplete ? `${revealRequest.filename} is no longer in this session` : "File name unavailable");
       useBlobStore.setState({ focusedBlobId: null });
-      if (listComplete) statusRef.current?.focus({ preventScroll: true });
+      statusRef.current?.focus({ preventScroll: true });
     }
     useBlobStore.getState().consumeRevealRequest(revealRequest.seq);
   }, [revealRequest, activeSessionId, isLoading, listBelongsToSession, listComplete, blobs, fileFilter]);
@@ -300,11 +300,11 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
       </div>
 
       <p ref={statusRef} tabIndex={-1} className="blob-manager-attached-summary" role="status" aria-live="polite">
-        {missingRevealName && listComplete ? `${missingRevealName} is no longer in this session` : selectedNodeId && attached.size > 0 && listBelongsToSession && listError === null ? <>
+        {revealMissMessage ?? (selectedNodeId && attached.size > 0 && listBelongsToSession && listError === null ? <>
           {isLoading ? `Checking files used by ${selectedNodeId}` : `${matchedIds.size} ${matchedIds.size === 1 ? "file" : "files"} used by ${selectedNodeId}`}
           {missingCount > 0 && ` · ${missingCount} attached ${missingCount === 1 ? "file is" : "files are"} not in this session`}
           {focusedBlobId && blobs.find((blob) => blob.id.toLowerCase() === focusedBlobId.toLowerCase()) && ` · Showing ${blobs.find((blob) => blob.id.toLowerCase() === focusedBlobId.toLowerCase())?.filename}.`}
-        </> : ""}
+        </> : "")}
       </p>
 
       {/* Error */}
