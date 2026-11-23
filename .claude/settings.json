@@ -1,12 +1,22 @@
 {
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "f=\"$CLAUDE_PROJECT_DIR/.claude/hooks/session-start-integration-book.sh\"; [ -f \"$f\" ] && bash \"$f\" || exit 0"
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "Bash",
         "hooks": [
           {
             "type": "command",
-            "command": "jq -r \".tool_input.command // empty\" | grep -Eq \"commit --amend|pkill -f|checkout -- \" && { echo \"BLOCKED: dangerous git/proc command (commit --amend, pkill -f, checkout --) \u2014 refused by the PreToolUse guard in .claude/settings.json\" >&2; exit 2; } || exit 0"
+            "command": "f=\"$CLAUDE_PROJECT_DIR/.claude/hooks/bash-guard.sh\"; [ -f \"$f\" ] || { echo \"BLOCKED: $f is missing, so the Bash guard cannot run. Restore it (git checkout of .claude/hooks/bash-guard.sh) before running shell commands.\" >&2; exit 2; }; bash \"$f\""
           }
         ]
       }

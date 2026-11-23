@@ -16,6 +16,14 @@ note says so.
 
 **Read order for a new agent**
 
+[M 2026-11-23] "lets have that file added as a start hook". At every session
+start, resume, clear and compaction, `.claude/hooks/session-start-integration-book.sh`
+puts the short version below into the session, with this book's path and an
+instruction to read it in full before starting work. Only the short version
+is injected because Claude Code caps a hook's output at 10,000 characters.
+When the checkout has no copy of the book, the hook writes the newest pushed
+copy to `.claude/lanes/integration-book/` and points there.
+
 1. The short version below (two minutes), then this book end to end (about
    35 minutes).
 2. [AGENTS.md](../../AGENTS.md), the covenant for every agent. If this book
@@ -914,6 +922,15 @@ the integrator's order rules [I] unless marked [M].
 - Exact PIDs only. Never walk from a parent: an orphan's parent is PID 1.
   Never kill by pattern (`pkill -f`). Refuse any PID at or below 1 and any
   agent harness process.
+- **The Bash guard.** [M 2026-11-23] "yes please block those shapes as well
+  with a message saying to speak to the lead integrator for authorisation".
+  `.claude/hooks/bash-guard.sh`, run before every Bash tool command, refuses
+  `pkill`, `killall`, `kill -1`, `kill 0`, `kill -- -PGID`, `kill $(...)`,
+  `xargs kill` and `killpg`, and points here. A kill of explicit numeric
+  PIDs (`kill -TERM 12345`) still runs. The guard is a backstop for slips: it
+  does not see Codex, scripts that stop their own children, or commands typed
+  by hand, so this procedure still applies to all of them. A refused command
+  is never retried in another form; take it to the checker.
 - For an orphan, stop its shell first, then pytest, so its cleanup step
   cannot delete a live run's files.
 - A script that stops its own children counts: name the PIDs to the checker
