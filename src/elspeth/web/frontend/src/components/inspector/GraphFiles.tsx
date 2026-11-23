@@ -123,6 +123,7 @@ function FileMappings({ state, onShowNode, visibleNodeIds, onCount }: GraphFiles
   const blobs = useBlobStore((store) => store.blobs);
   const loading = useBlobStore((store) => store.isLoading);
   const listCurrent = useBlobStore((store) => store.listCurrent);
+  const listStale = useBlobStore((store) => store.listStale);
   const error = useBlobStore((store) => store.activeSessionId === state.session_id ? store.error : null);
   const listError = useBlobStore((store) => store.activeSessionId === state.session_id ? store.listError : null);
   const listLoadFailed = useBlobStore((store) => store.activeSessionId === state.session_id && store.listLoadFailed);
@@ -186,7 +187,11 @@ function FileMappings({ state, onShowNode, visibleNodeIds, onCount }: GraphFiles
             hidden={visibleNodeIds !== undefined && !visibleNodeIds.has(row.componentId)}
             binding={binding} unsaved={unsavedFields.length > 0}
             sameSession={sameSession} current={sameSession && currentStateId === state.id}
-            listReady={!loading && blobSessionId === state.session_id && listCurrent} listError={listError} retryOffered={listLoadFailed}
+            // A stale list still vouches for the files it lists; only a
+            // file missing from it waits for the next read.
+            listReady={!loading && blobSessionId === state.session_id && (listCurrent
+              || (listStale && blobs.some((blob) => blob.id.toLowerCase() === row.blobId.toLowerCase())))}
+            listError={listError} retryOffered={listLoadFailed}
             blobs={blobSessionId === state.session_id ? blobs : []} pendingEvents={Object.values(pending ?? {})} />;
           })}
           </tbody>

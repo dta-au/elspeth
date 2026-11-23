@@ -88,6 +88,21 @@ describe("GraphFiles", () => {
     expect(screen.queryByText("This file is not in this session.")).not.toBeInTheDocument();
   });
 
+  it("keeps listed files editable while a turn has made the list stale, and waits only for a missing one", async () => {
+    useBlobStore.setState({ listCurrent: false, listStale: true,
+      blobs: [blob("input", "input.csv"), blob("shared", "shared.txt"), blob("criteria", "criteria.txt")] });
+    render(<GraphFiles state={state} onShowNode={vi.fn()} />);
+    await userEvent.setup().click(screen.getByText(filesSummary()));
+
+    const listed = screen.getByRole("button", { name: "Edit file for rationale" });
+    expect(listed).not.toHaveAttribute("aria-disabled", "true");
+    expect(listed).not.toHaveAccessibleDescription("Wait for the file list to load.");
+    expect(screen.getAllByText("shared.txt").length).toBeGreaterThan(0);
+    const missing = screen.getByRole("button", { name: "Edit file for solo" });
+    expect(missing).toHaveAccessibleDescription("Wait for the file list to load.");
+    expect(screen.queryByText("File not in this session")).not.toBeInTheDocument();
+  });
+
   it("groups each file's fields by component, including sources, multi-prompts and sinks", async () => {
     const before = JSON.stringify(state);
     render(<GraphFiles state={state} onShowNode={vi.fn()} />);

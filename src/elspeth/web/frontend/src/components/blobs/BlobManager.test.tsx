@@ -272,15 +272,67 @@ describe("BlobManager reveal request", () => {
       makeBlob({ id: "two", filename: "user.txt", mime_type: "text/plain" }), makeBlob({ id: "three" })]);
   });
 
-  it("holds a reveal made while the list is stale and shows the row once the list is current", () => {
+  it("keeps the rows visible and editable while a turn has made the list stale", () => {
     const { container } = render(<BlobManager onUseAsInput={vi.fn()} />);
+    expect(screen.getByText("Files (3)")).toBeInTheDocument();
     // A Composer turn marks the list stale before its graph is published.
     act(() => useBlobStore.getState().markListStale("session-1"));
+    expect(screen.queryByText("Loading files…")).not.toBeInTheDocument();
+    expect(container.querySelector('[data-blob-id="one"]')).toBeInTheDocument();
+    expect(container.querySelector('[data-blob-id="two"]')).toBeInTheDocument();
+    expect(container.querySelector('[data-blob-id="three"]')).toBeInTheDocument();
+    expect(within(container.querySelector('[data-blob-id="two"]') as HTMLElement)
+      .getByRole("button", { name: /^Edit prompt/ })).not.toHaveAttribute("aria-disabled", "true");
+    // Only the total, which a turn may have changed, is withheld.
+    expect(screen.queryByText("Files (3)")).not.toBeInTheDocument();
+    expect(screen.getByText("Files", { selector: ".blob-manager-title" })).toBeInTheDocument();
+  });
+
+  it("scrolls to a newly selected step's file once a stale list that lacks it is current", () => {
+    const scroll = vi.fn();
+    const original = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = scroll;
+    try {
+      const { container } = render(<BlobManager onUseAsInput={vi.fn()} />);
+      act(() => useBlobStore.getState().markListStale("session-1"));
+      scroll.mockClear();
+      // The step's file ("other") is not in the stale list yet.
+      act(() => useSessionStore.setState({ selectedNodeId: "inject" }));
+      expect(scroll).not.toHaveBeenCalled();
+      act(() => useBlobStore.setState((state) => ({ listCurrent: true, listStale: false,
+        blobs: [...state.blobs, makeBlob({ id: "other", filename: "notes.txt", mime_type: "text/plain" })] })));
+      expect(scroll).toHaveBeenCalledTimes(1);
+      expect(scroll.mock.contexts[0]).toBe(container.querySelector('[data-blob-id="other"]'));
+    } finally { Element.prototype.scrollIntoView = original; }
+  });
+
+  it("does not say there are no files while an empty list is stale", () => {
+    setBlobState([]);
+    render(<BlobManager onUseAsInput={vi.fn()} />);
+    expect(screen.getByText(/No files yet/)).toBeInTheDocument();
+    act(() => useBlobStore.getState().markListStale("session-1"));
+    expect(screen.queryByText(/No files yet/)).not.toBeInTheDocument();
+    expect(screen.getByText("Loading files…")).toBeInTheDocument();
+  });
+
+  it("reveals a listed file at once while the list is stale", () => {
+    const { container } = render(<BlobManager onUseAsInput={vi.fn()} />);
+    act(() => useBlobStore.getState().markListStale("session-1"));
     act(() => useBlobStore.getState().revealBlob("session-1", "two", "user.txt"));
-    expect(screen.queryByText("File name unavailable")).not.toBeInTheDocument();
-    expect(useBlobStore.getState().revealRequest).not.toBeNull();
-    act(() => useBlobStore.setState({ listCurrent: true }));
     expect(container.querySelector('[data-blob-id="two"]')).toHaveFocus();
+    expect(useBlobStore.getState().revealRequest).toBeNull();
+  });
+
+  it("holds a reveal of a file the stale list lacks and shows it once the list is current", () => {
+    const { container } = render(<BlobManager onUseAsInput={vi.fn()} />);
+    act(() => useBlobStore.getState().markListStale("session-1"));
+    act(() => useBlobStore.getState().revealBlob("session-1", "four", "created.txt"));
+    expect(screen.queryByText("File name unavailable")).not.toBeInTheDocument();
+    expect(screen.queryByText(/is no longer in this session/)).not.toBeInTheDocument();
+    expect(useBlobStore.getState().revealRequest).not.toBeNull();
+    act(() => useBlobStore.setState((state) => ({ listCurrent: true, listStale: false,
+      blobs: [...state.blobs, makeBlob({ id: "four", filename: "created.txt", mime_type: "text/plain" })] })));
+    expect(container.querySelector('[data-blob-id="four"]')).toHaveFocus();
     expect(useBlobStore.getState().revealRequest).toBeNull();
   });
 

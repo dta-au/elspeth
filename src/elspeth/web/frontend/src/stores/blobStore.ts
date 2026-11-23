@@ -23,6 +23,11 @@ interface BlobState {
    * and cannot establish file absence.
    */
   listCurrent: boolean;
+  /**
+   * The list was read for this activation and has gone stale since (a
+   * Composer turn). Its rows can still be shown; absence claims cannot.
+   */
+  listStale: boolean;
   /** The file-list read failed and can be retried. */
   listLoadFailed: boolean;
   /** Session whose rows may be published into this store instance. */
@@ -83,6 +88,7 @@ const initialState = {
   error: null as string | null,
   listError: null as string | null,
   listCurrent: false,
+  listStale: false,
   listLoadFailed: false,
   activeSessionId: null as string | null,
   activationEpoch: 0,
@@ -159,7 +165,7 @@ async function refreshBlobList(sessionId: string, publishError: boolean): Promis
   try {
     const blobs = await api.listBlobs(sessionId);
     if (requestSeq !== blobLoadRequestSeq) return;
-    set({ blobs, listError: null, listCurrent: true, isLoading: false });
+    set({ blobs, listError: null, listCurrent: true, listStale: false, isLoading: false });
   } catch (err) {
     if (requestSeq !== blobLoadRequestSeq) return;
     if (err instanceof BlobListTruncatedError) {
@@ -169,6 +175,7 @@ async function refreshBlobList(sessionId: string, publishError: boolean): Promis
         blobs: err.blobs,
         listError: err.message,
         listCurrent: true,
+        listStale: false,
         listLoadFailed: false,
         isLoading: false,
         ...(publishError ? { error: err.message } : {}),
@@ -179,6 +186,7 @@ async function refreshBlobList(sessionId: string, publishError: boolean): Promis
     set({
       listError: message,
       listCurrent: true,
+      listStale: false,
       listLoadFailed: true,
       isLoading: false,
       ...(publishError ? { error: message } : {}),
@@ -245,6 +253,7 @@ export const useBlobStore = create<BlobState>((set, get) => ({
       error: null,
       listError: null,
       listCurrent: false,
+      listStale: false,
       listLoadFailed: false,
       activeSessionId: sessionId,
       activationEpoch: state.activationEpoch + 1,
@@ -263,7 +272,9 @@ export const useBlobStore = create<BlobState>((set, get) => ({
     if (state.activeSessionId !== sessionId) return;
     // A read dispatched before the change cannot establish currentness.
     if (state.isLoading) blobLoadRequestSeq++;
-    set({ listCurrent: false });
+    // A read list keeps its rows (true for every file the turn did not
+    // delete); only absence claims wait for the next read.
+    set({ listCurrent: false, listStale: state.listCurrent || state.listStale });
     if (state.isLoading) void refreshBlobList(sessionId, false);
   },
 
@@ -304,6 +315,7 @@ export const useBlobStore = create<BlobState>((set, get) => ({
       set((state) => ({
         activeSessionId: sessionId,
         listCurrent: false,
+        listStale: false,
         activationEpoch: state.activationEpoch + 1,
       }));
     }
@@ -354,6 +366,7 @@ export const useBlobStore = create<BlobState>((set, get) => ({
       set((state) => ({
         activeSessionId: sessionId,
         listCurrent: false,
+        listStale: false,
         activationEpoch: state.activationEpoch + 1,
       }));
     }
@@ -433,6 +446,7 @@ export const useBlobStore = create<BlobState>((set, get) => ({
       error: null,
       listError: null,
       listCurrent: false,
+      listStale: false,
       listLoadFailed: false,
       activeSessionId: null,
       activationEpoch: state.activationEpoch + 1,

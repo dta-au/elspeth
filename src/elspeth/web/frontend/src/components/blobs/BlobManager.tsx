@@ -61,8 +61,11 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
   // `seq` re-keys the pad's alert so a repeated refusal is announced again.
   const [wireSendRefusal, setWireSendRefusal] = useState<{ message: string; seq: number } | null>(null);
   const pending = useInterpretationEventsStore((s) => activeSessionId ? s.pendingBySession[activeSessionId] : undefined);
-  const { blobs, isLoading, error, listError, listLoadFailed, listCurrent: listRead, activeSessionId: blobSessionId, loadBlobs, uploadBlob, deleteBlob, downloadBlob } =
+  const { blobs, isLoading, error, listError, listLoadFailed, listCurrent, listStale, activeSessionId: blobSessionId, loadBlobs, uploadBlob, deleteBlob, downloadBlob } =
     useBlobStore();
+  // Read for this activation: a stale list (a turn since the read) still shows
+  // its rows; only a current list can say a file is absent.
+  const listRead = listCurrent || listStale;
   const bannerMessages = blobBannerMessages(error, listError);
   const revealRequest = useBlobStore((s) => s.revealRequest);
   const focusedBlobId = useBlobStore((s) => s.focusedBlobId);
@@ -89,7 +92,7 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
   }, [compositionState, selectedNodeId]);
 
   const listBelongsToSession = blobSessionId === activeSessionId;
-  const listComplete = !isLoading && listBelongsToSession && listRead && listError === null;
+  const listComplete = !isLoading && listBelongsToSession && listCurrent && listError === null;
   const matchedIds = useMemo(
     () => new Set(blobs.filter((blob) => attached.has(blob.id.toLowerCase())).map((blob) => blob.id.toLowerCase())),
     [attached, blobs],
@@ -129,8 +132,8 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
     // loadBlobs above runs first in this same commit and flips isLoading
     // synchronously. Acting on the stale `false` would focus a cached row the
     // "Loading..." render then unmounts, and consume the request with it.
-    // A list that is not current shows "Loading files…" with no rows: wait
-    // for the read instead of consuming the request as a miss.
+    // An unread list shows "Loading files…" with no rows: wait for the read
+    // instead of consuming the request as a miss.
     if (!revealRequest || revealRequest.sessionId !== activeSessionId || useBlobStore.getState().isLoading || !listBelongsToSession || !listRead) return;
     const hiddenPane = listRef.current?.closest("[hidden], [inert]");
     if (hiddenPane) {
@@ -152,6 +155,9 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
       setFileFilter("");
       return;
     }
+    // A stale list (a turn since the read) may lack a file the turn created:
+    // keep the request until the list is current rather than report a miss.
+    if (!row && !listCurrent) return;
     if (row) {
       setRevealMissMessage(null);
       row.scrollIntoView?.({ block: "nearest" });
@@ -162,7 +168,7 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
       statusRef.current?.focus({ preventScroll: true });
     }
     useBlobStore.getState().consumeRevealRequest(revealRequest.seq);
-  }, [revealRequest, activeSessionId, isLoading, listBelongsToSession, listRead, listComplete, blobs, fileFilter]);
+  }, [revealRequest, activeSessionId, isLoading, listBelongsToSession, listRead, listCurrent, listComplete, blobs, fileFilter]);
 
   useEffect(() => {
     if (selectedNodeId === null) {
@@ -172,9 +178,11 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
     if (lastScrolledSelection.current === selectedNodeId || isLoading || !listBelongsToSession || !listRead) return;
     const firstRow = Array.from(listRef.current?.querySelectorAll<HTMLElement>(".blob-row-item") ?? [])
       .find((row) => attached.has(row.dataset.blobId?.toLowerCase() ?? ""));
+    // A stale list may lack the attached file a turn just created: scroll once current.
+    if (!firstRow && !listCurrent) return;
     if (firstRow) firstRow.scrollIntoView?.({ block: "nearest", behavior: "auto" });
     lastScrolledSelection.current = selectedNodeId;
-  }, [selectedNodeId, attached, isLoading, listBelongsToSession, listRead, blobs]);
+  }, [selectedNodeId, attached, isLoading, listBelongsToSession, listRead, listCurrent, blobs]);
   // Blob queued for deletion, awaiting confirmation. Blobs are pipeline
   // inputs/outputs, so deletion is irreversible data loss (WCAG 3.3.4). We
   // capture the session the blob belongs to alongside the blob: if the active
@@ -264,7 +272,7 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
         {/* No count until the list has been read: "Files (0)" while loading
             or after a failed read would say the session has no files. */}
         <span className="blob-manager-title">
-          Files{!isLoading && listRead && !listLoadFailed && ` (${blobs.length})`}
+          Files{!isLoading && listCurrent && !listLoadFailed && ` (${blobs.length})`}
         </span>
         <IdentityStorageTotal refreshKey={`${activeSessionId}:${blobs.map((blob) => `${blob.id}:${blob.size_bytes}`).join(",")}`} />
         {/* Label-only, and its accessible name IS its visible text
@@ -335,7 +343,8 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
 
       {/* Categorized file list */}
       <div className="blob-manager-list" ref={listRef}>
-        {isLoading || !listRead ? (
+        {/* A stale empty list cannot say "No files yet": the turn may have added one. */}
+        {isLoading || !listRead || (blobs.length === 0 && !listCurrent) ? (
           <div className="blob-manager-loading" role="status">
             Loading files…
           </div>

@@ -63,6 +63,29 @@ it.each([
   expect(screen.queryByText("Read only")).not.toBeInTheDocument();
 });
 
+it.each(["unread", "stale"] as const)("checks files instead of calling the file missing over a %s list", async (listState) => {
+  const blobId = "blob-1";
+  const slot = { sessionId: "session-1", nodeId: "first", fieldPath: "prompt_template" };
+  const options = { prompt_template: { mode: "inline_content", blob_ref: blobId, sha256: "a".repeat(64) } };
+  useSessionStore.setState({
+    compositionState: { sources: {}, outputs: [], nodes: [{ id: slot.nodeId, plugin: "llm", options }] } as unknown as CompositionState,
+  });
+  if (listState === "unread") useBlobStore.getState().activateSession(slot.sessionId);
+  // A turn since the read: the list lacks the file the turn bound.
+  else useBlobStore.setState({ activeSessionId: slot.sessionId, isLoading: false, listCurrent: false, listStale: true,
+    blobs: makeSessionBlobs(slot.sessionId, 1) });
+  usePromptDraftStore.getState().edit(slot, { blobId, baseSha256: "a".repeat(64), baseText: "text\n" }, "my draft");
+
+  await act(async () => {
+    render(<PromptFileEditors nodeId={slot.nodeId} options={options} />);
+  });
+
+  expect(screen.getByRole("textbox", { name: /Edit prompt file/ })).toHaveAccessibleName(/Loading file name…/);
+  expect(screen.getByRole("note")).toHaveTextContent("Checking files in this session.");
+  expect(screen.queryByText("This file is not in this session.")).not.toBeInTheDocument();
+  expect(screen.queryByText("Read only")).not.toBeInTheDocument();
+});
+
 it("blocks saving an unsaved draft while checking files in the session", async () => {
   const blobId = "blob-1";
   const baseSha256 = "a".repeat(64);
