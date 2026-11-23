@@ -22,6 +22,12 @@ does not establish qualification, a published tag or an image.
   stores need no action. This authorizes no migration, reset, restamping or
   downgrade.
 - **Upgrading from 0.8.15 or earlier: apply the 0.8.16 upgrade notes first.**
+- **Finish interrupted web runs before upgrading.** A web run is bound to the
+  application code it was admitted under, and this release changes that code.
+  A web run admitted under 0.8.16 is refused on resume as
+  `IMPLEMENTATION_CHANGED` (implementation drift): drain in-flight web runs
+  before upgrading, or run them again afterwards. No plugin file changed, so
+  the plugin policy hash is the same as 0.8.16's.
 - **Composer tool description.** The `get_pipeline_state` description gains
   one sentence, so the planner's fixed prompt grows slightly. The composer
   still offers 48 tools.
