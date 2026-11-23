@@ -149,7 +149,7 @@ function OptionValue({ label, value, fileStep }: { label: string; value: unknown
 function StepFileName({ blobId }: { blobId: string }): JSX.Element {
   const sessionId = useSessionStore((state) => state.activeSessionId);
   // A failed (or cut-short) list read is not evidence the file is gone.
-  const listFailed = useBlobStore((state) => state.activeSessionId === sessionId && !state.isLoading && state.error !== null);
+  const listFailed = useBlobStore((state) => state.activeSessionId === sessionId && !state.isLoading && state.listError !== null);
   return <BlobFileName blobId={blobId} fallback={listFailed ? "File name unavailable" : undefined} />;
 }
 

@@ -122,7 +122,8 @@ function FileMappings({ state, onShowNode, visibleNodeIds, onCount }: GraphFiles
   const blobSessionId = useBlobStore((store) => store.activeSessionId);
   const blobs = useBlobStore((store) => store.blobs);
   const loading = useBlobStore((store) => store.isLoading);
-  const loadError = useBlobStore((store) => store.activeSessionId === state.session_id ? store.error : null);
+  const error = useBlobStore((store) => store.activeSessionId === state.session_id ? store.error : null);
+  const listError = useBlobStore((store) => store.activeSessionId === state.session_id ? store.listError : null);
   const listLoadFailed = useBlobStore((store) => store.activeSessionId === state.session_id && store.listLoadFailed);
   const pending = useInterpretationEventsStore((store) => store.pendingBySession[state.session_id]);
   const bindings = useMemo(() => promptFileBindings(state), [state]);
@@ -148,10 +149,10 @@ function FileMappings({ state, onShowNode, visibleNodeIds, onCount }: GraphFiles
   // The body is a size container: in a narrow pane each row stacks into a
   // block (name, then who uses it) instead of cutting columns off.
   return <div className="graph-files-body">
-    {sameSession && loadError && <AlertBanner className="graph-files-alert" action={listLoadFailed ? (
+    {sameSession && (error || listError) && <AlertBanner className="graph-files-alert" action={listLoadFailed ? (
       // The same list read the table makes when it opens, issued again.
       <Button type="button" variant="ghost" compact onClick={() => void useBlobStore.getState().loadBlobs(state.session_id)}>Retry</Button>
-    ) : null}>{loadError}</AlertBanner>}
+    ) : null}>{error ?? listError}</AlertBanner>}
     {rows.length === 0 ? <p className="graph-config-empty-value">No session files are attached to this graph.</p>
       : <>
       <div className="graph-files-filter">
@@ -181,7 +182,7 @@ function FileMappings({ state, onShowNode, visibleNodeIds, onCount }: GraphFiles
             hidden={visibleNodeIds !== undefined && !visibleNodeIds.has(row.componentId)}
             binding={binding} unsaved={unsavedFields.length > 0}
             sameSession={sameSession} current={sameSession && currentStateId === state.id}
-            listReady={!loading && blobSessionId === state.session_id} loadError={loadError} retryOffered={listLoadFailed}
+            listReady={!loading && blobSessionId === state.session_id} listError={listError} retryOffered={listLoadFailed}
             blobs={blobSessionId === state.session_id ? blobs : []} pendingEvents={Object.values(pending ?? {})} />;
           })}
           </tbody>
@@ -192,7 +193,7 @@ function FileMappings({ state, onShowNode, visibleNodeIds, onCount }: GraphFiles
   </div>;
 }
 
-function FileMappingRow({ row, state, onShowNode, hidden, binding, unsaved, sameSession, current, listReady, loadError, retryOffered, blobs, pendingEvents }: {
+function FileMappingRow({ row, state, onShowNode, hidden, binding, unsaved, sameSession, current, listReady, listError, retryOffered, blobs, pendingEvents }: {
   row: FileMapping;
   /** A prompt slot in this row holds unsaved text in the editor. */
   unsaved: boolean;
@@ -203,7 +204,7 @@ function FileMappingRow({ row, state, onShowNode, hidden, binding, unsaved, same
   sameSession: boolean;
   current: boolean;
   listReady: boolean;
-  loadError: string | null;
+  listError: string | null;
   /** The banner above the table offers Retry (the list read failed). */
   retryOffered: boolean;
   blobs: ReturnType<typeof useBlobStore.getState>["blobs"];
@@ -214,12 +215,12 @@ function FileMappingRow({ row, state, onShowNode, hidden, binding, unsaved, same
   // and the file manager): a refused save still opens the editor read-only
   // with its reason; only a file with no prompt text to show stays shut. The
   // reason rides on title + an sr-only description, as in the file list.
-  const editability = binding && current && listReady && !loadError
+  const editability = binding && current && listReady && !listError
     ? promptFileEditability({ state, blobs, pendingEvents, nodeId: binding.nodeId, fieldPath: binding.fieldPath, blobId: row.blobId })
     : null;
   const editReason = !current ? "Open the current graph to edit its files."
     : !listReady ? "Wait for the file list to load."
-    : loadError ? (retryOffered ? "File names are unavailable. Use Retry above." : "File names are unavailable.")
+    : listError ? (retryOffered ? "File names are unavailable. Use Retry above." : "File names are unavailable.")
     : binding === undefined ? "Only prompt files can be edited here."
     : editability?.editable === false ? editability.reason : null;
   const editBlocked = binding === undefined || editability === null || (!editability.editable && !editability.opens);
@@ -242,7 +243,7 @@ function FileMappingRow({ row, state, onShowNode, hidden, binding, unsaved, same
       </div>
     </td>
     <th scope="row" role="rowheader">{sameSession
-      ? <BlobFileName bare blobId={row.blobId} fallback={loadError ? "File name unavailable" : undefined} />
+      ? <BlobFileName bare blobId={row.blobId} fallback={listError ? "File name unavailable" : undefined} />
       : <span title={row.blobId}>File reference</span>}</th>
     <td role="cell">{row.kind}: <code><BreakableName name={row.component} /></code>{unsaved && <> <span className="prompt-editor-tag">Unsaved changes</span></>}</td>
     <td role="cell" className="graph-files-fields">{row.fields.map((field) => <div key={field.path} title={field.path}>

@@ -1,6 +1,8 @@
 import { act, cleanup, render, screen, within, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import * as api from "@/api/client";
+import { BlobListTruncatedError } from "@/api/blobListing";
 import type { BlobMetadata, CompositionState } from "@/types";
 import { compositionStateAuthorityFields } from "@/test/composerFixtures";
 import { useBlobStore } from "@/stores/blobStore";
@@ -205,7 +207,7 @@ describe("GraphFiles", () => {
   });
 
   it("offers Retry for a failed list read, re-issuing the same read", async () => {
-    useBlobStore.setState({ blobs: [], error: "Failed to load files.", listLoadFailed: true });
+    useBlobStore.setState({ blobs: [], error: "Failed to load files.", listError: "Failed to load files.", listLoadFailed: true });
     render(<GraphFiles state={state} onShowNode={vi.fn()} />);
     await userEvent.setup().click(screen.getByText(filesSummary()));
     loadBlobs.mockClear();
@@ -213,15 +215,73 @@ describe("GraphFiles", () => {
     expect(loadBlobs).toHaveBeenCalledWith(state.session_id);
   });
 
+  const truncatedMessage = new BlobListTruncatedError([]).message;
   it.each([
-    ["a failed list read (Retry offered)", true, "File names are unavailable. Use Retry above."],
-    ["a plain list error (nothing to retry)", false, "File names are unavailable."],
-  ])("says why Edit is blocked after %s, never asking for a reload", async (_case, listLoadFailed, reason) => {
-    useBlobStore.setState({ blobs: [], error: "Failed to load files.", listLoadFailed });
+    ["a failed list read (Retry offered)", "Failed to load files.", "Failed to load files.", true, "File names are unavailable. Use Retry above."],
+    ["a truncated list (nothing to retry)", truncatedMessage, truncatedMessage, false, "File names are unavailable."],
+    ["an action refusal", "Download failed.", null, false, null],
+  ] as const)("gates Edit on the list state after %s", async (_case, error, listError, listLoadFailed, reason) => {
+    useBlobStore.setState({ error, listError, listLoadFailed });
     render(<GraphFiles state={state} onShowNode={vi.fn()} />);
     await userEvent.setup().click(screen.getByText(filesSummary()));
-    expect(screen.getByRole("button", { name: "Edit file for solo" })).toHaveAttribute("title", reason);
+    const edit = screen.getByRole("button", { name: "Edit file for solo" });
+    if (reason === null) {
+      expect(edit).not.toHaveAttribute("title");
+      expect(edit).toHaveAttribute("aria-disabled", "false");
+    } else {
+      expect(edit).toHaveAttribute("title", reason);
+      expect(edit).toHaveAttribute("aria-disabled", "true");
+    }
     expect(document.body).not.toHaveTextContent(/Reload/i);
+  });
+
+  it.each([
+    ["upload", "File exceeds the maximum upload size."],
+    ["delete", "This file is still attached."],
+  ] as const)("keeps file names and Edit available after a refused %s", async (action, message) => {
+    vi.spyOn(api, "listBlobs").mockResolvedValueOnce(useBlobStore.getState().blobs);
+    useBlobStore.setState({ loadBlobs: useBlobStore.getInitialState().loadBlobs });
+    render(<GraphFiles state={state} onShowNode={vi.fn()} />);
+    await userEvent.setup().click(screen.getByText(filesSummary()));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Edit file for solo" })).toHaveAttribute("aria-disabled", "false"));
+
+    await act(async () => {
+      if (action === "upload") {
+        const refusal = { status: 413 };
+        vi.spyOn(api, "uploadBlob").mockRejectedValueOnce(refusal);
+        await expect(useBlobStore.getState().uploadBlob(state.session_id, new File(["prompt"], "new.txt"))).rejects.toBe(refusal);
+      } else {
+        vi.spyOn(api, "deleteBlob").mockRejectedValueOnce({ status: 409, detail: message });
+        await useBlobStore.getState().deleteBlob(state.session_id, "solo");
+      }
+    });
+
+    const alert = screen.getByRole("alert");
+    expect(alert).toHaveTextContent(message);
+    expect(within(alert).queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+    const edit = screen.getByRole("button", { name: "Edit file for solo" });
+    expect(edit).toHaveAttribute("aria-disabled", "false");
+    expect(edit).not.toHaveAttribute("title");
+    expect(screen.getByRole("rowheader", { name: "solo.txt" })).toBeInTheDocument();
+    expect(screen.queryByText("File name unavailable")).not.toBeInTheDocument();
+  });
+
+  it("keeps Retry and the Edit list blocker after a successful upload following a failed list read", async () => {
+    vi.spyOn(api, "listBlobs").mockRejectedValueOnce(new Error("Network error"));
+    vi.spyOn(api, "uploadBlob").mockResolvedValueOnce(blob("uploaded", "uploaded.txt"));
+    useBlobStore.setState({ blobs: [], loadBlobs: useBlobStore.getInitialState().loadBlobs });
+    render(<GraphFiles state={state} onShowNode={vi.fn()} />);
+    await userEvent.setup().click(screen.getByText(filesSummary()));
+    await screen.findByRole("button", { name: "Retry" });
+
+    await act(async () => {
+      await useBlobStore.getState().uploadBlob(state.session_id, new File(["prompt"], "uploaded.txt"));
+    });
+
+    const alert = screen.getByRole("alert");
+    expect(alert).toHaveTextContent("Failed to load files.");
+    expect(within(alert).getByRole("button", { name: "Retry" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Edit file for solo" })).toHaveAttribute("title", "File names are unavailable. Use Retry above.");
   });
 
   it("lets a long file or step name wrap at its separators, keeping the text whole", async () => {
@@ -273,14 +333,14 @@ describe("GraphFiles", () => {
   });
 
   it("distinguishes a file-list failure from a missing file and blocks editing historical graphs", async () => {
-    useBlobStore.setState({ blobs: [], error: "Failed to load files." });
+    useBlobStore.setState({ blobs: [], error: truncatedMessage, listError: truncatedMessage });
     render(<GraphFiles state={state} onShowNode={vi.fn()} />);
     const user = userEvent.setup();
     await user.click(screen.getByText(filesSummary()));
-    expect(screen.getByRole("alert")).toHaveTextContent("Failed to load files.");
+    expect(screen.getByRole("alert")).toHaveTextContent(truncatedMessage);
     // The design system's error banner, not a bare paragraph at the pane edge.
     expect(screen.getByRole("alert")).toHaveClass("alert-banner", "graph-files-alert");
-    // A plain error (no failed read recorded) offers nothing to retry.
+    // Retrying a truncated list would reach the same limit.
     expect(within(screen.getByRole("alert")).queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
     expect(screen.queryByText("File not in this session")).not.toBeInTheDocument();
     expect(screen.getAllByText("File name unavailable")).toHaveLength(8);
