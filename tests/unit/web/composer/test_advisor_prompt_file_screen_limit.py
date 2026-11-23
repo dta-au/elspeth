@@ -19,14 +19,15 @@ import hashlib
 import json
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 import httpx
 import litellm
 import pytest
+from pydantic import SecretBytes
 
-from elspeth.contracts.blobs import BlobCreator
+from elspeth.contracts.blobs import BlobCreator, BlobServiceProtocol
 from elspeth.contracts.blobs_inline import is_widened_blob_ref
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.prompt_guard import PROMPT_GUARD_MAX_TEXT_CHARACTERS
@@ -251,7 +252,7 @@ def test_text_that_grows_in_the_summary_fence_is_measured_as_sent() -> None:
 
 
 @pytest.mark.asyncio
-async def test_the_same_input_is_rendered_whether_or_not_limits_are_enforced(tmp_path: Path) -> None:
+async def test_the_same_input_is_rendered_whether_or_not_limits_are_enforced(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The decision never consults the guard mode: an environment that does not enforce limits gets the same marker."""
     messages: dict[str, str] = {}
     for mode in ("debug-when-unconfigured", "required"):
@@ -262,7 +263,7 @@ async def test_the_same_input_is_rendered_whether_or_not_limits_are_enforced(tmp
             catalog=_mock_catalog(), settings=_make_settings(composer_prompt_guard_mode=mode), blob_service=store
         )
         advisor = _CapturedAdvisor()
-        service._advisor_checkpoint._call_advisor_with_audit = advisor
+        monkeypatch.setattr(service._advisor_checkpoint, "_call_advisor_with_audit", advisor)
         _arguments, message = await _checkpoint(
             service, advisor, _state(_llm_node({"prompt_template": _marker(record)})), context=_context()
         )
@@ -294,7 +295,7 @@ async def test_a_checkpoint_with_a_long_bound_file_passes_a_mounted_guard(
     guard_settings = PromptGuardSettings(endpoint="https://advisor-shield.example.test", subscription_key="offline-advisor-shield")
     settings = WebSettings(
         data_dir=tmp_path,
-        shareable_link_signing_key=b"\x00" * 32,
+        shareable_link_signing_key=SecretBytes(b"\x00" * 32),
         composer_max_composition_turns=15,
         composer_context_max_prompt_tokens=200_000,
         composer_max_discovery_turns=10,
@@ -324,14 +325,14 @@ async def test_a_checkpoint_with_a_long_bound_file_passes_a_mounted_guard(
         sessions_service=sessions,
         chargeable_admission=ComposerChargeableAdmission(sessions),
         prompt_guard_mount=PromptGuardMount(AzurePromptGuardClient(guard_settings, http_transport=httpx.MockTransport(inspect))),
-        blob_service=store,
+        blob_service=cast(BlobServiceProtocol, store),
     )
     await checkpoint._chargeable_admission.require(context)
     sent_messages: list[Any] = []
 
     async def complete_sdk(**kwargs: Any) -> litellm.ModelResponse:
         sent_messages.append(kwargs["messages"])
-        reply = {"verdict": "CLEAN", "category": "other", "steps": [], "findings": "", "note": None}
+        reply: dict[str, object] = {"verdict": "CLEAN", "category": "other", "steps": [], "findings": "", "note": None}
         return litellm.ModelResponse(
             model=kwargs["model"],
             choices=[{"finish_reason": "stop", "message": {"role": "assistant", "tool_calls": None, "content": json.dumps(reply)}}],
