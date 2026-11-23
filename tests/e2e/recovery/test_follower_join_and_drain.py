@@ -54,7 +54,7 @@ from sqlalchemy import select, update
 from elspeth.contracts import NodeType, RunStatus
 from elspeth.contracts.config import RuntimeRetryConfig
 from elspeth.contracts.coordination import CoordinationToken
-from elspeth.contracts.errors import FollowerSeatDeadError, JoinRefusedError, RunMembershipLostError
+from elspeth.contracts.errors import FollowerSeatDeadError, JoinNotReadyError, JoinRefusedError, RunMembershipLostError
 from elspeth.contracts.hashing import CANONICAL_VERSION
 from elspeth.contracts.scheduler import GroupLossSpec, SchedulerEventType, TokenWorkStatus
 from elspeth.core.landscape.factory import RecorderFactory, RunLifecycleReadRepository
@@ -296,7 +296,19 @@ class TestJoinRunAdmissionRefusals:
         with patch("elspeth.engine.orchestrator.join_admission.resolve_config", return_value={}):
             with pytest.raises(JoinRefusedError, match="not finished registering its graph"):
                 Orchestrator(db).join_run(run_id=run_id, settings=settings, config=config, graph=graph)
-            for edge in graph.get_edges():
+            edges = graph.get_edges()
+            assert len(edges) > 1
+            for edge in edges[:1]:
+                factory.data_flow.register_edge(
+                    coordination_token=leader_token,
+                    from_node_id=edge.from_node,
+                    to_node_id=edge.to_node,
+                    label=edge.label,
+                    mode=edge.mode,
+                )
+            with pytest.raises(JoinNotReadyError, match="not finished registering its graph"):
+                Orchestrator(db).join_run(run_id=run_id, settings=settings, config=config, graph=graph)
+            for edge in edges[1:]:
                 factory.data_flow.register_edge(
                     coordination_token=leader_token,
                     from_node_id=edge.from_node,
@@ -305,6 +317,18 @@ class TestJoinRunAdmissionRefusals:
                     mode=edge.mode,
                 )
             member = Orchestrator(db).join_run(run_id=run_id, settings=settings, config=config, graph=graph)
+            factory.data_flow.register_edge(
+                coordination_token=leader_token,
+                from_node_id=edges[0].from_node,
+                to_node_id=edges[0].to_node,
+                label="extra-recorded-edge",
+                mode=edges[0].mode,
+            )
+            with pytest.raises(
+                JoinRefusedError,
+                match=rf"recorded graph edge count {len(edges) + 1} does not match follower graph edge count {len(edges)}",
+            ):
+                Orchestrator(db).join_run(run_id=run_id, settings=settings, config=config, graph=graph)
         with db.engine.connect() as conn:
             rows = conn.execute(
                 select(run_workers_table.c.worker_id, run_workers_table.c.status).where(

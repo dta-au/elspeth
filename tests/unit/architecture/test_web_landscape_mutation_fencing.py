@@ -1057,8 +1057,11 @@ _EXPECTED_SUBORDINATE_EDGE_COUNT = 154
 # Durable quota accounting forwards preserve_call_id=explicit_call_id through
 # the existing record_call/record_operation_call -> _insert_allocated_call edges.
 _EXPECTED_SUBORDINATE_EDGE_SHA256 = "99e14aae3b82aca256018fc9c4c58da2db08a76ccc8724e47d7291d19d16e94b"
-_EXPECTED_COORDINATION_CALL_COUNT = 43
-_EXPECTED_COORDINATION_CALL_SHA256 = "0ff714e77188e7496cd3543a78e637d4a7107921bff7656e4af3100980af6d9e"
+# X1 join admission records departure after a post-admission refusal:
+# JoinAdmissionService.join_run -> depart_worker joins the existing admit_follower call.
+# Measured against a02f25747: 43/0ff714e7… -> 44/a980dd0f…; one arrival.
+_EXPECTED_COORDINATION_CALL_COUNT = 44
+_EXPECTED_COORDINATION_CALL_SHA256 = "a980dd0f9617eed8bd9f1f9d16cf371856ca4309b46c18c48bea19adff32c78f"
 _EXPECTED_INTERNAL_EDGE_COUNT = 93
 # QR (lane 5887): d1af3e66… -> the value below, 92 -> 93: the internal
 # insert_row_with_token_on edge moves from DataFlowRepository.create_quarantine_row_with_token

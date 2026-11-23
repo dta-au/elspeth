@@ -53,9 +53,15 @@ class JoinAdmissionService:
                 run_id,
                 f"canonical version changed from {run.canonical_version!r} to {CANONICAL_VERSION!r}",
             )
-        assert graph.get_edges(), "follower execution graph must have an edge"
-        if not read_factory.data_flow.get_edges(run_id):
+        recorded_edges = read_factory.data_flow.get_edges(run_id)
+        expected_edge_count = len(graph.get_edges())
+        if len(recorded_edges) < expected_edge_count:
             raise JoinNotReadyError(run_id, "the run's leader has not finished registering its graph; retry the join")
+        if len(recorded_edges) > expected_edge_count:
+            raise JoinRefusedError(
+                run_id,
+                f"recorded graph edge count {len(recorded_edges)} does not match follower graph edge count {expected_edge_count}",
+            )
         implementation_check = check_implementation_compatibility(read_factory, run_id, config, graph)
         if not implementation_check.can_resume:
             assert implementation_check.reason is not None
