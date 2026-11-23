@@ -116,7 +116,9 @@ prompt-guard requests no longer grow with the session.
 
 Session epoch 79 and Landscape epoch 51 are unchanged from 0.8.15; this release
 adds no schema-epoch cutover, and existing 0.8.15 session and Landscape stores
-need no action. Upgrading from 0.8.14 or earlier means applying the 0.8.15
+open unchanged. A web run admitted under 0.8.15 does not resume, because the
+plugin policy hash changes: finish interrupted web runs before upgrading, or
+run them again afterwards. Upgrading from 0.8.14 or earlier means applying the 0.8.15
 upgrade notes first: preserve epoch 78 session stores and epoch 50 Landscape
 stores, which startup refuses to open; use a separately provisioned epoch 79
 session store and epoch 51 Landscape store, and keep old workers isolated from

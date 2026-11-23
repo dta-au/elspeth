@@ -38,7 +38,7 @@ changes land and is not a release.
 
 ---
 
-## 0.8.16 - 2026-11-21
+## 0.8.16 - 2026-11-22
 
 Web Composer fixes for large pipelines, long sessions and prompts held in
 files, bounded advisor and prompt-guard requests, less redundant per-row engine
@@ -65,11 +65,24 @@ Schema and stored data:
   always empty in new records. Records written by 0.8.15 still load.
 - Advisor call records now fill `max_completion_tokens_requested` with the
   completion cap that was sent (it was null on advisor rows). No field is
-  added.
+  added to the advisor call record.
 - Prompt-guard audit records are written at `schema_version` 2, with
   `units_scanned` and `units_reused`. Version 1 records still load.
+- Composer guidance and tool text grew by about 21 KB over 0.8.15 (skill
+  +12,786 bytes, tool definitions about +8,500 bytes), about 7,000 estimated
+  tokens on every composer request, so on very large turns history shedding
+  starts correspondingly earlier. `composer_skill_hash` changes with the
+  skill text; it is a provenance field on review rows and gates nothing.
 
 Behaviour you will see:
+
+- **Web runs admitted under 0.8.15 do not resume.** The `reference_join`
+  plugin changed, and every web deployment authorizes it, so the compiled
+  plugin policy hash changes. A web run admitted under 0.8.15 is refused on
+  resume as `POLICY_CHANGED` (`admitted_policy_changed`): finish interrupted
+  web runs before upgrading, or run them again afterwards. A run approval is
+  bound to the policy hash, so one recorded under 0.8.15 must be given again.
+  The stores themselves open unchanged.
 
 - **Long inline prompts belong in files.** A Composer edit that adds or changes
   an inline LLM prompt (`system_prompt`, `prompt_template` or a query
@@ -119,9 +132,12 @@ Behaviour you will see:
   content is over the byte maximum is refused rather than cut. A compose
   request the gateway or model rejects as too long is sent once more with
   every earlier turn left out. If that is rejected too, or there was no
-  earlier turn to leave out, the turn reaches the user as a size refusal, not
-  as a provider outage; a planner request rejected as too long is refused
-  that way at once.
+  earlier turn to leave out, the turn reaches the user as the size refusal
+  `context_budget_exceeded`, not as a provider outage; a planner request
+  rejected as too long is refused that way at once. This replaces the 0.8.13
+  behaviour: tool results of the turn in progress are no longer shed, a
+  request over the token estimate is no longer refused, advisor requests are
+  now bounded, and a provider context-length rejection is retried once.
 - **Advisor requests are bounded by age, not stopped by size.** The advisor
   now sees earlier turns by age within a fixed budget; when a review's size
   estimate is over `composer_context_max_prompt_tokens`, older turns are left
@@ -262,9 +278,8 @@ Behaviour you will see:
   again, as before.
 - Wiring a file onto one query's template while the node's main prompt has a
   term review still pending is now refused, with the steps to fix it (approve
-  the pending term, then wire the file again). Previously that query silently
-  stopped receiving the term under review. Binding a file to the node's main
-  prompt is still the way to replace the prompt for every query.
+  the pending term, then wire the file again). Binding a file to the node's
+  main prompt is still the way to replace the prompt for every query.
 - A pipeline whose bound file's stored content no longer matches its record
   (changed or missing on disk) is now reported as a validation problem on that
   file, instead of failing with a server error when you validate or run it.
@@ -291,6 +306,41 @@ Behaviour you will see:
   was quoted text, where the redactor could rewrite call identifiers so they
   no longer matched their originals. The request sent to the model is
   unchanged.
+- Changing a JSON output's options no longer tells the composer that the
+  output's write-failure choice is missing when one is already saved.
+- After changing one option of a source or an output, the composer is no
+  longer given advice about options the change did not touch, such as a
+  reminder about a fixed schema it set earlier.
+- When you ask the composer to empty the pipeline (for example, to remove its
+  source and output), the reply no longer says the composer failed to build
+  and asks you to retry. It says the pipeline is empty and needs a source and
+  an output.
+- Moving a pipeline source onto another uploaded file no longer erases the
+  source's description. The composer is told the description was kept, so it
+  no longer reports the source as otherwise unchanged when that description
+  may name the earlier file.
+- When the composer sends a malformed content hash to a file-reading tool, for
+  example the text "null" instead of an empty value, the refusal says what to
+  send instead of only "Validation failed".
+- A reference-table lookup step with a required option left out (such as its
+  table or key field) reports the option as required instead of as the wrong
+  type.
+- The composer's guidance says how to create a reference-table lookup step
+  with its uploaded table in one call, and how to replace a table that was
+  written in as text.
+- When an edit's result cannot show the stored component (for example, on a
+  pipeline whose uploaded-file source has its own name), the result says so in
+  one line and names how to read it, instead of leaving it out silently. The
+  composer is also told when the exact pipeline-authoring document cannot be
+  produced for the current graph.
+- The composer's output tool states that an output may be fed by any route
+  that sends rows to it, including a step's error route.
+- The composer's guidance states when a step cannot be inserted between two
+  others in one call (either neighbour has its own error route), and the
+  refusal says how to make the same insertion in two steps.
+- The composer no longer brings up the suspected-bug reports it files for the
+  maintainers. If you ask about a report file it says plainly what it is, and
+  it still tells you when something it said earlier turns out to be wrong.
 - `upsert_node` accepts `routing_only=true` to rewire a step without re-sending
   it. It changes only an existing transform's `input`, `on_success` and
   `on_error` and keeps its plugin, options (file-held prompts included) and
@@ -524,6 +574,15 @@ Behaviour you will see:
   finalization members are copied only when recovery rebinds their ordinal and
   their output data is frozen once; gates hand their input token on instead of
   copying it.
+- Fixed: a web run whose final status write to the session store took
+  longer than 30 seconds could be recorded as failed although its pipeline
+  had completed. The run thread now waits for the write's real result. If a
+  write has still not finished after 60 seconds, or the server's event loop
+  has stopped, the thread records nothing further for that run and the
+  existing run recovery sets the status from the audit trail, at the next
+  recovery pass or at startup. Until then the run shows as running. A new
+  telemetry counter, `execution.loop_bridge_slow_total`, counts waits over 30
+  seconds.
 
 ### Operations and LLM gateway
 
@@ -597,6 +656,15 @@ Behaviour you will see:
   prefix (`node:`, `output:`, `sink:`, `source:`) and a pending review stored
   as a sentence or as its bare kind compare equal. A step whose query
   templates are held in files is judged as file-held, as the server does.
+- The edit battery gains a prompt-wording plan
+  (`composer_prompt_edits_50.json`): 54 chat edits to the file-held prompts of
+  a 30-step graph, each judged byte for byte on the stored file, with file
+  sizes, byte-exactness and output tokens recorded per edit.
+- The battery's judge accepts an edit that keeps the edited component's own
+  description true, reporting the rewrite as `own_description_corrected`
+  instead of failing the edit.
+
+### Publication and acceptance
 
 Automatic image publication from main remains held. The 0.8.16 tag and
 container publication follow successful required checks and the protected

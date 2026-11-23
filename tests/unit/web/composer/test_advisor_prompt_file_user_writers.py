@@ -4,10 +4,9 @@ The advisor keeps back the text of a prompt file only when the row says the
 user wrote it (``advisor_prompt_file_author`` returns ``user``). Two writers of
 such rows carry someone else's text, and the authorship decision recognises
 them by their stored description: the shared-link import and the session-fork
-copy. A third writer of user rows carrying another person's text would be
-treated as the user's own, and its text would silently stop reaching the
-advisor. This census fails when a writer appears that is not in the reviewed
-list below, so that case is decided when it is written, not discovered later.
+copy. Every writer of user rows must be in the reviewed list below; this
+census fails when a writer appears that is not, so each new writer is decided
+when it is written.
 
 A writer site is a call that passes ``created_by`` either as the constant
 ``"user"`` (any call), or as a non-constant value to a blob-row write

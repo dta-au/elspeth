@@ -11,7 +11,7 @@ preflights and pin:
 * the configuration and settings the runtime phase now uses equal what the
   deleted dump -> parse path produced (kept below as a test-local reference);
 * a graph holding the whole file-text cap validates in English, Chinese and
-  Cyrillic, at today's cap and at the ruled 4 MiB cap;
+  Cyrillic, at today's cap and at the 4 MiB cap;
 * the resolved configuration's own bound refuses with a code, total and limit;
 * the number of ``yaml.dump`` / ``yaml.load`` calls one preflight makes, and
   that no file-held prompt text passes through either.
@@ -315,7 +315,7 @@ _LANGUAGES = ["en", "zh", "ru"]
 # text and refused the same bytes of Chinese or Russian, which is what the
 # first test below compares against; at the raised cap it refused all three.
 _PREVIOUS_CAP = 1024 * 1024
-_RULED_CAP = 4 * 1024 * 1024
+_RAISED_CAP = 4 * 1024 * 1024
 
 
 def _cap_graph(tmp_path: Path, *, total_bytes: int, files: int, language: str) -> _Graph:
@@ -354,16 +354,16 @@ def test_a_graph_holding_the_whole_file_text_cap_validates_in_any_language(
 
 
 @pytest.mark.parametrize("language", ["en", "zh"])
-def test_the_ruled_4_mib_file_text_cap_validates(language: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """At the ruled cap, with the resolved bound derived from it as the module derives it.
+def test_the_4_mib_file_text_cap_validates(language: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """At the 4 MiB cap, with the resolved bound derived from it as the module derives it.
 
     Until the cap constant changes, the cap and the derived bound are set to
-    their ruled values here; once it has changed, both settings are no-ops.
+    their 4 MiB values here; once it has changed, both settings are no-ops.
     """
-    cap = max(BLOB_INLINE_AGGREGATE_BYTE_CAP, _RULED_CAP)
+    cap = max(BLOB_INLINE_AGGREGATE_BYTE_CAP, _RAISED_CAP)
     monkeypatch.setattr(_validation_materialization, "BLOB_INLINE_AGGREGATE_BYTE_CAP", cap)
     monkeypatch.setattr(_rendered_module(), "MAX_RESOLVED_PIPELINE_TEXT_BYTES", 4 * cap)
-    graph = _cap_graph(tmp_path, total_bytes=_RULED_CAP, files=256, language=language)
+    graph = _cap_graph(tmp_path, total_bytes=_RAISED_CAP, files=256, language=language)
 
     result = _web_preflight(tmp_path, graph)
 

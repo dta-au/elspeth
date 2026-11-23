@@ -34,7 +34,7 @@ or old container identifiers into a live command:
 | `HOTFIX_GATEWAY_ID` | Full current gateway container ID |
 | `HOTFIX_RECORDS_DIR` | New private operator-task directory under approved storage's resolved persistent data directory |
 | `HOTFIX_ARTIFACTS` | Code-only package directory inside the worktree |
-| `HOTFIX_TEST_RUN` | New lane-private directory inside the worktree for synthetic test logs and temporary files |
+| `HOTFIX_TEST_RUN` | New run-private directory inside the worktree for synthetic test logs and temporary files |
 | `HOTFIX_CANDIDATE_TAR`, `HOTFIX_ROLLBACK_TAR` | Reviewed candidate and exact baseline code archives |
 | `HOTFIX_STOP_SECONDS` | Grace interval chosen from live shutdown budgets, with a margin |
 | Backup reference | Exact immutable recovery-set manifest (see [staging hardware upgrade recovery](staging-hardware-upgrade-recovery.md)) |

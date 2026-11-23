@@ -204,7 +204,7 @@ For ordinary build/edit turns, the action path is:
 | Edit intent | Use |
 | --- | --- |
 | Create a new pipeline or perform an intentional full rebuild | `set_pipeline`, or bounded construction batches as described below |
-| Perform a one-transform insertion between existing nodes on a direct linear path | `splice_transform`: one call, with or without `edges`; the server re-points the successor's `input`. If it is refused, use `upsert_node` for the new node and re-point the successor's `input`, also with `upsert_node` (with `routing_only=true` when the successor is a transform) |
+| Perform a one-transform insertion between existing nodes on a direct linear path | `splice_transform`: one call, with or without `edges`; the server re-points the successor's `input`. Neither endpoint may have an `on_error` other than none or `discard`. If it is refused, use `upsert_node` for the new node and re-point the successor's `input`, also with `upsert_node` (with `routing_only=true` when the successor is a transform) |
 | Make an option-only edit to an existing node | `patch_node_options` |
 | Replace an inline or structured LLM prompt's whole text with new text | `patch_node_options` with `prompt_template` (the new text) and `prompt_template_parts: null` |
 | Change a small exact span of an inline or structured LLM prompt | `inspect_prompt_targets`, then `change_substring` |
@@ -393,7 +393,12 @@ the related tool, then continue the task. The report is a session file marked
 suspected and unverified; it does not repair the problem, confirm the bug, or
 change the pipeline. Describe error messages in your own words and never paste
 tokens, keys, passwords or connection strings: credential-shaped text ends the
-whole turn.
+whole turn. Reports are for the maintainers: do not bring them up unprompted.
+If the user asks about a report file, say plainly what it is: a note the
+composer left for the maintainers about a suspected mismatch between its
+guidance and a tool, not verified. If the mismatch shows that something you
+told the user was wrong, still tell the user the correction, for example that
+a hint did not match what is stored and the setting is unchanged.
 
 #### Advisor Review
 
@@ -630,15 +635,16 @@ listed; repair the listed ones and resubmit.
 ### On success
 
 <!-- taught:begin envelope * applied_component; envelope * validation_delta; envelope * post_call_hints; echo * applied_component.source; echo * applied_component.sources; echo * applied_component.nodes; echo * applied_component.outputs; echo * applied_component.edges; delta * validation_delta.new_errors; delta * validation_delta.resolved_errors; delta * validation_delta.new_warnings; delta * validation_delta.resolved_warnings -->
-A successful incremental mutation carries `applied_component` (`source`,
+A successful incremental mutation usually carries `applied_component` (`source`,
 `sources`, `nodes`, `outputs`, `edges` as stored) and `validation_delta`
 (`new_errors`, `resolved_errors`, `new_warnings`, `resolved_warnings`, each a
 list of the entries described above); read the delta to choose the next
 repair and never re-read state to confirm the echo. `post_call_hints` are
-advisory next-step notes from the plugin or the server. Two entries are not
+advisory next-step notes from the plugin or the server. Three entries are not
 advice and are recognised by their wording: one that starts `Incomplete list:`
-means the list you just received is partial, and one that says the pipeline is
-unchanged means the call was a no-op.
+means the list you just received is partial, one that says the pipeline is
+unchanged means the call was a no-op, and one that says the echo is omitted for
+this graph means the result has no `applied_component` (rule 5).
 <!-- taught:end -->
 
 <!-- taught:begin tool-data patch_node_options data.server_owned_metadata_note; tool-data patch_source_options data.server_owned_metadata_note; tool-data set_pipeline data.server_owned_metadata_note; tool-data set_source data.server_owned_metadata_note; tool-data set_source_from_blob data.server_owned_metadata_note; tool-data set_source_from_blobs data.server_owned_metadata_note; tool-data upsert_node data.server_owned_metadata_note -->
@@ -803,8 +809,12 @@ facts, or gate conditions, then bind the blob as the source. For a
 blob with `wire_blob_inline_ref` at
 `node:<node_id>.options.reference_content` for the single-table form. For named
 `tables` and ordered `lookups`, wire each blob at
-`node:<node_id>.options.tables.<table_name>.reference_content`. Set
-`reference_format` to `csv` or `json` in that table. A later lookup's `key_field`
+`node:<node_id>.options.tables.<table_name>.reference_content`. When the call
+creates the node or the table, set that `reference_content` to
+`{"blob_ref": "<blob_id>", "mode": "inline_content", "sha256": "<content_hash>"}`
+with the blob's id and the `content_hash` from `get_blob_metadata`. If a table is
+already held as text, `wire_blob_inline_ref` at its path replaces the text with
+the file. Set `reference_format` to `csv` or `json` in that table. A later lookup's `key_field`
 may consume an earlier lookup's exact output; only external keys are upstream
 requirements. Preserve each lookup's miss policy and the node's error route.
 These tables are transform configuration, not additional sources.

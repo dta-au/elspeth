@@ -82,8 +82,9 @@ _SET_OUTPUT_DECLARATION = ToolDeclaration(
                 "type": "string",
                 "description": (
                     "Sink name: BOTH the sink's identifier (used by patch_output_options/"
-                    "remove_output) AND the connection-name the sink consumes — it MUST equal "
-                    "some upstream's on_success value; it need not match any node id."
+                    "remove_output) AND the connection-name the sink consumes. Something upstream must send rows "
+                    "to it: a source's `on_success` or `on_validation_failure`, a step's `on_success`, `on_error`, "
+                    "`routes` or `fork_to`, or another output's `on_write_failure`. It need not match any node id."
                 ),
             },
             "plugin": {"type": "string", "description": "Sink plugin name (e.g. 'csv', 'json')."},
@@ -377,13 +378,19 @@ def _handle_patch_output_options(
             f"_execute_patch_output_options succeeded for output '{sink_name}' but "
             "the post-mutation state does not contain it — invariant violation."
         )
+    # Hints speak only about the option keys this patch touched. The
+    # write-failure choice is a field of the output beside ``options``, not an
+    # option key; the plugin hint reads it from the snapshot.
     return _attach_post_call_hints(
         result,
         context.catalog,
         plugin_type="sink",
         tool_name="patch_output_options",
         plugin_name=output.plugin,
-        config_snapshot=output.options,
+        config_snapshot={
+            **{key: output.options[key] for key in validated.patch if key in output.options},
+            "on_write_failure": output.on_write_failure,
+        },
     )
 
 

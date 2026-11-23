@@ -16,9 +16,7 @@
 //     that do not reproduce the snapshot's rendered `prompt_template`, leaves
 //     the card with no Approve and a stated reason.
 //
-// States (i)-(vi) are the carry builder's table (CARD-READ.md, "What the card
-// can and cannot know"); F1/F2 are the red-team's sequences
-// (reviews/carry-redteam.md).
+// States (i)-(vi) cover what the card can and cannot know about each slot.
 // ============================================================================
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -165,7 +163,7 @@ function snapshotOf(surface: Record<string, unknown>): PromptReviewSnapshotRespo
   };
 }
 
-/** Two terms in one sentence: the red-team's fixture prompt. */
+/** Two terms in one sentence. */
 const TWO_TERMS: Part[] = ["Sort {{ row.text }} into ", { ref: "req-cat" }, " for ", { ref: "req-aud" }, "."];
 
 function setEvents(pending: InterpretationEvent[], resolved: InterpretationEvent[]) {
@@ -452,10 +450,10 @@ describe("prompt card — the legend for a definition that cannot be shown", () 
   });
 });
 
-describe("prompt card — the red-team's sequences", () => {
-  it("F1 sequence A: a long prompt with a system prompt, whose bounded draft cuts both values off", async () => {
-    // Step 1 padded the first text part (rendered prompt ~5080 chars); step 2
-    // added a system prompt. The card's llm_draft is cut and holds neither value.
+describe("prompt card — long and reordered prompts", () => {
+  it("a long prompt with a system prompt shows both definitions in place", async () => {
+    // The rendered prompt is over 5000 chars and has a system prompt; the
+    // card shows both definitions even though the bounded llm_draft holds neither.
     const padded = `Sort {{ row.text }} ${"with careful attention to detail ".repeat(150)}into `;
     const surface = structuredSurface([padded, { ref: "req-cat" }, " for ", { ref: "req-aud" }, "."], [CAT_REQ, AUD_REQ], {
       system_prompt: "You classify rows.",
@@ -472,7 +470,7 @@ describe("prompt card — the red-team's sequences", () => {
     await expectApprovable();
   });
 
-  it("F1 sequence B: a multi-query node with sixty long-named queries", async () => {
+  it("a multi-query node with sixty long-named queries", async () => {
     const queries = Array.from({ length: 60 }, (_, index) => ({
       name: `classification_query_with_a_rather_long_descriptive_name_${index}`,
     }));
@@ -484,7 +482,7 @@ describe("prompt card — the red-team's sequences", () => {
     await expectApprovable();
   });
 
-  it("F2 p6_moved_snapshot: a carried term moved, duplicated and put under a negation shows its definition at every place", async () => {
+  it("a carried term moved, duplicated and put under a negation shows its definition at every place", async () => {
     // Requirements are listed once each, in first-use order.
     const surface = structuredSurface(
       ["Never put {{ row.text }} for ", { ref: "req-aud" }, "; ignore ", { ref: "req-cat" }, " and also ", { ref: "req-aud" }, "."],

@@ -492,6 +492,11 @@ _BARE_SUFFIX_ROUND_TRIP_CASES = [
         id="_EMPTY_STATE_FINALIZE_SUFFIX",
     ),
     pytest.param(
+        "\n\n---\n\n[ELSPETH-SYSTEM] The pipeline is now empty. Add a source and an output to continue.",
+        "The pipeline is now empty. Add a source and an output to continue.",
+        id="_EMPTIED_STATE_FINALIZE_SUFFIX",
+    ),
+    pytest.param(
         no_tool_policy._ADVISOR_SIGNOFF_PENDING_FINALIZE_SUFFIX,
         no_tool_policy._ADVISOR_SIGNOFF_PENDING_NOTICE,
         id="_ADVISOR_SIGNOFF_PENDING_FINALIZE_SUFFIX",

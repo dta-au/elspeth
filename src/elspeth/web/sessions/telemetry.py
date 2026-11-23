@@ -197,6 +197,10 @@ class _SessionsTelemetry:
     # degradation: the Landscape run row remains primary, while WebSocket
     # progress delivery is an ephemeral client-notification channel.
     progress_broadcast_dropped_total: _Counter
+    # A pipeline thread waiting on the event loop for longer than the slow
+    # threshold. Operational pressure only: the run row stays primary and the
+    # wait continues. Attributes: run_id, operation.
+    execution_loop_bridge_slow_total: _Counter
     # Orphan cleanup is operational lifecycle telemetry: the run row is the
     # permanent record of the cancellation, while this counter exposes cleanup
     # pressure by source without turning logs into a lifecycle channel.
@@ -272,6 +276,7 @@ def build_sessions_telemetry(*, meter: _Meter | None = None) -> _SessionsTelemet
             interpretation_rate_cap_exceeded_total=_FakeCounter(),
             interpretation_placeholder_unresolved_at_runtime_total=_FakeCounter(),
             progress_broadcast_dropped_total=_FakeCounter(),
+            execution_loop_bridge_slow_total=_FakeCounter(),
             orphaned_runs_cancelled_total=_FakeCounter(),
             # Phase 8 counters.
             session_switched_total=_FakeCounter(),
@@ -303,6 +308,12 @@ def build_sessions_telemetry(*, meter: _Meter | None = None) -> _SessionsTelemet
         progress_broadcast_dropped_total=meter.create_counter(
             "execution.progress.broadcast_dropped_total",
             description=("Execution progress WebSocket broadcasts dropped or drained under client backpressure. Attribute: reason."),
+        ),
+        execution_loop_bridge_slow_total=meter.create_counter(
+            "execution.loop_bridge_slow_total",
+            description=(
+                "Calls from a pipeline thread to the event loop still waiting after the slow threshold. Attributes: run_id, operation."
+            ),
         ),
         orphaned_runs_cancelled_total=meter.create_counter(
             "execution.orphaned_runs_cancelled_total",

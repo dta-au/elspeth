@@ -1677,6 +1677,11 @@ def _mutation_result(
     else:
         validation = catalog.validate_composition_state(new_state).validation
         validation_snapshot_hash = catalog.snapshot.snapshot_hash
+    echo = None if full_replacement or not component_echo else _applied_component_echo(new_state, affected)
+    if echo == ECHO_OMITTED_NO_EXACT_FORM:
+        # The graph has no exact set_pipeline form, so no mutation on it can echo.
+        echo = None
+        post_call_hints = (*post_call_hints, _ECHO_OMITTED_HINT)
     return ToolResult(
         success=True,
         updated_state=new_state,
@@ -1685,7 +1690,7 @@ def _mutation_result(
         prior_validation=prior_validation,
         data=data,
         post_call_hints=post_call_hints,
-        applied_component=None if full_replacement or not component_echo else _applied_component_echo(new_state, affected),
+        applied_component=echo,
         _validation_snapshot_hash=validation_snapshot_hash,
     )
 
@@ -4243,12 +4248,16 @@ def _serialize_set_pipeline_arguments(state: CompositionState) -> tuple[dict[str
 # WHOLE state in the wider diagnostic serialization, so the cap bounds a
 # pathological single response — it is not a parsimony budget.
 _APPLIED_COMPONENT_ECHO_MAX_CANONICAL_BYTES: Final[int] = 16 * 1024
+ECHO_OMITTED_NO_EXACT_FORM: Final = "no_exact_form"
+_ECHO_OMITTED_HINT: Final[str] = (
+    "The applied_component echo is omitted for this graph; get_pipeline_state for the component shows what was stored."
+)
 
 
 def _applied_component_echo(
     state: CompositionState,
     affected: tuple[str, ...],
-) -> AppliedComponentEcho | None:
+) -> AppliedComponentEcho | Literal["no_exact_form"] | None:
     """Project the components a successful mutation applied, post-finalizer.
 
     The echo is the exact ``set_pipeline`` arguments that
@@ -4268,27 +4277,16 @@ def _applied_component_echo(
     exists to avoid.
 
     Returns ``None`` when nothing resolves (a removal whose subject is gone
-    from the new state), when the state cannot be represented as exact
-    ``set_pipeline`` arguments, or when the canonical projection exceeds
-    ``_APPLIED_COMPONENT_ECHO_MAX_CANONICAL_BYTES``. An oversized echo is
-    dropped WHOLE, never truncated: half a component reads as a complete one
-    and would author a wrong repair.
+    from the new state) or when the canonical projection exceeds
+    ``_APPLIED_COMPONENT_ECHO_MAX_CANONICAL_BYTES``, and
+    ``ECHO_OMITTED_NO_EXACT_FORM`` when a component resolves but the state
+    cannot be represented as exact ``set_pipeline`` arguments (the caller
+    says so in one hint line). An oversized echo is dropped WHOLE, never
+    truncated: half a component reads as a complete one and would author a
+    wrong repair.
     """
     if not affected:
         return None
-    payload, round_trip_error = _serialize_set_pipeline_arguments(state)
-    if round_trip_error is not None:
-        # The public authoring payload is unavailable for this state; the
-        # model can still get the diagnostic view (and the exact reason) from
-        # get_pipeline_state. An echo is never worth a second projection.
-        return None
-    assert payload is not None
-    # Storage-path redaction runs on the full authoring payload before the echo
-    # is narrowed: same bytes redacted, and the echo is then assembled directly
-    # in its closed shape (AppliedComponentEcho) with no round-trip through an
-    # open dict.
-    payload = redact_source_storage_path(payload)
-
     state_node_ids = {node.id for node in state.nodes}
     state_output_names = {output.name for output in state.outputs}
     source_names: list[str] = []
@@ -4307,6 +4305,22 @@ def _applied_component_echo(
             node_ids.add(component)
         elif component in state_output_names:
             output_names.add(component)
+    if not (source_names or node_ids or output_names):
+        # A removal whose subject is gone: nothing to echo, and no projection is built.
+        return None
+
+    payload, round_trip_error = _serialize_set_pipeline_arguments(state)
+    if round_trip_error is not None:
+        # The public authoring payload is unavailable for this state; the
+        # model can still get the diagnostic view (and the exact reason) from
+        # get_pipeline_state. An echo is never worth a second projection.
+        return ECHO_OMITTED_NO_EXACT_FORM
+    assert payload is not None
+    # Storage-path redaction runs on the full authoring payload before the echo
+    # is narrowed: same bytes redacted, and the echo is then assembled directly
+    # in its closed shape (AppliedComponentEcho) with no round-trip through an
+    # open dict.
+    payload = redact_source_storage_path(payload)
 
     echo: AppliedComponentEcho = {}
     if "source" in payload and SOURCE_COMPONENT_ID in source_names:

@@ -243,6 +243,7 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: Promp
     const sent = draft.text;
     setSaving(true);
     setStatus(null);
+    usePromptDraftStore.getState().beginSave(slot);
     // Bound to THIS activation, not only the session id: switching away and
     // back advances the publication generation, so a slow post-save refetch
     // cannot overwrite a newer graph published since.
@@ -260,6 +261,7 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: Promp
       void useBlobStore.getState().loadBlobs(sessionId);
       await refreshGraphAfterSave(sessionId, isCurrent);
     } catch (failure: unknown) {
+      usePromptDraftStore.getState().saveFailed(slot);
       if (isCurrent()) {
         const typed = failure as { detail?: unknown; error_type?: unknown };
         if (typed.error_type === "prompt_file_stale") {

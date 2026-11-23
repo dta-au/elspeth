@@ -24,7 +24,9 @@ Both plans leave the graph as found.
 
 A third plan, `composer_file_bindings.json`, measures connecting and
 reconnecting files rather than a long run of edits; it is described under
-[File-binding plan](#file-binding-plan).
+[File-binding plan](#file-binding-plan). A fourth, `composer_prompt_edits_50.json`,
+measures changing prompt wording by chat in prompts held in files on the 30-step
+acceptance fixture; see [Prompt-wording plan](#prompt-wording-plan).
 
 ## Before you start
 
@@ -286,7 +288,7 @@ the workload, and the battery's `setup` action creates it in a session. All
 names, fields and text are made up from a seed; the same seed and arguments
 give the same bytes.
 
-The `acceptance` preset is wired like a real assessment graph rather than one
+The `acceptance` preset is wired like a multi-step assessment graph rather than one
 big LLM block: a CSV source with a fixed schema of 14 fields, bound to an
 uploaded file, with validation failures routed to the error sink; a
 `file_inject` step with file-held content; two case-study chains (an
@@ -617,6 +619,88 @@ python -m scripts.staging.composer_edit_battery plan --plan scripts/staging/edit
 python -m scripts.staging.composer_edit_battery run --plan scripts/staging/edit_plans/composer_file_bindings.json \
   --base-url "$URL" --session "$NEW_EMPTY_SESSION" --account "$ACCOUNT" --state-dir "$STATE" --execute
 ```
+
+## Prompt-wording plan
+
+`scripts/staging/edit_plans/composer_prompt_edits_50.json` measures a
+common workflow: changing the wording of a prompt held in a file by
+asking in chat. It is written for one fixture, `fx-acc30`, the acceptance
+preset with 30 steps, 14 LLM steps, 17 queries and 43 prompt files the user
+uploaded:
+
+```bash
+python -m scripts.staging.large_graph_fixture --preset acceptance --steps 30 --llm-steps 14 \
+  --total-prompt-bytes 300000 --out "$FIXTURE"
+python -m scripts.staging.composer_edit_battery setup --fixture "$FIXTURE" \
+  --base-url "$URL" --session "$NEW_SESSION" --account "$ACCOUNT" --execute
+python -m scripts.staging.composer_edit_battery plan --plan scripts/staging/edit_plans/composer_prompt_edits_50.json
+python -m scripts.staging.composer_edit_battery run --plan scripts/staging/edit_plans/composer_prompt_edits_50.json \
+  --base-url "$URL" --session "$NEW_SESSION" --account "$ACCOUNT" --state-dir "$STATE" --execute
+```
+
+It has 54 edits, all applicable on that fixture, and is judged by the gold
+rule. Each of its 14 roles is one LLM step named by id (`named_llm_step`): the
+step must exist and hold a prompt in a file, so on any other graph the battery
+stops before sending anything. Each edit adds a marker sentence directly after
+a named sentence of the file, changes that marker or removes it again, in 26
+of the fixture's 41 prompt slots across all 14 steps: system prompts (three of
+them rubrics of about 21 KB), prompts and query templates. It also asks for two prompts
+to be moved into new files the Composer writes and then edited, changes two
+steps in one message (twice), edits one 21 KB system prompt five times in a row,
+and sends three no-op requests. Every marker is removed again, so the graph is
+left as found.
+
+What it judges, beyond the usual verdict:
+
+- Byte for byte. Every wording change is a `text` `replace` with
+  `"exact": true`: the bytes the server returns for the file the step uses
+  afterwards must be the old file's bytes with that one replacement, and the
+  bytes its marker's `sha256` pins. Nothing is stripped or normalised, so a
+  final newline added or dropped, LF turned into CRLF, or `é` stored as `e`
+  plus a combining accent all fail it, as does any other changed byte. The
+  finding names the first differing byte:
+  `expect[0]:text:PTR:first_difference_at_byte_N_expected_E_bytes_got_G`.
+  Before sending, the old sentence must occur exactly once in the file
+  (`precondition:expect[0]_anchor_count_N` otherwise). Without `exact`, a
+  `replace` compares the decoded text, and `append`, `remove` and `bound`
+  `content` ignore trailing whitespace; other plans keep that behaviour. The
+  Composer cannot rewrite a bound file (`update_blob` refuses it,
+  `blob_bound_update`) or edit inside one (`change_substring` refuses it,
+  `blob_substring_not_supported`), so it writes a new file and re-points the
+  slot: each wording edit needs `wire_blob_inline_ref` and one of
+  `create_blob` or `update_blob`. A refused `change_substring` attempt shows
+  as a `tool_call_rejected` warning.
+- The slot and the rest of the step stay as they were: a change to another
+  slot or option, or to another step, is an unrelated change.
+- The card. Every wording edit names an `agent_written` card for each step it
+  changes (the new file is one the Composer wrote), marked `blocks_run`: the
+  step's `interpretation_review_pending` error must be on the graph before the
+  battery approves the card, or the edit fails with
+  `review_did_not_block_run:` and nothing is approved. A message that changes
+  two steps lists two cards; each must open and be approved.
+- A no-op (`unchanged`): the step's file already holds the asked-for
+  sentence, and that is checked before the message is sent. The edit passes
+  only if the graph is unchanged (the same file binding, with the bytes its
+  marker pins), no card opens, and every session file is as it was, by id
+  and content hash (`no_op_file_added:` and the like otherwise). It names no
+  tools.
+- Recorded per edit, not only as findings: `completion_tokens` (the sum over
+  the edit's provider calls, `null` if a call lacks a count; split by the
+  model each call requested in `evidence.completion_tokens_by_model`), and
+  `text_checks`, one record per prompt it changes or asks to leave alone,
+  with `bytes_before`, `bytes_after`, `byte_exact` and `first_difference_at`,
+  plus `byte_exact` for the edit as a whole. The summary totals the tokens
+  and gives `byte_exact: {edits_checked, exact, not_exact}`.
+- The model is not part of the plan. The server's `ELSPETH_WEB__COMPOSER_MODEL`
+  (and `ELSPETH_WEB__COMPOSER_ADVISOR_MODEL` for the advisor) picks it, read
+  once at startup; run the same plan on each model by restarting the server
+  with another value.
+
+The fixture has no accepted vague term: every prompt is held in a file, and a
+vague term lives only in a structured inline prompt (`prompt_template_parts`),
+so the plan has no edit that checks an accepted term is kept.
+`test_prompt_edit_plan.py` rebuilds the fixture from its spec, checks it is
+`fx-acc30` by digest, and runs the plan to gold against a simulated Composer.
 
 ## Prompt review cards
 

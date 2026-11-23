@@ -17,7 +17,7 @@ from elspeth.web.composer.discovery_cache import RuntimePreflightCache as _Runti
 from elspeth.web.composer.no_tool_policy import (
     blocking_result_from_tool_invocations as _blocking_result_from_tool_invocations,
 )
-from elspeth.web.composer.no_tool_policy import compose_clarification_message
+from elspeth.web.composer.no_tool_policy import compose_clarification_message, compose_emptied_state_message
 from elspeth.web.composer.no_tool_policy import (
     compose_empty_state_message as _compose_empty_state_message,
 )
@@ -85,7 +85,9 @@ async def finalize_no_tool_response(
        is invalid AND the state is structurally empty. Same
        augmentation shape as (1); ``raw_assistant_content`` carries
        the unaugmented prose so the LLM context is unaffected by the
-       operator-facing suffix.
+       operator-facing suffix. When a change succeeded this turn the
+       suffix states only that the pipeline is now empty, not a failed
+       build.
     3. **Preflight-invalid non-empty-state augmentation** —
        preflight is invalid and the state is non-empty. Panel-evals
        evidence (issue elspeth-9cfbad6901) showed the model's prose
@@ -264,7 +266,10 @@ async def finalize_no_tool_response(
         #    the operator-facing suffix is stripped from LLM history
         #    so the LLM sees only its own prose.
         if _state_is_structurally_empty(state):
-            augmented_message = _compose_empty_state_message(content)
+            # A change that succeeded this turn left the pipeline empty (for
+            # example a requested removal): say so without claiming a failed
+            # build. With no successful change, keep the failed-build notice.
+            augmented_message = compose_emptied_state_message(content) if mutation_success_seen else _compose_empty_state_message(content)
             _enforce_augmentation_prefix_invariant(
                 branch="preflight_invalid_empty_state_augmentation",
                 content=content,

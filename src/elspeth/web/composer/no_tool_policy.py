@@ -163,6 +163,12 @@ _EMPTY_STATE_FINALIZE_SUFFIX_WITH_BLOCKER = _wrapped_diagnostic_template(
     diagnostic_slots="{blocker}",
 )
 
+# A change succeeded this turn and left the pipeline structurally empty (for
+# example the user asked to remove the source and the output). The sentence
+# is true whether or not emptying was the goal, so it asserts no failure.
+_EMPTIED_STATE_NOTICE: Final = "The pipeline is now empty. Add a source and an output to continue."
+_EMPTIED_STATE_FINALIZE_SUFFIX = _bare_trusted_suffix(_EMPTIED_STATE_NOTICE)
+
 _CLARIFICATION_NOTICE: Final = "No pipeline has been built yet. Answer the clarification above to continue."
 _CLARIFICATION_FINALIZE_SUFFIX = _bare_trusted_suffix(_CLARIFICATION_NOTICE)
 
@@ -729,6 +735,8 @@ def _canonical_base_suffix_segments(suffix: str, *, allow_request_rejection: boo
             return None
     if suffix == _EMPTY_STATE_FINALIZE_SUFFIX:
         return (TrustedSystemNoticeSegment(_EMPTY_STATE_NOTICE_BODY),)
+    if suffix == _EMPTIED_STATE_FINALIZE_SUFFIX:
+        return (TrustedSystemNoticeSegment(_EMPTIED_STATE_NOTICE),)
     if suffix == _CLARIFICATION_FINALIZE_SUFFIX:
         return (TrustedSystemNoticeSegment(_CLARIFICATION_NOTICE),)
     empty_with_blocker = _split_wrapped_diagnostic(
@@ -897,6 +905,13 @@ def compose_empty_state_message(content: str, *, blocker: str | None = None) -> 
     if not content:
         return suffix.lstrip("\n").lstrip("-").lstrip()
     return content + suffix
+
+
+def compose_emptied_state_message(content: str) -> str:
+    """Build the user-facing message when this turn's changes left the pipeline empty."""
+    if not content:
+        return _EMPTIED_STATE_FINALIZE_SUFFIX.lstrip("\n").lstrip("-").lstrip()
+    return content + _EMPTIED_STATE_FINALIZE_SUFFIX
 
 
 def first_validation_objection(runtime_result: ValidationResult) -> str | None:
