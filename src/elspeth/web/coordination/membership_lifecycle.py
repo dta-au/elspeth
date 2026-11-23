@@ -106,6 +106,7 @@ class RegisteredWebInstanceMembership(WebInstanceMembership):
     __slots__ = (
         "_authority",
         "_drain_capability",
+        "_heartbeat_authority",
         "_heartbeat_task",
         "_identity",
         "_interval_seconds",
@@ -132,6 +133,9 @@ class RegisteredWebInstanceMembership(WebInstanceMembership):
             raise TypeError("identity must be a WebInstanceIdentity")
         super().__init__(instance_draining=instance_draining)
         self._authority = authority
+        # create_app always wires the upkeep sibling; the fallback is for bare test authorities.
+        upkeep = authority.lease_upkeep_authority
+        self._heartbeat_authority = authority if upkeep is None else upkeep
         self._identity = identity
         self._lease_seconds = lease_seconds
         resolved_interval = heartbeat_interval_seconds(lease_seconds) if interval_seconds is None else interval_seconds
@@ -173,7 +177,9 @@ class RegisteredWebInstanceMembership(WebInstanceMembership):
         while True:
             await asyncio.sleep(self._interval_seconds)
             try:
-                await run_lease_upkeep_in_worker(self._authority.heartbeat, self._identity.instance_id, lease_seconds=self._lease_seconds)
+                await run_lease_upkeep_in_worker(
+                    self._heartbeat_authority.heartbeat, self._identity.instance_id, lease_seconds=self._lease_seconds
+                )
                 consecutive_failures = 0
             except OperationalError as exc:
                 # Only OperationalError is retried, and only a bounded number
