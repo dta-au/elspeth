@@ -931,14 +931,17 @@ the integrator's order rules [I] unless marked [M].
   `.claude/hooks/bash_guard.py`, run before every Bash tool command, refuses
   `pkill`, `killall`, `kill -1`, `kill 0`, `kill -- -PGID`, `kill $(...)`,
   `xargs kill` and `killpg`, including behind wrappers such as `sudo`,
-  `timeout` or `bash -c`, and points here. It checks only what the shell
+  `timeout`, `bash -c` or `eval`, and points here. It also refuses
+  `git commit --amend` and, [M 2026-11-23] "lets block git check yeah - we
+  had a few losses like that early on", both `git checkout -- <path>` and
+  `git checkout <ref> -- <path>`, which overwrite uncommitted work. It checks only what the shell
   would run: quoted text, heredoc bodies and comments are ignored, so a
   commit message or a grep that mentions these commands still runs. A kill
   of explicit numeric PIDs (`kill -TERM 12345`) still runs. The guard is a
   backstop for slips, not a lock: it does not see Codex, scripts that stop
   their own children, or commands typed by hand, so this procedure still
   applies to all of them. If the script is missing, commands run unguarded
-  with a warning. A refused kill is never retried in another form; take it to
+  with a warning ([M 2026-11-23] "warning is fine"). A refused kill is never retried in another form; take it to
   the checker. If the guard refuses something that is not a kill, tell the
   lead integrator so the guard can be fixed.
 - For an orphan, stop its shell first, then pytest, so its cleanup step

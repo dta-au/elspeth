@@ -40,15 +40,20 @@ KILL_MESSAGE = (
 # optionally behind a wrapper (sudo, nohup, exec, command, env with its
 # settings, time, nice, ionice, setsid, stdbuf, timeout with its duration) or a
 # loop or if keyword. The command word may carry a path (/usr/bin/pkill).
+#
+# An option's argument may not itself start with "-": otherwise "-u -u -u ..."
+# can be split two ways at every step and matching time grows exponentially
+# (measured: 28 repeats took 2 s). A hook that times out lets the command run.
 _TOK = r"[^\s;&|)]+"
+_ARG = rf"(?!-){_TOK}"
 _WRAP = (
     r"(?:(?:nohup|exec|command|time|setsid|do|then|else)\s+"
-    rf"|sudo(?:\s+(?:-[ugCDhpRTUr]\s+{_TOK}|-{_TOK}))*\s+"
+    rf"|sudo(?:\s+(?:-[ugCDhpRTUr]\s+{_ARG}|-{_TOK}))*\s+"
     rf"|(?:env|nice|ionice|stdbuf)(?:\s+(?:-{_TOK}|\w+=\S*|\d+))*\s+"
     rf"|timeout(?:\s+-{_TOK})*\s+\S+\s+)"
 )
 _CP = rf"(?:^|[;&|({{`])\s*{_WRAP}*(?:[^\s;&|()]*/)?"
-_OPT = rf"(?:-[sn]\s+{_TOK}|-{_TOK})"
+_OPT = rf"(?:-[sn]\s+{_ARG}|-{_TOK})"
 _END = r"(?=\s|$|[;&|)])"
 
 KILL_SHAPES = [
@@ -71,17 +76,25 @@ SHELL_C = re.compile(
 # argument, is unquoted before matching ("pkill" x, kill "-1").
 QUOTED_COMMAND_WORD = re.compile(rf"({_CP})(['\"])(_+)\2", re.M)
 QUOTED_KILL_ARG = re.compile(rf"({_CP}kill(?:\s+[^\s;&|)]+)*?\s+)(['\"])(_+)\2", re.M)
+# Only a plain word is put back. A quoted word holding spaces or shell
+# punctuation is one word to the shell ("pkill x" names no real command), and
+# putting its separators back would show the patterns commands that do not run.
+PLAIN_WORD = re.compile(r"[A-Za-z0-9_./=+:@%,-]+")
 
 
 def _restore_live_words(live: str, original: str) -> str:
     """Put back quoted words that sit where a command or a kill argument goes."""
     for pattern in (QUOTED_COMMAND_WORD, QUOTED_KILL_ARG):
+        pos = 0
         while True:
-            match = pattern.search(live)
+            match = pattern.search(live, pos)
             if match is None:
                 break
             start, end = match.start(3), match.end(3)
             word = original[start:end]
+            pos = end + 1
+            if PLAIN_WORD.fullmatch(word) is None:
+                continue
             # Keep offsets: the quote marks become spaces around the word.
             live = live[: start - 1] + " " + word + " " + live[end + 1 :]
     return live
@@ -89,8 +102,9 @@ def _restore_live_words(live: str, original: str) -> str:
 
 GIT_SHAPES = [
     re.compile(rf"{_CP}git\s+(?:-\S+\s+)*commit\b[^\n;&|]*\s--amend\b", re.M),
-    # The same form the earlier guard refused; `git checkout <ref> -- <path>` runs.
-    re.compile(rf"{_CP}git\s+(?:-\S+\s+)*checkout\s+--(?:\s|$)", re.M),
+    # Both `git checkout -- <path>` and `git checkout <ref> -- <path>`: each
+    # overwrites uncommitted work in those paths, which has lost work before.
+    re.compile(rf"{_CP}git\s+(?:-\S+\s+)*checkout\b[^\n;&|]*\s--(?:\s|$)", re.M),
 ]
 PYTHON_C = re.compile(r"\bpython[0-9.]*\s+(?:-\S+\s+)*-c\b")
 PYTHON_KILL = re.compile(r"\bkillpg\s*\(|\bos\.kill\(\s*(?:-|0\s*[,)])")
@@ -200,7 +214,11 @@ def refusal(command: str, depth: int = 0) -> str | None:
                 return inner
     for shape in GIT_SHAPES:
         if shape.search(live):
-            return "git commit --amend and git checkout -- <path> are refused here."
+            return (
+                "git commit --amend and git checkout [<ref>] -- <path> are refused here: "
+                "the first rewrites a commit, the second overwrites uncommitted work in "
+                "those paths. If you need one, ask the lead integrator."
+            )
     for shape in KILL_SHAPES:
         if shape.search(live):
             return KILL_MESSAGE
