@@ -5,9 +5,9 @@ from __future__ import annotations
 import csv
 import io
 import json
-import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import Barrier, Lock
 
 import httpx
 import pytest
@@ -175,17 +175,20 @@ def test_progress_keeps_visibility_delays_that_precede_slow_run_completion(tmp_p
     operation_id = ""
     message_ack = run_ack = 0.0
     output_reads: list[float] = []
+    clock = _Clock()
+    first_run_reads = Barrier(2, timeout=10)
+    status_started = outputs_started = False
     interval = 0.02
     delay = 0.08
     run_duration = 0.20
     assistant = {"id": "55555555-5555-4555-8555-555555555555", "role": "assistant", "content": "Acknowledged"}
 
     def respond(request: httpx.Request) -> httpx.Response:
-        nonlocal uploaded, user_content, message_ack, run_ack, operation_id
+        nonlocal uploaded, user_content, message_ack, run_ack, operation_id, status_started, outputs_started
         label = request.url.host.split(".")[0]
         path = request.url.path
         headers = {"X-Elspeth-Instance": label}
-        now = time.monotonic()
+        now = clock.now()
         if path == "/api/system/status":
             return httpx.Response(200, json={}, headers=headers)
         if path.endswith("/state"):
@@ -210,6 +213,9 @@ def test_progress_keeps_visibility_delays_that_precede_slow_run_completion(tmp_p
             run_ack = now
             return httpx.Response(202, json={"run_id": RUN}, headers=headers)
         if path.endswith("/outputs"):
+            if not outputs_started:
+                outputs_started = True
+                first_run_reads.wait()
             output_reads.append(now - run_ack)
             artifacts = (
                 []
@@ -220,6 +226,9 @@ def test_progress_keeps_visibility_delays_that_precede_slow_run_completion(tmp_p
         if path.endswith("/content"):
             return httpx.Response(200, content=uploaded, headers=headers)
         assert path == f"/api/runs/{RUN}"
+        if not status_started:
+            status_started = True
+            first_run_reads.wait()
         if label == "b" and delayed_surface == "status" and now - run_ack < delay:
             return httpx.Response(404, json={"detail": "Run not found"}, headers=headers)
         terminal_after = run_duration + (delay if label == "b" and delayed_surface == "terminal" else 0)
@@ -234,9 +243,12 @@ def test_progress_keeps_visibility_delays_that_precede_slow_run_completion(tmp_p
             reader=reader,
             session_id=SESSION,
             capture=Capture(tmp_path / "evidence"),
-            polling=Polling(interval=interval, timeout=30),
+            polling=Polling(interval=interval, timeout=30, clock=clock.now, sleep=clock.sleep),
         )
-    assert decide_cross_replica_progress(observation).outcome == "fail"
+    decision = decide_cross_replica_progress(observation)
+    assert decision.outcome == "fail"
+    reason_surface = "status" if delayed_surface == "terminal" else delayed_surface
+    assert f"{reason_surface}_not_visible_within_one_poll_interval" in decision.reasons
     if delayed_surface == "messages":
         assert observation.messages_visible_after_seconds > interval
     elif delayed_surface == "outputs":
@@ -249,12 +261,15 @@ def test_progress_keeps_visibility_delays_that_precede_slow_run_completion(tmp_p
 class _Clock:
     def __init__(self) -> None:
         self.seconds = 0.0
+        self._lock = Lock()
 
     def now(self) -> float:
-        return self.seconds
+        with self._lock:
+            return self.seconds
 
     def sleep(self, seconds: float) -> None:
-        self.seconds += seconds
+        with self._lock:
+            self.seconds += seconds
 
 
 class _Partition(RoleRevocationPartition):
