@@ -610,6 +610,13 @@ Never use the question dialog tool.
 - A scoped set is: tests for the touched modules, the new tests, ruff and
   mypy on changed files, and every whole-tree gate whose inputs the change
   could alter. State the selection and its exit codes in the HANDOFF.
+- [Lead 2026-11-24] A branch that touches web worker or lifecycle code,
+  `contracts/` or `core/` runs `test_web_landscape_mutation_fencing.py` and
+  the fencing inventory before its HANDOFF. Those gates pin whole files by
+  hash, so a locally green scoped run does not cover them.
+- [Lead 2026-11-24] The integrator runs the whole `tests/unit/architecture`
+  batch on the merged tree before every push of the integration branch, not
+  only the gates the landed branches name.
 - This does not relax AGENTS.md. A change whose effects scoped checks cannot
   bound (shared runtime behaviour, contracts, schemas, plugin registration,
   graph construction, test or scan infrastructure) still gets the full suite
