@@ -58,8 +58,14 @@ PromptFileUnavailable = Literal[
     "changed_since_wired",
     "too_large",
     "not_text",
+    "too_long_to_screen",
 ]
-"""Why the file's facts or text could not be read; the text is then not reviewed."""
+"""Why the file's facts or text could not be read or sent; the text is then not reviewed.
+
+``too_long_to_screen`` is decided where the evidence is rendered, not here:
+the text was read, but as rendered at its prompt position it is one prompt
+guard unit longer than the guard can screen in one piece, so it is not sent.
+"""
 
 PromptFileKey = tuple[UUID, str, str]
 """``(blob id, marker sha256, marker encoding)``: the bytes a marker selects and how they decode."""
