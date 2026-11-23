@@ -403,6 +403,9 @@ _UPSERT_NODE_ROUTING_ONLY_CANONICAL_BYTES = 601
 # get_pipeline_state component description says when the authoring document is refused and what to read
 # instead (0.8.16, +178 B); measured at 146,013 vs 145,835.
 _GET_PIPELINE_STATE_DOCUMENT_REFUSAL_CANONICAL_BYTES = 178
+# get_pipeline_state description says a page under large diagnostics carries a validation summary and where
+# the full diagnostics come from (0.8.16, +190 B); measured at 146,203 vs 146,013.
+_GET_PIPELINE_STATE_VALIDATION_SUMMARY_CANONICAL_BYTES = 190
 _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
     int(_FIXED_SCAFFOLDING_BASELINE_BYTES * 1.10)
     + _POWER_AUTOMATE_CATALOG_CANONICAL_BYTES
@@ -432,6 +435,7 @@ _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
     + _GET_PIPELINE_STATE_WRAP_ANTECEDENT_CANONICAL_BYTES
     + _UPSERT_NODE_ROUTING_ONLY_CANONICAL_BYTES
     + _GET_PIPELINE_STATE_DOCUMENT_REFUSAL_CANONICAL_BYTES
+    + _GET_PIPELINE_STATE_VALIDATION_SUMMARY_CANONICAL_BYTES
 )
 
 

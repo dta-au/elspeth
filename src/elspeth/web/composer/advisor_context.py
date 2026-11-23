@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, cast
 from uuid import UUID
@@ -14,7 +14,7 @@ from pydantic import JsonValue
 
 from elspeth.contracts.credential_material import REDACTED_CREDENTIAL_TEXT, is_secret_field, scrub_credential_material
 from elspeth.contracts.freeze import deep_thaw
-from elspeth.contracts.prompt_guard import PromptGuardContentPart
+from elspeth.contracts.prompt_guard import PROMPT_GUARD_MAX_TEXT_CHARACTERS, PromptGuardContentPart
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.core.templates import TemplateSourceRefusedError, extract_jinja2_fields
@@ -169,8 +169,9 @@ _ADVISOR_UNTRUSTED_SUMMARY_HEADER: Final[str] = (
     "additional_fields_withheld or additional_*_withheld count means that many further "
     "entries exist but are not shown; never FLAG an option, field, or contract merely "
     "because its value or entry is withheld, and never read a withheld entry as absent. "
-    "A prompt shown with text=not_sent is held in a file the user wrote; its text is not shown by design, "
-    "so never FLAG a step or withhold a reply because that text is not shown. "
+    "A prompt shown with text=not_sent is held in a file the user wrote; its text is not shown by design. "
+    "A prompt shown with text=unavailable:too_long_to_screen is too long to screen, so its text is not shown. "
+    "Never FLAG a step or withhold a reply because either text is not shown. "
     "A prompt shown with text=sent is held in a file that is not recorded as the user's own writing; its text follows "
     "and is reviewed "
     "like any inline prompt:"
@@ -867,7 +868,11 @@ def _advisor_query_option_values(
         if isinstance(override, str):
             values.append((f"queries.{label}.template", override, True))
         elif marker is not None:
-            values.extend(_advisor_prompt_file_values(f"queries.{label}.template", prompt_files.file(marker)))
+            values.extend(
+                _advisor_prompt_file_values(
+                    f"queries.{label}.template", prompt_files.file(marker), limits_enforced=prompt_files.screen_limits_enforced
+                )
+            )
         elif override is None:
             if node_template_present:
                 node_template_users.append(label)
@@ -903,15 +908,53 @@ def _advisor_query_option_values(
 
 _ADVISOR_PROMPT_FILE_FACT: Final[str] = "(prompt held in a file: file={file} bytes={size} author={author} text={text})"
 
+# Characters the summary and the prompt guard add around one rendered unit
+# before the guard measures it: the summary's ", " / "options: " / "\n"
+# framing and the guard's "Message <i>, content part <n>:\n" label. 64 covers
+# both with indexes of up to 30 digits between them.
+_ADVISOR_GUARD_UNIT_FRAMING_RESERVE: Final[int] = 64
 
-def _advisor_prompt_file_values(key: str, prompt_file: AdvisorPromptFile) -> list[tuple[str, str, bool]]:
+
+def _advisor_prose_part(key: str, text: str) -> PromptGuardContentPart:
+    """One prose-shaped prompt value as ONE guard unit: the JSON wire text and its decoded inspection text."""
+    return PromptGuardContentPart(f"{key}_untrusted_json={json.dumps(text)}", inspection_text=f'{key}_untrusted_json="{text}"')
+
+
+def _advisor_screenable_prompt_file(key: str, prompt_file: AdvisorPromptFile, *, limits_enforced: bool) -> AdvisorPromptFile:
+    """The file as stated at ``key``: where the guard enforces its limits, its text only when it can be screened in one piece.
+
+    A file's text is rendered as one guard unit (:func:`_advisor_prose_part`),
+    and the guard never splits a unit. Where the guard enforces its character
+    limits (``limits_enforced``, :attr:`AdvisorPromptFiles.screen_limits_enforced`),
+    a unit longer than its per-document limit would make the whole advisor
+    request unscreenable, so such a file is stated
+    ``unavailable:too_long_to_screen`` and its text is not sent. The unit is
+    measured as the guard will read it: its inspection text after the
+    summary's redaction and fence-sentinel neutralisation, plus
+    :data:`_ADVISOR_GUARD_UNIT_FRAMING_RESERVE`. Where the limits are not
+    enforced the text is sent whole, whatever its length. Nothing is cut.
+    """
+    if prompt_file.text is None or not limits_enforced:
+        return prompt_file
+    part = _advisor_prose_part(key, cast(str, _advisor_option_value(prompt_file.text)))
+    inspected = part.inspection_text if part.inspection_text is not None else part.text
+    measured = _neutralize_untrusted_summary_sentinels(_redact_sensitive_content(inspected))
+    if len(measured) + _ADVISOR_GUARD_UNIT_FRAMING_RESERVE <= PROMPT_GUARD_MAX_TEXT_CHARACTERS:
+        return prompt_file
+    return replace(prompt_file, text=None, unavailable="too_long_to_screen")
+
+
+def _advisor_prompt_file_values(key: str, prompt_file: AdvisorPromptFile, *, limits_enforced: bool) -> list[tuple[str, str, bool]]:
     """The structural fact line for a file-held prompt, then its text when sent.
 
     The fact line is server-written: name, size, author and whether the text
     follows. No digest or blob id is shown. The filename is user-controlled and
     stays under the summary's ordinary redaction. Sent text takes the same
     credential policy as an inline prompt (:func:`_advisor_option_value`).
+    Where the guard enforces its limits, text too long to screen at ``key``
+    is stated, not sent (:func:`_advisor_screenable_prompt_file`).
     """
+    prompt_file = _advisor_screenable_prompt_file(key, prompt_file, limits_enforced=limits_enforced)
     fact = _ADVISOR_PROMPT_FILE_FACT.format(
         file=json.dumps(prompt_file.filename) if prompt_file.filename is not None else "unknown",
         size=prompt_file.size_bytes if prompt_file.size_bytes is not None else "unknown",
@@ -991,7 +1034,7 @@ def _node_effective_prompt_templates(node: NodeSpec, prompt_files: AdvisorPrompt
     it was sent (a file not recorded as the user's own writing, read successfully); otherwise
     it is counted in the second value, distinct prompts not analysed.
     """
-    node_text, node_unshown = _advisor_prompt_text(_node_prompt_template_value(node), prompt_files)
+    node_text, node_unshown = _advisor_prompt_text(_node_prompt_template_value(node), prompt_files, key="prompt_template")
     raw_queries = node.options.get("queries")
     if raw_queries is None:
         nested = node.options.get("options")
@@ -1003,7 +1046,7 @@ def _node_effective_prompt_templates(node: NodeSpec, prompt_files: AdvisorPrompt
     templates: list[str] = []
     unshown = 0
     node_template_used = False
-    for _label, entry in entries:
+    for label, entry in entries:
         override = entry.get("template")
         if isinstance(override, str):
             templates.append(override)
@@ -1012,7 +1055,9 @@ def _node_effective_prompt_templates(node: NodeSpec, prompt_files: AdvisorPrompt
             if node_text is not None:
                 templates.append(node_text)
         else:
-            text, file_unshown = _advisor_prompt_text(override, prompt_files)
+            # The renderer states a query under its credential-redacted label.
+            rendered_key = f"queries.{cast(str, _advisor_option_value(label))}.template"
+            text, file_unshown = _advisor_prompt_text(override, prompt_files, key=rendered_key)
             if text is not None:
                 templates.append(text)
             unshown += 1 if file_unshown else 0
@@ -1026,14 +1071,18 @@ def _node_effective_prompt_templates(node: NodeSpec, prompt_files: AdvisorPrompt
     suppresses=("R5",),
     invariant="returns the shown text and whether the value is a file-held prompt whose text is not shown; never raises",
 )
-def _advisor_prompt_text(value: object, prompt_files: AdvisorPromptFiles) -> tuple[str | None, bool]:
-    """A prompt value's shown text, and whether it is a file-held prompt whose text is not shown."""
+def _advisor_prompt_text(value: object, prompt_files: AdvisorPromptFiles, *, key: str) -> tuple[str | None, bool]:
+    """A prompt value's shown text, and whether it is a file-held prompt whose text is not shown.
+
+    ``key`` is the evidence key the value is rendered under, so a file whose
+    text is too long to screen there is not shown here either.
+    """
     if isinstance(value, str):
         return value, False
     marker = inline_content_reference(deep_thaw(value))
     if marker is None:
         return None, False
-    text = prompt_files.file(marker).text
+    text = _advisor_screenable_prompt_file(key, prompt_files.file(marker), limits_enforced=prompt_files.screen_limits_enforced).text
     return text, text is None
 
 
@@ -1485,14 +1534,7 @@ def _render_options_for_advisor_parts(
             if expansion and expansion[0][1] != _ADVISOR_SUMMARY_INVALID_QUERIES_MARKER and complete_entries:
                 for query_key, text, prose_shaped in expansion:
                     if prose_shaped:
-                        value_parts.append(
-                            (
-                                PromptGuardContentPart(
-                                    f"{query_key}_untrusted_json={json.dumps(text)}",
-                                    inspection_text=f'{query_key}_untrusted_json="{text}"',
-                                ),
-                            )
-                        )
+                        value_parts.append((_advisor_prose_part(query_key, text),))
                     else:
                         value_parts.append((PromptGuardContentPart(f"{query_key}={text}"),))
                 authored_entries = _well_formed_query_entries(authored_queries)
@@ -1534,16 +1576,11 @@ def _render_options_for_advisor_parts(
             )
             continue
         if key in _ADVISOR_SUMMARY_PROMPT_VALUE_KEYS and (marker := inline_content_reference(deep_thaw(options[key]))) is not None:
-            for file_key, text, prose_shaped in _advisor_prompt_file_values(display_key, prompt_files.file(marker)):
+            for file_key, text, prose_shaped in _advisor_prompt_file_values(
+                display_key, prompt_files.file(marker), limits_enforced=prompt_files.screen_limits_enforced
+            ):
                 if prose_shaped:
-                    value_parts.append(
-                        (
-                            PromptGuardContentPart(
-                                f"{file_key}_untrusted_json={json.dumps(text)}",
-                                inspection_text=f'{file_key}_untrusted_json="{text}"',
-                            ),
-                        )
-                    )
+                    value_parts.append((_advisor_prose_part(file_key, text),))
                 else:
                     value_parts.append((PromptGuardContentPart(f"{file_key}={text}"),))
         elif key in _ADVISOR_SUMMARY_PROMPT_VALUE_KEYS:

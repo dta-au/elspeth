@@ -38,6 +38,65 @@ changes land and is not a release.
 
 ---
 
+## 0.8.17 - 2026-11-23
+
+A hotfix for 0.8.16: three Web Composer fixes for large pipelines and
+prompts held in files. The session epoch stays at 79 and the Landscape epoch
+at 51, so 0.8.16 session and Landscape stores open unchanged. The dated entry
+does not establish qualification, a published tag or an image.
+
+### Upgrade notes
+
+- **No schema or stored-data change.** No schema epoch changed and no stored
+  data is migrated, reset or rewritten. Existing 0.8.16 session and Landscape
+  stores need no action. This authorizes no migration, reset, restamping or
+  downgrade.
+- **Upgrading from 0.8.15 or earlier: apply the 0.8.16 upgrade notes first.**
+- **Finish interrupted web runs before upgrading.** A web run is bound to the
+  application code it was admitted under, and this release changes that code.
+  A web run admitted under 0.8.16 is refused on resume as
+  `IMPLEMENTATION_CHANGED` (implementation drift): drain in-flight web runs
+  before upgrading, or run them again afterwards. No plugin file changed, so
+  the plugin policy hash is the same as 0.8.16's.
+- **Composer tool description.** The `get_pipeline_state` description gains
+  one sentence, so the planner's fixed prompt grows slightly. The composer
+  still offers 48 tools.
+- **Advisor instructions.** One sentence is added to the advisor's evidence
+  header (below), so the advisor's fixed prompt grows by about 100
+  characters.
+
+### Fixed
+
+- **The planner can read exact state on a large invalid pipeline.**
+  `get_pipeline_state` reads that name a field, a since-start window or a
+  component used to be refused once the pipeline's validation list alone was
+  larger than a page, so the planner could not read the values it needed to
+  repair the pipeline. Such reads now return the exact values with a short
+  validation summary (the error and warning counts and the first few
+  entries). A whole-state read with no arguments is still refused when it
+  does not fit, and its message now tells the planner to name a component.
+- **Saving prompt files in the editor reads each file once.** Saving a node
+  that holds several prompt files re-read every bound file once per file
+  under the session lock. The save now passes the file versions it has
+  already resolved to the approval record, so the work no longer grows with
+  the square of the file count. Approval records are unchanged.
+- **Advisor checks no longer fail on a long prompt file.** Where the prompt
+  guard enforces its per-text character limits (a guard is configured, or the
+  guard mode is `required`), a bound prompt file the user did not write and
+  whose text is too long to screen in one piece made every advisor check
+  fail while the file stayed bound. The advisor is now told that the file is
+  too long to screen (`text=unavailable:too_long_to_screen`) instead of being
+  sent its text, and is instructed never to flag a step or withhold a reply
+  for that reason alone. Where the limits are not enforced, the text is sent
+  as in 0.8.16.
+
+### Publication and acceptance
+
+Automatic image publication from main remains held. The 0.8.17 tag and
+container publication follow successful required checks and the protected
+merge. Operator signing, live-provider acceptance and deployment remain
+separate steps.
+
 ## 0.8.16 - 2026-11-22
 
 Web Composer fixes for large pipelines, long sessions and prompts held in

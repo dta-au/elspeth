@@ -209,6 +209,7 @@ def record_prompt_file_approval(
     request: PromptFileApprovalRequest,
     *,
     now: datetime,
+    resolved_snapshot: PromptReviewSnapshot | None = None,
 ) -> PromptFileApprovalRecord:
     """Record a server-computed approval in the caller's open transaction.
 
@@ -216,9 +217,21 @@ def record_prompt_file_approval(
     session owner, live binding, metadata, actual bytes, and current card
     snapshot before any insert. The editor-save trigger can mint evidence
     without a card event after its byte write has settled in this transaction.
+
+    ``resolved_snapshot`` is the node's snapshot as the caller already
+    resolved it on this connection, in this transaction and under the session
+    lock. When it is given it is used in place of resolving the snapshot again
+    (which reads every file bound on the node); every other check still runs,
+    and the request's own binding is checked against it. An editor save
+    passes the post-save snapshot it resolved once for all of the node's
+    bindings, as :func:`record_prompt_file_card_approvals` reuses its own;
+    re-resolving per binding made one save O(N^2) custody reads. When it is
+    ``None`` the writer resolves the snapshot itself.
     """
     if type(request) is not PromptFileApprovalRequest or type(now) is not datetime:
         raise TypeError("prompt-file approval requires an owned request and datetime")
+    if resolved_snapshot is not None and type(resolved_snapshot) is not PromptReviewSnapshot:
+        raise TypeError("prompt-file approval requires an owned snapshot")
     owner = conn.execute(select(sessions_table.c.user_id).where(sessions_table.c.id == str(request.session_id))).scalar_one_or_none()
     if owner != request.actor_user_id:
         raise PromptFileApprovalStale()
@@ -229,7 +242,12 @@ def record_prompt_file_approval(
     marker = _binding_marker(options, request.field_path)
     if marker.blob_id != request.blob_id or marker.sha256 != request.content_sha256:
         raise PromptFileApprovalStale()
-    snapshot = _current_snapshot(conn, request, options)
+    if resolved_snapshot is None:
+        snapshot = _current_snapshot(conn, request, options)
+    elif resolved_snapshot.session_id != request.session_id or resolved_snapshot.node_id != request.node_id:
+        raise PromptFileApprovalStale()
+    else:
+        snapshot = resolved_snapshot
     selected = next((binding for binding in snapshot.bindings if binding.field_path == request.field_path), None)
     if selected is None or selected.blob_id != request.blob_id or selected.content_sha256 != request.content_sha256:
         raise PromptFileApprovalStale()
