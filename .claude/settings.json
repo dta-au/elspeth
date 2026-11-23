@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "f=\"$CLAUDE_PROJECT_DIR/.claude/hooks/session-start-integration-book.sh\"; [ -f \"$f\" ] && bash \"$f\" || exit 0"
+            "command": "f=\"$CLAUDE_PROJECT_DIR/.claude/hooks/session-start-integration-book.sh\"; if [ -f \"$f\" ]; then sh \"$f\"; fi; exit 0"
           }
         ]
       }
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "f=\"$CLAUDE_PROJECT_DIR/.claude/hooks/bash-guard.sh\"; [ -f \"$f\" ] || { echo \"BLOCKED: $f is missing, so the Bash guard cannot run. Restore it (git checkout of .claude/hooks/bash-guard.sh) before running shell commands.\" >&2; exit 2; }; bash \"$f\""
+            "command": "f=\"$CLAUDE_PROJECT_DIR/.claude/hooks/bash_guard.py\"; if [ -f \"$f\" ]; then python3 -I \"$f\"; else echo \"WARNING: $f is missing, so this command ran without the Bash guard. Tell the lead integrator; restore the file with the Write tool from the copy on the integration branch.\" >&2; exit 1; fi"
           }
         ]
       }
