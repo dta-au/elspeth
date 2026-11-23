@@ -1134,7 +1134,9 @@ def test_pipeline_dispatch_binding_reads_pre_upgrade_stored_text() -> None:
 
 def test_pre_upgrade_raw_reserved_mapping_hash_differs_from_stored_hash() -> None:
     pre_upgrade_hash = "a87b90e83d104a5fdabd58720c274ce0cf9fd1660ab73256931fb24c4bf18ff2"
-    assert semantic_redacted_pipeline_arguments_hash({"__elspeth_canonical_type__": {"literal": True}}) != pre_upgrade_hash
+    current_hash = "5530f965a45087df67e62bf18589bca5b4fd045e219e534dc4db0d27b4eec4b4"
+    assert semantic_redacted_pipeline_arguments_hash({"__elspeth_canonical_type__": {"literal": True}}) == current_hash
+    assert current_hash != pre_upgrade_hash
 
 
 @pytest.mark.asyncio
@@ -1167,7 +1169,9 @@ async def test_settlement_refuses_pre_upgrade_hash_for_reserved_mapping(service:
     with pytest.raises(AuditIntegrityError, match="arguments do not match"):
         await service.settle_pipeline_composition_proposal(**_settlement_kwargs(session_id, row.id, plan, binding))
 
-    assert semantic_redacted_pipeline_arguments_hash(_redacted_pipeline(arguments)) != pre_upgrade_hash
+    current_hash = "de0f1f3fecab7b48fe74c93bcd5185d87725225a8b439ea8ab387beed4655e8c"
+    assert semantic_redacted_pipeline_arguments_hash(_redacted_pipeline(arguments)) == current_hash
+    assert current_hash != pre_upgrade_hash
 
 
 @pytest.mark.asyncio

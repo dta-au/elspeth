@@ -34,7 +34,7 @@ from sqlalchemy import insert, select, update
 
 from elspeth.contracts import ResumeCheck
 from elspeth.contracts.coordination import WorkerMembershipToken, mint_worker_id
-from elspeth.contracts.errors import JoinRefusedError
+from elspeth.contracts.errors import JoinNotReadyError, JoinRefusedError
 from elspeth.contracts.hashing import CANONICAL_VERSION
 from elspeth.core.landscape import run_coordination_repository as coordination_module
 from elspeth.core.landscape.database import LandscapeDB
@@ -48,7 +48,7 @@ from elspeth.core.landscape.schema import (
 )
 from elspeth.engine.orchestrator.core import Orchestrator
 from tests.fixtures.audit_hashing import fake_sha256
-from tests.fixtures.landscape import expire_leader_seat, make_landscape_db
+from tests.fixtures.landscape import expire_leader_seat, make_landscape_db, make_recorder_with_run
 from tests.helpers.state_engine import capture_state_engine_image
 
 # ---------------------------------------------------------------------------
@@ -70,7 +70,7 @@ _PATCH_HASH_SENTINEL = patch("elspeth.engine.orchestrator.join_admission.stable_
 _JOIN_INPUTS = {"config": types.SimpleNamespace(), "graph": types.SimpleNamespace(get_edges=lambda: [object()])}
 
 
-@pytest.fixture(autouse=True)
+@pytest.fixture
 def _registered_graph_baseline() -> object:
     with (
         patch.object(DataFlowReadRepository, "get_edges", return_value=[object()]),
@@ -152,11 +152,23 @@ def _coord_events(db: LandscapeDB, run_id: str = RUN_ID) -> list[dict[str, objec
     return [dict(r) for r in rows]
 
 
+class TestJoinRealReadiness:
+    """Exercise the recorded graph through the read-only Landscape repository."""
+
+    def test_live_leader_waits_for_recorded_edges(self) -> None:
+        setup = make_recorder_with_run(run_id=RUN_ID, leader_worker_id=f"worker:{RUN_ID}:leader")
+        with _PATCH_RESOLVE, pytest.raises(JoinNotReadyError, match="not finished registering its graph"):
+            _orchestrator(setup.db).join_run(run_id=RUN_ID, settings=types.SimpleNamespace(), **_JOIN_INPUTS)
+        assert [row for row in _worker_rows(setup.db) if row["role"] == "follower"] == []
+        setup.db.close()
+
+
 # ---------------------------------------------------------------------------
 # §H test #2(b): happy path — test_join_attaches_follower_to_running_run
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("_registered_graph_baseline")
 class TestJoinAdmissionHappyPath:
     """§H contract (b): join_run attaches a follower to a RUNNING run."""
 
@@ -212,6 +224,7 @@ class TestJoinAdmissionHappyPath:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("_registered_graph_baseline")
 class TestJoinAdmissionRefusals:
     """Four refusal arms: terminal run, config_hash mismatch, dead/vacant seat,
     filesystem permission failure."""
@@ -422,6 +435,7 @@ class TestJoinAdmissionRefusals:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("_registered_graph_baseline")
 class TestJoinAdmissionAtomicity:
     """Admission is atomic: a refused join leaves ZERO mutation in the DB."""
 
@@ -468,6 +482,7 @@ class TestJoinAdmissionAtomicity:
         assert _coord_events(db) == events_before
 
 
+@pytest.mark.usefixtures("_registered_graph_baseline")
 class TestSeatLivenessBoundary:
     """ADR-047: admission decides ``leader_heartbeat_expires_at >= database_now`` on the Landscape clock.
 

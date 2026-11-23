@@ -532,21 +532,36 @@ class TestJoinRunAdmissionRefusals:
         _assert_no_follower_mutation(setup, run_id=setup.run_id, seat_before=seat_before)
         setup.db.close()
 
-    def test_join_refused_on_plugin_implementation_difference(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize("mismatch", ["source_file_hash", "node_set", "plugin_version", "determinism"])
+    def test_join_refused_on_plugin_implementation_difference(self, tmp_path: Path, mismatch: str) -> None:
         crashed = _run_to_interrupted_checkpoint(tmp_path, MockClock(start=_T0))
         _seat_run_with_live_leader(crashed, leader_id=f"worker:{crashed.run_id}:leader-implementation")
-        with crashed.db.engine.begin() as conn:
-            conn.execute(
-                update(nodes_table)
-                .where(nodes_table.c.run_id == crashed.run_id, nodes_table.c.node_id == crashed.source_node_id)
-                .values(source_file_hash="sha256:0000000000000000")
-            )
+        if mismatch == "node_set":
+            register_test_node(crashed.factory.data_flow, crashed.run_id, "extra-test-node")
+        else:
+            changed_value = {
+                "source_file_hash": "sha256:0000000000000000",
+                "plugin_version": "test-mismatch",
+                "determinism": "seeded",
+            }[mismatch]
+            with crashed.db.engine.begin() as conn:
+                current_value = conn.execute(
+                    select(nodes_table.c[mismatch]).where(
+                        nodes_table.c.run_id == crashed.run_id, nodes_table.c.node_id == crashed.source_node_id
+                    )
+                ).scalar_one()
+                assert current_value != changed_value
+                conn.execute(
+                    update(nodes_table)
+                    .where(nodes_table.c.run_id == crashed.run_id, nodes_table.c.node_id == crashed.source_node_id)
+                    .values({mismatch: changed_value})
+                )
         seat_before = _coordination_row(crashed.db, crashed.run_id)
         db_hash = _get_db_config_hash(crashed)
         with (
             patch("elspeth.engine.orchestrator.join_admission.resolve_config", return_value={}),
             patch("elspeth.engine.orchestrator.join_admission.stable_hash", return_value=db_hash),
-            pytest.raises(JoinRefusedError, match="Plugin implementation"),
+            pytest.raises(JoinRefusedError, match="different node set" if mismatch == "node_set" else "Plugin implementation changed"),
         ):
             _orchestrator(crashed).join_run(run_id=crashed.run_id, settings=types.SimpleNamespace(), **_join_inputs())
         _assert_no_follower_mutation(crashed, run_id=crashed.run_id, seat_before=seat_before)
@@ -632,6 +647,7 @@ class TestJoinRunAdmissionRefusals:
         crashed.db.close()
 
     def test_join_config_hash_reason_precedes_graph_readiness(self) -> None:
+        """Base-green control: a config mismatch retains the admission transaction's reason."""
         setup = make_recorder_with_run(
             run_id="run-join-config-order",
             canonical_version=CANONICAL_VERSION,
@@ -649,6 +665,7 @@ class TestJoinRunAdmissionRefusals:
         setup.db.close()
 
     def test_join_status_reason_precedes_graph_readiness(self) -> None:
+        """Base-green control: a terminal run retains the admission transaction's reason."""
         setup = make_recorder_with_run(
             run_id="run-join-status-order",
             canonical_version=CANONICAL_VERSION,

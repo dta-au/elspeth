@@ -64,7 +64,7 @@ def test_cli_run_records_current_constant(tmp_path: Path, monkeypatch: pytest.Mo
     assert version == (_PATCHED_VERSION,)
 
 
-def test_follower_orchestrator_uses_current_constant(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_orchestrator_initializes_with_current_constant(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(hashing, "CANONICAL_VERSION", _PATCHED_VERSION)
     db = LandscapeDB("sqlite:///:memory:")
     try:
