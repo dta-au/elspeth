@@ -54,7 +54,8 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: Promp
   // never the list index the slot path uses.
   const slotLabel = queryName === undefined ? optionLabel(fieldPath) : `User prompt, query ${queryName}`;
   const sessionId = useSessionStore((state) => state.activeSessionId);
-  const filenameLoading = useBlobStore((state) => state.activeSessionId !== sessionId || state.isLoading);
+  const filenameLoading = useBlobStore((state) => sessionId === null || state.activeSessionId !== sessionId || state.isLoading);
+  const listError = useBlobStore((state) => state.activeSessionId === sessionId ? state.listError : null);
   const blobSessionId = useBlobStore((state) => state.activeSessionId);
   const blobs = useBlobStore((state) => state.blobs);
   // The file's hash as the file list last reported it. A change that is not
@@ -313,7 +314,8 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: Promp
   const refusalId = `${fieldId}-refusal`;
   const hintId = `${fieldId}-hint`;
   const staleId = `${fieldId}-stale`;
-  const shownName = filename ?? (filenameLoading ? "Loading file name…" : "File not in this session");
+  const shownName = filename ?? (filenameLoading ? "Loading file name…"
+    : listError !== null ? "File name unavailable" : "File not in this session");
   const loading = text === null && status?.tone !== "error";
   const dirty = draft !== undefined;
   // Why Save is disabled when the server would not refuse: said in one line

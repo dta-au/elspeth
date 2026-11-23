@@ -93,7 +93,7 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
     () => new Set(blobs.filter((blob) => attached.has(blob.id.toLowerCase())).map((blob) => blob.id.toLowerCase())),
     [attached, blobs],
   );
-  const missingCount = !isLoading && listBelongsToSession ? attached.size - matchedIds.size : 0;
+  const missingCount = !isLoading && listBelongsToSession && listError === null ? attached.size - matchedIds.size : 0;
   const promptBindings = useMemo(() => promptFileBindings(compositionState), [compositionState]);
   const wireFile = pendingWire ? blobs.find((blob) => blob.id === pendingWire.blob.id) : undefined;
   const wiringDisabledReason = !composeReady ? COMPOSE_LOADING_SESSION_MESSAGE
@@ -299,7 +299,7 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
       </div>
 
       <p ref={statusRef} tabIndex={-1} className="blob-manager-attached-summary" role="status" aria-live="polite">
-        {missingRevealName ? `${missingRevealName} is no longer in this session` : selectedNodeId && attached.size > 0 && listBelongsToSession ? <>
+        {missingRevealName ? `${missingRevealName} is no longer in this session` : selectedNodeId && attached.size > 0 && listBelongsToSession && listError === null ? <>
           {isLoading ? `Checking files used by ${selectedNodeId}` : `${matchedIds.size} ${matchedIds.size === 1 ? "file" : "files"} used by ${selectedNodeId}`}
           {missingCount > 0 && ` · ${missingCount} attached ${missingCount === 1 ? "file is" : "files are"} not in this session`}
           {focusedBlobId && blobs.find((blob) => blob.id.toLowerCase() === focusedBlobId.toLowerCase()) && ` · Showing ${blobs.find((blob) => blob.id.toLowerCase() === focusedBlobId.toLowerCase())?.filename}.`}

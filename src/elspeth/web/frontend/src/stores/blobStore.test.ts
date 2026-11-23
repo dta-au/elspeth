@@ -345,6 +345,142 @@ describe("blobStore", () => {
     expect(useBlobStore.getState()).toMatchObject({ ...listState, error: "Download failed." });
   });
 
+  describe("list refresh after mutations", () => {
+    it.each(["upload", "delete"] as const)("replaces a pending Retry after a successful %s", async (action) => {
+      const retryResult = deferred<BlobMetadata[]>();
+      const refreshResult = deferred<BlobMetadata[]>();
+      const target = makeBlob({ id: "target" });
+      const existing = makeBlob({ id: "existing" });
+      const { listBlobs, uploadBlob, deleteBlob } = await import("@/api/client");
+      vi.mocked(listBlobs)
+        .mockResolvedValueOnce([target])
+        .mockRejectedValueOnce(new Error("Network error"))
+        .mockReturnValueOnce(retryResult.promise)
+        .mockReturnValueOnce(refreshResult.promise);
+      const store = useBlobStore.getState();
+      await store.loadBlobs("session-1");
+      await store.loadBlobs("session-1");
+      expect(useBlobStore.getState().listLoadFailed).toBe(true);
+
+      const retry = store.loadBlobs("session-1");
+      let refreshed: BlobMetadata[];
+      if (action === "upload") {
+        const uploaded = makeBlob({ id: "uploaded" });
+        vi.mocked(uploadBlob).mockResolvedValueOnce(uploaded);
+        await store.uploadBlob("session-1", new File(["content"], "new.csv"));
+        expect(useBlobStore.getState().blobs).toEqual([uploaded, target]);
+        refreshed = [uploaded, existing, target];
+      } else {
+        vi.mocked(deleteBlob).mockResolvedValueOnce(undefined);
+        await store.deleteBlob("session-1", target.id);
+        expect(useBlobStore.getState().blobs).toEqual([]);
+        refreshed = [existing];
+      }
+
+      expect(useBlobStore.getState().isLoading).toBe(true);
+      refreshResult.resolve(refreshed);
+      await refreshResult.promise;
+      expect(useBlobStore.getState()).toMatchObject({
+        blobs: refreshed, isLoading: false, listError: null, listLoadFailed: false,
+      });
+
+      retryResult.resolve([target]);
+      await retry;
+      expect(useBlobStore.getState().blobs).toEqual(refreshed);
+    });
+
+    it("adds one list request for an upload only when a read is pending", async () => {
+      const pendingList = deferred<BlobMetadata[]>();
+      const refresh = deferred<BlobMetadata[]>();
+      const first = makeBlob({ id: "first" });
+      const second = makeBlob({ id: "second" });
+      const { listBlobs, uploadBlob } = await import("@/api/client");
+      vi.mocked(listBlobs).mockReturnValueOnce(pendingList.promise).mockReturnValueOnce(refresh.promise);
+      vi.mocked(uploadBlob).mockResolvedValueOnce(first).mockResolvedValueOnce(second);
+      const store = useBlobStore.getState();
+      const file = new File(["content"], "new.csv");
+
+      await store.uploadBlob("session-1", file);
+      expect(listBlobs).not.toHaveBeenCalled();
+
+      const read = store.loadBlobs("session-1");
+      expect(listBlobs).toHaveBeenCalledTimes(1);
+      await store.uploadBlob("session-1", file);
+      expect(listBlobs).toHaveBeenCalledTimes(2);
+      expect(listBlobs).toHaveBeenLastCalledWith("session-1");
+
+      pendingList.resolve([first]);
+      await read;
+      refresh.resolve([second, first]);
+      await refresh.promise;
+      expect(listBlobs).toHaveBeenCalledTimes(2);
+    });
+
+    it("keeps a delete refusal while an overlapping upload refreshes the list", async () => {
+      const pendingList = deferred<BlobMetadata[]>();
+      const refresh = deferred<BlobMetadata[]>();
+      const pendingUpload = deferred<BlobMetadata>();
+      const uploaded = makeBlob({ id: "uploaded" });
+      const detail = "This file is still attached.";
+      const { listBlobs, uploadBlob, deleteBlob } = await import("@/api/client");
+      vi.mocked(listBlobs).mockReturnValueOnce(pendingList.promise).mockReturnValueOnce(refresh.promise);
+      vi.mocked(uploadBlob).mockReturnValueOnce(pendingUpload.promise);
+      vi.mocked(deleteBlob).mockRejectedValueOnce({ status: 409, detail });
+      const store = useBlobStore.getState();
+
+      const upload = store.uploadBlob("session-1", new File(["content"], "new.csv"));
+      const read = store.loadBlobs("session-1");
+      // Both starts clear error, so let the refusal land after both have started.
+      await store.deleteBlob("session-1", "blob-1");
+      expect(useBlobStore.getState().error).toBe(detail);
+
+      pendingUpload.resolve(uploaded);
+      await upload;
+      expect(useBlobStore.getState()).toMatchObject({ isLoading: true, error: detail });
+      pendingList.resolve([]);
+      await read;
+      const refreshed = [uploaded, makeBlob()];
+      refresh.resolve(refreshed);
+      await refresh.promise;
+      expect(useBlobStore.getState()).toMatchObject({ blobs: refreshed, isLoading: false, error: detail });
+    });
+
+    it("replaces the list once per overlapping upload and stops after the final refresh", async () => {
+      const pendingList = deferred<BlobMetadata[]>();
+      const firstRefresh = deferred<BlobMetadata[]>();
+      const finalRefresh = deferred<BlobMetadata[]>();
+      const first = makeBlob({ id: "first" });
+      const second = makeBlob({ id: "second" });
+      const { listBlobs, uploadBlob } = await import("@/api/client");
+      vi.mocked(listBlobs)
+        .mockReturnValueOnce(pendingList.promise)
+        .mockReturnValueOnce(firstRefresh.promise)
+        .mockReturnValueOnce(finalRefresh.promise);
+      vi.mocked(uploadBlob).mockResolvedValueOnce(first).mockResolvedValueOnce(second);
+      const store = useBlobStore.getState();
+      const file = new File(["content"], "new.csv");
+
+      const read = store.loadBlobs("session-1");
+      await store.uploadBlob("session-1", file);
+      expect(useBlobStore.getState().isLoading).toBe(true);
+      expect(listBlobs).toHaveBeenCalledTimes(2);
+      await store.uploadBlob("session-1", file);
+      expect(useBlobStore.getState().isLoading).toBe(true);
+      expect(listBlobs).toHaveBeenCalledTimes(3);
+
+      const refreshed = [second, first];
+      finalRefresh.resolve(refreshed);
+      await finalRefresh.promise;
+      firstRefresh.resolve([first]);
+      await firstRefresh.promise;
+      pendingList.resolve([]);
+      await read;
+
+      expect(useBlobStore.getState()).toMatchObject({ blobs: refreshed, isLoading: false });
+      expect(listBlobs).toHaveBeenCalledTimes(3);
+    });
+  });
+
   describe("uploadBlob", () => {
     it("uploads and prepends blob to existing list", async () => {
       const existing = makeBlob({ id: "blob-old" });
@@ -388,32 +524,6 @@ describe("blobStore", () => {
       await upload;
 
       expect(useBlobStore.getState().blobs).toEqual([uploadedBlob]);
-    });
-
-    it("preserves a completed upload when an older list request resolves last", async () => {
-      const staleList = deferred<BlobMetadata[]>();
-      const staleBlob = makeBlob({ id: "blob-stale", filename: "stale.csv" });
-      const uploadedBlob = makeBlob({
-        id: "blob-uploaded",
-        filename: "uploaded.csv",
-      });
-      const { listBlobs, uploadBlob } = await import("@/api/client");
-      (listBlobs as ReturnType<typeof vi.fn>).mockReturnValue(staleList.promise);
-      (uploadBlob as ReturnType<typeof vi.fn>).mockResolvedValue(uploadedBlob);
-
-      const load = useBlobStore.getState().loadBlobs("session-1");
-      const file = new File(["content"], "uploaded.csv", { type: "text/csv" });
-      await useBlobStore.getState().uploadBlob("session-1", file);
-
-      expect(useBlobStore.getState().blobs).toEqual([uploadedBlob]);
-
-      staleList.resolve([staleBlob]);
-      await load;
-
-      const state = useBlobStore.getState();
-      expect(state.blobs).toEqual([uploadedBlob]);
-      expect(state.isLoading).toBe(false);
-      expect(state.error).toBeNull();
     });
 
     it("lets a new session load win over an older session upload success", async () => {
@@ -562,28 +672,6 @@ describe("blobStore", () => {
       expect(state.blobs[0].id).toBe("blob-2");
     });
 
-    it("preserves a completed deletion when an older list request resolves last", async () => {
-      const staleList = deferred<BlobMetadata[]>();
-      const deletedBlob = makeBlob({ id: "blob-deleted" });
-      useBlobStore.setState({ blobs: [deletedBlob] });
-      const { listBlobs, deleteBlob } = await import("@/api/client");
-      (listBlobs as ReturnType<typeof vi.fn>).mockReturnValue(staleList.promise);
-      (deleteBlob as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
-
-      const load = useBlobStore.getState().loadBlobs("session-1");
-      await useBlobStore.getState().deleteBlob("session-1", deletedBlob.id);
-
-      expect(useBlobStore.getState().blobs).toEqual([]);
-
-      staleList.resolve([deletedBlob]);
-      await load;
-
-      const state = useBlobStore.getState();
-      expect(state.blobs).toEqual([]);
-      expect(state.isLoading).toBe(false);
-      expect(state.error).toBeNull();
-    });
-
     it("lets a new session load win over an older session deletion success", async () => {
       const sessionBList = deferred<BlobMetadata[]>();
       const deleteAResult = deferred<void>();
@@ -666,9 +754,32 @@ describe("blobStore", () => {
         "Failed to delete file.",
       );
     });
+
+    it("falls back to a generic delete failure when the refusal detail is empty", async () => {
+      const { deleteBlob } = await import("@/api/client");
+      vi.mocked(deleteBlob).mockRejectedValueOnce({ status: 409, detail: "" });
+      await useBlobStore.getState().deleteBlob("session-1", "blob-1");
+      expect(useBlobStore.getState().error).toBe("Failed to delete file.");
+    });
   });
 
   describe("downloadBlob", () => {
+    it.each(["session-b", "session-a"] as const)("drops a download failure after switching away from A and ending in %s", async (activeSessionId) => {
+      const { downloadBlobContent } = await import("@/api/client");
+      const result = deferred<Awaited<ReturnType<typeof downloadBlobContent>>>();
+      vi.mocked(downloadBlobContent).mockReturnValueOnce(result.promise);
+      const store = useBlobStore.getState();
+      store.activateSession("session-a");
+      const download = store.downloadBlob("session-a", "blob-1");
+      store.activateSession("session-b");
+      store.activateSession(activeSessionId);
+
+      result.reject(new Error("Network error"));
+      await download;
+
+      expect(useBlobStore.getState()).toMatchObject({ activeSessionId, error: null });
+    });
+
     it("triggers browser download via object URL", async () => {
       const fakeBlob = new Blob(["data"], { type: "text/csv" });
       const { downloadBlobContent } = await import("@/api/client");

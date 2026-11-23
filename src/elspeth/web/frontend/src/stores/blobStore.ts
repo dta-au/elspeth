@@ -138,6 +138,43 @@ interface BlobMutationOwnership {
   ownsStore: boolean;
 }
 
+async function refreshBlobList(sessionId: string, publishError: boolean): Promise<void> {
+  const requestSeq = ++blobLoadRequestSeq;
+  const set = useBlobStore.setState;
+  set({
+    isLoading: true,
+    listError: null,
+    listLoadFailed: false,
+    ...(publishError ? { error: null } : {}),
+  });
+  try {
+    const blobs = await api.listBlobs(sessionId);
+    if (requestSeq !== blobLoadRequestSeq) return;
+    set({ blobs, listError: null, isLoading: false });
+  } catch (err) {
+    if (requestSeq !== blobLoadRequestSeq) return;
+    if (err instanceof BlobListTruncatedError) {
+      // Past the client's ceiling: show the newest files and say that
+      // older ones are not listed, instead of dropping them silently.
+      set({
+        blobs: err.blobs,
+        listError: err.message,
+        listLoadFailed: false,
+        isLoading: false,
+        ...(publishError ? { error: err.message } : {}),
+      });
+      return;
+    }
+    const message = "Failed to load files.";
+    set({
+      listError: message,
+      listLoadFailed: true,
+      isLoading: false,
+      ...(publishError ? { error: message } : {}),
+    });
+  }
+}
+
 export const useBlobStore = create<BlobState>((set, get) => ({
   ...initialState,
   // Not part of initialState: hosts are mounted components, so reset() on
@@ -233,33 +270,8 @@ export const useBlobStore = create<BlobState>((set, get) => ({
 
   async loadBlobs(sessionId: string) {
     get().activateSession(sessionId);
-    const requestSeq = ++blobLoadRequestSeq;
-    set({ isLoading: true, error: null, listError: null, listLoadFailed: false });
-    try {
-      const blobs = await api.listBlobs(sessionId);
-      if (requestSeq !== blobLoadRequestSeq) {
-        return;
-      }
-      set({ blobs, listError: null, isLoading: false });
-    } catch (err) {
-      if (requestSeq !== blobLoadRequestSeq) {
-        return;
-      }
-      if (err instanceof BlobListTruncatedError) {
-        // Past the client's ceiling: show the newest files and say that
-        // older ones are not listed, instead of dropping them silently.
-        set({
-          blobs: err.blobs,
-          error: err.message,
-          listError: err.message,
-          listLoadFailed: false,
-          isLoading: false,
-        });
-        return;
-      }
-      const message = "Failed to load files.";
-      set({ error: message, listError: message, listLoadFailed: true, isLoading: false });
-    }
+    // Explicit reads still mirror list errors into the shared banner state.
+    await refreshBlobList(sessionId, true);
   },
 
   async uploadBlob(
@@ -292,11 +304,15 @@ export const useBlobStore = create<BlobState>((set, get) => ({
       ) {
         return blob;
       }
-      blobLoadRequestSeq++;
+      const refreshNeeded = current.isLoading;
+      const mutationSeq = ++blobLoadRequestSeq;
+      // Keep loading set until the replacement read settles.
       set((state) => ({
         blobs: [blob, ...state.blobs.filter((item) => item.id !== blob.id)],
-        isLoading: false,
       }));
+      if (refreshNeeded && mutationSeq === blobLoadRequestSeq) {
+        void refreshBlobList(sessionId, false);
+      }
       return blob;
     } catch (err) {
       const detail = uploadRefusalMessage(err);
@@ -336,13 +352,16 @@ export const useBlobStore = create<BlobState>((set, get) => ({
       ) {
         return;
       }
-      blobLoadRequestSeq++;
+      const refreshNeeded = current.isLoading;
+      const mutationSeq = ++blobLoadRequestSeq;
       set((state) => ({
         blobs: state.blobs.filter((b) => b.id !== blobId),
-        isLoading: false,
       }));
+      if (refreshNeeded && mutationSeq === blobLoadRequestSeq) {
+        void refreshBlobList(sessionId, false);
+      }
     } catch (err) {
-      const detail = (err as ApiError).detail ?? "Failed to delete file.";
+      const detail = (err as ApiError).detail || "Failed to delete file.";
       const current = get();
       if (
         ownership.ownsStore &&
@@ -355,6 +374,12 @@ export const useBlobStore = create<BlobState>((set, get) => ({
   },
 
   async downloadBlob(sessionId: string, blobId: string) {
+    const ownerState = get();
+    const ownership: BlobMutationOwnership = {
+      sessionId,
+      ownerEpoch: ownerState.activationEpoch,
+      ownsStore: ownerState.activeSessionId === sessionId,
+    };
     try {
       const { data, filename } = await api.downloadBlobContent(
         sessionId,
@@ -370,7 +395,14 @@ export const useBlobStore = create<BlobState>((set, get) => ({
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
     } catch {
-      set({ error: "Download failed." });
+      const current = get();
+      if (
+        ownership.ownsStore &&
+        current.activeSessionId === ownership.sessionId &&
+        current.activationEpoch === ownership.ownerEpoch
+      ) {
+        set({ error: "Download failed." });
+      }
     }
   },
 

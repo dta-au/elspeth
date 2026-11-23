@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach, onTestFinished } from 
 import { render, screen, within, act, fireEvent, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import * as api from "@/api/client";
+import { BlobListTruncatedError } from "@/api/blobListing";
 import { useBlobStore } from "@/stores/blobStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { BlobManager } from "./BlobManager";
@@ -104,6 +105,50 @@ describe("BlobManager selected-node highlighting", () => {
     expect(screen.getByRole("status")).toHaveTextContent("1 attached file is not in this session");
     act(() => useBlobStore.setState({ isLoading: true }));
     expect(screen.queryByText(/attached file is not in this session/)).not.toBeInTheDocument();
+  });
+
+  it("leaves the selected node's attachment summary empty after a failed list read", async () => {
+    setBlobState([]);
+    const list = vi.spyOn(api, "listBlobs").mockRejectedValueOnce(new Error("Network error"));
+    onTestFinished(() => {
+      list.mockRestore();
+      useBlobStore.getState().reset();
+    });
+    useBlobStore.setState({ loadBlobs: useBlobStore.getInitialState().loadBlobs });
+    render(<BlobManager onUseAsInput={vi.fn()} />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Failed to load files.");
+    expect(screen.getByRole("status")).toBeEmptyDOMElement();
+  });
+
+  it.each(["upload", "delete"] as const)("keeps the truncation notice and hides attachment counts after a successful %s", async (action) => {
+    setBlobState([]);
+    const listedBlob = makeBlob({ id: "one", filename: "system.txt" });
+    const truncation = new BlobListTruncatedError([listedBlob]);
+    const list = vi.spyOn(api, "listBlobs").mockRejectedValueOnce(truncation);
+    const upload = vi.spyOn(api, "uploadBlob").mockResolvedValueOnce(makeBlob({ id: "uploaded", filename: "new.csv" }));
+    const deleteBlob = vi.spyOn(api, "deleteBlob").mockResolvedValueOnce(undefined);
+    onTestFinished(() => {
+      list.mockRestore();
+      upload.mockRestore();
+      deleteBlob.mockRestore();
+      useBlobStore.getState().reset();
+    });
+    useBlobStore.setState({ loadBlobs: useBlobStore.getInitialState().loadBlobs });
+    render(<BlobManager onUseAsInput={vi.fn()} />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(truncation.message);
+    await act(async () => {
+      const store = useBlobStore.getState();
+      if (action === "upload") {
+        await store.uploadBlob("session-1", new File(["content"], "new.csv"));
+      } else {
+        await store.deleteBlob("session-1", listedBlob.id);
+      }
+    });
+
+    expect(screen.getByRole("alert")).toHaveTextContent(truncation.message);
+    expect(screen.getByRole("status")).toBeEmptyDOMElement();
   });
 
   it("counts a file used by two slots once and lists both slots", () => {
@@ -441,6 +486,30 @@ describe("BlobManager upload affordance (elspeth-29eef452a8)", () => {
     }
     expect(within(alert).getByRole("button", { name: "Retry" })).toBeInTheDocument();
     expect(screen.getByText("Files", { selector: ".blob-manager-title" })).toBeInTheDocument();
+  });
+
+  it("renders the failed list message before the fallback delete refusal on separate lines", async () => {
+    setBlobState([makeBlob()]);
+    const list = vi.spyOn(api, "listBlobs").mockRejectedValueOnce(new Error("Network error"));
+    const deleteBlob = vi.spyOn(api, "deleteBlob").mockRejectedValueOnce({ status: 409, detail: "" });
+    onTestFinished(() => {
+      list.mockRestore();
+      deleteBlob.mockRestore();
+      useBlobStore.getState().reset();
+    });
+    useBlobStore.setState({ loadBlobs: useBlobStore.getInitialState().loadBlobs });
+    render(<BlobManager onUseAsInput={vi.fn()} />);
+    const alert = await screen.findByRole("alert");
+    const listMessage = within(alert).getByText("Failed to load files.");
+
+    await act(async () => {
+      await useBlobStore.getState().deleteBlob("session-1", "blob-1");
+    });
+
+    const refusalMessage = within(alert).getByText("Failed to delete file.");
+    expect(listMessage.nextElementSibling).toBe(refusalMessage);
+    expect(listMessage).toHaveStyle({ display: "block" });
+    expect(refusalMessage).toHaveStyle({ display: "block" });
   });
 
   it("closes from a design-system button at the end of the header", async () => {

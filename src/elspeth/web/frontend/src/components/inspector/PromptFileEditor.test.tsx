@@ -1,6 +1,8 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, expect, it, vi } from "vitest";
-import { fetchCompositionState, readPromptFileText, savePromptFile } from "@/api/client";
+import { fetchCompositionState, listBlobs, readPromptFileText, savePromptFile } from "@/api/client";
+import { BlobListTruncatedError } from "@/api/blobListing";
+import { makeSessionBlobs } from "@/test/blobListRouteDouble";
 import { useBlobStore } from "@/stores/blobStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import type { BlobMetadata } from "@/types/api";
@@ -18,6 +20,7 @@ function PromptFileEditors({ nodeId, options }: { nodeId: string; options: Recor
 
 vi.mock("@/api/client", () => ({
   fetchCompositionState: vi.fn(),
+  listBlobs: vi.fn(),
   readPromptFileText: vi.fn(),
   savePromptFile: vi.fn(),
 }));
@@ -32,6 +35,24 @@ beforeEach(() => {
   vi.mocked(readPromptFileText).mockResolvedValue({ text: "first line\n  second line\n", sha256: "a".repeat(64) });
   vi.mocked(savePromptFile).mockResolvedValue({ changed: true, content_sha256: "b".repeat(64) });
   vi.mocked(fetchCompositionState).mockResolvedValue(null);
+  // Background list reads fail unless a test stubs them, as before listBlobs was mocked here.
+  vi.mocked(listBlobs).mockRejectedValue(new Error("listBlobs not stubbed"));
+});
+
+it.each([
+  ["failed", new Error("Network error")],
+  ["truncated", new BlobListTruncatedError(makeSessionBlobs("session-1", 1))],
+] as const)("shows an unavailable file name in the editor after a %s list read", async (_outcome, error) => {
+  vi.mocked(listBlobs).mockRejectedValueOnce(error);
+  const store = useBlobStore.getState();
+  await store.loadBlobs("session-1");
+  store.requestPromptEdit("first", "prompt_template");
+
+  render(<PromptFileEditors nodeId="first" options={{ prompt_template: { mode: "inline_content", blob_ref: "blob-1" } }} />);
+
+  const editor = await screen.findByRole("textbox", { name: /Edit prompt file/ });
+  expect(editor).toHaveAccessibleName(/File name unavailable/);
+  expect(editor).not.toHaveAccessibleName(/File not in this session/);
 });
 
 it("starts collapsed and opens the requested slot with keyboard focus", async () => {

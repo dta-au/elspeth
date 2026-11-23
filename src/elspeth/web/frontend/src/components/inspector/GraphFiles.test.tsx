@@ -284,6 +284,41 @@ describe("GraphFiles", () => {
     expect(screen.getByRole("button", { name: "Edit file for solo" })).toHaveAttribute("title", "File names are unavailable. Use Retry above.");
   });
 
+  it("keeps Edit blocked and unknown names pending while an upload replaces a pending Retry", async () => {
+    let resolveRetry!: (blobs: BlobMetadata[]) => void;
+    const retry = new Promise<BlobMetadata[]>((resolve) => { resolveRetry = resolve; });
+    let resolveRefresh!: (blobs: BlobMetadata[]) => void;
+    const refresh = new Promise<BlobMetadata[]>((resolve) => { resolveRefresh = resolve; });
+    const solo = blob("solo", "solo.txt");
+    vi.spyOn(api, "listBlobs")
+      .mockRejectedValueOnce(new Error("Network error"))
+      .mockReturnValueOnce(retry)
+      .mockReturnValueOnce(refresh);
+    vi.spyOn(api, "uploadBlob").mockResolvedValueOnce(solo);
+    useBlobStore.setState({ blobs: [], loadBlobs: useBlobStore.getInitialState().loadBlobs });
+    render(<GraphFiles state={state} onShowNode={vi.fn()} />);
+    const user = userEvent.setup();
+    await user.click(screen.getByText(filesSummary()));
+    await user.click(await screen.findByRole("button", { name: "Retry" }));
+
+    await act(async () => {
+      await useBlobStore.getState().uploadBlob(state.session_id, new File(["prompt"], solo.filename));
+    });
+
+    const edit = screen.getByRole("button", { name: "Edit file for solo" });
+    expect(screen.getByRole("rowheader", { name: solo.filename })).toBeInTheDocument();
+    expect(edit).toHaveAttribute("aria-disabled", "true");
+    expect(edit).toHaveAccessibleDescription("Wait for the file list to load.");
+    expect(screen.queryByText("File not in this session")).not.toBeInTheDocument();
+    expect(screen.getAllByRole("rowheader", { name: "Loading file name…" }).length).toBeGreaterThan(0);
+
+    await act(async () => {
+      resolveRetry([]);
+      resolveRefresh([solo]);
+    });
+    expect(edit).toHaveAttribute("aria-disabled", "false");
+  });
+
   it("shows the list failure and upload refusal together with Retry", async () => {
     const refusal = { status: 413 };
     vi.spyOn(api, "listBlobs").mockRejectedValueOnce(new Error("Network error"));
