@@ -1697,6 +1697,7 @@ jobs:
       - e2e-frontend
       - frontend-unit
       - gateway
+      - integration
     if: always()
     steps:
       - name: Reject fork pull requests
@@ -1708,7 +1709,33 @@ jobs:
             exit 1
           fi
 
+      # Integration Tests runs only on push events. A pull request's CI Success
+      # may therefore accept it as skipped only when the head branch is one
+      # whose own push run carries Integration Tests (the push patterns above).
+      - name: Require a push-pattern head for pull requests
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            case "$HEAD_REF" in
+              main|master|release/?*) ;;
+              RC*)
+                if [[ "$HEAD_REF" == */* ]]; then
+                  echo "Pull request head $HEAD_REF does not match a push pattern (main, master, RC*, release/**)."
+                  exit 1
+                fi
+                ;;
+              *)
+                echo "Pull request head $HEAD_REF does not match a push pattern (main, master, RC*, release/**)."
+                exit 1
+                ;;
+            esac
+          fi
+
       - name: Check all jobs passed
+        env:
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           if [[ "${{ needs.static-analysis.result }}" != "success" ]]; then
             echo "Static analysis job failed"
@@ -1760,6 +1787,17 @@ jobs:
           fi
           if [[ "${{ needs.gateway.result }}" != "success" ]]; then
             echo "Gateway locked tests and image job failed"
+            exit 1
+          fi
+          integration_result="${{ needs.integration.result }}"
+          if [[ "${EVENT_NAME:-}" == "pull_request" ]]; then
+            # Reached only past the push-pattern step: this head's push run carries Integration Tests.
+            if [[ "$integration_result" != "success" && "$integration_result" != "skipped" ]]; then
+              echo "Integration Tests job failed"
+              exit 1
+            fi
+          elif [[ "$integration_result" != "success" ]]; then
+            echo "Integration Tests job did not succeed"
             exit 1
           fi
           echo "All CI checks passed!"
