@@ -54,10 +54,11 @@ from sqlalchemy import select, update
 from elspeth.contracts import NodeType, RoutingMode, RunStatus
 from elspeth.contracts.config import RuntimeRetryConfig
 from elspeth.contracts.coordination import CoordinationToken
-from elspeth.contracts.errors import FollowerSeatDeadError, JoinNotReadyError, JoinRefusedError, RunMembershipLostError
+from elspeth.contracts.errors import AuditIntegrityError, FollowerSeatDeadError, JoinNotReadyError, JoinRefusedError, RunMembershipLostError
 from elspeth.contracts.hashing import CANONICAL_VERSION
 from elspeth.contracts.scheduler import GroupLossSpec, SchedulerEventType, TokenWorkStatus
 from elspeth.core.landscape.factory import RecorderFactory, RunLifecycleReadRepository
+from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 from elspeth.core.landscape.schema import (
     group_losses_table,
     nodes_table,
@@ -375,6 +376,51 @@ class TestJoinRunAdmissionRefusals:
         assert [(row.worker_id, row.status) for row in rows] == (
             [(worker_id, "active")] if compatible else [(rows[0].worker_id, "departed")]
         )
+        crashed.db.close()
+
+    @pytest.mark.parametrize("integrity_failure", [False, True])
+    def test_join_departure_failure_preserves_refusal(self, tmp_path: Path, integrity_failure: bool) -> None:
+        crashed = _run_to_interrupted_checkpoint(tmp_path, MockClock(start=_T0))
+        _seat_run_with_live_leader(crashed, leader_id=f"worker:{crashed.run_id}:leader-departure")
+        with crashed.db.engine.begin() as conn:
+            conn.execute(update(runs_table).where(runs_table.c.run_id == crashed.run_id).values(status=RunStatus.FAILED.value))
+            conn.execute(update(runs_table).where(runs_table.c.run_id == crashed.run_id).values(canonical_version="previous-version"))
+
+        original_get_run = RunLifecycleReadRepository.get_run
+        reads = 0
+
+        def resume_between_reads(repo: RunLifecycleReadRepository, run_id: str) -> Any:
+            nonlocal reads
+            run = original_get_run(repo, run_id)
+            reads += 1
+            if reads == 1:
+                with crashed.db.engine.begin() as conn:
+                    conn.execute(update(runs_table).where(runs_table.c.run_id == run_id).values(status=RunStatus.RUNNING.value))
+            return run
+
+        departure_error = AuditIntegrityError("departure integrity failure") if integrity_failure else ValueError("departure unavailable")
+        with (
+            patch.object(RunLifecycleReadRepository, "get_run", resume_between_reads),
+            patch.object(RunCoordinationRepository, "depart_worker", side_effect=departure_error),
+            pytest.raises(AuditIntegrityError if integrity_failure else JoinRefusedError) as exc_info,
+        ):
+            _join_follower(crashed, leader_token_for(crashed.db, crashed.run_id))
+        with crashed.db.engine.connect() as conn:
+            rows = conn.execute(
+                select(run_workers_table.c.worker_id, run_workers_table.c.status).where(
+                    run_workers_table.c.run_id == crashed.run_id, run_workers_table.c.role == "follower"
+                )
+            ).all()
+        assert reads >= 2
+        assert len(rows) == 1
+        assert rows[0].status == "active"
+        if integrity_failure:
+            assert exc_info.value is departure_error
+            assert isinstance(exc_info.value.__cause__, JoinRefusedError)
+            assert "canonical version" in str(exc_info.value.__cause__)
+        else:
+            assert "canonical version" in str(exc_info.value)
+            assert any("departure unavailable" in note and rows[0].worker_id in note for note in exc_info.value.__notes__)
         crashed.db.close()
 
     def test_join_rechecks_graph_after_run_appears(self) -> None:
