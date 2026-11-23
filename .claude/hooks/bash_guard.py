@@ -48,9 +48,12 @@ _TOK = r"[^\s;&|)]+"
 _ARG = rf"(?!-){_TOK}"
 _WRAP = (
     r"(?:(?:nohup|exec|command|time|setsid|do|then|else)\s+"
-    rf"|sudo(?:\s+(?:-[ugCDhpRTUr]\s+{_ARG}|-{_TOK}))*\s+"
-    rf"|(?:env|nice|ionice|stdbuf)(?:\s+(?:-{_TOK}|\w+=\S*|\d+))*\s+"
-    rf"|timeout(?:\s+-{_TOK})*\s+\S+\s+)"
+    # Option loops are atomic and possessive (Python 3.11+): each option is
+    # read one way only, so a word such as "sudo" after "-u" cannot be tried
+    # both as the option's value and as a new wrapper.
+    rf"|sudo(?>\s+(?:-[ugCDhpRTUr]\s+{_ARG}|-{_TOK}))*+\s+"
+    rf"|(?:env|nice|ionice|stdbuf)(?>\s+(?:-{_TOK}|\w+=\S*|\d+))*+\s+"
+    rf"|timeout(?>\s+(?:-[ks]\s+{_ARG}|-{_TOK}))*+\s+\S+\s+)"
 )
 _CP = rf"(?:^|[;&|({{`])\s*{_WRAP}*(?:[^\s;&|()]*/)?"
 _OPT = rf"(?:-[sn]\s+{_ARG}|-{_TOK})"
@@ -84,7 +87,7 @@ PLAIN_WORD = re.compile(r"[A-Za-z0-9_./=+:@%,-]+")
 
 def _restore_live_words(live: str, original: str) -> str:
     """Put back quoted words that sit where a command or a kill argument goes."""
-    for pattern in (QUOTED_COMMAND_WORD, QUOTED_KILL_ARG):
+    for pattern, strip in ((QUOTED_COMMAND_WORD, False), (QUOTED_KILL_ARG, True)):
         pos = 0
         while True:
             match = pattern.search(live, pos)
@@ -93,10 +96,12 @@ def _restore_live_words(live: str, original: str) -> str:
             start, end = match.start(3), match.end(3)
             word = original[start:end]
             pos = end + 1
-            if PLAIN_WORD.fullmatch(word) is None:
+            # kill reads a padded number (" -1") as the number; a command name
+            # with padding names no command, so only kill arguments are stripped.
+            if PLAIN_WORD.fullmatch(word.strip() if strip else word) is None:
                 continue
-            # Keep offsets: the quote marks become spaces around the word.
-            live = live[: start - 1] + " " + word + " " + live[end + 1 :]
+            # Keep offsets: the quote marks and any padding become spaces.
+            live = live[: start - 1] + " " + re.sub(r"\s", " ", word) + " " + live[end + 1 :]
     return live
 
 
