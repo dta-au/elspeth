@@ -163,9 +163,8 @@ _EMPTY_STATE_FINALIZE_SUFFIX_WITH_BLOCKER = _wrapped_diagnostic_template(
     diagnostic_slots="{blocker}",
 )
 
-# A change succeeded this turn and left the pipeline structurally empty (for
-# example the user asked to remove the source and the output). The sentence
-# is true whether or not emptying was the goal, so it asserts no failure.
+# Neutral notice for a structurally empty result after a successful change.
+# A failed composition attempt from an empty start can use the blocker notice.
 _EMPTIED_STATE_NOTICE: Final = "The pipeline is now empty. Add a source and an output to continue."
 _EMPTIED_STATE_FINALIZE_SUFFIX = _bare_trusted_suffix(_EMPTIED_STATE_NOTICE)
 
@@ -1280,6 +1279,37 @@ def last_mutation_was_pending_proposal(tool_invocations: tuple[ComposerToolInvoc
     return False
 
 
+def _invocation_success_payload(invocation: ComposerToolInvocation) -> object:
+    if invocation.status is ComposerToolStatus.SUCCESS and invocation.result_canonical is not None:
+        return json.loads(invocation.result_canonical)
+    return None
+
+
+def _failed_invocation_blocker(invocation: ComposerToolInvocation, payload: object) -> str | None:
+    if invocation.status is ComposerToolStatus.ARG_ERROR:
+        return f"{invocation.tool_name} failed before mutation ({invocation.error_class}: {invocation.error_message})."
+    if invocation.status is ComposerToolStatus.PLUGIN_CRASH:
+        return f"{invocation.tool_name} crashed before a safe mutation completed ({invocation.error_class}: {invocation.error_message})."
+    if type(payload) is dict and "success" in payload and payload["success"] is False:
+        return f"{invocation.tool_name} returned success=false{_tool_failure_detail(payload)}"
+    return None
+
+
+def failed_composition_blocker(tool_invocations: tuple[ComposerToolInvocation, ...]) -> str | None:
+    """Name the most recent failed composition attempt, if one exists."""
+    for invocation in reversed(tool_invocations):
+        if is_discovery_tool(invocation.tool_name):
+            continue
+        payload = _invocation_success_payload(invocation)
+        match payload:
+            case {"data": {"status": "APPROVAL_REQUIRED"}}:
+                continue
+        blocker = _failed_invocation_blocker(invocation, payload)
+        if blocker is not None:
+            return blocker
+    return None
+
+
 def blocking_result_from_tool_invocations(tool_invocations: tuple[ComposerToolInvocation, ...]) -> str:
     """Name the most recent failed build/edit tool result, if one exists."""
     for invocation in reversed(tool_invocations):
@@ -1289,23 +1319,17 @@ def blocking_result_from_tool_invocations(tool_invocations: tuple[ComposerToolIn
         # Cause and mask the failed build/edit call before it.
         if is_discovery_tool(invocation.tool_name):
             continue
-        if invocation.status is ComposerToolStatus.ARG_ERROR:
-            return f"{invocation.tool_name} failed before mutation ({invocation.error_class}: {invocation.error_message})."
-        if invocation.status is ComposerToolStatus.PLUGIN_CRASH:
-            return (
-                f"{invocation.tool_name} crashed before a safe mutation completed ({invocation.error_class}: {invocation.error_message})."
-            )
-        if invocation.status is ComposerToolStatus.SUCCESS and invocation.result_canonical is not None:
-            payload = json.loads(invocation.result_canonical)
-            if type(payload) is dict and "success" in payload and payload["success"] is False:
-                return f"{invocation.tool_name} returned success=false{_tool_failure_detail(payload)}"
-            if (
-                type(payload) is dict
-                and "success" in payload
-                and payload["success"] is True
-                and invocation.version_after == invocation.version_before
-            ):
-                return f"{invocation.tool_name} succeeded without mutating CompositionState (version stayed {invocation.version_before})."
+        payload = _invocation_success_payload(invocation)
+        blocker = _failed_invocation_blocker(invocation, payload)
+        if blocker is not None:
+            return blocker
+        if (
+            type(payload) is dict
+            and "success" in payload
+            and payload["success"] is True
+            and invocation.version_after == invocation.version_before
+        ):
+            return f"{invocation.tool_name} succeeded without mutating CompositionState (version stayed {invocation.version_before})."
     return "the model ended the turn without calling any build/edit tool."
 
 
