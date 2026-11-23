@@ -2962,6 +2962,8 @@ _GET_PIPELINE_STATE_DECLARATION = ToolDeclaration(
         "Inspect graph or since_start changes. Oversized whole-graph reads return a structural `view`; "
         "pages carry exact `content`, `encoding`, `field_path`, `offset_chars`, `total_chars`, `next_offset_chars` and `sha256`. "
         "Use field_path for exact values; pass the hash to continue. "
+        "When full diagnostics would crowd out a page, its `validation` lists only the first error codes and a `post_call_hints` line gives the totals; "
+        "preview_pipeline returns the full diagnostics. "
         "Changes give `baseline_kind`, `from_version`, `projection`, and `changes` with `operation`, `path`, optional `value`. "
         'For the web set_pipeline tool, put the flat `set_pipeline_arguments` document inside {"pipeline": <document>}; do not send its source/nodes/edges/outputs fields at the top level. '
         "Full diagnostic reads include `inspection`: `requested_component`, `resolved_component` and `accepted_full_state_aliases`."
