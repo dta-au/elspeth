@@ -1522,7 +1522,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="25d067430d78e918",
         ordinal=1,
         authority="SessionInterpretationAuthority",
-        line=284,
+        line=339,
     ),
     # A card resolve writes the same approval row shape for every file binding
     # of the card in one pass (the per-binding loop re-resolved the snapshot
@@ -1551,7 +1551,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="c2f3cb9cac30a37c",
         ordinal=1,
         authority="SessionInterpretationAuthority",
-        line=303,
+        line=358,
     ),
     # Durable output bytes are reserved and reclaimed by the fenced blob facet.
     WriterIdentity(

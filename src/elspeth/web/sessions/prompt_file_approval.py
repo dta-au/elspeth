@@ -209,8 +209,8 @@ def reuse_resolved_prompt_snapshot(conn: Connection, request: PromptFileApproval
     block opened; any other call resolves as usual. Each writer still checks the owner, its own blob row, marker,
     snapshot binding and pending card per request. The only statements
     between two writes are approval inserts and the pending-card supersede,
-    which no snapshot input reads, and the caller's session lock keeps other
-    writers of the state and the custody bytes out for the whole transaction.
+    which no snapshot input reads, and the caller's session write lock keeps
+    other writers out for the whole transaction, as for the card writer below.
     """
     token = _RESOLVED_SNAPSHOT.set(
         _ResolvedSnapshot(
