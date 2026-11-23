@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach, onTestFinished } from "vitest";
 import { render, screen, within, act, fireEvent, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import * as api from "@/api/client";
 import { useBlobStore } from "@/stores/blobStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { BlobManager } from "./BlobManager";
@@ -40,6 +41,8 @@ function setBlobState(blobs: BlobMetadata[]) {
     activeSessionId: "session-1",
     isLoading: false,
     error: null,
+    listError: null,
+    listLoadFailed: false,
     loadBlobs: vi.fn().mockResolvedValue(undefined),
   });
 }
@@ -376,17 +379,19 @@ describe("BlobManager upload affordance (elspeth-29eef452a8)", () => {
     expect(screen.getByText("Files", { selector: ".blob-manager-title" })).toBeInTheDocument();
     expect(screen.queryByText(/Files \(0\)/)).not.toBeInTheDocument();
     expect(screen.getByText("Loading files…")).toHaveAttribute("role", "status");
-    act(() => useBlobStore.setState({ isLoading: false, error: "Failed to load files.", listLoadFailed: true }));
+    act(() => useBlobStore.setState({
+      isLoading: false, error: "Failed to load files.", listError: "Failed to load files.", listLoadFailed: true,
+    }));
     rerender(<BlobManager onUseAsInput={vi.fn()} />);
     expect(screen.getByText("Files", { selector: ".blob-manager-title" })).toBeInTheDocument();
-    act(() => useBlobStore.setState({ error: null, listLoadFailed: false }));
+    act(() => useBlobStore.setState({ error: null, listError: null, listLoadFailed: false }));
     rerender(<BlobManager onUseAsInput={vi.fn()} />);
     expect(screen.getByText("Files (0)", { selector: ".blob-manager-title" })).toBeInTheDocument();
   });
 
   it("offers Retry for a failed list read, re-issuing the same read", async () => {
     setBlobState([]);
-    useBlobStore.setState({ error: "Failed to load files.", listLoadFailed: true });
+    useBlobStore.setState({ error: "Failed to load files.", listError: "Failed to load files.", listLoadFailed: true });
     render(<BlobManager onUseAsInput={vi.fn()} />);
     const loadBlobs = useBlobStore.getState().loadBlobs;
     vi.mocked(loadBlobs).mockClear();
@@ -402,6 +407,40 @@ describe("BlobManager upload affordance (elspeth-29eef452a8)", () => {
     render(<BlobManager onUseAsInput={vi.fn()} />);
     expect(screen.getByRole("alert")).toHaveTextContent("Download failed.");
     expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+  });
+
+  it.each(["refused", "successful"] as const)("keeps Retry after a %s upload following a failed list read", async (outcome) => {
+    setBlobState([]);
+    const list = vi.spyOn(api, "listBlobs").mockRejectedValueOnce(new Error("Network error"));
+    const upload = vi.spyOn(api, "uploadBlob");
+    onTestFinished(() => {
+      list.mockRestore();
+      upload.mockRestore();
+      useBlobStore.getState().reset();
+    });
+    useBlobStore.setState({ loadBlobs: useBlobStore.getInitialState().loadBlobs });
+    render(<BlobManager onUseAsInput={vi.fn()} />);
+    await screen.findByRole("button", { name: "Retry" });
+
+    const file = new File(["content"], "new.csv");
+    await act(async () => {
+      if (outcome === "refused") {
+        const refusal = { status: 413 };
+        upload.mockRejectedValueOnce(refusal);
+        await expect(useBlobStore.getState().uploadBlob("session-1", file)).rejects.toBe(refusal);
+      } else {
+        upload.mockResolvedValueOnce(makeBlob({ filename: file.name }));
+        await useBlobStore.getState().uploadBlob("session-1", file);
+      }
+    });
+
+    const alert = screen.getByRole("alert");
+    expect(alert).toHaveTextContent("Failed to load files.");
+    if (outcome === "refused") {
+      expect(alert).toHaveTextContent("File exceeds the maximum upload size.");
+    }
+    expect(within(alert).getByRole("button", { name: "Retry" })).toBeInTheDocument();
+    expect(screen.getByText("Files", { selector: ".blob-manager-title" })).toBeInTheDocument();
   });
 
   it("closes from a design-system button at the end of the header", async () => {

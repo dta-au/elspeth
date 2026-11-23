@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { useBlobStore } from "./blobStore";
+import { BlobListTruncatedError } from "@/api/blobListing";
+import { blobBannerMessages, useBlobStore } from "./blobStore";
 import type { BlobMetadata } from "@/types/api";
 
 // Mock the API client
@@ -49,6 +50,28 @@ function deferred<T>(): {
   });
   return { promise, resolve, reject };
 }
+
+describe("blobBannerMessages", () => {
+  it("de-duplicates identical messages", () => {
+    expect(blobBannerMessages("Failed to load files.", "Failed to load files.")).toEqual(["Failed to load files."]);
+  });
+
+  it("drops empty strings and null", () => {
+    expect(blobBannerMessages("", "Failed to load files.")).toEqual(["Failed to load files."]);
+    expect(blobBannerMessages("Download failed.", null)).toEqual(["Download failed."]);
+  });
+
+  it("puts the list message first", () => {
+    expect(blobBannerMessages("Download failed.", "Failed to load files.")).toEqual([
+      "Failed to load files.",
+      "Download failed.",
+    ]);
+  });
+
+  it("returns no messages when both fields are empty", () => {
+    expect(blobBannerMessages("", null)).toEqual([]);
+  });
+});
 
 describe("blobStore", () => {
   beforeEach(() => {
@@ -189,18 +212,44 @@ describe("blobStore", () => {
       expect(state.error).toBeNull();
     });
 
-    it("sets error state when API call fails", async () => {
+    it("records a failed list read and clears it when a fresh load starts", async () => {
       const { listBlobs } = await import("@/api/client");
-      (listBlobs as ReturnType<typeof vi.fn>).mockRejectedValue(
-        new Error("Network error"),
-      );
+      const freshList = deferred<BlobMetadata[]>();
+      vi.mocked(listBlobs)
+        .mockRejectedValueOnce(new Error("Network error"))
+        .mockReturnValueOnce(freshList.promise);
 
       await useBlobStore.getState().loadBlobs("session-1");
 
-      const state = useBlobStore.getState();
-      expect(state.error).toBe("Failed to load files.");
-      expect(state.isLoading).toBe(false);
-      expect(state.blobs).toEqual([]);
+      expect(useBlobStore.getState()).toMatchObject({
+        blobs: [], error: "Failed to load files.", listError: "Failed to load files.",
+        listLoadFailed: true, isLoading: false,
+      });
+
+      const retry = useBlobStore.getState().loadBlobs("session-1");
+      expect(useBlobStore.getState()).toMatchObject({
+        error: null, listError: null, listLoadFailed: false, isLoading: true,
+      });
+      const blobs = [makeBlob()];
+      freshList.resolve(blobs);
+      await retry;
+      expect(useBlobStore.getState()).toMatchObject({
+        blobs, error: null, listError: null, listLoadFailed: false, isLoading: false,
+      });
+    });
+
+    it("keeps the newest files and records truncation without offering a retry", async () => {
+      const { listBlobs } = await import("@/api/client");
+      const blobs = [makeBlob()];
+      const truncation = new BlobListTruncatedError(blobs);
+      vi.mocked(listBlobs).mockRejectedValueOnce(truncation);
+
+      await useBlobStore.getState().loadBlobs("session-1");
+
+      expect(useBlobStore.getState()).toMatchObject({
+        blobs, error: truncation.message, listError: truncation.message,
+        listLoadFailed: false, isLoading: false,
+      });
     });
 
     it("drops stale blob results when an older session load resolves last", async () => {
@@ -259,6 +308,41 @@ describe("blobStore", () => {
       await loadB;
       expect(useBlobStore.getState().blobs).toEqual([blobB]);
     });
+  });
+
+  it.each([
+    // This row guards listError invariance. GraphFiles and OptionRows refusal tests cover the visible regression.
+    ["a good list", null, false],
+    ["a failed list", "Failed to load files.", true],
+  ] as const)("preserves %s state through upload, delete, and download refusals", async (_case, listError, listLoadFailed) => {
+    const { listBlobs, uploadBlob, deleteBlob, downloadBlobContent } = await import("@/api/client");
+    if (listLoadFailed) {
+      vi.mocked(listBlobs).mockRejectedValueOnce(new Error("Network error"));
+    } else {
+      vi.mocked(listBlobs).mockResolvedValueOnce([makeBlob()]);
+    }
+    const store = useBlobStore.getState();
+    const listState = { listError, listLoadFailed };
+    await store.loadBlobs("session-1");
+    expect(useBlobStore.getState()).toMatchObject(listState);
+
+    const refusal = { status: 413 };
+    vi.mocked(uploadBlob).mockRejectedValueOnce(refusal);
+    const pendingUpload = store.uploadBlob("session-1", new File(["content"], "data.csv"));
+    expect(useBlobStore.getState()).toMatchObject({ ...listState, error: null });
+    await expect(pendingUpload).rejects.toBe(refusal);
+    expect(useBlobStore.getState()).toMatchObject({
+      ...listState, error: "File exceeds the maximum upload size.",
+    });
+
+    const detail = "This file is still attached.";
+    vi.mocked(deleteBlob).mockRejectedValueOnce({ status: 409, detail });
+    await store.deleteBlob("session-1", "blob-1");
+    expect(useBlobStore.getState()).toMatchObject({ ...listState, error: detail });
+
+    vi.mocked(downloadBlobContent).mockRejectedValueOnce(new Error("Download refused"));
+    await store.downloadBlob("session-1", "blob-1");
+    expect(useBlobStore.getState()).toMatchObject({ ...listState, error: "Download failed." });
   });
 
   describe("uploadBlob", () => {
@@ -630,10 +714,12 @@ describe("blobStore", () => {
   });
 
   describe("clearBlobs", () => {
-    it("clears blobs and error", () => {
+    it("clears blobs and errors", () => {
       useBlobStore.setState({
         blobs: [makeBlob()],
-        error: "some error",
+        error: "Failed to load files.",
+        listError: "Failed to load files.",
+        listLoadFailed: true,
       });
 
       useBlobStore.getState().clearBlobs();
@@ -641,6 +727,8 @@ describe("blobStore", () => {
       const state = useBlobStore.getState();
       expect(state.blobs).toEqual([]);
       expect(state.error).toBeNull();
+      expect(state.listError).toBeNull();
+      expect(state.listLoadFailed).toBe(false);
     });
   });
 
@@ -649,7 +737,9 @@ describe("blobStore", () => {
       useBlobStore.setState({
         blobs: [makeBlob()],
         isLoading: true,
-        error: "something",
+        error: "Failed to load files.",
+        listError: "Failed to load files.",
+        listLoadFailed: true,
       });
 
       useBlobStore.getState().reset();
@@ -658,6 +748,8 @@ describe("blobStore", () => {
       expect(state.blobs).toEqual([]);
       expect(state.isLoading).toBe(false);
       expect(state.error).toBeNull();
+      expect(state.listError).toBeNull();
+      expect(state.listLoadFailed).toBe(false);
     });
   });
 });

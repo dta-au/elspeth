@@ -1,6 +1,7 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
+import * as api from "@/api/client";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { usePluginCatalogStore } from "@/stores/pluginCatalogStore";
 import { useBlobStore } from "@/stores/blobStore";
@@ -147,10 +148,33 @@ describe("source and sink file names", () => {
   });
 
   it("says the name is unavailable when the list read failed, not that the file is gone", () => {
-    useBlobStore.setState({ activeSessionId: "session-1", blobs: [], isLoading: false, error: "Failed to load files.", listLoadFailed: true });
+    useBlobStore.setState({
+      activeSessionId: "session-1", blobs: [], isLoading: false,
+      error: "Failed to load files.", listError: "Failed to load files.", listLoadFailed: true,
+    });
     render(<OptionRows options={{ path: MASKED_PATH, blob_ref: FILE_ID }} ariaLabel="source settings" plugin={{ kind: "source", name: "csv" }} />);
     expect(screen.getByText("File name unavailable")).toBeInTheDocument();
     expect(screen.queryByText("File not in this session")).not.toBeInTheDocument();
+  });
+
+  it("keeps resolving step file names after a refused upload", async () => {
+    seedFile({ filename: "evaluation.csv" });
+    const refusal = { status: 413 };
+    const upload = vi.spyOn(api, "uploadBlob").mockRejectedValueOnce(refusal);
+    onTestFinished(() => { upload.mockRestore(); });
+    const plugin = { kind: "source", name: "csv" } as const;
+    render(<>
+      <OptionRows options={{ path: MASKED_PATH, blob_ref: FILE_ID }} ariaLabel="source settings" plugin={plugin} />
+      <OptionRows options={{ path: MASKED_PATH, blob_ref: "80c51a89-8a61-4184-a096-93b7d3999a37" }} ariaLabel="other source settings" plugin={plugin} />
+    </>);
+
+    await act(async () => {
+      await expect(useBlobStore.getState().uploadBlob("session-1", new File(["content"], "new.csv"))).rejects.toBe(refusal);
+    });
+
+    expect(screen.getByText("File: evaluation.csv")).toBeInTheDocument();
+    expect(screen.getByText("File not in this session")).toBeInTheDocument();
+    expect(screen.queryByText("File name unavailable")).not.toBeInTheDocument();
   });
 
   it("writes nothing to browser storage", () => {

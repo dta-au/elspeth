@@ -1,6 +1,6 @@
 // src/components/blobs/BlobManager.tsx
 import { useEffect, useId, useLayoutEffect, useRef, useCallback, useMemo, useState } from "react";
-import { useBlobStore } from "@/stores/blobStore";
+import { blobBannerMessages, useBlobStore } from "@/stores/blobStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { AlertBanner, Button, Icon, Input } from "@/components/ui";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
@@ -61,8 +61,9 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
   // `seq` re-keys the pad's alert so a repeated refusal is announced again.
   const [wireSendRefusal, setWireSendRefusal] = useState<{ message: string; seq: number } | null>(null);
   const pending = useInterpretationEventsStore((s) => activeSessionId ? s.pendingBySession[activeSessionId] : undefined);
-  const { blobs, isLoading, error, listLoadFailed, activeSessionId: blobSessionId, loadBlobs, uploadBlob, deleteBlob, downloadBlob } =
+  const { blobs, isLoading, error, listError, listLoadFailed, activeSessionId: blobSessionId, loadBlobs, uploadBlob, deleteBlob, downloadBlob } =
     useBlobStore();
+  const bannerMessages = blobBannerMessages(error, listError);
   const revealRequest = useBlobStore((s) => s.revealRequest);
   const focusedBlobId = useBlobStore((s) => s.focusedBlobId);
   const [missingRevealName, setMissingRevealName] = useState<string | null>(null);
@@ -306,7 +307,7 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
       </p>
 
       {/* Error */}
-      {error && (
+      {bannerMessages.length > 0 && (
         <AlertBanner
           className="blob-manager-error"
           action={listLoadFailed && activeSessionId ? (
@@ -314,7 +315,7 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
             <Button type="button" variant="ghost" compact onClick={() => void loadBlobs(activeSessionId)}>Retry</Button>
           ) : null}
         >
-          {error}
+          {bannerMessages.map((message) => <span key={message} style={{ display: "block" }}>{message}</span>)}
         </AlertBanner>
       )}
 
