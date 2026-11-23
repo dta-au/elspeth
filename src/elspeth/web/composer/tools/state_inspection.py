@@ -12,10 +12,19 @@ from pydantic import JsonValue
 
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.core.canonical import canonical_json
+from elspeth.web.composer.state import ValidationEntry, ValidationSummary
 from elspeth.web.composer.tools._common import ToolContext, ToolResult, _failure_result, normalize_tool_result_validation
 from elspeth.web.composer.tools.state_responses import StateInspectionPage, state_inspection_page_payload
 
 STATE_INSPECTION_MAX_BYTES = 32_768
+# A page whose full validation block leaves it no room carries this bounded
+# summary instead: the validation verdict and the first error codes and
+# components, with no per-entry detail. Fixed caps, so nothing the summary adds
+# grows with the graph; the totals and the pointer to preview_pipeline ride in
+# one post_call_hints line.
+VALIDATION_SUMMARY_MAX_ENTRIES = 3
+VALIDATION_SUMMARY_MAX_BYTES = 1_024
+_VALIDATION_SUMMARY_ENTRY_MESSAGE = "Detail omitted on this page; preview_pipeline returns it."
 
 
 def _disclosure_bytes(result: ToolResult) -> int:
@@ -23,6 +32,32 @@ def _disclosure_bytes(result: ToolResult) -> int:
     # is conservative for the production UTF-8 serializer, including Unicode.
     content = json.dumps(result.to_dict(), ensure_ascii=True)
     return len(json.dumps(content, ensure_ascii=True).encode("utf-8"))
+
+
+def _plural(count: int, noun: str) -> str:
+    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
+
+
+def _summarized_validation(result: ToolResult) -> tuple[ValidationSummary, str]:
+    """Return the bounded wire summary of ``result.validation`` and the hint that states its totals."""
+    validation = result.validation
+    shown: tuple[ValidationEntry, ...] = ()
+    for entry in validation.errors[:VALIDATION_SUMMARY_MAX_ENTRIES]:
+        candidate = (
+            *shown,
+            ValidationEntry(entry.component, _VALIDATION_SUMMARY_ENTRY_MESSAGE, entry.severity, error_code=entry.error_code),
+        )
+        # Measure the block exactly as ToolResult.to_dict emits it, repair suggestions included.
+        block = replace(result, data=None, _wire_validation=ValidationSummary(validation.is_valid, candidate)).to_dict()["validation"]
+        if len(json.dumps(json.dumps(block, ensure_ascii=True), ensure_ascii=True).encode("utf-8")) > VALIDATION_SUMMARY_MAX_BYTES:
+            break
+        shown = candidate
+    hint = (
+        f"Validation summary only: the pipeline has {_plural(len(validation.errors), 'error')} and "
+        f"{_plural(len(validation.warnings), 'warning')}. This page lists the first {len(shown)} error codes and "
+        "components without detail, to leave room for the content. Call preview_pipeline for the full diagnostics."
+    )
+    return ValidationSummary(is_valid=validation.is_valid, errors=shown), hint
 
 
 def _structure(data: dict[str, JsonValue]) -> dict[str, JsonValue]:
@@ -93,6 +128,7 @@ def bounded_state_inspection(
     offset_chars: int,
     expected_sha256: str | None,
     since_start: bool,
+    whole_graph: bool,
 ) -> ToolResult:
     result = normalize_tool_result_validation(result, context.catalog)
     state = result.updated_state
@@ -129,7 +165,7 @@ def bounded_state_inspection(
             state, "offset_chars exceeds the selected content length.", error_code="argument_error", with_state_validation=False
         )
 
-    def _state_inspection_page_result(length: int) -> ToolResult:
+    def _state_inspection_page_result(length: int, envelope: ToolResult) -> ToolResult:
         end = offset_chars + length
         payload = StateInspectionPage(
             view,
@@ -141,20 +177,33 @@ def bounded_state_inspection(
             end if end < len(content) else None,
             digest,
         )
-        return replace(result, data=state_inspection_page_payload(payload))
+        return replace(envelope, data=state_inspection_page_payload(payload))
 
-    low, high = 0, min(len(content) - offset_chars, STATE_INSPECTION_MAX_BYTES)
-    while low < high:
-        middle = (low + high + 1) // 2
-        if _disclosure_bytes(_state_inspection_page_result(middle)) <= STATE_INSPECTION_MAX_BYTES:
-            low = middle
-        else:
-            high = middle - 1
-    bounded = _state_inspection_page_result(low)
-    if _disclosure_bytes(bounded) > STATE_INSPECTION_MAX_BYTES or (low == 0 and offset_chars < len(content)):
+    def _largest_page(envelope: ToolResult) -> ToolResult | None:
+        low, high = 0, min(len(content) - offset_chars, STATE_INSPECTION_MAX_BYTES)
+        while low < high:
+            middle = (low + high + 1) // 2
+            if _disclosure_bytes(_state_inspection_page_result(middle, envelope)) <= STATE_INSPECTION_MAX_BYTES:
+                low = middle
+            else:
+                high = middle - 1
+        page = _state_inspection_page_result(low, envelope)
+        if _disclosure_bytes(page) > STATE_INSPECTION_MAX_BYTES or (low == 0 and offset_chars < len(content)):
+            return None
+        return page
+
+    bounded = _largest_page(result)
+    if bounded is None and not (view == "structure" and whole_graph):
+        # The full validation block leaves this page no room. A field, changes
+        # or named-component page carries the bounded summary instead; a
+        # whole-graph structural read is still refused.
+        summary, hint = _summarized_validation(result)
+        bounded = _largest_page(replace(result, _wire_validation=summary, post_call_hints=(*result.post_call_hints, hint)))
+    if bounded is None:
         return _failure_result(
             state,
-            "Validation diagnostics exceed the inspection response budget. Call preview_pipeline to inspect validation.",
+            "Validation diagnostics exceed the inspection response budget. "
+            "Name a component or pass field_path to read values; call preview_pipeline for the full diagnostics.",
             error_code="inspection_response_too_large",
             with_state_validation=False,
         )
