@@ -113,12 +113,41 @@ def test_offset_continuation_pages_return_the_exact_value_under_large_validation
     assert "".join(parts) == value
 
 
-def test_whole_graph_read_under_large_validation_is_still_refused(catalog: CatalogServiceImpl) -> None:
+@pytest.mark.parametrize(
+    ("component", "selected"),
+    [
+        ("step_000", lambda data: data["node"]["id"] == "step_000"),
+        ("source", lambda data: list(data["sources"]) == ["source"]),
+        ("conn_005", lambda data: data["output"]["sink_name"] == "conn_005"),
+        ("set_pipeline_arguments", None),
+    ],
+)
+def test_component_only_read_returns_its_structure_under_large_validation(catalog: CatalogServiceImpl, component, selected) -> None:
+    state, preview = _invalid_large_state(catalog)
+    result = execute_tool("get_pipeline_state", {"component": component}, state, catalog)
+    _assert_bounded_summary(result, preview)
+    page = result.to_dict()["data"]
+    assert page["view"] == "structure"
+    assert page["offset_chars"] == 0
+    if selected is not None:
+        # A single component's structure fits on one page once the summary replaces the full block.
+        assert page["next_offset_chars"] is None
+        assert selected(json.loads(page["content"]))
+    else:
+        assert page["content"]
+
+
+@pytest.mark.parametrize("args", [{}, {"component": "full"}, {"component": "pipeline"}, {"component": ""}])
+def test_whole_graph_read_under_large_validation_is_still_refused(catalog: CatalogServiceImpl, args) -> None:
     state, _ = _invalid_large_state(catalog)
-    wire = execute_tool("get_pipeline_state", {}, state, catalog).to_dict()
+    wire = execute_tool("get_pipeline_state", args, state, catalog).to_dict()
     assert not wire["success"]
     assert _wire_bytes(wire) <= BUDGET
-    assert wire["validation"]["errors"][0]["error_code"] == "inspection_response_too_large"
+    (refusal,) = wire["validation"]["errors"]
+    assert refusal["error_code"] == "inspection_response_too_large"
+    # The refusal names the reads that still work, in static text only.
+    assert "Name a component or pass field_path" in refusal["message"]
+    assert "preview_pipeline" in refusal["message"]
 
 
 def test_a_summarized_page_is_never_revalidated_under_another_snapshot(catalog: CatalogServiceImpl) -> None:

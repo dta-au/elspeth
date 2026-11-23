@@ -128,6 +128,7 @@ def bounded_state_inspection(
     offset_chars: int,
     expected_sha256: str | None,
     since_start: bool,
+    whole_graph: bool,
 ) -> ToolResult:
     result = normalize_tool_result_validation(result, context.catalog)
     state = result.updated_state
@@ -192,16 +193,17 @@ def bounded_state_inspection(
         return page
 
     bounded = _largest_page(result)
-    if bounded is None and view != "structure":
-        # The full validation block leaves this page no room. An exact field or
-        # changes page carries the bounded summary instead; a whole-graph
-        # structural read is still refused.
+    if bounded is None and not (view == "structure" and whole_graph):
+        # The full validation block leaves this page no room. A field, changes
+        # or named-component page carries the bounded summary instead; a
+        # whole-graph structural read is still refused.
         summary, hint = _summarized_validation(result)
         bounded = _largest_page(replace(result, _wire_validation=summary, post_call_hints=(*result.post_call_hints, hint)))
     if bounded is None:
         return _failure_result(
             state,
-            "Validation diagnostics exceed the inspection response budget. Call preview_pipeline to inspect validation.",
+            "Validation diagnostics exceed the inspection response budget. "
+            "Name a component or pass field_path to read values; call preview_pipeline for the full diagnostics.",
             error_code="inspection_response_too_large",
             with_state_validation=False,
         )
