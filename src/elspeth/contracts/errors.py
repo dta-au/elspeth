@@ -2774,6 +2774,18 @@ class CapacityError(Exception):
         self.status_code = status_code
 
 
+# Classes the processor records as the row's own failure. Check the live
+# TIER_1_ERRORS registry first: a registered subclass still ends the run.
+ROW_SCOPED_PLUGIN_ERRORS: tuple[type[Exception], ...] = (
+    InterruptedError,
+    PluginRetryableError,
+    ConnectionError,
+    TimeoutError,
+    CapacityError,
+    PluginContractViolation,
+)
+
+
 # TIER-2: telemetry-subsystem configuration/initialization failure.
 # Lives in contracts/ so the engine can reference it without crossing the
 # L2→L3 layer boundary; the telemetry package re-exports it for its
