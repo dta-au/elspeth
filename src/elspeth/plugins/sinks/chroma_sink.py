@@ -208,7 +208,7 @@ class ChromaSink(BaseSink, MemberSinkEffectCapability):
     name = "chroma_sink"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:8609eab8e69c3992"
+    source_file_hash: str | None = "sha256:8bf8ad099149d4e6"
     config_model = ChromaSinkConfig
     supports_resume = False
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
@@ -351,7 +351,11 @@ class ChromaSink(BaseSink, MemberSinkEffectCapability):
         # its creation metadata is not applied. Refuse a collection built with
         # another distance function rather than silently index into it (the
         # retrieval provider refuses the same mismatch when reading).
-        actual_space = _collection_distance_space(collection.metadata, self._config.collection)
+        actual_space = _collection_distance_space(
+            collection_configuration=collection.configuration_json,
+            collection_metadata=collection.metadata,
+            collection_name=self._config.collection,
+        )
         if actual_space != self._config.distance_function:
             raise ValueError(
                 f"Chroma collection {self._config.collection!r} already exists with "

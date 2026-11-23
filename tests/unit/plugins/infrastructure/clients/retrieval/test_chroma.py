@@ -24,6 +24,7 @@ chromadb = pytest.importorskip("chromadb")
 from elspeth.contracts.call_mode import CallModeSession, ReplayCallEvidence  # noqa: E402
 from elspeth.contracts.enums import CallStatus, CallType, RunMode  # noqa: E402
 from elspeth.core.security.web import SSRFSafeRequest  # noqa: E402
+from elspeth.plugins.infrastructure.clients.retrieval import chroma as chroma_module  # noqa: E402
 from elspeth.plugins.infrastructure.clients.retrieval.base import RetrievalError  # noqa: E402
 from elspeth.plugins.infrastructure.clients.retrieval.chroma import (  # noqa: E402
     ChromaSearchProvider,
@@ -101,25 +102,162 @@ def _precreate_collection(name: str, distance_function: str = "cosine") -> None:
     client.get_or_create_collection(name=name, metadata={"hnsw:space": distance_function})
 
 
-def test_collection_distance_space_rejects_non_mapping_metadata() -> None:
-    """Trust-boundary honesty: non-mapping SDK metadata is rejected, never defaulted."""
-    with pytest.raises(RetrievalError, match="malformed metadata") as exc_info:
-        _collection_distance_space(collection_metadata=12345, collection_name="corrupt")
+_HNSW_COSINE: dict[str, object] = {"hnsw": {"space": "cosine", "ef_search": 100}, "spann": None}
+
+
+def _migrated_collection_double(legacy_space: str) -> MagicMock:
+    """Reduced to the keys the parser reads, from the measured 1.5.5 migrated shape.
+
+    The review opened chromadb 0.6.3 cosine and ip corpora with chromadb 1.5.5.
+    """
+    collection = MagicMock(spec_set=["configuration_json", "metadata"])
+    collection.configuration_json = {"hnsw": {"space": "l2"}, "spann": None}
+    collection.metadata = {"hnsw:space": legacy_space}
+    return collection
+
+
+def test_configured_distance_space_rejects_non_mapping_configuration() -> None:
+    """Trust-boundary honesty: a non-mapping SDK configuration is rejected, never defaulted."""
+    with pytest.raises(RetrievalError, match="malformed configuration") as exc_info:
+        chroma_module._configured_distance_space(collection_configuration=12345, collection_name="corrupt")
     assert exc_info.value.retryable is False
 
 
-def test_collection_distance_space_rejects_missing_hnsw_space() -> None:
-    with pytest.raises(RetrievalError, match="hnsw:space"):
-        _collection_distance_space(collection_metadata={"other": "x"}, collection_name="no-space")
+def test_configured_distance_space_reads_hnsw_space() -> None:
+    assert chroma_module._configured_distance_space(collection_configuration=_HNSW_COSINE, collection_name="ok") == "cosine"
 
 
-def test_collection_distance_space_rejects_non_string_space() -> None:
-    with pytest.raises(RetrievalError, match="non-string 'hnsw:space'"):
-        _collection_distance_space(collection_metadata={"hnsw:space": 7}, collection_name="typed-wrong")
+def test_configured_distance_space_reads_spann_space() -> None:
+    configuration = {"hnsw": None, "spann": {"space": "ip"}}
+    assert chroma_module._configured_distance_space(collection_configuration=configuration, collection_name="ok") == "ip"
 
 
-def test_collection_distance_space_returns_declared_space() -> None:
-    assert _collection_distance_space(collection_metadata={"hnsw:space": "l2"}, collection_name="ok") == "l2"
+@pytest.mark.parametrize(
+    "configuration",
+    [
+        pytest.param({}, id="empty"),
+        pytest.param({"hnsw": None, "spann": None}, id="both-null"),
+        pytest.param({"hnsw_configuration": {"space": "l2"}, "_type": "CollectionConfigurationInternal"}, id="pre-1.0-server"),
+    ],
+)
+def test_configured_distance_space_is_none_when_configuration_names_no_index(configuration: dict[str, object]) -> None:
+    """Only a configuration that names no index at all defers to the legacy metadata."""
+    assert chroma_module._configured_distance_space(collection_configuration=configuration, collection_name="old") is None
+
+
+@pytest.mark.parametrize(
+    ("configuration", "message"),
+    [
+        pytest.param({"hnsw": {"space": "cosine"}, "spann": {"space": "cosine"}}, "both 'hnsw' and 'spann'", id="both-indexes"),
+        pytest.param({"hnsw": "cosine"}, "malformed 'hnsw' index configuration", id="index-not-mapping"),
+        pytest.param({"spann": ["cosine"]}, "malformed 'spann' index configuration", id="spann-not-mapping"),
+        pytest.param({"hnsw": {"ef_search": 100}}, "no 'space'", id="space-absent"),
+        pytest.param({"hnsw": {"space": None}}, "non-string 'space'", id="space-null"),
+        pytest.param({"hnsw": {"space": 7}}, "non-string 'space'", id="space-int"),
+        pytest.param({"hnsw": {"space": "PROVIDER-SUPPLIED-hamming"}}, "unrecognised 'space'", id="space-unknown"),
+        pytest.param({"hnsw": {"space": "Cosine"}}, "unrecognised 'space'", id="space-wrong-case"),
+    ],
+)
+def test_configured_distance_space_fails_closed_on_unrecognised_shape(configuration: dict[str, object], message: str) -> None:
+    with pytest.raises(RetrievalError, match=message) as exc_info:
+        chroma_module._configured_distance_space(collection_configuration=configuration, collection_name="odd")
+    assert exc_info.value.retryable is False
+    # The error names the collection (ours) and the shape problem, never the provider's value.
+    assert "PROVIDER-SUPPLIED" not in str(exc_info.value)
+
+
+def test_legacy_metadata_distance_space_rejects_non_mapping_metadata() -> None:
+    """Trust-boundary honesty: non-mapping SDK metadata is rejected, never defaulted."""
+    with pytest.raises(RetrievalError, match="malformed metadata") as exc_info:
+        chroma_module._legacy_metadata_distance_space(collection_metadata=12345, collection_name="corrupt")
+    assert exc_info.value.retryable is False
+
+
+@pytest.mark.parametrize("metadata", [None, {}, {"owner": "x"}], ids=["none", "empty", "no-key"])
+def test_legacy_metadata_distance_space_is_none_when_metadata_names_no_space(metadata: object) -> None:
+    assert chroma_module._legacy_metadata_distance_space(collection_metadata=metadata, collection_name="plain") is None
+
+
+def test_legacy_metadata_distance_space_returns_declared_space() -> None:
+    assert chroma_module._legacy_metadata_distance_space(collection_metadata={"hnsw:space": "l2"}, collection_name="ok") == "l2"
+
+
+@pytest.mark.parametrize(
+    ("metadata", "message"),
+    [
+        pytest.param({"hnsw:space": 7}, "non-string 'hnsw:space'", id="int"),
+        pytest.param({"hnsw:space": None}, "non-string 'hnsw:space'", id="null"),
+        pytest.param({"hnsw:space": "PROVIDER-SUPPLIED-hamming"}, "unrecognised 'hnsw:space'", id="unknown"),
+    ],
+)
+def test_legacy_metadata_distance_space_fails_closed_on_unrecognised_value(metadata: dict[str, object], message: str) -> None:
+    with pytest.raises(RetrievalError, match=message) as exc_info:
+        chroma_module._legacy_metadata_distance_space(collection_metadata=metadata, collection_name="odd")
+    assert exc_info.value.retryable is False
+    assert "PROVIDER-SUPPLIED" not in str(exc_info.value)
+
+
+def test_collection_distance_space_prefers_configuration_when_metadata_is_absent() -> None:
+    assert _collection_distance_space(collection_configuration=_HNSW_COSINE, collection_metadata=None, collection_name="cfg") == "cosine"
+
+
+def test_collection_distance_space_accepts_agreeing_configuration_and_metadata() -> None:
+    assert (
+        _collection_distance_space(
+            collection_configuration=_HNSW_COSINE, collection_metadata={"hnsw:space": "cosine"}, collection_name="both"
+        )
+        == "cosine"
+    )
+
+
+def test_collection_distance_space_falls_back_to_legacy_metadata_when_configuration_names_no_index() -> None:
+    assert _collection_distance_space(collection_configuration={}, collection_metadata={"hnsw:space": "ip"}, collection_name="old") == "ip"
+
+
+@pytest.mark.parametrize("space", ["cosine", "ip"])
+def test_collection_distance_space_uses_legacy_metric_over_migration_l2_default(space: str) -> None:
+    assert (
+        _collection_distance_space(
+            collection_configuration={"hnsw": {"space": "l2"}},
+            collection_metadata={"hnsw:space": space},
+            collection_name="migrated",
+        )
+        == space
+    )
+
+
+@pytest.mark.parametrize("configured_space,legacy_space", [("cosine", "l2"), ("cosine", "ip"), ("ip", "cosine"), ("ip", "l2")])
+def test_collection_distance_space_rejects_disagreeing_configuration_and_metadata(configured_space: str, legacy_space: str) -> None:
+    with pytest.raises(RetrievalError, match="disagree") as exc_info:
+        _collection_distance_space(
+            collection_configuration={"hnsw": {"space": configured_space}},
+            collection_metadata={"hnsw:space": legacy_space},
+            collection_name="split",
+        )
+    assert exc_info.value.retryable is False
+    assert "split" in str(exc_info.value)
+    assert configured_space not in str(exc_info.value)
+    assert legacy_space not in str(exc_info.value)
+
+
+@pytest.mark.parametrize("metadata", [7, {"hnsw:space": 7}, {"hnsw:space": "unknown"}])
+def test_collection_distance_space_rejects_malformed_legacy_metadata_with_valid_configuration(metadata: object) -> None:
+    with pytest.raises(RetrievalError, match="metadata") as exc_info:
+        _collection_distance_space(collection_configuration=_HNSW_COSINE, collection_metadata=metadata, collection_name="malformed")
+    assert exc_info.value.retryable is False
+
+
+def test_collection_distance_space_rejects_collection_naming_no_distance_function() -> None:
+    with pytest.raises(RetrievalError, match="names no distance function") as exc_info:
+        _collection_distance_space(collection_configuration={}, collection_metadata={"owner": "x"}, collection_name="none")
+    assert exc_info.value.retryable is False
+
+
+def test_collection_distance_space_does_not_let_metadata_rescue_a_malformed_configuration() -> None:
+    with pytest.raises(RetrievalError, match="non-string 'space'"):
+        _collection_distance_space(
+            collection_configuration={"hnsw": {"space": 7}}, collection_metadata={"hnsw:space": "cosine"}, collection_name="odd"
+        )
 
 
 class TestChromaSearchProviderConfig:
@@ -230,6 +368,23 @@ class TestToConnectionConfig:
 class TestChromaSearchProvider:
     """Tests using real ephemeral ChromaDB — no mocks."""
 
+    @pytest.mark.parametrize("legacy_space", ["cosine", "ip"])
+    @pytest.mark.parametrize("matches_legacy", [True, False])
+    def test_migrated_collection_uses_legacy_metric(self, legacy_space: str, matches_legacy: bool) -> None:
+        requested_space = legacy_space if matches_legacy else "l2"
+        collection = _migrated_collection_double(legacy_space)
+        client = MagicMock(spec_set=["get_collection"])
+        client.get_collection.return_value = collection
+        config = ChromaSearchProviderConfig(collection="migrated-corpus", distance_function=requested_space)
+        with patch("elspeth.plugins.infrastructure.clients.retrieval.chroma.chromadb.Client", return_value=client):
+            if matches_legacy:
+                provider = ChromaSearchProvider(config=config, execution=_fake_execution(), run_id="test-run")
+                assert provider._collection is collection
+            else:
+                with pytest.raises(RetrievalError, match=f"exists with distance_function='{legacy_space}'") as exc_info:
+                    ChromaSearchProvider(config=config, execution=_fake_execution(), run_id="test-run")
+                assert exc_info.value.retryable is False
+
     def test_client_mode_passes_validated_ip_not_original_hostname_to_sdk(self) -> None:
         with plugin_preflight_mode(True):
             config = ChromaSearchProviderConfig(
@@ -248,7 +403,8 @@ class TestChromaSearchProvider:
             scheme="http",
             bare_hostname="localhost",
         )
-        fake_collection = MagicMock(spec_set=["metadata"])
+        fake_collection = MagicMock(spec_set=["configuration_json", "metadata"])
+        fake_collection.configuration_json = {"hnsw": {"space": "cosine"}, "spann": None}
         fake_collection.metadata = {"hnsw:space": "cosine"}
         fake_client = MagicMock(spec_set=["get_collection"])
         fake_client.get_collection.return_value = fake_collection
@@ -461,18 +617,24 @@ class TestChromaSearchProvider:
         with pytest.raises(RetrievalError, match="distance_function"):
             ChromaSearchProvider(config=config_l2, execution=_fake_execution(), run_id="test-run")
 
-    def test_missing_hnsw_space_metadata_raises(self, tmp_path):
-        """Collection without hnsw:space metadata must crash — can't normalize scores."""
+    def test_collection_created_with_no_declared_metric_is_read_as_chromas_l2_default(self, tmp_path):
+        """Chroma builds an undeclared collection as l2 and says so in its configuration."""
         client = chromadb.PersistentClient(path=str(tmp_path))
-        client.get_or_create_collection(name="no-metadata-test")
+        collection = client.create_collection(name="no-metadata-test", configuration={})
+        assert collection.metadata is None
+        assert collection.configuration_json["hnsw"]["space"] == "l2"
 
-        config = ChromaSearchProviderConfig(
-            collection="no-metadata-test",
-            mode="persistent",
-            persist_directory=str(tmp_path),
-        )
-        with pytest.raises(RetrievalError, match="hnsw:space"):
-            ChromaSearchProvider(config=config, execution=_fake_execution(), run_id="test-run")
+        def config(distance_function: str) -> ChromaSearchProviderConfig:
+            return ChromaSearchProviderConfig(
+                collection="no-metadata-test",
+                mode="persistent",
+                persist_directory=str(tmp_path),
+                distance_function=distance_function,
+            )
+
+        with pytest.raises(RetrievalError, match="distance_function='l2'"):
+            ChromaSearchProvider(config=config("cosine"), execution=_fake_execution(), run_id="test-run")
+        ChromaSearchProvider(config=config("l2"), execution=_fake_execution(), run_id="test-run")
 
     def test_close_does_not_raise(self):
         provider = self._make_provider()

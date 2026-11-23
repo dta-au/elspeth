@@ -393,6 +393,152 @@ class TestFinding92ChromaSinkDistanceFunctionMismatch:
             sink.close()
 
 
+class TestChromaSinkReadsMetricFromCollectionConfiguration:
+    """Sink startup reads configuration and refuses contradictory legacy metadata."""
+
+    @staticmethod
+    def _create(tmp_path: Any, space: str) -> str:
+        chromadb = pytest.importorskip("chromadb")
+        persist = str(tmp_path / "chroma")
+        collection = chromadb.PersistentClient(path=persist).create_collection(
+            "p3-sink-collection", configuration={"hnsw": {"space": space}}
+        )
+        # The configuration-only shape: nothing for a metadata-only parser to read.
+        assert collection.metadata is None
+        return persist
+
+    def test_configured_collection_with_matching_distance_function_accepted(self, tmp_path: Any) -> None:
+        from elspeth.plugins.infrastructure.clients.retrieval.base import RetrievalError
+        from elspeth.plugins.sinks.chroma_sink import ChromaSink
+        from tests.fixtures.factories import make_context
+
+        persist = self._create(tmp_path, "cosine")
+
+        sink = ChromaSink(_chroma_sink_config(persist, distance_function="cosine"))
+        startup_error: RetrievalError | None = None
+        try:
+            try:
+                sink.on_start(make_context(node_id="chroma"))
+            except RetrievalError as exc:
+                startup_error = exc
+        finally:
+            sink.close()
+        assert startup_error is None
+
+    def test_configured_collection_with_other_distance_function_refused(self, tmp_path: Any) -> None:
+        from elspeth.plugins.sinks.chroma_sink import ChromaSink
+        from tests.fixtures.factories import make_context
+
+        persist = self._create(tmp_path, "l2")
+
+        sink = ChromaSink(_chroma_sink_config(persist, distance_function="cosine"))
+        try:
+            with pytest.raises(ValueError, match="already exists with distance_function='l2'"):
+                sink.on_start(make_context(node_id="chroma"))
+        finally:
+            sink.close()
+
+    def test_collection_the_sink_created_is_reopened_and_still_refuses_a_mismatch(self, tmp_path: Any) -> None:
+        from elspeth.plugins.sinks.chroma_sink import ChromaSink
+        from tests.fixtures.factories import make_context
+
+        persist = str(tmp_path / "chroma")
+        for distance_function, refused in (("ip", False), ("ip", False), ("cosine", True)):
+            sink = ChromaSink(_chroma_sink_config(persist, distance_function=distance_function))
+            try:
+                if refused:
+                    with pytest.raises(ValueError, match="already exists with distance_function='ip'"):
+                        sink.on_start(make_context(node_id="chroma"))
+                else:
+                    sink.on_start(make_context(node_id="chroma"))
+            finally:
+                sink.close()
+
+    @pytest.mark.parametrize("distance_function", ["cosine", "ip"])
+    def test_disagreeing_configuration_and_legacy_metadata_refused(self, tmp_path: Any, distance_function: str) -> None:
+        chromadb = pytest.importorskip("chromadb")
+        from elspeth.plugins.infrastructure.clients.retrieval.base import RetrievalError
+        from elspeth.plugins.sinks.chroma_sink import ChromaSink
+        from tests.fixtures.factories import make_context
+
+        persist = str(tmp_path / "chroma")
+        collection = chromadb.PersistentClient(path=persist).create_collection(
+            name="p3-sink-collection", configuration={"hnsw": {"space": "cosine"}}, metadata={"hnsw:space": "ip"}
+        )
+        assert collection.configuration_json["hnsw"]["space"] == "cosine"
+        assert collection.metadata == {"hnsw:space": "ip"}
+
+        sink = ChromaSink(_chroma_sink_config(persist, distance_function=distance_function))
+        try:
+            with pytest.raises(RetrievalError, match=r"configuration and legacy metadata.*disagree") as exc_info:
+                sink.on_start(make_context(node_id="chroma"))
+            assert exc_info.value.retryable is False
+        finally:
+            sink.close()
+
+
+class TestChromaRetrievalReadsMetricFromCollectionConfiguration:
+    """Retrieval opens configuration-only corpora and refuses contradictory metadata."""
+
+    @staticmethod
+    def _open(tmp_path: Any, *, created_as: str, configured_as: str) -> None:
+        chromadb = pytest.importorskip("chromadb")
+        from elspeth.plugins.infrastructure.clients.retrieval.chroma import ChromaSearchProvider, ChromaSearchProviderConfig
+
+        persist = str(tmp_path / "chroma")
+        collection = chromadb.PersistentClient(path=persist).create_collection(
+            "p3-configured-corpus", configuration={"hnsw": {"space": created_as}}
+        )
+        assert collection.metadata is None
+
+        ChromaSearchProvider(
+            config=ChromaSearchProviderConfig(
+                collection="p3-configured-corpus",
+                mode="persistent",
+                persist_directory=persist,
+                distance_function=configured_as,
+            ),
+            execution=_ChromaExecutionRecorder(),
+            run_id="p3-run",
+        )
+
+    def test_configured_collection_with_matching_distance_function_opened(self, tmp_path: Any) -> None:
+        from elspeth.plugins.infrastructure.clients.retrieval.base import RetrievalError
+
+        startup_error: RetrievalError | None = None
+        try:
+            self._open(tmp_path, created_as="cosine", configured_as="cosine")
+        except RetrievalError as exc:
+            startup_error = exc
+        assert startup_error is None
+
+    def test_configured_collection_with_other_distance_function_refused(self, tmp_path: Any) -> None:
+        from elspeth.plugins.infrastructure.clients.retrieval.base import RetrievalError
+
+        with pytest.raises(RetrievalError, match="exists with distance_function='l2'"):
+            self._open(tmp_path, created_as="l2", configured_as="cosine")
+
+    @pytest.mark.parametrize("distance_function", ["cosine", "ip"])
+    def test_disagreeing_configuration_and_legacy_metadata_refused(self, tmp_path: Any, distance_function: str) -> None:
+        chromadb = pytest.importorskip("chromadb")
+        from elspeth.plugins.infrastructure.clients.retrieval.base import RetrievalError
+        from elspeth.plugins.infrastructure.clients.retrieval.chroma import ChromaSearchProvider, ChromaSearchProviderConfig
+
+        persist = str(tmp_path / "chroma")
+        collection = chromadb.PersistentClient(path=persist).create_collection(
+            name="p3-configured-corpus", configuration={"hnsw": {"space": "cosine"}}, metadata={"hnsw:space": "ip"}
+        )
+        assert collection.configuration_json["hnsw"]["space"] == "cosine"
+        assert collection.metadata == {"hnsw:space": "ip"}
+
+        config = ChromaSearchProviderConfig(
+            collection="p3-configured-corpus", mode="persistent", persist_directory=persist, distance_function=distance_function
+        )
+        with pytest.raises(RetrievalError, match=r"configuration and legacy metadata.*disagree") as exc_info:
+            ChromaSearchProvider(config=config, execution=_ChromaExecutionRecorder(), run_id="p3-run")
+        assert exc_info.value.retryable is False
+
+
 class TestFinding93ChromaComposerHintMatchesDiversion:
     """#93: the composer hint must say a non-string id/document diverts that row, as the code does."""
 
