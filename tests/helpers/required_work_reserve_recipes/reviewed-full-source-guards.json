@@ -1,7 +1,7 @@
 {
   "src/elspeth/web/async_workers.py": {
     "protected_exports": [],
-    "sha256": "3e97fa7f9a9106faeb419921febf7c5dc9b3c8c015a85ab5327c037df5b73c38"
+    "sha256": "69dce2260bf22c2677ce33f32e954f8c1a92f7fd63478a061a3c3cb12ec50d7d"
   },
   "src/elspeth/web/coordination/composer_operation_authority.py": {
     "protected_exports": [],
@@ -9,7 +9,7 @@
   },
   "src/elspeth/web/coordination/lifecycle.py": {
     "protected_exports": [],
-    "sha256": "1ae482b54d4b8888c08eebe0d3d903795d683a95b6704d2ae4b4cbeb6b73cd5b"
+    "sha256": "124155eec61a8c8363b4c28b915807c7225b01793b8c85a86a2bd8bea57b878d"
   },
   "src/elspeth/web/execution_lease_cleanup.py": {
     "protected_exports": [],
