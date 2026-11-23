@@ -216,7 +216,7 @@ def test_failed_approval_rolls_back_bytes_and_approval_row(tmp_path, monkeypatch
     with blob_service._engine.begin() as conn:
         conn.execute(text("CREATE TABLE prompt_save_probe (hash TEXT NOT NULL)"))
 
-    def fail_after_write(conn, request, *, now):
+    def fail_after_write(conn, request, *, now, **_):
         conn.execute(text("INSERT INTO prompt_save_probe (hash) VALUES (:hash)"), {"hash": request.content_sha256})
         raise RuntimeError("approval failed")
 
@@ -517,7 +517,7 @@ def test_multiple_file_save_rolls_back_when_sibling_evidence_fails(tmp_path: Pat
     before = _save_side_effects(service, blob_service, session_id, first["id"])
     record_approval = prompt_text_routes.record_prompt_file_approval
 
-    def fail_sibling(conn, request, *, now):
+    def fail_sibling(conn, request, *, now, **_):
         if request.field_path == "system_prompt":
             raise RuntimeError("sibling evidence failed")
         return record_approval(conn, request, now=now)
@@ -1625,7 +1625,7 @@ def test_editor_save_supersedes_only_pending_card_never_a_resolved_one(tmp_path:
     # the whole save transaction rolls back, so neither write survives.
     real_record = prompt_text_routes.record_prompt_file_approval
 
-    def record_then_fail(conn: Any, request: Any, *, now: datetime) -> Any:
+    def record_then_fail(conn: Any, request: Any, *, now: datetime, **_: Any) -> Any:
         real_record(conn, request, now=now)
         raise RuntimeError("fault after supersede")
 

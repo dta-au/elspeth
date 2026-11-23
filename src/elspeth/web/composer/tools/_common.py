@@ -40,7 +40,7 @@ from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.composer_paths import McpConfiguredRootAuthority
 from elspeth.contracts.emitted_option import emitted_option_values, env_placeholders_in
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.hashing import canonical_json, stable_hash
 from elspeth.contracts.plugin_capabilities import PluginCapability
@@ -968,6 +968,13 @@ class ToolResult:
     # snapshot change cannot reattach the withheld stale-state errors.
     # Private framing — never serialized by to_dict().
     _state_validation_withheld: bool = field(default=False, compare=False, repr=False)
+    # The bounded validation summary a state-inspection page sends in place of
+    # ``validation`` when the full block leaves the page no room
+    # (``state_inspection.bounded_state_inspection``). Wire only: ``validation``
+    # stays complete, because a successful result's validation is the next
+    # mutation's delta base. normalize_tool_result_validation refuses to
+    # revalidate a result that carries one.
+    _wire_validation: ValidationSummary | None = field(default=None, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         # Admission before freezing: a refusal must leave nothing half-frozen behind.
@@ -997,19 +1004,20 @@ class ToolResult:
         full validation state.
         """
 
+        shown = self.validation if self._wire_validation is None else self._wire_validation
         result: dict[str, Any] = {
             "success": self.success,
             "validation": {
-                "is_valid": self.validation.is_valid,
-                "errors": [e.to_dict() for e in self.validation.errors],
-                "warnings": [e.to_dict() for e in self.validation.warnings],
-                "suggestions": [e.to_dict() for e in self.validation.suggestions],
+                "is_valid": shown.is_valid,
+                "errors": [e.to_dict() for e in shown.errors],
+                "warnings": [e.to_dict() for e in shown.warnings],
+                "suggestions": [e.to_dict() for e in shown.suggestions],
                 "semantic_contracts": _semantic_contracts_payload(
-                    self.validation.semantic_contracts,
+                    shown.semantic_contracts,
                 ),
                 "graph_repair_suggestions": _graph_repair_suggestions(
                     self.updated_state,
-                    self.validation,
+                    shown,
                 ),
             },
             "affected_nodes": list(self.affected_nodes),
@@ -3968,6 +3976,10 @@ def normalize_tool_result_validation(
     snapshot_hash = catalog.snapshot.snapshot_hash
     if result._validation_snapshot_hash == snapshot_hash:
         return result
+    if result._wire_validation is not None:
+        # The summary was sized for one snapshot's validation; sending it beside
+        # another snapshot's would disagree, and dropping it would exceed the page budget.
+        raise FrameworkBugError("A bounded state-inspection page cannot be revalidated under another plugin snapshot")
     rejections = tuple(entry for entry in result.validation.errors if entry.component == "rejected_mutation")
     if rejections and result._state_validation_withheld:
         # Full-replacement rejection: updated_state is the untouched input

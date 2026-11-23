@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.14+](https://img.shields.io/badge/python-3.14+-blue.svg)](https://www.python.org/downloads/)
-![Status: 0.8.16](https://img.shields.io/badge/status-0.8.16-green.svg)
+![Status: 0.8.17](https://img.shields.io/badge/status-0.8.17-green.svg)
 
 ELSPETH builds, validates, runs, and audits data and LLM workflows whose
 outputs need to be reviewed and explained. You can author a pipeline in
@@ -100,33 +100,22 @@ ELSPETH supports audit export and optional signing. The
 [export settings and limits](docs/reference/configuration.md#export-settings)
 describe what is exported and how to configure it.
 
-## What changed in 0.8.16
+## What changed in 0.8.17
 
-0.8.16 carries Web Composer fixes for large pipelines and for prompts held in
-files, bounded advisor and prompt-guard requests, and less redundant per-row
-engine work. See the [release notes](CHANGELOG.md), which also record earlier
-releases.
+0.8.17 is a hotfix for 0.8.16 with three Web Composer fixes for large
+pipelines and prompts held in files: the planner can read exact state on a
+large invalid pipeline, saving prompt files in the editor reads each file once,
+and advisor checks no longer fail on a long prompt file. See the
+[release notes](CHANGELOG.md), which also record earlier releases.
 
-Long inline prompts belong in files: a Composer edit that adds or changes an
-inline LLM prompt over 100 words or 1,000 characters is refused, and the
-composer puts the text in a file instead. One prompt template may hold up to
-64 KiB and a pipeline up to 4 MiB of text in attached files. A composer request
-that fits the configured request size is always sent, and advisor and
-prompt-guard requests no longer grow with the session.
-
-Session epoch 79 and Landscape epoch 51 are unchanged from 0.8.15; this release
-adds no schema-epoch cutover, and existing 0.8.15 session and Landscape stores
-open unchanged. A web run admitted under 0.8.15 does not resume, because the
-plugin policy hash changes: finish interrupted web runs before upgrading, or
-run them again afterwards. Upgrading from 0.8.14 or earlier means applying the 0.8.15
-upgrade notes first: preserve epoch 78 session stores and epoch 50 Landscape
-stores, which startup refuses to open; use a separately provisioned epoch 79
-session store and epoch 51 Landscape store, and keep old workers isolated from
-the new stores. The 0.8.10 cutover guidance below continues to apply to older
-stores. Backwards compatibility is permitted and considered from 0.8.5 within
-explicitly supported boundaries.
+Session epoch 79 and Landscape epoch 51 are unchanged from 0.8.16; this release
+adds no schema-epoch cutover, and existing 0.8.16 session and Landscape stores
+open unchanged. Upgrading from 0.8.15 or earlier means applying the 0.8.16
+upgrade notes first; the upgrading section below lists what each earlier
+release requires. Backwards compatibility is permitted and considered from
+0.8.5 within explicitly supported boundaries.
 This release authorizes no in-place migration, reset or downgrade. Package
-metadata is 0.8.16; the package version alone does not establish qualification
+metadata is 0.8.17; the package version alone does not establish qualification
 or image publication. Automatic image publication from main is held; verify
 the release tag and image digest before installing a published image.
 
@@ -139,6 +128,26 @@ carry each release's full upgrade notes, and the
 compatibility is permitted and considered from 0.8.5 within explicitly
 supported boundaries. None of these releases authorizes an in-place migration,
 reset or downgrade.
+
+### 0.8.16
+
+0.8.16 changed no schema epoch; 0.8.15 session and Landscape stores open
+unchanged.
+
+- Web runs admitted under 0.8.15 do not resume, because the plugin policy hash
+  changes: finish interrupted web runs before upgrading, or run them again
+  afterwards. A run approval recorded under 0.8.15 must be given again.
+- Long inline prompts belong in files: a Composer edit that adds or changes an
+  inline LLM prompt over 100 words or 1,000 characters is refused, and the
+  composer puts the text in a file instead. Existing long inline prompts still
+  validate and run, but the composer cannot change them in place.
+- An inline prompt the template check refuses (over the size limit for one
+  template, nested too deeply or holding a number literal too long to read)
+  now makes the pipeline invalid; it used to be valid with a warning.
+- The advisor reply cap now defaults to 16384 tokens (was 8192) and the
+  advisor timeout to 180 seconds (was 60); explicit settings are used as given.
+- Clients or tests that pin Composer tool results must follow the 0.8.16 tool
+  changes in the release notes.
 
 ### 0.8.15
 

@@ -333,6 +333,10 @@ def create_prompt_text_router() -> APIRouter:
                     # approved_at.
                     saved_snapshot = _current_snapshot(conn, approval_request, _current_node_options(conn, approval_request))
                     assert_editor_save_may_carry_approvals(conn, prior=attested_snapshot, saved=saved_snapshot, saved_blob_id=blob_id)
+                    # Each row is checked against this one snapshot, resolved
+                    # above on this connection in this transaction, instead of
+                    # re-reading every file of the node per row (N squared
+                    # custody reads per save).
                     for file_binding in saved_snapshot.bindings:
                         record_prompt_file_approval(
                             conn,
@@ -346,6 +350,7 @@ def create_prompt_text_router() -> APIRouter:
                                 trigger=PromptApprovalTrigger.EDITOR_SAVE,
                             ),
                             now=now,
+                            resolved_snapshot=saved_snapshot,
                         )
                     if pending_event is not None:
                         latest_row = conn.execute(

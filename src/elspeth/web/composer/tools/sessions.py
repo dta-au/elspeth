@@ -2883,6 +2883,9 @@ def _execute_get_pipeline_state(
         )
     component = validated.component
     data: Any
+    # A whole-graph read (no component, or a full-state alias) is refused when
+    # its diagnostics exceed the page budget; a read that names one component is not.
+    whole_graph = False
 
     if validated.since_start:
         if component is not None:
@@ -2927,6 +2930,7 @@ def _execute_get_pipeline_state(
                 data = {"output": _serialize_output(output)}
             elif _is_full_state_component_alias(component):
                 data = _serialize_full_pipeline_state(state, requested_component=component)
+                whole_graph = True
             else:
                 return _failure_result(
                     state,
@@ -2935,6 +2939,7 @@ def _execute_get_pipeline_state(
                 )
     else:
         data = _serialize_full_pipeline_state(state, requested_component=None)
+        whole_graph = True
 
     data = redact_source_storage_path(data)
     result = _discovery_result(state, data)
@@ -2945,6 +2950,7 @@ def _execute_get_pipeline_state(
         offset_chars=validated.offset_chars,
         expected_sha256=validated.expected_sha256,
         since_start=validated.since_start,
+        whole_graph=whole_graph,
     )
 
 
@@ -2962,6 +2968,8 @@ _GET_PIPELINE_STATE_DECLARATION = ToolDeclaration(
         "Inspect graph or since_start changes. Oversized whole-graph reads return a structural `view`; "
         "pages carry exact `content`, `encoding`, `field_path`, `offset_chars`, `total_chars`, `next_offset_chars` and `sha256`. "
         "Use field_path for exact values; pass the hash to continue. "
+        "When full diagnostics would crowd out a page, its `validation` lists only the first error codes and a `post_call_hints` line gives the totals; "
+        "preview_pipeline returns the full diagnostics. "
         "Changes give `baseline_kind`, `from_version`, `projection`, and `changes` with `operation`, `path`, optional `value`. "
         'For the web set_pipeline tool, put the flat `set_pipeline_arguments` document inside {"pipeline": <document>}; do not send its source/nodes/edges/outputs fields at the top level. '
         "Full diagnostic reads include `inspection`: `requested_component`, `resolved_component` and `accepted_full_state_aliases`."

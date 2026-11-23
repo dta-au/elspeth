@@ -633,13 +633,14 @@ async def test_the_manual_hint_reads_files_under_the_tool_calls_operation(tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_the_summary_header_explains_both_text_states(tmp_path: Path) -> None:
+async def test_the_summary_header_explains_each_text_state(tmp_path: Path) -> None:
     store = _PromptFileStore(root=tmp_path)
     service, advisor = _service(store)
     _arguments, message = await _checkpoint(service, advisor, _state(_llm_node({"prompt_template": "plain"})), context=_context())
     assert (
-        "A prompt shown with text=not_sent is held in a file the user wrote; its text is not shown by design, "
-        "so never FLAG a step or withhold a reply because that text is not shown. "
+        "A prompt shown with text=not_sent is held in a file the user wrote; its text is not shown by design. "
+        "A prompt shown with text=unavailable:too_long_to_screen is too long to screen, so its text is not shown. "
+        "Never FLAG a step or withhold a reply because either text is not shown. "
         "A prompt shown with text=sent is held in a file that is not recorded as the user's own writing; its text follows "
         "and is reviewed "
         "like any inline prompt:"
