@@ -23,6 +23,7 @@ from elspeth.contracts import Checkpoint, Determinism, NodeType, RunStatus
 from elspeth.contracts.barrier_scalars import BarrierScalars
 from elspeth.contracts.contract_records import ContractAuditRecord
 from elspeth.contracts.enums import TerminalOutcome, TerminalPath
+from elspeth.contracts.hashing import CANONICAL_VERSION
 from elspeth.contracts.schema_contract import FieldContract, SchemaContract
 from elspeth.core.checkpoint import CheckpointManager
 from elspeth.core.dag import ExecutionGraph
@@ -259,7 +260,7 @@ class TestCheckpointRecoveryIntegration:
                     started_at=now,
                     config_hash=fake_sha256("test"),
                     settings_json="{}",
-                    canonical_version="sha256-rfc8785-v1",
+                    canonical_version=CANONICAL_VERSION,
                     status=RunStatus.FAILED,
                     openrouter_catalog_sha256="0" * 64,
                     openrouter_catalog_source="bundled",
@@ -411,7 +412,7 @@ class TestCheckpointTopologyHashAtomicity:
 
         # Create run
         _cj, _ch, _test_contract = _create_test_schema_contract()
-        run = factory.run_lifecycle.begin_run(config={}, canonical_version="test-v1")
+        run = factory.run_lifecycle.begin_run(config={}, canonical_version=CANONICAL_VERSION)
 
         # Register nodes in database
         schema_config = SchemaConfig(mode="observed", fields=None)
@@ -493,7 +494,7 @@ class TestCheckpointTopologyHashAtomicity:
 
         # Create minimal run
         _cj, _ch, _test_contract = _create_test_schema_contract()
-        run = factory.run_lifecycle.begin_run(config={}, canonical_version="test-v1")
+        run = factory.run_lifecycle.begin_run(config={}, canonical_version=CANONICAL_VERSION)
 
         # Register source node
         schema_config = SchemaConfig(mode="observed", fields=None)
@@ -582,7 +583,7 @@ class TestResumeCheckpointCleanup:
         # Create run and required parent records
         factory = make_factory(db)
         _cj, _ch, _test_contract = _create_test_schema_contract()
-        run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
+        run = factory.run_lifecycle.begin_run(config={}, canonical_version=CANONICAL_VERSION)
 
         now = datetime.now(UTC)
         with db.engine.begin() as conn:
@@ -690,7 +691,7 @@ class TestCanResumeErrorHandling:
 
         # Create run with FAILED status (required for resume eligibility)
         _cj, _ch, _test_contract = _create_test_schema_contract()
-        run = factory.run_lifecycle.begin_run(config={}, canonical_version="test-v1")
+        run = factory.run_lifecycle.begin_run(config={}, canonical_version=CANONICAL_VERSION)
 
         # Register nodes
         schema_config = SchemaConfig(mode="observed", fields=None)

@@ -27,7 +27,9 @@ from elspeth.contracts import (
     NodeType,
     RunStatus,
 )
+from elspeth.contracts.checkpoint import ResumeRefusalCause
 from elspeth.contracts.contract_records import ContractAuditRecord
+from elspeth.contracts.hashing import CANONICAL_VERSION
 from elspeth.contracts.schema_contract import FieldContract, SchemaContract
 from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
 from elspeth.core.dag import ExecutionGraph
@@ -163,12 +165,7 @@ class TestResumeRejection:
 
         The crafted run has row/token audit rows but NO recoverable resume
         state: zero ``token_work_items`` journal rows and no checkpoint.
-        Whatever layer the resume gate reads — the checkpoint store today,
-        the scheduler journal after the durability unification (F1) — a run
-        with nothing to recover must be rejected. The assertion is therefore
-        only the public ``can_resume`` boolean plus a non-empty reason; the
-        gate's wording is deliberately NOT pinned (today it is
-        checkpoint-flavoured; post-F1 it becomes journal-flavoured).
+        The absent checkpoint leaves no resume baseline.
         """
         db = LandscapeDB(f"sqlite:///{tmp_path}/audit.db")
 
@@ -188,7 +185,7 @@ class TestResumeRejection:
                     started_at=now,
                     config_hash=fake_sha256("test"),
                     settings_json="{}",
-                    canonical_version="sha256-rfc8785-v1",
+                    canonical_version=CANONICAL_VERSION,
                     status=RunStatus.FAILED,
                     openrouter_catalog_sha256="0" * 64,
                     openrouter_catalog_source="bundled",
@@ -265,9 +262,7 @@ class TestResumeRejection:
 
         check = recovery_mgr.can_resume(run_id, graph)
         assert check.can_resume is False
-        # The durable claim is "a run with nothing recoverable is rejected",
-        # not any particular reason wording (checkpoint-flavoured today,
-        # journal-flavoured after F1) — so only non-emptiness is pinned.
+        assert check.cause is ResumeRefusalCause.CHECKPOINT_MISSING
         assert check.reason is not None
         assert check.reason != ""
 

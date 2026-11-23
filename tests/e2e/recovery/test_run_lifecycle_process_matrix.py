@@ -14,6 +14,7 @@ from elspeth.contracts import FrameworkBugError, NodeType, RunStatus
 from elspeth.contracts.checkpoint import CheckpointDraft, ResumePoint
 from elspeth.contracts.enums import TerminalPath
 from elspeth.contracts.errors import IncompleteSourceResumeError
+from elspeth.contracts.hashing import CANONICAL_VERSION
 from elspeth.contracts.sink_effects import SinkEffectMemberCandidate
 from elspeth.core.checkpoint import CheckpointManager
 from elspeth.core.landscape import LandscapeDB
@@ -60,7 +61,7 @@ def _build_open_effect_run(
         factory = RecorderFactory(db)
         factory.run_lifecycle.begin_run(
             config={},
-            canonical_version="v1",
+            canonical_version=CANONICAL_VERSION,
             run_id=run_id,
             leader_worker_id=_LEADER_WORKER_ID,
         )

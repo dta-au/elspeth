@@ -25,6 +25,7 @@ import pytest
 
 from elspeth.contracts import Determinism, NodeType, RunStatus
 from elspeth.contracts.enums import TerminalOutcome, TerminalPath
+from elspeth.contracts.hashing import CANONICAL_VERSION
 from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.landscape.database import LandscapeDB
@@ -116,7 +117,7 @@ def run_with_checkpoint_and_payloads(
                 started_at=now,
                 config_hash="test",
                 settings_json="{}",
-                canonical_version="sha256-rfc8785-v1",
+                canonical_version=CANONICAL_VERSION,
                 status=RunStatus.FAILED,
                 openrouter_catalog_sha256="0" * 64,
                 openrouter_catalog_source="bundled",

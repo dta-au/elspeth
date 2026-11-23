@@ -22,6 +22,7 @@ from sqlalchemy import event, select
 from elspeth.contracts import PipelineRow
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.errors import AuditIntegrityError, RunLeadershipLostError, RunMembershipLostError
+from elspeth.contracts.hashing import CANONICAL_VERSION
 from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkStatus
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
@@ -354,7 +355,7 @@ def _begin_run_with_registered_leader_process(
     prepare_for_run()
     run = RecorderFactory(db).run_lifecycle.begin_run(
         config={"process_authority": True},
-        canonical_version="v1",
+        canonical_version=CANONICAL_VERSION,
         run_id=run_id,
         openrouter_catalog_sha256="0" * 64,
         openrouter_catalog_source="bundled",
