@@ -51,7 +51,7 @@ from unittest.mock import patch
 import pytest
 from sqlalchemy import select, update
 
-from elspeth.contracts import NodeType, RunStatus
+from elspeth.contracts import NodeType, RoutingMode, RunStatus
 from elspeth.contracts.config import RuntimeRetryConfig
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.errors import FollowerSeatDeadError, JoinNotReadyError, JoinRefusedError, RunMembershipLostError
@@ -454,6 +454,35 @@ class TestJoinRunAdmissionRefusals:
         ):
             Orchestrator(setup.db).join_run(run_id=setup.run_id, settings=types.SimpleNamespace(), **_join_inputs())
         assert type(exc_info.value).__name__ == "JoinNotReadyError"
+        _assert_no_follower_mutation(setup, run_id=setup.run_id, seat_before=seat_before)
+        setup.db.close()
+
+    @pytest.mark.parametrize("edge_count,seat_live", [(0, False), (1, False), (1, True)])
+    def test_join_readiness_uses_leader_seat_reason(self, edge_count: int, seat_live: bool) -> None:
+        setup = make_recorder_with_run(
+            run_id="run-join-seat-readiness",
+            canonical_version=CANONICAL_VERSION,
+            leader_worker_id="worker:run-join-seat-readiness:leader",
+        )
+        if edge_count:
+            sink_id = register_test_node(setup.factory.data_flow, setup.run_id, "partial-sink", node_type=NodeType.SINK)
+            setup.factory.data_flow.register_edge(
+                from_node_id=setup.source_node_id,
+                to_node_id=sink_id,
+                label="default",
+                mode=RoutingMode.MOVE,
+                coordination_token=setup.coordination_token,
+            )
+        if not seat_live:
+            expire_leader_seat(setup.db, setup.run_id)
+        seat_before = _coordination_row(setup.db, setup.run_id)
+        with (
+            patch("elspeth.engine.orchestrator.join_admission.resolve_config", return_value={}),
+            pytest.raises(JoinRefusedError) as exc_info,
+        ):
+            Orchestrator(setup.db).join_run(run_id=setup.run_id, settings=cast(Any, types.SimpleNamespace()), **_join_inputs())
+        assert type(exc_info.value) is (JoinNotReadyError if seat_live else JoinRefusedError)
+        assert ("not finished registering its graph" if seat_live else "no live leader") in str(exc_info.value)
         _assert_no_follower_mutation(setup, run_id=setup.run_id, seat_before=seat_before)
         setup.db.close()
 

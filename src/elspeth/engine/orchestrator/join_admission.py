@@ -28,6 +28,7 @@ from elspeth.contracts.hashing import CANONICAL_VERSION
 from elspeth.core.canonical import stable_hash
 from elspeth.core.config import resolve_config
 from elspeth.core.landscape.factory import LandscapeReadRepositories, RecorderFactory
+from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 from elspeth.engine.orchestrator.implementation_compatibility import check_implementation_compatibility
 
 if TYPE_CHECKING:
@@ -44,9 +45,15 @@ class JoinAdmissionService:
     def __init__(self, *, db: LandscapeDB) -> None:
         self._db = db
 
-    @staticmethod
     def _check_join_compatibility(
-        read_factory: LandscapeReadRepositories, run: Run, run_id: str, config: PipelineConfig, graph: ExecutionGraph
+        self,
+        read_factory: LandscapeReadRepositories,
+        run: Run,
+        run_id: str,
+        config: PipelineConfig,
+        graph: ExecutionGraph,
+        *,
+        defer_to_admission_on_dead_leader: bool = True,
     ) -> None:
         if run.canonical_version != CANONICAL_VERSION:
             raise JoinRefusedError(
@@ -56,6 +63,10 @@ class JoinAdmissionService:
         recorded_edges = read_factory.data_flow.get_edges(run_id)
         expected_edge_count = len(graph.get_edges())
         if len(recorded_edges) < expected_edge_count:
+            if defer_to_admission_on_dead_leader:
+                leader = RunCoordinationRepository(self._db.engine).live_leader(run_id=run_id)
+                if leader is None or not leader.seat_live:
+                    return
             raise JoinNotReadyError(run_id, "the run's leader has not finished registering its graph; retry the join")
         if len(recorded_edges) > expected_edge_count:
             raise JoinRefusedError(
@@ -213,7 +224,7 @@ class JoinAdmissionService:
                 current_factory = RecorderFactory.read_only(self._db)
                 current_run = current_factory.run_lifecycle.get_run(run_id)
                 assert current_run is not None
-                self._check_join_compatibility(current_factory, current_run, run_id, config, graph)
+                self._check_join_compatibility(current_factory, current_run, run_id, config, graph, defer_to_admission_on_dead_leader=False)
             except Exception:
                 factory.run_coordination.depart_worker(member_token=token)
                 raise
