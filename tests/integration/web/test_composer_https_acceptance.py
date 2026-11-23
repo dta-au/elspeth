@@ -444,6 +444,7 @@ try {
             harness.composer.release.set()
 
 
+@pytest.mark.timing_sensitive
 def test_four_live_tls_readers_leave_auth_and_worker_terminal_usable(tmp_path: Path) -> None:
     """Measure one principal's supported reader cap while real workers settle.
 
@@ -524,6 +525,7 @@ def test_four_live_tls_readers_leave_auth_and_worker_terminal_usable(tmp_path: P
             harness.composer.release.set()
 
 
+@pytest.mark.timing_sensitive
 def test_eight_tls_readers_bound_real_pool_submissions_and_settle_jobs(
     tmp_path: Path,
 ) -> None:
@@ -736,6 +738,7 @@ def test_eight_tls_readers_bound_real_pool_submissions_and_settle_jobs(
             harness.composer.release.set()
 
 
+@pytest.mark.timing_sensitive
 def test_tls_global_cap_control_detects_removed_global_bound(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A ninth admitted reader must make the complete real-TLS control fail."""
     from elspeth.web.composer_stream import ComposerStreamCapacityError, ComposerStreamPermit, ComposerStreamPermits
