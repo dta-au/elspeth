@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import os
 import stat
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -181,7 +183,60 @@ def _binding_marker(options: Mapping[str, Any], field_path: str) -> WidenedBlobR
     return marker
 
 
+@dataclass(frozen=True, slots=True)
+class _ResolvedSnapshot:
+    conn: Connection
+    session_id: UUID
+    node_id: str
+    options_hash: str
+    snapshot: PromptReviewSnapshot
+
+
+_RESOLVED_SNAPSHOT: ContextVar[_ResolvedSnapshot | None] = ContextVar("elspeth_prompt_file_resolved_snapshot", default=None)
+
+
+@contextmanager
+def reuse_resolved_prompt_snapshot(conn: Connection, request: PromptFileApprovalRequest, snapshot: PromptReviewSnapshot) -> Iterator[None]:
+    """Let the writers reuse one snapshot the caller resolved, for the duration of the block.
+
+    An editor save writes one approval per file binding of a node, and each
+    :func:`record_prompt_file_approval` call resolves the node's snapshot, so
+    one save read N files N times under the session lock. The save resolves
+    the snapshot once in its transaction, from the node's current options, and
+    opens this block around its per-binding writes. Inside the block a writer
+    reuses ``snapshot`` only on the same connection, session and node, and
+    only while the node's options still hash to the options read here when the
+    block opened; any other call resolves as usual. Each writer still checks the owner, its own blob row, marker,
+    snapshot binding and pending card per request. The only statements
+    between two writes are approval inserts and the pending-card supersede,
+    which no snapshot input reads, and the caller's session lock keeps other
+    writers of the state and the custody bytes out for the whole transaction.
+    """
+    token = _RESOLVED_SNAPSHOT.set(
+        _ResolvedSnapshot(
+            conn=conn,
+            session_id=request.session_id,
+            node_id=request.node_id,
+            options_hash=stable_hash(_current_node_options(conn, request)),
+            snapshot=snapshot,
+        )
+    )
+    try:
+        yield
+    finally:
+        _RESOLVED_SNAPSHOT.reset(token)
+
+
 def _current_snapshot(conn: Connection, request: PromptFileApprovalRequest, options: Mapping[str, Any]) -> PromptReviewSnapshot:
+    resolved = _RESOLVED_SNAPSHOT.get()
+    if (
+        resolved is not None
+        and resolved.conn is conn
+        and resolved.session_id == request.session_id
+        and resolved.node_id == request.node_id
+        and resolved.options_hash == stable_hash(options)
+    ):
+        return resolved.snapshot
     records: dict[UUID, tuple[BlobRecord, bytes]] = {}
 
     def read_blob(blob_id: UUID) -> tuple[BlobRecord, bytes]:
