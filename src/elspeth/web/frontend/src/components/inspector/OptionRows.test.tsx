@@ -11,6 +11,8 @@ import type { BlobMetadata, CompositionState } from "@/types/api";
 import type { InterpretationEvent } from "@/types/interpretation";
 import { resetStore } from "@/test/store-helpers";
 import { expectNoIdentifiersInDefaultDom } from "@/test/defaultDomPins";
+import { makeSessionBlobs } from "@/test/blobListRouteDouble";
+import { compositionStateAuthorityFields } from "@/test/composerFixtures";
 import { OptionRows } from "./OptionRows";
 
 const OPTIONS = {
@@ -42,6 +44,7 @@ const FILE_HASH = "a".repeat(64);
 function seedFile(overrides: Partial<BlobMetadata> = {}) {
   useBlobStore.setState({
     activeSessionId: "session-1",
+    listCurrent: true,
     blobs: [{
       id: FILE_ID, session_id: "session-1", filename: "prompt.md", mime_type: "text/plain",
       size_bytes: 12, content_hash: FILE_HASH, created_at: "2026-11-18T00:00:00Z",
@@ -132,7 +135,10 @@ describe("source and sink file names", () => {
   });
 
   it("issues one list read for two views of the same step (inspector and Spec tab)", () => {
-    const loadBlobs = vi.fn(async (sessionId: string) => { useBlobStore.getState().activateSession(sessionId); });
+    const loadBlobs = vi.fn(async (sessionId: string) => {
+      useBlobStore.getState().activateSession(sessionId);
+      useBlobStore.setState({ isLoading: true });
+    });
     useBlobStore.setState({ activeSessionId: null, loadBlobs });
     const props = { options: { path: MASKED_PATH, blob_ref: FILE_ID }, plugin: { kind: "source", name: "csv" } } as const;
     render(<><OptionRows {...props} ariaLabel="inspector" /><OptionRows {...props} ariaLabel="spec" /></>);
@@ -141,7 +147,7 @@ describe("source and sink file names", () => {
 
   it("does not read the list again when this session's list is already read and lacks the file", () => {
     const loadBlobs = vi.fn().mockResolvedValue(undefined);
-    useBlobStore.setState({ activeSessionId: "session-1", blobs: [], isLoading: false, loadBlobs });
+    useBlobStore.setState({ activeSessionId: "session-1", listCurrent: true, blobs: [], isLoading: false, loadBlobs });
     render(<OptionRows options={{ path: MASKED_PATH, blob_ref: FILE_ID }} ariaLabel="source settings" plugin={{ kind: "source", name: "csv" }} />);
     expect(loadBlobs).not.toHaveBeenCalled();
     expect(screen.getByText("File not in this session")).toBeInTheDocument();
@@ -149,7 +155,7 @@ describe("source and sink file names", () => {
 
   it("says the name is unavailable when the list read failed, not that the file is gone", () => {
     useBlobStore.setState({
-      activeSessionId: "session-1", blobs: [], isLoading: false,
+      activeSessionId: "session-1", listCurrent: true, blobs: [], isLoading: false,
       error: "Failed to load files.", listError: "Failed to load files.", listLoadFailed: true,
     });
     render(<OptionRows options={{ path: MASKED_PATH, blob_ref: FILE_ID }} ariaLabel="source settings" plugin={{ kind: "source", name: "csv" }} />);
@@ -247,7 +253,7 @@ describe("file-backed option values", () => {
 
   it("keeps a missing file action focusable and describes its refusal", () => {
     const marker = { blob_ref: FILE_ID, mode: "inline_content", sha256: FILE_HASH };
-    useBlobStore.setState({ activeSessionId: "session-1", blobs: [], isLoading: false });
+    useBlobStore.setState({ activeSessionId: "session-1", listCurrent: true, blobs: [], isLoading: false });
     render(<OptionRows options={{ prompt_template: marker }} ariaLabel="inspector options" plugin={{ kind: "transform", name: "llm" }} slotActions={{ nodeId: "llm" }} />);
     const show = screen.getByRole("button", { name: /^Show in files: .*User prompt/ });
     expect(show).toHaveAttribute("aria-disabled", "true");
@@ -283,6 +289,50 @@ describe("file-backed option values", () => {
     expect(show).toHaveAccessibleDescription("Checking files in this session.");
     expect(edit).toHaveAccessibleDescription("Checking files in this session.");
     expect(screen.queryByText("This file is not in this session.")).not.toBeInTheDocument();
+  });
+
+  it.each(["activate", "create"] as const)("checks a bound prompt after a chat upload into a session opened via %s", async (entry) => {
+    const previous = useSessionStore.getState();
+    const [uploaded] = makeSessionBlobs("session-1", 1);
+    const list = vi.spyOn(api, "listBlobs");
+    const upload = vi.spyOn(api, "uploadBlob").mockResolvedValueOnce(uploaded);
+    const create = vi.spyOn(api, "createSession").mockResolvedValueOnce({
+      id: "session-1", title: "New session", created_at: uploaded.created_at, updated_at: uploaded.created_at,
+    });
+    onTestFinished(() => {
+      list.mockRestore();
+      upload.mockRestore();
+      create.mockRestore();
+      useSessionStore.setState(previous);
+    });
+    if (entry === "create") await useSessionStore.getState().createSession();
+    else useBlobStore.getState().activateSession("session-1");
+    await useBlobStore.getState().uploadBlob("session-1", new File(["rows"], "upload.csv"));
+    expect(list).not.toHaveBeenCalled();
+
+    const node: CompositionState["nodes"][number] = {
+      id: "llm", node_type: "transform", plugin: "llm", input: "rows", on_success: "out", on_error: null,
+      options: { prompt_template: { blob_ref: FILE_ID, mode: "inline_content", sha256: FILE_HASH } },
+    };
+    useSessionStore.setState({
+      compositionState: {
+        ...compositionStateAuthorityFields, id: "state-1", session_id: "session-1", version: 1,
+        sources: {}, nodes: [node], outputs: [], edges: [], metadata: { name: null, description: null },
+      },
+      selectedNodeId: node.id,
+    });
+    function Inspector() {
+      const selected = useSessionStore((state) => state.compositionState?.nodes.find((item) => item.id === state.selectedNodeId));
+      return selected ? <OptionRows options={selected.options} ariaLabel="inspector options"
+        plugin={{ kind: "transform", name: "llm" }} slotActions={{ nodeId: selected.id }} /> : null;
+    }
+    render(<Inspector />);
+
+    expect(screen.queryByText(/^File not in this session$/)).not.toBeInTheDocument();
+    expect(screen.queryByText("This file is not in this session.")).not.toBeInTheDocument();
+    expect(screen.getByText("Loading file name…")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Edit Loading file name… (User prompt)" }))
+      .toHaveAccessibleDescription("Checking files in this session.");
   });
 
   it("opens Edit for a file on a step that uses more than one prompt file", () => {
@@ -371,7 +421,7 @@ describe("file-backed option values", () => {
     const options = { path: `blob:${FILE_ID}` };
     const { rerender } = render(<OptionRows options={options} ariaLabel="source options" />);
     expect(screen.getByText("Uploaded sample data")).toBeInTheDocument();
-    useBlobStore.setState({ isLoading: false });
+    useBlobStore.setState({ isLoading: false, listCurrent: true });
     rerender(<OptionRows options={options} ariaLabel="source options" />);
     expect(screen.getByText("Uploaded sample data")).toBeInTheDocument();
   });

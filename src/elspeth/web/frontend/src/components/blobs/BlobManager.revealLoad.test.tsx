@@ -33,7 +33,7 @@ beforeEach(() => {
 });
 
 it("focuses the revealed row after the mount-time list refresh, not before it", async () => {
-  useBlobStore.setState({ activeSessionId: "session-1", blobs: [promptBlob()], isLoading: false });
+  useBlobStore.setState({ activeSessionId: "session-1", listCurrent: true, blobs: [promptBlob()], isLoading: false });
   let resolveList!: (blobs: BlobMetadata[]) => void;
   vi.mocked(client.listBlobs).mockReturnValue(new Promise((resolve) => { resolveList = resolve; }));
   const trigger = document.createElement("button");

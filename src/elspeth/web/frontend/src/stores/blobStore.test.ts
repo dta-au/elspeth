@@ -1,5 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { createElement } from "react";
+import { act, render, screen } from "@testing-library/react";
+import * as api from "@/api/client";
 import { BlobListTruncatedError } from "@/api/blobListing";
+import { BlobFileName } from "@/components/blobs/BlobFileName";
+import { useSessionStore } from "./sessionStore";
 import { blobBannerMessages, useBlobStore } from "./blobStore";
 import type { BlobMetadata } from "@/types/api";
 
@@ -78,6 +83,130 @@ describe("blobStore", () => {
     useBlobStore.getState().reset();
     vi.restoreAllMocks();
     vi.clearAllMocks();
+  });
+
+  it("leaves names loading on activation and after an upload before any read", async () => {
+    vi.mocked(api.uploadBlob).mockResolvedValueOnce(makeBlob());
+    useSessionStore.setState({ activeSessionId: "session-1" });
+    useBlobStore.getState().activateSession("session-1");
+    render(createElement(BlobFileName, { blobId: "bound-file" }));
+
+    expect(screen.getByText("Loading file name…")).toBeInTheDocument();
+    expect(useBlobStore.getState().listCurrent).toBe(false);
+    await act(async () => {
+      await useBlobStore.getState().uploadBlob("session-1", new File(["rows"], "data.csv"));
+    });
+    expect(api.listBlobs).not.toHaveBeenCalled();
+    expect(screen.getByText("Loading file name…")).toBeInTheDocument();
+    expect(useBlobStore.getState().listCurrent).toBe(false);
+  });
+
+  it.each([
+    { result: "success", expected: "File not in this session" },
+    { result: "truncation", expected: "File name unavailable" },
+    { result: "failure", expected: "File name unavailable" },
+  ])("publishes the name status when the first read settles with $result", async ({ result, expected }) => {
+    const read = deferred<BlobMetadata[]>();
+    vi.mocked(api.listBlobs).mockReturnValueOnce(read.promise);
+    useSessionStore.setState({ activeSessionId: "session-1" });
+    useBlobStore.getState().activateSession("session-1");
+    render(createElement(BlobFileName, { blobId: "bound-file" }));
+    expect(screen.getByText("Loading file name…")).toBeInTheDocument();
+
+    await act(async () => {
+      const loading = useBlobStore.getState().loadBlobs("session-1");
+      if (result === "success") read.resolve([]);
+      else read.reject(result === "truncation" ? new BlobListTruncatedError([]) : new Error("Network error"));
+      await loading;
+    });
+    expect(screen.getByText(expected)).toBeInTheDocument();
+    expect(useBlobStore.getState().listCurrent).toBe(true);
+  });
+
+  it.each(["activation", "clear", "reset", "upload adoption", "delete adoption"] as const)(
+    "discards file absence evidence on %s",
+    async (change) => {
+      vi.mocked(api.listBlobs).mockResolvedValueOnce([]);
+      await useBlobStore.getState().loadBlobs("session-1");
+      useSessionStore.setState({ activeSessionId: "session-1" });
+      const { unmount } = render(createElement(BlobFileName, { blobId: "bound-file" }));
+      expect(screen.getByText("File not in this session")).toBeInTheDocument();
+      unmount();
+
+      const store = useBlobStore.getState();
+      if (change === "activation") {
+        store.activateSession("session-2");
+        useSessionStore.setState({ activeSessionId: "session-2" });
+      } else if (change === "clear") store.clearBlobs();
+      else if (change === "reset") store.reset();
+      else {
+        // Isolate the null-adoption transition with evidence left over from
+        // the previous read. Clearing the store first would mask that reset.
+        useBlobStore.setState({ activeSessionId: null });
+        if (change === "upload adoption") {
+          vi.mocked(api.uploadBlob).mockResolvedValueOnce(makeBlob());
+          await store.uploadBlob("session-1", new File(["rows"], "data.csv"));
+        } else {
+          vi.mocked(api.deleteBlob).mockResolvedValueOnce(undefined);
+          await store.deleteBlob("session-1", "bound-file");
+        }
+      }
+
+      const listCurrent = useBlobStore.getState().listCurrent;
+      if (change === "clear" || change === "reset") store.activateSession("session-1");
+      render(createElement(BlobFileName, { blobId: "bound-file" }));
+      expect(screen.getByText("Loading file name…")).toBeInTheDocument();
+      expect(listCurrent).toBe(false);
+      expect(api.listBlobs).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("keeps a new activation unread when a superseded list read settles", async () => {
+    const read = deferred<BlobMetadata[]>();
+    vi.mocked(api.listBlobs).mockReturnValueOnce(read.promise);
+    const loading = useBlobStore.getState().loadBlobs("session-1");
+    useBlobStore.getState().activateSession("session-2");
+    useSessionStore.setState({ activeSessionId: "session-2" });
+    read.resolve([]);
+    await loading;
+
+    render(createElement(BlobFileName, { blobId: "bound-file" }));
+    expect(screen.getByText("Loading file name…")).toBeInTheDocument();
+    expect(useBlobStore.getState().listCurrent).toBe(false);
+  });
+
+  it("replaces one in-flight read on a matching stale mark and ignores another session's mark", async () => {
+    vi.mocked(api.listBlobs).mockResolvedValueOnce([]);
+    await useBlobStore.getState().loadBlobs("session-1");
+    const older = deferred<BlobMetadata[]>();
+    const replacement = deferred<BlobMetadata[]>();
+    vi.mocked(api.listBlobs).mockReturnValueOnce(older.promise).mockReturnValueOnce(replacement.promise);
+    vi.mocked(api.listBlobs).mockClear();
+    const loading = useBlobStore.getState().loadBlobs("session-1");
+    const inFlight = useBlobStore.getState();
+    inFlight.markListStale?.("session-2");
+    expect(api.listBlobs).toHaveBeenCalledTimes(1);
+    expect(useBlobStore.getState()).toBe(inFlight);
+
+    // The request-count assertion also catches a store with no stale action.
+    inFlight.markListStale?.("session-1");
+    expect(api.listBlobs).toHaveBeenCalledTimes(2);
+    expect(api.listBlobs).toHaveBeenLastCalledWith("session-1");
+    expect(inFlight.listCurrent).toBe(true);
+    expect(useBlobStore.getState().listCurrent).toBe(false);
+    older.resolve([makeBlob({ id: "bound-file", filename: "old.txt" })]);
+    await loading;
+    expect(useBlobStore.getState()).toMatchObject({ blobs: [], listCurrent: false, isLoading: true });
+
+    useSessionStore.setState({ activeSessionId: "session-1" });
+    render(createElement(BlobFileName, { blobId: "bound-file" }));
+    expect(screen.getByText("Loading file name…")).toBeInTheDocument();
+    await act(async () => {
+      replacement.resolve([makeBlob({ id: "bound-file", filename: "fresh.txt" })]);
+    });
+    expect(screen.getByText("File: fresh.txt")).toBeInTheDocument();
+    expect(useBlobStore.getState().listCurrent).toBe(true);
+    expect(api.listBlobs).toHaveBeenCalledTimes(2);
   });
 
   it("opens a requested file and consumes only the matching reveal sequence", () => {
