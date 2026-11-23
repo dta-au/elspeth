@@ -859,6 +859,11 @@ the integrator's order rules [I] unless marked [M].
   lead integrator means all stop'". So make the case to the **lead
   integrator** and get its explicit authority; any other peer is not enough.
   With no identifiable lead integrator, nothing is deleted.
+- **Merged means durable anywhere.** [M 2026-11-23], asked whether this covers
+  the integration branch: "yes, if its branches that are no longer requierd
+  because the work is durable in another branch we don't need to double up
+  and triple up". Reading (the lead integrator's): durable means pushed to
+  origin. A containing branch that exists only locally does not count.
 - **The lead integrator's own close-outs.** [M 2026-11-23] "ok, when the lead
   integrator wants to close out a position (process, run, whatever), they get
   agreeement from the most relevant agent available (or spin up a new one and
@@ -869,9 +874,11 @@ the integrator's order rules [I] unless marked [M].
   proportionate: the check catches mistakes; it does not police.
 - **What the lead integrator checks before a deletion.** Reading (the lead
   integrator's): it checks
-  - merged: the tip is an ancestor of the release or integration branch; for
-    a squash or rebuild, the content difference is zero, or only what the
-    landing integrator recorded;
+  - merged: the tip is an ancestor of a pushed branch that holds the work
+    (`git merge-base --is-ancestor <tip> origin/<branch>`, against the origin
+    ref after a fetch); for a squash or rebuild, the content difference
+    against that pushed branch is zero, or only what the landing integrator
+    recorded;
   - read-only: no commits or unique content beyond its base;
   - every tree: clean `git status`, ignored content inspected and not needed,
     and not in use.
