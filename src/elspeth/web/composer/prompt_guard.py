@@ -602,6 +602,17 @@ async def _join_audit(operation: Coroutine[Any, Any, None]) -> None:
         raise cancellations[0]
 
 
+def prompt_guard_enforces_character_limits(*, mount: PromptGuardMount | None, mode: PromptGuardMode) -> bool:
+    """Whether a check with this mount and mode applies the service's per-text character limits.
+
+    They apply whenever inspection is required: a guard is mounted, or the
+    mode is ``required``. Only explicit unconfigured debug mode does not
+    enforce them. :func:`enforce_prompt_guard` decides with this function, and
+    so do producers that must know before rendering what the check will refuse.
+    """
+    return not (mount is None and mode == "debug-when-unconfigured")
+
+
 async def enforce_prompt_guard(
     *,
     mount: PromptGuardMount | None,
@@ -632,7 +643,7 @@ async def enforce_prompt_guard(
     # The service's character limits apply whenever inspection is required.
     # Explicit unconfigured debug mode still builds and validates the complete
     # request; its audit records skipped inspection rather than a clean result.
-    enforce_azure_character_limits = not (mount is None and mode == "debug-when-unconfigured")
+    enforce_azure_character_limits = prompt_guard_enforces_character_limits(mount=mount, mode=mode)
     policy_fingerprint = (
         mount.client.policy_fingerprint
         if mount is not None

@@ -104,7 +104,12 @@ from elspeth.web.composer.no_tool_policy import (
 )
 from elspeth.web.composer.pipeline_planner import PlannerContinuationBudget, PlannerContinuationUnavailable
 from elspeth.web.composer.progress import advisor_checkpoint_progress_event, emit_progress
-from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused, build_prompt_guard_mount
+from elspeth.web.composer.prompt_guard import (
+    PromptGuardMount,
+    PromptGuardRefused,
+    build_prompt_guard_mount,
+    prompt_guard_enforces_character_limits,
+)
 from elspeth.web.composer.protocol import ComposerResult, ComposerSettings, ToolArgumentError
 from elspeth.web.composer.provider_context import capture_provider_context
 from elspeth.web.composer.provider_errors import ProviderRequestFailure, classify_provider_failure, is_context_length_rejection
@@ -277,6 +282,12 @@ class AdvisorCheckpointOwner:
         self._prompt_guard_mount = (
             prompt_guard_mount if prompt_guard_mount is not None else build_prompt_guard_mount(settings.composer_advisor_prompt_guard)
         )
+        # The same mount and mode every advisor call passes to the guard, so
+        # the evidence withholds prompt-file text the guard would refuse to
+        # screen exactly when the guard enforces its character limits.
+        self._prompt_screen_limits_enforced = prompt_guard_enforces_character_limits(
+            mount=self._prompt_guard_mount, mode=settings.composer_prompt_guard_mode
+        )
 
     def _require_sessions_service(self) -> SessionServiceProtocol:
         if self._sessions_service is None:
@@ -298,7 +309,7 @@ class AdvisorCheckpointOwner:
             return UNREAD_PROMPT_FILES
         keys = _advisor_context.advisor_prompt_file_keys(state)
         if not keys:
-            return AdvisorPromptFiles(read=True)
+            return AdvisorPromptFiles(read=True, screen_limits_enforced=self._prompt_screen_limits_enforced)
         if session_operation_context in self._prompt_file_cache:
             self._prompt_file_cache.move_to_end(session_operation_context)
         else:
@@ -317,7 +328,7 @@ class AdvisorCheckpointOwner:
             files = {**{key: cached[key] for key in keys if key in cached}, **fresh.files}
         else:
             files = {key: cached[key] for key in keys}
-        return AdvisorPromptFiles(files=files, read=True)
+        return AdvisorPromptFiles(files=files, read=True, screen_limits_enforced=self._prompt_screen_limits_enforced)
 
     def _validate_advisor_arguments(self, arguments: dict[str, Any]) -> RequestAdvisorHintArgumentsModel | AdvisorArgumentRejection:
         """Admit complete public input before advisor budget or provider effects.

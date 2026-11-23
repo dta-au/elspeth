@@ -6859,11 +6859,13 @@ def test_bound_advisor_checkpoint_summary_publishes_marker_alone_when_no_line_fi
         "attempted_actions": [],
         "schema_excerpt": "\n".join(["a" * 3000, "b" * 3000]),
     }
-    bounded = {**arguments, "schema_excerpt": bound_advisor_checkpoint_summary(arguments, 1000)}
+    # The cap leaves room for the summary header and the marker alone (1,079
+    # characters measured); neither 3,000-character line fits.
+    bounded = {**arguments, "schema_excerpt": bound_advisor_checkpoint_summary(arguments, 1104)}
 
     assert bounded["schema_excerpt"].startswith("additional_evidence_lines_withheld=2 ")
     assert "a" * 10 not in bounded["schema_excerpt"]
-    assert advisor_checkpoint_summary_chars(bounded) <= 1000
+    assert advisor_checkpoint_summary_chars(bounded) <= 1104
 
 
 @pytest.mark.parametrize("headroom", [-1, 0, 1])
