@@ -184,6 +184,7 @@ def test_write_primary_effect_ownership_and_buffered_outcome_guards(
             tokens=[],
             pending_outcome=pending_outcome,
             all_states=[],
+            durable_member_ids=frozenset(),
             sink_name="legacy",
             sink_node_id="node-legacy",
             join_group_id_by_token={},
