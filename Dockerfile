@@ -163,7 +163,7 @@ RUN groupadd --gid 1654 elspeth && \
 # =============================================================================
 # Stage 3: Runtime
 # =============================================================================
-FROM gcr.io/distroless/cc-debian13:debug-nonroot@sha256:c69d16acb50ae6ee26adfb0645467b507753c0eb91c389afad87914cd2ecf6de AS runtime
+FROM gcr.io/distroless/cc-debian13:debug-nonroot@sha256:bdb634669ffbf44cdfef9495238b03ce33a02e9ef631fc718b7dd6d2531f4325 AS runtime
 
 ARG INSTALL_EXTRAS
 ARG RDS_CA_BUNDLE_SHA256
