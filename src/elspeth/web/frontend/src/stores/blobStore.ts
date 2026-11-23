@@ -62,6 +62,13 @@ interface BlobState {
   reset: () => void;
 }
 
+export function blobBannerMessages(error: string | null, listError: string | null): string[] {
+  const messages = [listError, error].filter(
+    (message): message is string => message !== null && message !== "",
+  );
+  return [...new Set(messages)];
+}
+
 const initialState = {
   blobs: [] as BlobMetadata[],
   isLoading: false,

@@ -1,7 +1,7 @@
 import { useCallback, useDeferredValue, useEffect, useId, useLayoutEffect, useMemo, useState, type JSX } from "react";
 import type { CompositionState } from "@/types";
 import { optionBlobReferences, promptFileBindings, promptFileEditability, promptFileSlots, type PromptFileBinding } from "@/lib/blobBindings";
-import { useBlobStore } from "@/stores/blobStore";
+import { blobBannerMessages, useBlobStore } from "@/stores/blobStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import { usePromptDraftStore } from "@/stores/promptDraftStore";
@@ -125,6 +125,7 @@ function FileMappings({ state, onShowNode, visibleNodeIds, onCount }: GraphFiles
   const error = useBlobStore((store) => store.activeSessionId === state.session_id ? store.error : null);
   const listError = useBlobStore((store) => store.activeSessionId === state.session_id ? store.listError : null);
   const listLoadFailed = useBlobStore((store) => store.activeSessionId === state.session_id && store.listLoadFailed);
+  const bannerMessages = blobBannerMessages(error, listError);
   const pending = useInterpretationEventsStore((store) => store.pendingBySession[state.session_id]);
   const bindings = useMemo(() => promptFileBindings(state), [state]);
   const drafts = usePromptDraftStore((store) => store.drafts);
@@ -149,10 +150,12 @@ function FileMappings({ state, onShowNode, visibleNodeIds, onCount }: GraphFiles
   // The body is a size container: in a narrow pane each row stacks into a
   // block (name, then who uses it) instead of cutting columns off.
   return <div className="graph-files-body">
-    {sameSession && (error || listError) && <AlertBanner className="graph-files-alert" action={listLoadFailed ? (
+    {sameSession && bannerMessages.length > 0 && <AlertBanner className="graph-files-alert" action={listLoadFailed ? (
       // The same list read the table makes when it opens, issued again.
       <Button type="button" variant="ghost" compact onClick={() => void useBlobStore.getState().loadBlobs(state.session_id)}>Retry</Button>
-    ) : null}>{error ?? listError}</AlertBanner>}
+    ) : null}>
+      {bannerMessages.map((message) => <span key={message} style={{ display: "block" }}>{message}</span>)}
+    </AlertBanner>}
     {rows.length === 0 ? <p className="graph-config-empty-value">No session files are attached to this graph.</p>
       : <>
       <div className="graph-files-filter">

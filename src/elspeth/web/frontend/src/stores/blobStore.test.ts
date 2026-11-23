@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { BlobListTruncatedError } from "@/api/blobListing";
-import { useBlobStore } from "./blobStore";
+import { blobBannerMessages, useBlobStore } from "./blobStore";
 import type { BlobMetadata } from "@/types/api";
 
 // Mock the API client
@@ -50,6 +50,28 @@ function deferred<T>(): {
   });
   return { promise, resolve, reject };
 }
+
+describe("blobBannerMessages", () => {
+  it("de-duplicates identical messages", () => {
+    expect(blobBannerMessages("Failed to load files.", "Failed to load files.")).toEqual(["Failed to load files."]);
+  });
+
+  it("drops empty strings and null", () => {
+    expect(blobBannerMessages("", "Failed to load files.")).toEqual(["Failed to load files."]);
+    expect(blobBannerMessages("Download failed.", null)).toEqual(["Download failed."]);
+  });
+
+  it("puts the list message first", () => {
+    expect(blobBannerMessages("Download failed.", "Failed to load files.")).toEqual([
+      "Failed to load files.",
+      "Download failed.",
+    ]);
+  });
+
+  it("returns no messages when both fields are empty", () => {
+    expect(blobBannerMessages("", null)).toEqual([]);
+  });
+});
 
 describe("blobStore", () => {
   beforeEach(() => {
@@ -289,6 +311,7 @@ describe("blobStore", () => {
   });
 
   it.each([
+    // This row guards listError invariance. GraphFiles and OptionRows refusal tests cover the visible regression.
     ["a good list", null, false],
     ["a failed list", "Failed to load files.", true],
   ] as const)("preserves %s state through upload, delete, and download refusals", async (_case, listError, listLoadFailed) => {

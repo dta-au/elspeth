@@ -409,10 +409,7 @@ describe("BlobManager upload affordance (elspeth-29eef452a8)", () => {
     expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
   });
 
-  it.each([
-    ["refused", "File exceeds the maximum upload size."],
-    ["successful", "Failed to load files."],
-  ] as const)("keeps Retry after a %s upload following a failed list read", async (outcome, message) => {
+  it.each(["refused", "successful"] as const)("keeps Retry after a %s upload following a failed list read", async (outcome) => {
     setBlobState([]);
     const list = vi.spyOn(api, "listBlobs").mockRejectedValueOnce(new Error("Network error"));
     const upload = vi.spyOn(api, "uploadBlob");
@@ -438,7 +435,10 @@ describe("BlobManager upload affordance (elspeth-29eef452a8)", () => {
     });
 
     const alert = screen.getByRole("alert");
-    expect(alert).toHaveTextContent(message);
+    expect(alert).toHaveTextContent("Failed to load files.");
+    if (outcome === "refused") {
+      expect(alert).toHaveTextContent("File exceeds the maximum upload size.");
+    }
     expect(within(alert).getByRole("button", { name: "Retry" })).toBeInTheDocument();
     expect(screen.getByText("Files", { selector: ".blob-manager-title" })).toBeInTheDocument();
   });

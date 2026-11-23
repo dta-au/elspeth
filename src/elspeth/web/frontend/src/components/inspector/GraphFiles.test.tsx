@@ -284,6 +284,52 @@ describe("GraphFiles", () => {
     expect(screen.getByRole("button", { name: "Edit file for solo" })).toHaveAttribute("title", "File names are unavailable. Use Retry above.");
   });
 
+  it("shows the list failure and upload refusal together with Retry", async () => {
+    const refusal = { status: 413 };
+    vi.spyOn(api, "listBlobs").mockRejectedValueOnce(new Error("Network error"));
+    vi.spyOn(api, "uploadBlob").mockRejectedValueOnce(refusal);
+    useBlobStore.setState({ blobs: [], loadBlobs: useBlobStore.getInitialState().loadBlobs });
+    render(<GraphFiles state={state} onShowNode={vi.fn()} />);
+    await userEvent.setup().click(screen.getByText(filesSummary()));
+    await screen.findByRole("button", { name: "Retry" });
+
+    await act(async () => {
+      const file = new File(["prompt"], "new.txt");
+      await expect(useBlobStore.getState().uploadBlob(state.session_id, file)).rejects.toBe(refusal);
+    });
+
+    const alert = screen.getByRole("alert");
+    expect(within(alert).getByText("Failed to load files.")).toBeInTheDocument();
+    expect(within(alert).getByText("File exceeds the maximum upload size.")).toBeInTheDocument();
+    expect(within(alert).getByRole("button", { name: "Retry" })).toBeInTheDocument();
+  });
+
+  it("shows a partial list and keeps its truncation notice alongside an upload refusal", async () => {
+    const truncation = new BlobListTruncatedError([blob("solo", "solo.txt")]);
+    const refusal = { status: 413 };
+    vi.spyOn(api, "listBlobs").mockRejectedValueOnce(truncation);
+    vi.spyOn(api, "uploadBlob").mockRejectedValueOnce(refusal);
+    useBlobStore.setState({ blobs: [], loadBlobs: useBlobStore.getInitialState().loadBlobs });
+    render(<GraphFiles state={state} onShowNode={vi.fn()} />);
+    await userEvent.setup().click(screen.getByText(filesSummary()));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(truncation.message);
+    expect(within(alert).queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+    expect(screen.getByRole("rowheader", { name: "solo.txt" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Edit file for solo" })).toHaveAttribute("title", "File names are unavailable.");
+
+    await act(async () => {
+      const file = new File(["prompt"], "new.txt");
+      await expect(useBlobStore.getState().uploadBlob(state.session_id, file)).rejects.toBe(refusal);
+    });
+
+    const alertAfterRefusal = screen.getByRole("alert");
+    expect(within(alertAfterRefusal).getByText(truncation.message)).toBeInTheDocument();
+    expect(within(alertAfterRefusal).getByText("File exceeds the maximum upload size.")).toBeInTheDocument();
+    expect(within(alertAfterRefusal).queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+  });
+
   it("lets a long file or step name wrap at its separators, keeping the text whole", async () => {
     render(<GraphFiles state={state} onShowNode={vi.fn()} />);
     await userEvent.setup().click(screen.getByText(filesSummary()));
@@ -333,15 +379,16 @@ describe("GraphFiles", () => {
   });
 
   it("distinguishes a file-list failure from a missing file and blocks editing historical graphs", async () => {
-    useBlobStore.setState({ blobs: [], error: truncatedMessage, listError: truncatedMessage });
+    vi.spyOn(api, "listBlobs").mockRejectedValueOnce(new Error("Network error"));
+    useBlobStore.setState({ blobs: [], loadBlobs: useBlobStore.getInitialState().loadBlobs });
     render(<GraphFiles state={state} onShowNode={vi.fn()} />);
     const user = userEvent.setup();
     await user.click(screen.getByText(filesSummary()));
-    expect(screen.getByRole("alert")).toHaveTextContent(truncatedMessage);
-    // The design system's error banner, not a bare paragraph at the pane edge.
-    expect(screen.getByRole("alert")).toHaveClass("alert-banner", "graph-files-alert");
-    // Retrying a truncated list would reach the same limit.
-    expect(within(screen.getByRole("alert")).queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("Failed to load files.");
+    expect(alert).toHaveClass("alert-banner", "graph-files-alert");
+    // A failed list read offers Retry.
+    expect(within(alert).getByRole("button", { name: "Retry" })).toBeInTheDocument();
     expect(screen.queryByText("File not in this session")).not.toBeInTheDocument();
     expect(screen.getAllByText("File name unavailable")).toHaveLength(8);
     act(() => useSessionStore.setState({ compositionState: { ...state, id: "new-state" } }));
