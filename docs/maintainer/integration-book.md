@@ -209,7 +209,6 @@ integrator so the book is corrected.
   see section 8.)
 - Moving scope between releases, and any serious finding after a lock
   (section 4).
-- A session-store epoch change or a database CHECK constraint change.
 - `--no-verify` for a specific commit.
 - Abandoning a branch that holds unlanded commits.
 - Confirming a new integrator or a change of box custody.
@@ -387,11 +386,15 @@ Never use the question dialog tool.
   - every break is stated in the upgrade notes;
   - nothing a user can do today breaks by accident.
   Ask the integrator whether a change needs compatibility work.
-- **No epoch or CHECK change without approval.** [I, carried into later
-  releases as a standing limit] No lane changes the session schema epoch or
-  any database CHECK constraint without the maintainer's explicit approval.
-  Why: an epoch bump makes existing stores refuse to open at startup, and
-  there is no migration path. Put this line in every build brief.
+- **Epoch and CHECK changes go ahead when required.** [M 2026-11-23] "no,
+  they can go ahead if they're required, regulard review processes apply."
+  From 0.8.18, a change to the session schema epoch or to a database CHECK
+  constraint needs no separate approval when the work requires it. The
+  hand-off names it, the reviewer checks it is needed, and the upgrade notes
+  say that stores written by earlier releases are refused at startup and what
+  an operator must do. Wiping, resetting, migrating or downgrading a store
+  still needs the maintainer. Before 0.8.18 each such change needed his
+  explicit approval.
 - **Corrupt stored data fails closed.** [M 2026-11-22] "if its corrupted its a
   bug and the system shouldn't proceed in a buggy stae." In a store the
   current release opens, a shape an earlier writer legitimately produced is
@@ -738,10 +741,10 @@ the integrator's order rules [I] unless marked [M].
 - One broad test run at a time across all sessions, and only through the
   custody holder.
 - At most `-n 4` workers per run.
-- At least 12 GB of memory available (`free -g`, the "available" column) and
-  at least 12 GB of free disk (`df -h /`) before a broad run starts. [I,
-  settled 2026-11-23 by the custody holder: the two sources disagreed on which
-  one the figure meant, so both apply.]
+- At least 12 GB of memory available (`free -g`, the "available" column)
+  before a broad run starts. [M 2026-11-23] The figure means memory; the disk
+  shortage that once also applied has been fixed. Still read `df -h /` before
+  a broad run, and stop if the disk is nearly full.
 - Short named-file runs (under 5 minutes, at most `-n 2`) take a short lock.
   Longer runs take the long lock, granted by the custody holder.
 - New lanes get a short-lock-only limit, pinned to a core range with
@@ -1007,7 +1010,8 @@ Every brief names:
   runner;
 - the no-`timeout` line and the no-kill rule, verbatim;
 - no memory writes, no CHANGELOG edits, no `--no-verify`, no suppressions;
-- "no change to the session schema epoch or any CHECK constraint";
+- that any session schema epoch or CHECK constraint change is named in the
+  hand-off and in the proposed upgrade notes;
 - that every measurement names the view or configuration it used.
 
 **Reviewers and claims**
