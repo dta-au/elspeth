@@ -42,7 +42,8 @@ KILL_MESSAGE = (
 # loop or if keyword. The command word may carry a path (/usr/bin/pkill).
 _TOK = r"[^\s;&|)]+"
 _WRAP = (
-    r"(?:(?:sudo|nohup|exec|command|time|setsid|do|then|else)\s+"
+    r"(?:(?:nohup|exec|command|time|setsid|do|then|else)\s+"
+    rf"|sudo(?:\s+(?:-[ugCDhpRTUr]\s+{_TOK}|-{_TOK}))*\s+"
     rf"|(?:env|nice|ionice|stdbuf)(?:\s+(?:-{_TOK}|\w+=\S*|\d+))*\s+"
     rf"|timeout(?:\s+-{_TOK})*\s+\S+\s+)"
 )
@@ -61,14 +62,35 @@ KILL_SHAPES = [
         re.M,
     ),
 ]
-# A shell started with -c runs its quoted argument: check that argument too.
+# A shell started with -c, or eval, runs its quoted argument: check it too.
 SHELL_C = re.compile(
-    rf"{_CP}(?:ba|da|z|k)?sh(?:\s+-[a-zA-Z]+)*\s+-[a-zA-Z]*c[a-zA-Z]*\s+(['\"])([^'\"]*)\1",
+    rf"{_CP}(?:(?:ba|da|z|k)?sh(?:\s+-[a-zA-Z]+)*\s+-[a-zA-Z]*c[a-zA-Z]*|eval)\s+(['\"])([^'\"]*)\1",
     re.M,
 )
+# A quoted word the shell runs as the command, or passes to kill as an
+# argument, is unquoted before matching ("pkill" x, kill "-1").
+QUOTED_COMMAND_WORD = re.compile(rf"({_CP})(['\"])(_+)\2", re.M)
+QUOTED_KILL_ARG = re.compile(rf"({_CP}kill(?:\s+[^\s;&|)]+)*?\s+)(['\"])(_+)\2", re.M)
+
+
+def _restore_live_words(live: str, original: str) -> str:
+    """Put back quoted words that sit where a command or a kill argument goes."""
+    for pattern in (QUOTED_COMMAND_WORD, QUOTED_KILL_ARG):
+        while True:
+            match = pattern.search(live)
+            if match is None:
+                break
+            start, end = match.start(3), match.end(3)
+            word = original[start:end]
+            # Keep offsets: the quote marks become spaces around the word.
+            live = live[: start - 1] + " " + word + " " + live[end + 1 :]
+    return live
+
+
 GIT_SHAPES = [
     re.compile(rf"{_CP}git\s+(?:-\S+\s+)*commit\b[^\n;&|]*\s--amend\b", re.M),
-    re.compile(rf"{_CP}git\s+(?:-\S+\s+)*checkout\b[^\n;&|]*\s--(?:\s|$)", re.M),
+    # The same form the earlier guard refused; `git checkout <ref> -- <path>` runs.
+    re.compile(rf"{_CP}git\s+(?:-\S+\s+)*checkout\s+--(?:\s|$)", re.M),
 ]
 PYTHON_C = re.compile(r"\bpython[0-9.]*\s+(?:-\S+\s+)*-c\b")
 PYTHON_KILL = re.compile(r"\bkillpg\s*\(|\bos\.kill\(\s*(?:-|0\s*[,)])")
@@ -160,7 +182,7 @@ def _drop_quotes_and_comments(text: str) -> str:
 def refusal(command: str, depth: int = 0) -> str | None:
     """Return the reason to refuse ``command``, or None to let it run."""
     without_heredocs, bodies = _split_heredocs(command)
-    live = _drop_quotes_and_comments(without_heredocs)
+    live = _restore_live_words(_drop_quotes_and_comments(without_heredocs), without_heredocs)
     for opener, body in bodies:
         opener_live = _drop_quotes_and_comments(opener)
         if PYTHON_FED.search(opener_live) and PYTHON_KILL.search(body):
