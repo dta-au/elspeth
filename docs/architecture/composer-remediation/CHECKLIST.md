@@ -1,6 +1,6 @@
 # Composer remediation checklist
 
-This file is the tracker of record. It began as a snapshot of an external working Page (sequence 46), which is no longer available; later edits are made here. The 17 November 2026 triage below reconciles it with what has landed. See [pickup notes](RESUME.md) for the original 9 November checkpoint (historical) and [STITCHED-PLAN.md](STITCHED-PLAN.md) for the current delivery order.
+This file is the tracker of record. It began as a snapshot of an external working Page (sequence 46), which is no longer available; later edits are made here. The 17 November 2026 triage below reconciles it with what has landed. The original 9 November pickup notes (RESUME.md) were removed once this triage overtook them; see git history. See [STITCHED-PLAN.md](STITCHED-PLAN.md) for the current delivery order.
 
 Working remediation checklist for ELSPETH on `fix/composer-tool-remediation`, agreed in chat on 9 November 2026. Paused at the user's request after integration checkpoint `dd3b3524c`. Ruff, mypy and contracts passed on that frozen tree; the lint scan completed with 5,454 findings and its delta still needs review. Broad branch review and combined behavior, proof and PostgreSQL gates remain pending. Detailed pickup notes are in `docs/architecture/composer-remediation/RESUME.md` on the remediation branch. Shared fixes appear once, with affected tools named; verify each affected route before closing a shared fix.
 

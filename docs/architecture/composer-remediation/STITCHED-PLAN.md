@@ -5,7 +5,7 @@ other, and resequences the work on the code that exists today.
 
 | Input | What it is | Where |
 |---|---|---|
-| **Prior attempt** | The 0.8.12 tool remediation, its forward plan (design items A1–A3, defects B1–B19, operator rulings of 2026-11-10) and its original 320-item tracker | `NEXT-SESSION.md`, `CHECKLIST.md`, `RESUME.md` and `reports/` beside this file |
+| **Prior attempt** | The 0.8.12 tool remediation, its forward plan (design items A1–A3, defects B1–B19, operator rulings of 2026-11-10) and its original 320-item tracker | `NEXT-SESSION.md`, `CHECKLIST.md` and `reports/` beside this file (`RESUME.md` and the reports for landed work were removed; see git history) |
 | **CDA plan** | The desk audit of 2026-11-12: 23 lane briefs, CDA-01 to CDA-23 | Branch `ccr-d14093ba-glu6bw` at `b1ec0aacd`, `docs/development/composer-desk-audit-2026-11-12/work-packages.md` |
 | **Base** | The union of the 0.8.12 and 0.8.13 release candidates | Branch `integration/composer-remediation`, started at `8f5ca4292` |
 
