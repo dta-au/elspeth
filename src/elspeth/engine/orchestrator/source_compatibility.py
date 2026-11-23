@@ -49,10 +49,10 @@ def admit_source_configuration(
         source_settings = json.loads(source.settings_json)
     except json.JSONDecodeError as exc:
         raise AuditIntegrityError("Replay source settings are malformed") from exc
-    if type(source_settings) is not dict or stable_hash(source_settings) != source.config_hash:
-        raise AuditIntegrityError("Replay source settings hash is invalid")
     if source.canonical_version != canonical_version:
         raise AuditIntegrityError("Replay source canonical version differs")
+    if type(source_settings) is not dict or stable_hash(source_settings) != source.config_hash:
+        raise AuditIntegrityError("Replay source settings hash is invalid")
     current_settings: dict[str, Any] = dict(config.config)
     for field in _INVOCATION_FIELDS:
         if field in source_settings:

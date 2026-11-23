@@ -32,6 +32,7 @@ import threading
 from typing import TYPE_CHECKING, Any
 
 import elspeth.engine.executors.declaration_contract_bootstrap  # noqa: F401
+from elspeth.contracts import hashing
 from elspeth.contracts.call_governance import LLMCallGovernance
 from elspeth.contracts.sink_effects import SinkEffectInputKind
 from elspeth.engine.orchestrator.bootstrap import prepare_for_run as prepare_for_run
@@ -107,7 +108,6 @@ class Orchestrator:
         db: LandscapeDB,
         *,
         event_bus: EventBusProtocol | None = None,
-        canonical_version: str = "sha256-rfc8785-v1",
         checkpoint_manager: CheckpointManager | None = None,
         checkpoint_config: RuntimeCheckpointConfig | None = None,
         clock: Clock | None = None,
@@ -123,7 +123,7 @@ class Orchestrator:
 
         self._db = db
         self._events = event_bus if event_bus is not None else NullEventBus()
-        self._canonical_version = canonical_version
+        self._canonical_version = hashing.CANONICAL_VERSION
         self._span_factory = SpanFactory(
             telemetry_emit=telemetry_manager.handle_event if telemetry_manager is not None else None,
         )
@@ -408,6 +408,8 @@ class Orchestrator:
         run_id: str,
         settings: ElspethSettings,
         *,
+        config: PipelineConfig,
+        graph: ExecutionGraph,
         window_seconds: float | None = None,
     ) -> WorkerMembershipToken:
         """§B.1: atomic follower admission — public entry point (ADR-030).
@@ -420,5 +422,7 @@ class Orchestrator:
         return self._join_admission.join_run(
             run_id,
             settings,
+            config=config,
+            graph=graph,
             window_seconds=window_seconds,
         )

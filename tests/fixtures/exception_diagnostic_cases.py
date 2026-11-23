@@ -92,6 +92,14 @@ def _text_cases(exception: type[BaseException], baseline: Mapping[str, Any], *fi
     )
 
 
+def _exercise_join_not_ready_inherited() -> None:
+    try:
+        raise errors.JoinNotReadyError("fixed-run", "graph registration is pending")
+    except errors.JoinRefusedError as error:
+        assert error.run_id == "fixed-run"
+        assert error.reason == "graph registration is pending"
+
+
 def _exercise_structured(
     exception: type[BaseException],
     baseline: Mapping[str, Any],
@@ -460,6 +468,13 @@ DIAGNOSTIC_CASES = (
         "reason",
     ),
     *_text_cases(errors.JoinRefusedError, {"run_id": "fixed-run", "reason": "fixed-reason"}, "run_id", "reason"),
+    DiagnosticCase(
+        errors.JoinNotReadyError,
+        frozenset(),
+        "inherited",
+        "The retryable join refusal inherits its diagnostic fields and is caught by the join refusal handler.",
+        _exercise_join_not_ready_inherited,
+    ),
     *_text_cases(errors.FollowerSeatDeadError, {"run_id": "fixed-run", "worker_id": "fixed-worker"}, "run_id", "worker_id"),
     *_text_cases(
         errors.AbandonRefusedError,

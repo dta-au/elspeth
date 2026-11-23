@@ -279,6 +279,8 @@ def _join_after_follower_sink_preflight(
     orchestrator: Orchestrator,
     run_id: str,
     settings: ElspethSettings,
+    config: PipelineConfig,
+    graph: ExecutionGraph,
 ) -> tuple[WorkerMembershipToken, PluginBundle, Mapping[str, SinkProtocol], Mapping[str, str], object]:
     """Join only after the exact follower execution sinks earn admission."""
     from elspeth.engine.orchestrator.preflight import SinkEffectExecutionPurpose
@@ -289,7 +291,7 @@ def _join_after_follower_sink_preflight(
         plugins,
         purpose=SinkEffectExecutionPurpose.FOLLOWER,
     )
-    member_token = orchestrator.join_run(run_id, settings)
+    member_token = orchestrator.join_run(run_id, settings, config=config, graph=graph)
     return member_token, plugins, execution_sinks, execution_sink_modes, admission
 
 
@@ -4439,7 +4441,7 @@ def join(
     """
     import traceback
 
-    from elspeth.contracts.errors import FollowerSeatDeadError, JoinRefusedError
+    from elspeth.contracts.errors import FollowerSeatDeadError, JoinNotReadyError, JoinRefusedError
     from elspeth.core.landscape import LandscapeDB
 
     # Settings are REQUIRED — the joiner must produce the same config_hash
@@ -4502,6 +4504,16 @@ def join(
         typer.echo(f"Sink effect preflight failed: {e}", err=True)
         raise typer.Exit(1) from None
 
+    # Build the execution graph for the follower (needed to recognise
+    # barrier / sink nodes for hand-off routing).
+    try:
+        execution_graph = _build_resume_graph(settings_config, plugins)
+    except contract_errors.TIER_1_ERRORS:
+        raise
+    except Exception as e:
+        typer.echo(f"Error building execution graph: {e}", err=True)
+        raise typer.Exit(1) from None
+
     # Resolve database URL.
     if database:
         db_path = Path(database).expanduser().resolve()
@@ -4561,6 +4573,39 @@ def join(
     follower_rate_limit_registry: RateLimitRegistry | None = None
     follower_telemetry_manager: TelemetryManager | None = None
     try:
+        from elspeth.core.config import AggregationSettings as _AggregationSettings
+        from elspeth.engine.orchestrator.preflight import execution_sink_bindings_for_runtime
+        from elspeth.engine.orchestrator.types import PipelineConfig
+
+        # Build PipelineConfig from settings (same shape as _orchestrator_context).
+        # Extract raw TransformProtocol instances from WiredTransform wrappers.
+        follower_transforms: list[RowPlugin] = [wired.plugin for wired in plugins.transforms]
+
+        agg_id_map = execution_graph.get_aggregation_id_map()
+        follower_agg_settings: dict[str, _AggregationSettings] = {}
+        for agg_name, (agg_transform, agg_config) in plugins.aggregations.items():
+            from elspeth.contracts.types import AggregationName as _AggregationName
+
+            node_id = agg_id_map[_AggregationName(agg_name)]
+            follower_agg_settings[node_id] = agg_config
+            agg_transform.node_id = node_id
+            follower_transforms.append(agg_transform)
+
+        execution_sink_bindings = execution_sink_bindings_for_runtime(settings_config, plugins.sink_effect_bindings)
+        pipeline_config = PipelineConfig(
+            config=resolve_config(settings_config),
+            sources=plugins.sources,
+            transforms=follower_transforms,
+            sinks=execution_sinks,
+            gates=list(settings_config.gates),
+            aggregation_settings=follower_agg_settings,
+            coalesce_settings=(list(settings_config.coalesce) if settings_config.coalesce else []),
+            sink_effect_modes=execution_sink_modes,
+            sink_effect_admission=sink_effect_admission,
+            sink_effect_bindings=execution_sink_bindings,
+            escalation_fixpoint_bound=execution_graph.escalation_fixpoint_bound,
+        )
+
         import threading
 
         from elspeth.contracts.config.runtime import (
@@ -4587,7 +4632,7 @@ def join(
         orchestrator = Orchestrator(db)
 
         try:
-            member_token = orchestrator.join_run(run_id, settings_config)
+            member_token = orchestrator.join_run(run_id, settings_config, config=pipeline_config, graph=execution_graph)
         except JoinRefusedError as e:
             if output_format == "json":
                 import json as json_mod
@@ -4595,7 +4640,7 @@ def join(
                 typer.echo(
                     json_mod.dumps(
                         {
-                            "event": "join_refused",
+                            "event": "join_not_ready" if isinstance(e, JoinNotReadyError) else "join_refused",
                             "run_id": run_id,
                             "reason": e.reason,
                         }
@@ -4632,16 +4677,6 @@ def join(
         else:
             typer.echo(f"Joined run {run_id} as follower {worker_id}")
             typer.echo("Draining available work…")
-
-        # Build the execution graph for the follower (needed to recognise
-        # barrier / sink nodes for hand-off routing).
-        try:
-            execution_graph = _build_resume_graph(settings_config, plugins)
-        except contract_errors.TIER_1_ERRORS:
-            raise
-        except Exception as e:
-            typer.echo(f"Error building execution graph: {e}", err=True)
-            raise typer.Exit(1) from None
 
         # Get payload store.
         from elspeth.core.payload_store import FilesystemPayloadStore
@@ -4686,43 +4721,10 @@ def join(
         # Build and run the follower processor.
         from elspeth.contracts.config import RuntimeRetryConfig
         from elspeth.contracts.plugin_context import PluginContext
-        from elspeth.core.config import AggregationSettings as _AggregationSettings
         from elspeth.core.landscape.factory import RecorderFactory
         from elspeth.engine.orchestrator.follower import build_follower_processor
-        from elspeth.engine.orchestrator.types import PipelineConfig
 
         factory = RecorderFactory(active_db, payload_store=payload_store)
-
-        # Build PipelineConfig from settings (same shape as _orchestrator_context).
-        # Extract raw TransformProtocol instances from WiredTransform wrappers.
-        follower_transforms: list[RowPlugin] = [wired.plugin for wired in plugins.transforms]
-
-        agg_id_map = execution_graph.get_aggregation_id_map()
-        follower_agg_settings: dict[str, _AggregationSettings] = {}
-        for agg_name, (agg_transform, agg_config) in plugins.aggregations.items():
-            from elspeth.contracts.types import AggregationName as _AggregationName
-
-            node_id = agg_id_map[_AggregationName(agg_name)]
-            follower_agg_settings[node_id] = agg_config
-            agg_transform.node_id = node_id
-            follower_transforms.append(agg_transform)
-
-        from elspeth.engine.orchestrator.preflight import execution_sink_bindings_for_runtime
-
-        execution_sink_bindings = execution_sink_bindings_for_runtime(settings_config, plugins.sink_effect_bindings)
-        pipeline_config = PipelineConfig(
-            config=resolve_config(settings_config),
-            sources=plugins.sources,
-            transforms=follower_transforms,
-            sinks=execution_sinks,
-            gates=list(settings_config.gates),
-            aggregation_settings=follower_agg_settings,
-            coalesce_settings=(list(settings_config.coalesce) if settings_config.coalesce else []),
-            sink_effect_modes=execution_sink_modes,
-            sink_effect_admission=sink_effect_admission,
-            sink_effect_bindings=execution_sink_bindings,
-            escalation_fixpoint_bound=execution_graph.escalation_fixpoint_bound,
-        )
 
         follower_proc = build_follower_processor(
             factory=factory,

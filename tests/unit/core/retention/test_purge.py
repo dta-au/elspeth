@@ -514,6 +514,40 @@ class TestFindExpiredPayloadRefs:
         assert result.deleted_count == len(expected_refs)
         assert not store.exists(output_ref)
 
+    @pytest.mark.parametrize(
+        "output_text",
+        [
+            '{"__elspeth_canonical_type__":"mapping","entries":[{"key":"__elspeth_canonical_type__","value":{"literal":true}}]}',
+            '{"other_output":"x"}',
+        ],
+        ids=["synthetic-pre-upgrade-tagged", "json-only"],
+    )
+    def test_stored_canonical_operation_metadata_can_be_purged(self, db: LandscapeDB, tmp_path: Path, output_text: str) -> None:
+        store = FilesystemPayloadStore(tmp_path / "payloads")
+        manager = PurgeManager(db, store)
+        now = datetime(2026, 2, 8, tzinfo=UTC)
+        output_ref = store.store(output_text.encode("utf-8"))
+        with db.write_connection() as conn:
+            _create_run(conn, "stored-canonical", status=RunStatus.COMPLETED, completed_at=now - timedelta(days=40))
+            _create_node(conn, "stored-canonical", "stored-canonical-node")
+            conn.execute(
+                operations_table.insert().values(
+                    operation_id="stored-canonical-op",
+                    run_id="stored-canonical",
+                    node_id="stored-canonical-node",
+                    operation_type="source_load",
+                    started_at=now,
+                    status="completed",
+                    output_data_ref=output_ref,
+                    output_data_hash=output_ref,
+                )
+            )
+
+        assert set(manager.find_expired_payload_refs(retention_days=30, as_of=now)) == {output_ref}
+        result = manager.purge_payloads([output_ref])
+        assert result.deleted_count == 1
+        assert not store.exists(output_ref)
+
     @pytest.mark.parametrize("large_output", [False, True])
     @pytest.mark.parametrize("retention_case", ["failed-output", "retained-output", "active-shared-output"])
     def test_generic_source_output_keeps_classification_input_until_output_removed(

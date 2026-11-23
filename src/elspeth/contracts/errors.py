@@ -1215,6 +1215,11 @@ class JoinRefusedError(Exception):
         super().__init__(f"Cannot join run {run_id!r}: {reason}")
 
 
+# TIER-2: Retryable join refusal while the leader is registering the run graph.
+class JoinNotReadyError(JoinRefusedError):
+    """Raised when a follower must retry after graph registration completes."""
+
+
 # ADR-030 §B.1 step 5: leader seat expired while a follower was draining.
 # The follower departed cleanly but the run is NOT complete — the operator
 # must use `elspeth resume` to continue.  Distinct from RunWorkerEvictedError

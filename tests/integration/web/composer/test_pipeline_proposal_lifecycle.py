@@ -145,12 +145,12 @@ def _pipeline_dispatch_result(*, pipeline_content_hash: str) -> dict[str, object
     }
 
 
-def _plan(base: AbsentBase | PresentBase | None = None) -> PipelinePlanResult:
+def _plan(base: AbsentBase | PresentBase | None = None, *, pipeline: dict[str, object] | None = None) -> PipelinePlanResult:
     if base is None:
         base = AbsentBase()
     return PipelinePlanResult(
         proposal=PipelineProposal.create(
-            pipeline=_pipeline(),
+            pipeline=_pipeline() if pipeline is None else pipeline,
             base=base,
             repair_count=0,
             skill_hash=stable_hash("skill"),
@@ -253,14 +253,14 @@ def _redacted_pipeline(pipeline: dict[str, object]) -> dict[str, object]:
     return redact_tool_call_arguments("set_pipeline", pipeline, telemetry=NoopRedactionTelemetry())
 
 
-async def _create(service: SessionServiceImpl, session_id: UUID, plan: PipelinePlanResult):
+async def _create(service: SessionServiceImpl, session_id: UUID, plan: PipelinePlanResult, *, arguments: dict[str, object] | None = None):
     return await service.create_pipeline_composition_proposal(
         session_id=session_id,
         plan=plan,
         summary="Replace the pipeline.",
         rationale="Requested by the operator.",
         affects=("graph", "validation"),
-        arguments_redacted_json=_redacted_pipeline(_pipeline()),
+        arguments_redacted_json=_redacted_pipeline(_pipeline() if arguments is None else arguments),
         actor="composer-web:user:alice",
         composer_model_identifier="planner-model",
         composer_model_version="planner-model-v1",
@@ -1070,13 +1070,13 @@ async def test_pipeline_dispatch_recovery_rejects_duplicate_json_object_key(serv
     ],
     ids=["top_level", "nested"],
 )
-def test_pipeline_dispatch_binding_restores_core_domain_normalized_reserved_mapping(
+def test_pipeline_dispatch_binding_round_trips_reserved_mapping(
     arguments: dict[str, object],
 ) -> None:
     arguments_canonical = canonical_json(arguments)
     result_canonical = canonical_json({"success": True})
-    assert arguments_canonical.count('"__elspeth_canonical_type__":"mapping"') == 1
-    assert '"entries":[' in arguments_canonical
+    assert '"__elspeth_canonical_type__":{"literal":true}' in arguments_canonical
+    assert '"entries":[' not in arguments_canonical
     arguments_hash = hashlib.sha256(arguments_canonical.encode("utf-8")).hexdigest()
     authority_arguments_canonical = composer_authority_canonical_json(arguments)
     authority_arguments_hash = hashlib.sha256(authority_arguments_canonical.encode("utf-8")).hexdigest()
@@ -1102,10 +1102,72 @@ def test_pipeline_dispatch_binding_restores_core_domain_normalized_reserved_mapp
     assert binding.tool_name == "set_pipeline"
     assert binding.status is ComposerToolStatus.SUCCESS
     assert binding.arguments_hash == authority_arguments_hash
-    # Session row comparisons receive the original JSON value, unlike the
-    # canonical-domain mapping restored from the persisted envelope.
     assert binding.arguments_hash == semantic_redacted_pipeline_arguments_hash(arguments)
     assert binding.result_hash == result_hash
+
+
+def test_pipeline_dispatch_binding_reads_pre_upgrade_stored_text() -> None:
+    arguments_canonical = (
+        '{"__elspeth_canonical_type__":"mapping","entries":[{"key":"__elspeth_canonical_type__","value":{"literal":true}}]}'
+    )
+    pre_upgrade_hash = "a87b90e83d104a5fdabd58720c274ce0cf9fd1660ab73256931fb24c4bf18ff2"
+    result_canonical = '{"success":true}'
+    envelope: dict[str, object] = {
+        "_kind": "audit",
+        "invocation": {
+            "tool_call_id": "stored-mapping-call",
+            "tool_name": "set_pipeline",
+            "status": ComposerToolStatus.SUCCESS.value,
+            "arguments_canonical": arguments_canonical,
+            "arguments_hash": pre_upgrade_hash,
+            "authority_arguments_canonical": arguments_canonical,
+            "authority_arguments_hash": pre_upgrade_hash,
+            "result_canonical": result_canonical,
+            "result_hash": hashlib.sha256(result_canonical.encode("utf-8")).hexdigest(),
+        },
+    }
+
+    binding = PipelineDispatchAuditBinding.from_persisted_envelope(envelope)
+
+    assert binding.arguments_hash == pre_upgrade_hash
+
+
+def test_pre_upgrade_raw_reserved_mapping_hash_differs_from_stored_hash() -> None:
+    pre_upgrade_hash = "a87b90e83d104a5fdabd58720c274ce0cf9fd1660ab73256931fb24c4bf18ff2"
+    assert semantic_redacted_pipeline_arguments_hash({"__elspeth_canonical_type__": {"literal": True}}) != pre_upgrade_hash
+
+
+@pytest.mark.asyncio
+async def test_settlement_refuses_pre_upgrade_hash_for_reserved_mapping(service: SessionServiceImpl) -> None:
+    session_id = uuid4()
+    _insert_session(service, session_id)
+    arguments = {
+        **_pipeline(),
+        "nodes": [
+            {
+                "id": "n1",
+                "options": {},
+                "node_type": "gate",
+                "input": "rows",
+                "routes": {"__elspeth_canonical_type__": "out"},
+            }
+        ],
+    }
+    pre_upgrade_hash = "b2f1ffb6dd946b9b0dd02292441f555a7efbac294813f7c2362140e18a35a6b1"
+    plan = _plan(pipeline=arguments)
+    row = await _create(service, session_id, plan, arguments=arguments)
+    binding = PipelineDispatchAuditBinding(
+        tool_call_id=plan.tool_call_id,
+        tool_name="set_pipeline",
+        status=ComposerToolStatus.SUCCESS,
+        arguments_hash=pre_upgrade_hash,
+        result_hash="a" * 64,
+    )
+
+    with pytest.raises(AuditIntegrityError, match="arguments do not match"):
+        await service.settle_pipeline_composition_proposal(**_settlement_kwargs(session_id, row.id, plan, binding))
+
+    assert semantic_redacted_pipeline_arguments_hash(_redacted_pipeline(arguments)) != pre_upgrade_hash
 
 
 @pytest.mark.asyncio

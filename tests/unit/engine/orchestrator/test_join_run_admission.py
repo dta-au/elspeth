@@ -32,11 +32,14 @@ from unittest.mock import patch
 import pytest
 from sqlalchemy import insert, select, update
 
+from elspeth.contracts import ResumeCheck
 from elspeth.contracts.coordination import WorkerMembershipToken, mint_worker_id
 from elspeth.contracts.errors import JoinRefusedError
+from elspeth.contracts.hashing import CANONICAL_VERSION
 from elspeth.core.landscape import run_coordination_repository as coordination_module
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.database_clock import read_landscape_decision_time, read_landscape_transaction_time
+from elspeth.core.landscape.factory import DataFlowReadRepository
 from elspeth.core.landscape.schema import (
     run_coordination_events_table,
     run_coordination_table,
@@ -64,6 +67,17 @@ _SENTINEL_HASH = fake_sha256("sentinel-config-hash-abc123")
 _PATCH_RESOLVE = patch("elspeth.engine.orchestrator.join_admission.resolve_config", return_value={})
 _PATCH_HASH_SENTINEL = patch("elspeth.engine.orchestrator.join_admission.stable_hash", return_value=_SENTINEL_HASH)
 
+_JOIN_INPUTS = {"config": types.SimpleNamespace(), "graph": types.SimpleNamespace(get_edges=lambda: [object()])}
+
+
+@pytest.fixture(autouse=True)
+def _registered_graph_baseline() -> object:
+    with (
+        patch.object(DataFlowReadRepository, "get_edges", return_value=[object()]),
+        patch("elspeth.engine.orchestrator.join_admission.check_implementation_compatibility", return_value=ResumeCheck(can_resume=True)),
+    ):
+        yield
+
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -90,7 +104,7 @@ def _begin_run_with_leader(db: LandscapeDB, *, run_id: str = RUN_ID, config_hash
                 started_at=NOW,
                 config_hash=config_hash,
                 settings_json="{}",
-                canonical_version="v1",
+                canonical_version=CANONICAL_VERSION,
                 status="running",
                 openrouter_catalog_sha256="0" * 64,
                 openrouter_catalog_source="bundled",
@@ -154,7 +168,7 @@ class TestJoinAdmissionHappyPath:
         fake_settings = types.SimpleNamespace()
         with _PATCH_RESOLVE, _PATCH_HASH_SENTINEL:
             orch = _orchestrator(db)
-            member = orch.join_run(run_id=RUN_ID, settings=fake_settings)
+            member = orch.join_run(run_id=RUN_ID, settings=fake_settings, **_JOIN_INPUTS)
 
         # join_run returns the follower's membership token — the exact value
         # admit_follower established — naming the run and a fresh identity.
@@ -187,8 +201,8 @@ class TestJoinAdmissionHappyPath:
         fake_settings = types.SimpleNamespace()
         with _PATCH_RESOLVE, _PATCH_HASH_SENTINEL:
             orch = _orchestrator(db)
-            wid1 = orch.join_run(run_id=RUN_ID, settings=fake_settings)
-            wid2 = orch.join_run(run_id=RUN_ID, settings=fake_settings)
+            wid1 = orch.join_run(run_id=RUN_ID, settings=fake_settings, **_JOIN_INPUTS)
+            wid2 = orch.join_run(run_id=RUN_ID, settings=fake_settings, **_JOIN_INPUTS)
 
         assert wid1 != wid2
 
@@ -213,8 +227,9 @@ class TestJoinAdmissionRefusals:
                     started_at=NOW,
                     config_hash=_SENTINEL_HASH,
                     settings_json="{}",
-                    canonical_version="v1",
+                    canonical_version=CANONICAL_VERSION,
                     status="completed",
+                    completed_at=NOW,
                     openrouter_catalog_sha256="0" * 64,
                     openrouter_catalog_source="bundled",
                 )
@@ -232,7 +247,7 @@ class TestJoinAdmissionRefusals:
         fake_settings = types.SimpleNamespace()
         with _PATCH_RESOLVE, _PATCH_HASH_SENTINEL, pytest.raises(JoinRefusedError) as exc_info:
             orch = _orchestrator(db)
-            orch.join_run(run_id=RUN_ID, settings=fake_settings)
+            orch.join_run(run_id=RUN_ID, settings=fake_settings, **_JOIN_INPUTS)
 
         assert exc_info.value.run_id == RUN_ID
         assert "terminal" in str(exc_info.value).lower()
@@ -247,7 +262,7 @@ class TestJoinAdmissionRefusals:
                     started_at=NOW,
                     config_hash=_SENTINEL_HASH,
                     settings_json="{}",
-                    canonical_version="v1",
+                    canonical_version=CANONICAL_VERSION,
                     status="failed",
                     openrouter_catalog_sha256="0" * 64,
                     openrouter_catalog_source="bundled",
@@ -266,7 +281,7 @@ class TestJoinAdmissionRefusals:
         fake_settings = types.SimpleNamespace()
         with _PATCH_RESOLVE, _PATCH_HASH_SENTINEL, pytest.raises(JoinRefusedError) as exc_info:
             orch = _orchestrator(db)
-            orch.join_run(run_id=RUN_ID, settings=fake_settings)
+            orch.join_run(run_id=RUN_ID, settings=fake_settings, **_JOIN_INPUTS)
 
         # Should mention resume (not terminal)
         assert "resume" in str(exc_info.value).lower()
@@ -283,7 +298,7 @@ class TestJoinAdmissionRefusals:
             pytest.raises(JoinRefusedError) as exc_info,
         ):
             orch = _orchestrator(db)
-            orch.join_run(run_id=RUN_ID, settings=fake_settings)
+            orch.join_run(run_id=RUN_ID, settings=fake_settings, **_JOIN_INPUTS)
 
         err = exc_info.value
         assert err.run_id == RUN_ID
@@ -306,7 +321,7 @@ class TestJoinAdmissionRefusals:
             pytest.raises(JoinRefusedError) as exc_info,
         ):
             orch = _orchestrator(db)
-            orch.join_run(run_id=RUN_ID, settings=fake_settings)
+            orch.join_run(run_id=RUN_ID, settings=fake_settings, **_JOIN_INPUTS)
 
         err = exc_info.value
         assert err.run_id == RUN_ID
@@ -327,7 +342,7 @@ class TestJoinAdmissionRefusals:
                     started_at=NOW,
                     config_hash=_SENTINEL_HASH,
                     settings_json="{}",
-                    canonical_version="v1",
+                    canonical_version=CANONICAL_VERSION,
                     status="running",
                     openrouter_catalog_sha256="0" * 64,
                     openrouter_catalog_source="bundled",
@@ -347,7 +362,7 @@ class TestJoinAdmissionRefusals:
         fake_settings = types.SimpleNamespace()
         with _PATCH_RESOLVE, _PATCH_HASH_SENTINEL, pytest.raises(JoinRefusedError) as exc_info:
             orch = _orchestrator(db)
-            orch.join_run(run_id=RUN_ID, settings=fake_settings)
+            orch.join_run(run_id=RUN_ID, settings=fake_settings, **_JOIN_INPUTS)
 
         assert "no live leader" in str(exc_info.value).lower()
 
@@ -368,7 +383,7 @@ class TestJoinAdmissionRefusals:
         with patch("elspeth.engine.orchestrator.join_admission.os.access", side_effect=fake_access):
             orch = _orchestrator(db)
             with pytest.raises(JoinRefusedError) as exc_info:
-                orch.join_run(run_id=RUN_ID, settings=fake_settings)
+                orch.join_run(run_id=RUN_ID, settings=fake_settings, **_JOIN_INPUTS)
 
         err = exc_info.value
         assert err.run_id == RUN_ID
@@ -395,7 +410,7 @@ class TestJoinAdmissionRefusals:
         with patch("elspeth.engine.orchestrator.join_admission.os.access", side_effect=fake_access):
             orch = _orchestrator(db)
             with pytest.raises(JoinRefusedError) as exc_info:
-                orch.join_run(run_id=RUN_ID, settings=fake_settings)
+                orch.join_run(run_id=RUN_ID, settings=fake_settings, **_JOIN_INPUTS)
 
         err = exc_info.value
         assert err.run_id == RUN_ID
@@ -424,7 +439,7 @@ class TestJoinAdmissionAtomicity:
             pytest.raises(JoinRefusedError),
         ):
             orch = _orchestrator(db)
-            orch.join_run(run_id=RUN_ID, settings=fake_settings)
+            orch.join_run(run_id=RUN_ID, settings=fake_settings, **_JOIN_INPUTS)
 
         # run_workers: still only the leader row
         workers = _worker_rows(db)
@@ -445,7 +460,7 @@ class TestJoinAdmissionAtomicity:
         fake_settings = types.SimpleNamespace()
         with _PATCH_RESOLVE, _PATCH_HASH_SENTINEL, pytest.raises(JoinRefusedError):
             orch = _orchestrator(db)
-            orch.join_run(run_id=RUN_ID, settings=fake_settings)
+            orch.join_run(run_id=RUN_ID, settings=fake_settings, **_JOIN_INPUTS)
 
         workers = _worker_rows(db)
         assert len(workers) == 1
@@ -478,7 +493,7 @@ class TestSeatLivenessBoundary:
         # real-clock PostgreSQL tests separately cover expiry during admission.
         monkeypatch.setattr(coordination_module, "read_landscape_decision_time", lambda _conn: database_now)
         with _PATCH_RESOLVE, _PATCH_HASH_SENTINEL:
-            worker_id = _orchestrator(db).join_run(run_id=RUN_ID, settings=fake_settings).worker_id
+            worker_id = _orchestrator(db).join_run(run_id=RUN_ID, settings=fake_settings, **_JOIN_INPUTS).worker_id
         assert worker_id.startswith(f"worker:{RUN_ID}:")
         assert [w["status"] for w in _worker_rows(db) if w["worker_id"] == worker_id] == ["active"]
 
@@ -491,7 +506,7 @@ class TestSeatLivenessBoundary:
             )
         before_refusal = capture_state_engine_image(db, run_id=RUN_ID)
         with _PATCH_RESOLVE, _PATCH_HASH_SENTINEL, pytest.raises(JoinRefusedError) as exc_info:
-            _orchestrator(db).join_run(run_id=RUN_ID, settings=fake_settings)
+            _orchestrator(db).join_run(run_id=RUN_ID, settings=fake_settings, **_JOIN_INPUTS)
         assert "no live leader" in str(exc_info.value).lower()
         assert len([w for w in _worker_rows(db) if w["role"] == "follower"]) == 1, "the refused join registered no second follower"
         assert capture_state_engine_image(db, run_id=RUN_ID) == before_refusal

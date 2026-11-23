@@ -65,6 +65,7 @@ from elspeth.contracts.sink_effects import (
     SinkEffectRuntimeBinding,
 )
 from elspeth.core.canonical import canonical_json as pipeline_canonical_json
+from elspeth.core.canonical import normalize_for_canonical
 from elspeth.core.clock import Clock
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
 from elspeth.core.landscape.errors import LandscapeRecordError
@@ -1157,12 +1158,13 @@ class SinkExecutor:
         for token, index, _state in primary_divert_states:
             diversion = diversion_by_index[index]
             reason_hash = diversion_reason_hashes[index]
-            row = {
+            raw_row = {
                 **diversion.row_data,
                 "__diversion_reason": f"effect-diversion:{reason_hash}",
                 "__diverted_from": sink_name,
                 "__diversion_timestamp": stable_timestamp,
             }
+            row = normalize_for_canonical(raw_row)
             enriched_rows.append(row)
             enriched_by_token[token.token_id] = row
             diverted_tokens.append(token)

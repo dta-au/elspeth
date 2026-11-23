@@ -48,6 +48,7 @@ from tests.e2e.recovery.harness import (
 )
 from tests.e2e.recovery.test_follower_join_and_drain import (
     _join_follower,
+    _join_inputs,
     _seat_run_with_live_leader,
     _seed_ready_row,
 )
@@ -312,6 +313,7 @@ def _join_follower_process(
             run_id=run_id,
             settings=types.SimpleNamespace(),  # type: ignore[arg-type]  # resolved settings are patched at this process boundary
             window_seconds=10**9,
+            **_join_inputs(),
         )
     Path(worker_id_path).write_text(member_token.worker_id, encoding="utf-8")
 

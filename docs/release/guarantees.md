@@ -96,7 +96,7 @@ This is not optional. This is not best-effort. This is the reason ELSPETH exists
 **Promise:** Hashes are stable and verifiable.
 
 - Same data → same hash (deterministic)
-- Hash algorithm versioned (`sha256-rfc8785-v1`)
+- Hash algorithm versioned (`sha256-rfc8785-v2`)
 - NaN/Infinity strictly rejected (not silently converted)
 - Integers beyond ±(2**53-1) strictly rejected; a source quarantines a row that carries one
 - Stored canonical JSON reads back to the value that was hashed (a double printed in integer notation stays a double)

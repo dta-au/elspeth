@@ -51,13 +51,16 @@ from unittest.mock import patch
 import pytest
 from sqlalchemy import select, update
 
-from elspeth.contracts import RunStatus
+from elspeth.contracts import NodeType, RunStatus
 from elspeth.contracts.config import RuntimeRetryConfig
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.errors import FollowerSeatDeadError, JoinRefusedError, RunMembershipLostError
+from elspeth.contracts.hashing import CANONICAL_VERSION
 from elspeth.contracts.scheduler import GroupLossSpec, SchedulerEventType, TokenWorkStatus
+from elspeth.core.landscape.factory import RecorderFactory, RunLifecycleReadRepository
 from elspeth.core.landscape.schema import (
     group_losses_table,
+    nodes_table,
     run_coordination_table,
     run_workers_table,
     runs_table,
@@ -67,9 +70,17 @@ from elspeth.core.landscape.schema import (
 from elspeth.engine.clock import MockClock
 from elspeth.engine.orchestrator import Orchestrator
 from elspeth.engine.orchestrator.follower import FollowerProcessor
+from elspeth.engine.orchestrator.graph_wiring import build_source_id_map
+from elspeth.engine.orchestrator.landscape_registration import (
+    register_nodes_with_landscape,
+    resolve_node_audit_metadata,
+    resolve_source_contracts_by_node_id,
+)
 from tests.e2e.recovery.harness import (
     _DEFAULT_LEASE_SECONDS,
+    _SOURCE_ROWS,
     _T0,
+    _build_pipeline,
     _coord,
     _coordination_events,
     _coordination_row,
@@ -81,7 +92,14 @@ from tests.e2e.recovery.harness import (
 from tests.e2e.recovery.test_suspended_winner_fences import (
     _work_item,
 )
-from tests.fixtures.landscape import expire_leader_seat, leader_token_for, member_token_for
+from tests.fixtures.landscape import (
+    expire_leader_seat,
+    leader_token_for,
+    make_landscape_db,
+    make_recorder_with_run,
+    member_token_for,
+    register_test_node,
+)
 
 if TYPE_CHECKING:
     from scripts.state_engine_profile_reporter import RuntimeProfileReporter
@@ -117,6 +135,11 @@ def _get_db_config_hash(crashed: Any) -> str:
         return str(conn.execute(select(runs_table.c.config_hash).where(runs_table.c.run_id == crashed.run_id)).scalar_one())
 
 
+def _join_inputs() -> dict[str, Any]:
+    config, graph, _sink, _source = _build_pipeline(_SOURCE_ROWS)
+    return {"config": config, "graph": graph}
+
+
 def _join_follower(crashed: Any, leader_token: CoordinationToken) -> str:
     """Admit a follower via join_run, mocking stable_hash to the real DB hash."""
     db_hash = _get_db_config_hash(crashed)
@@ -132,6 +155,7 @@ def _join_follower(crashed: Any, leader_token: CoordinationToken) -> str:
             run_id=crashed.run_id,
             settings=types.SimpleNamespace(),
             window_seconds=_GUARD_LIVE_SEAT_WINDOW_SECONDS,
+            **_join_inputs(),
         ).worker_id
 
 
@@ -171,7 +195,7 @@ def _assert_no_follower_mutation(crashed: Any, *, run_id: str, seat_before: dict
     """Common 'zero durable mutation' contract for refusal tests."""
     # No follower run_workers row at all
     workers = {w["worker_id"]: w for w in _run_workers(crashed.db, run_id)}
-    follower_rows = [w for w in workers.values() if w["role"] == "follower" and w["status"] == "active"]
+    follower_rows = [w for w in workers.values() if w["role"] == "follower"]
     assert follower_rows == [], "no follower run_workers row on refusal"
     # No worker_register event for any new follower
     register_events = [
@@ -212,6 +236,223 @@ class _DrainFollowerReadyWork:
 class TestJoinRunAdmissionRefusals:
     """join_run refuses with JoinRefusedError; zero durable mutation on all arms."""
 
+    @pytest.mark.parametrize("old_version", [False, True])
+    def test_join_real_checks_keep_version_before_readiness_before_plugin(self, old_version: bool) -> None:
+        setup = make_recorder_with_run(
+            run_id="run-join-check-order",
+            canonical_version=CANONICAL_VERSION,
+            leader_worker_id="worker:run-join-check-order:leader",
+        )
+        with setup.db.engine.begin() as conn:
+            conn.execute(update(nodes_table).where(nodes_table.c.run_id == setup.run_id).values(source_file_hash="sha256:0000000000000000"))
+            if old_version:
+                conn.execute(update(runs_table).where(runs_table.c.run_id == setup.run_id).values(canonical_version="previous-version"))
+        seat_before = _coordination_row(setup.db, setup.run_id)
+        with (
+            patch("elspeth.engine.orchestrator.join_admission.resolve_config", return_value={}),
+            pytest.raises(JoinRefusedError, match="canonical version" if old_version else "not finished registering its graph") as exc_info,
+        ):
+            Orchestrator(setup.db).join_run(run_id=setup.run_id, settings=cast(Any, types.SimpleNamespace()), **_join_inputs())
+        assert type(exc_info.value).__name__ == ("JoinRefusedError" if old_version else "JoinNotReadyError")
+        _assert_no_follower_mutation(setup, run_id=setup.run_id, seat_before=seat_before)
+        setup.db.close()
+
+    def test_same_follower_joins_after_graph_registration(self) -> None:
+        config, graph, _sink, _source = _build_pipeline(_SOURCE_ROWS)
+        db = make_landscape_db()
+        factory = RecorderFactory(db)
+        run_id = "run-join-registration-completes"
+        factory.run_lifecycle.begin_run(
+            config={},
+            canonical_version=CANONICAL_VERSION,
+            run_id=run_id,
+            leader_worker_id=f"worker:{run_id}:leader",
+            openrouter_catalog_sha256="0" * 64,
+            openrouter_catalog_source="bundled",
+        )
+        leader_token = leader_token_for(db, run_id)
+        source_id_map = build_source_id_map(graph)
+        metadata = resolve_node_audit_metadata(
+            config,
+            graph,
+            source_id_map=source_id_map,
+            transform_id_map=graph.get_transform_id_map(),
+            sink_id_map=graph.get_sink_id_map(),
+            config_gate_node_ids=set(graph.get_config_gate_id_map().values()),
+            aggregation_node_ids=set(graph.get_aggregation_id_map().values()),
+            coalesce_node_ids=set(graph.get_coalesce_id_map().values()),
+            collector_id_map=graph.get_collector_id_map(),
+            collector_transforms=graph.get_collector_transform_map(),
+        )
+        register_nodes_with_landscape(
+            factory,
+            graph,
+            graph.topological_order(),
+            metadata,
+            resolve_source_contracts_by_node_id(config, source_id_map),
+            coordination_token=leader_token,
+        )
+        settings = cast(Any, types.SimpleNamespace())
+        with patch("elspeth.engine.orchestrator.join_admission.resolve_config", return_value={}):
+            with pytest.raises(JoinRefusedError, match="not finished registering its graph"):
+                Orchestrator(db).join_run(run_id=run_id, settings=settings, config=config, graph=graph)
+            for edge in graph.get_edges():
+                factory.data_flow.register_edge(
+                    coordination_token=leader_token,
+                    from_node_id=edge.from_node,
+                    to_node_id=edge.to_node,
+                    label=edge.label,
+                    mode=edge.mode,
+                )
+            member = Orchestrator(db).join_run(run_id=run_id, settings=settings, config=config, graph=graph)
+        with db.engine.connect() as conn:
+            rows = conn.execute(
+                select(run_workers_table.c.worker_id, run_workers_table.c.status).where(
+                    run_workers_table.c.run_id == run_id, run_workers_table.c.role == "follower"
+                )
+            ).all()
+        assert [(row.worker_id, row.status) for row in rows] == [(member.worker_id, "active")]
+        db.close()
+
+    @pytest.mark.parametrize("compatible", [False, True])
+    def test_join_rechecks_after_run_becomes_running(self, tmp_path: Path, compatible: bool) -> None:
+        crashed = _run_to_interrupted_checkpoint(tmp_path, MockClock(start=_T0))
+        _seat_run_with_live_leader(crashed, leader_id=f"worker:{crashed.run_id}:leader-race")
+        with crashed.db.engine.begin() as conn:
+            conn.execute(update(runs_table).where(runs_table.c.run_id == crashed.run_id).values(status=RunStatus.FAILED.value))
+            if not compatible:
+                conn.execute(update(runs_table).where(runs_table.c.run_id == crashed.run_id).values(canonical_version="previous-version"))
+
+        original_get_run = RunLifecycleReadRepository.get_run
+        reads = 0
+
+        def read_then_complete_resume(repo: RunLifecycleReadRepository, run_id: str) -> Any:
+            nonlocal reads
+            run = original_get_run(repo, run_id)
+            reads += 1
+            if reads == 1:
+                with crashed.db.engine.begin() as conn:
+                    conn.execute(update(runs_table).where(runs_table.c.run_id == crashed.run_id).values(status=RunStatus.RUNNING.value))
+            return run
+
+        with patch.object(RunLifecycleReadRepository, "get_run", read_then_complete_resume):
+            if compatible:
+                worker_id = _join_follower(crashed, leader_token_for(crashed.db, crashed.run_id))
+            else:
+                with pytest.raises(JoinRefusedError, match="canonical version"):
+                    _join_follower(crashed, leader_token_for(crashed.db, crashed.run_id))
+        with crashed.db.engine.connect() as conn:
+            rows = conn.execute(
+                select(run_workers_table.c.worker_id, run_workers_table.c.status).where(
+                    run_workers_table.c.run_id == crashed.run_id, run_workers_table.c.role == "follower"
+                )
+            ).all()
+        assert reads >= 2
+        assert [(row.worker_id, row.status) for row in rows] == (
+            [(worker_id, "active")] if compatible else [(rows[0].worker_id, "departed")]
+        )
+        crashed.db.close()
+
+    def test_join_rechecks_graph_after_run_appears(self) -> None:
+        db = make_landscape_db()
+        factory = RecorderFactory(db)
+        run_id = "run-join-appears"
+        original_get_run = RunLifecycleReadRepository.get_run
+        reads = 0
+
+        def first_read_absent(repo: RunLifecycleReadRepository, run_id: str) -> Any:
+            nonlocal reads
+            run = original_get_run(repo, run_id)
+            reads += 1
+            if reads == 1:
+                assert run is None
+                factory.run_lifecycle.begin_run(
+                    config={},
+                    canonical_version=CANONICAL_VERSION,
+                    run_id=run_id,
+                    leader_worker_id=f"worker:{run_id}:leader",
+                    openrouter_catalog_sha256="0" * 64,
+                    openrouter_catalog_source="bundled",
+                )
+                register_test_node(factory.data_flow, run_id, "source", node_type=NodeType.SOURCE, plugin_name="source")
+            return run
+
+        with (
+            patch.object(RunLifecycleReadRepository, "get_run", first_read_absent),
+            patch("elspeth.engine.orchestrator.join_admission.resolve_config", return_value={}),
+            pytest.raises(JoinRefusedError, match="not finished registering its graph") as exc_info,
+        ):
+            Orchestrator(db).join_run(run_id=run_id, settings=cast(Any, types.SimpleNamespace()), **_join_inputs())
+        assert type(exc_info.value).__name__ == "JoinNotReadyError"
+        with db.engine.connect() as conn:
+            statuses = (
+                conn.execute(
+                    select(run_workers_table.c.status).where(run_workers_table.c.run_id == run_id, run_workers_table.c.role == "follower")
+                )
+                .scalars()
+                .all()
+            )
+        assert reads >= 2
+        assert statuses == ["departed"]
+        db.close()
+
+    def test_join_refused_on_canonical_version_difference(self, tmp_path: Path) -> None:
+        crashed = _run_to_interrupted_checkpoint(tmp_path, MockClock(start=_T0))
+        _seat_run_with_live_leader(crashed, leader_id=f"worker:{crashed.run_id}:leader-version")
+        with crashed.db.engine.begin() as conn:
+            conn.execute(
+                update(runs_table).where(runs_table.c.run_id == crashed.run_id).values(canonical_version="sha256-rfc8785-previous")
+            )
+        seat_before = _coordination_row(crashed.db, crashed.run_id)
+        db_hash = _get_db_config_hash(crashed)
+        with (
+            patch("elspeth.engine.orchestrator.join_admission.resolve_config", return_value={}),
+            patch("elspeth.engine.orchestrator.join_admission.stable_hash", return_value=db_hash),
+            pytest.raises(JoinRefusedError, match="canonical version"),
+        ):
+            _orchestrator(crashed).join_run(run_id=crashed.run_id, settings=types.SimpleNamespace(), **_join_inputs())
+        _assert_no_follower_mutation(crashed, run_id=crashed.run_id, seat_before=seat_before)
+        crashed.db.close()
+
+    @pytest.mark.parametrize("partial_nodes", [False, True])
+    def test_join_waits_for_graph_registration(self, partial_nodes: bool) -> None:
+        setup = make_recorder_with_run(
+            run_id="run-join-registration",
+            canonical_version=CANONICAL_VERSION,
+            leader_worker_id="worker:run-join-registration:leader",
+        )
+        if partial_nodes:
+            register_test_node(setup.factory.data_flow, setup.run_id, "partial-transform")
+        seat_before = _coordination_row(setup.db, setup.run_id)
+        with (
+            patch("elspeth.engine.orchestrator.join_admission.resolve_config", return_value={}),
+            pytest.raises(JoinRefusedError) as exc_info,
+        ):
+            Orchestrator(setup.db).join_run(run_id=setup.run_id, settings=types.SimpleNamespace(), **_join_inputs())
+        assert type(exc_info.value).__name__ == "JoinNotReadyError"
+        _assert_no_follower_mutation(setup, run_id=setup.run_id, seat_before=seat_before)
+        setup.db.close()
+
+    def test_join_refused_on_plugin_implementation_difference(self, tmp_path: Path) -> None:
+        crashed = _run_to_interrupted_checkpoint(tmp_path, MockClock(start=_T0))
+        _seat_run_with_live_leader(crashed, leader_id=f"worker:{crashed.run_id}:leader-implementation")
+        with crashed.db.engine.begin() as conn:
+            conn.execute(
+                update(nodes_table)
+                .where(nodes_table.c.run_id == crashed.run_id, nodes_table.c.node_id == crashed.source_node_id)
+                .values(source_file_hash="sha256:0000000000000000")
+            )
+        seat_before = _coordination_row(crashed.db, crashed.run_id)
+        db_hash = _get_db_config_hash(crashed)
+        with (
+            patch("elspeth.engine.orchestrator.join_admission.resolve_config", return_value={}),
+            patch("elspeth.engine.orchestrator.join_admission.stable_hash", return_value=db_hash),
+            pytest.raises(JoinRefusedError, match="Plugin implementation"),
+        ):
+            _orchestrator(crashed).join_run(run_id=crashed.run_id, settings=types.SimpleNamespace(), **_join_inputs())
+        _assert_no_follower_mutation(crashed, run_id=crashed.run_id, seat_before=seat_before)
+        crashed.db.close()
+
     def test_join_refused_when_run_terminal_completed(self, tmp_path: Path) -> None:
         """R1: COMPLETED run raises JoinRefusedError with 'terminal' in reason."""
         clock = MockClock(start=_T0)
@@ -230,6 +471,7 @@ class TestJoinRunAdmissionRefusals:
             _orchestrator(crashed).join_run(
                 run_id=crashed.run_id,
                 settings=types.SimpleNamespace(),
+                **_join_inputs(),
             )
 
         assert exc_info.value.run_id == crashed.run_id
@@ -253,6 +495,7 @@ class TestJoinRunAdmissionRefusals:
             _orchestrator(crashed).join_run(
                 run_id=crashed.run_id,
                 settings=types.SimpleNamespace(),
+                **_join_inputs(),
             )
 
         assert exc_info.value.run_id == crashed.run_id
@@ -279,6 +522,7 @@ class TestJoinRunAdmissionRefusals:
             _orchestrator(crashed).join_run(
                 run_id=crashed.run_id,
                 settings=types.SimpleNamespace(),
+                **_join_inputs(),
             )
 
         assert exc_info.value.run_id == crashed.run_id
@@ -288,6 +532,43 @@ class TestJoinRunAdmissionRefusals:
         _assert_no_follower_mutation(crashed, run_id=crashed.run_id, seat_before=seat_before)
         crashed.db.close()
 
+    def test_join_config_hash_reason_precedes_graph_readiness(self) -> None:
+        setup = make_recorder_with_run(
+            run_id="run-join-config-order",
+            canonical_version=CANONICAL_VERSION,
+            leader_worker_id="worker:run-join-config-order:leader",
+        )
+        seat_before = _coordination_row(setup.db, setup.run_id)
+        with (
+            patch("elspeth.engine.orchestrator.join_admission.resolve_config", return_value={}),
+            patch("elspeth.engine.orchestrator.join_admission.stable_hash", return_value="different-config-hash"),
+            pytest.raises(JoinRefusedError, match=r"does.not.match") as exc_info,
+        ):
+            Orchestrator(setup.db).join_run(run_id=setup.run_id, settings=types.SimpleNamespace(), **_join_inputs())
+        assert type(exc_info.value) is JoinRefusedError
+        _assert_no_follower_mutation(setup, run_id=setup.run_id, seat_before=seat_before)
+        setup.db.close()
+
+    def test_join_status_reason_precedes_graph_readiness(self) -> None:
+        setup = make_recorder_with_run(
+            run_id="run-join-status-order",
+            canonical_version=CANONICAL_VERSION,
+            leader_worker_id="worker:run-join-status-order:leader",
+        )
+        with setup.db.engine.begin() as conn:
+            conn.execute(update(runs_table).where(runs_table.c.run_id == setup.run_id).values(status=RunStatus.FAILED.value))
+        seat_before = _coordination_row(setup.db, setup.run_id)
+        db_hash = setup.factory.run_lifecycle.get_run(setup.run_id).config_hash
+        with (
+            patch("elspeth.engine.orchestrator.join_admission.resolve_config", return_value={}),
+            patch("elspeth.engine.orchestrator.join_admission.stable_hash", return_value=db_hash),
+            pytest.raises(JoinRefusedError, match="status is 'failed'") as exc_info,
+        ):
+            Orchestrator(setup.db).join_run(run_id=setup.run_id, settings=types.SimpleNamespace(), **_join_inputs())
+        assert type(exc_info.value) is JoinRefusedError
+        _assert_no_follower_mutation(setup, run_id=setup.run_id, seat_before=seat_before)
+        setup.db.close()
+
     def test_join_refused_when_no_live_leader(self, tmp_path: Path) -> None:
         """R3: RUNNING but seat expired/vacant → 'no live leader; use elspeth resume'."""
         clock = MockClock(start=_T0)
@@ -295,7 +576,7 @@ class TestJoinRunAdmissionRefusals:
         # Flip to RUNNING but do NOT seat a live leader: set status RUNNING
         # and leave the seat vacant (leader_worker_id=None, expires=None).
         with crashed.db.engine.begin() as conn:
-            conn.execute(update(runs_table).where(runs_table.c.run_id == crashed.run_id).values(status="running"))
+            conn.execute(update(runs_table).where(runs_table.c.run_id == crashed.run_id).values(status="running", completed_at=None))
             conn.execute(
                 update(run_coordination_table)
                 .where(run_coordination_table.c.run_id == crashed.run_id)
@@ -312,6 +593,7 @@ class TestJoinRunAdmissionRefusals:
             _orchestrator(crashed).join_run(
                 run_id=crashed.run_id,
                 settings=types.SimpleNamespace(),
+                **_join_inputs(),
             )
 
         assert exc_info.value.run_id == crashed.run_id
@@ -352,6 +634,7 @@ class TestJoinRunAdmissionRefusals:
             _orchestrator(crashed).join_run(
                 run_id=crashed.run_id,
                 settings=types.SimpleNamespace(),
+                **_join_inputs(),
             )
 
         assert exc_info.value.run_id == crashed.run_id
@@ -1177,12 +1460,6 @@ def _run_real_follower(
         target_step_index=graph.get_node_step_map()[target_node_id],
     )
 
-    member_token = Orchestrator(db).join_run(
-        run_id,
-        settings,
-        window_seconds=_GUARD_LIVE_SEAT_WINDOW_SECONDS,
-    )
-
     follower_plugins = _instantiate_plugins_for_runtime_preflight(
         settings,
         purpose=SinkEffectExecutionPurpose.FOLLOWER,
@@ -1202,6 +1479,13 @@ def _run_real_follower(
         graph=execution_graph,
         sink_effect_modes=execution_modes,
         sink_effect_admission=admission,
+    )
+    member_token = Orchestrator(db).join_run(
+        run_id,
+        settings,
+        config=follower_config,
+        graph=execution_graph,
+        window_seconds=_GUARD_LIVE_SEAT_WINDOW_SECONDS,
     )
     follower = build_follower_processor(
         factory=factory,

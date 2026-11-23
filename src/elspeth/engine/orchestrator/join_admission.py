@@ -17,19 +17,25 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from elspeth.contracts import RunStatus
 from elspeth.contracts.coordination import (
     DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
     WorkerMembershipToken,
     mint_worker_id,
 )
-from elspeth.contracts.errors import JoinRefusedError
+from elspeth.contracts.errors import JoinNotReadyError, JoinRefusedError
+from elspeth.contracts.hashing import CANONICAL_VERSION
 from elspeth.core.canonical import stable_hash
 from elspeth.core.config import resolve_config
-from elspeth.core.landscape.factory import RecorderFactory
+from elspeth.core.landscape.factory import LandscapeReadRepositories, RecorderFactory
+from elspeth.engine.orchestrator.implementation_compatibility import check_implementation_compatibility
 
 if TYPE_CHECKING:
+    from elspeth.contracts.audit import Run
     from elspeth.core.config import ElspethSettings
+    from elspeth.core.dag import ExecutionGraph
     from elspeth.core.landscape import LandscapeDB
+    from elspeth.engine.orchestrator.types import PipelineConfig
 
 
 class JoinAdmissionService:
@@ -37,6 +43,23 @@ class JoinAdmissionService:
 
     def __init__(self, *, db: LandscapeDB) -> None:
         self._db = db
+
+    @staticmethod
+    def _check_join_compatibility(
+        read_factory: LandscapeReadRepositories, run: Run, run_id: str, config: PipelineConfig, graph: ExecutionGraph
+    ) -> None:
+        if run.canonical_version != CANONICAL_VERSION:
+            raise JoinRefusedError(
+                run_id,
+                f"canonical version changed from {run.canonical_version!r} to {CANONICAL_VERSION!r}",
+            )
+        assert graph.get_edges(), "follower execution graph must have an edge"
+        if not read_factory.data_flow.get_edges(run_id):
+            raise JoinNotReadyError(run_id, "the run's leader has not finished registering its graph; retry the join")
+        implementation_check = check_implementation_compatibility(read_factory, run_id, config, graph)
+        if not implementation_check.can_resume:
+            assert implementation_check.reason is not None
+            raise JoinRefusedError(run_id, implementation_check.reason)
 
     @staticmethod
     def _join_preflight(db: LandscapeDB, run_id: str) -> None:
@@ -97,6 +120,8 @@ class JoinAdmissionService:
         run_id: str,
         settings: ElspethSettings,
         *,
+        config: PipelineConfig,
+        graph: ExecutionGraph,
         window_seconds: float | None = None,
     ) -> WorkerMembershipToken:
         """§B.1: atomic follower admission — new public entry point (ADR-030).
@@ -165,10 +190,25 @@ class JoinAdmissionService:
         joiner_config_hash = stable_hash(resolve_config(settings))
         worker_id = mint_worker_id(run_id)
 
+        read_factory = RecorderFactory.read_only(self._db)
+        run = read_factory.run_lifecycle.get_run(run_id)
+        if run is not None and run.status is RunStatus.RUNNING and run.config_hash == joiner_config_hash:
+            self._check_join_compatibility(read_factory, run, run_id, config, graph)
+
         factory = RecorderFactory(self._db, payload_store=None)
-        return factory.run_coordination.admit_follower(
+        token = factory.run_coordination.admit_follower(
             run_id=run_id,
             worker_id=worker_id,
             config_hash=joiner_config_hash,
             window_seconds=_window,
         )
+        if run is None or run.status is not RunStatus.RUNNING or run.config_hash != joiner_config_hash:
+            try:
+                current_factory = RecorderFactory.read_only(self._db)
+                current_run = current_factory.run_lifecycle.get_run(run_id)
+                assert current_run is not None
+                self._check_join_compatibility(current_factory, current_run, run_id, config, graph)
+            except Exception:
+                factory.run_coordination.depart_worker(member_token=token)
+                raise
+        return token
