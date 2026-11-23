@@ -20,7 +20,7 @@ const state = {
 function setup(disabledReason: string | null = null, sendRefusal: { message: string; seq: number } | null = null) {
   const onConnect = vi.fn();
   const onClose = vi.fn();
-  render(<FileWiringPad blob={blob} state={state} blobs={[blob]} disabledReason={disabledReason} sendRefusal={sendRefusal}
+  render(<FileWiringPad blob={blob} state={state} blobs={[blob]} listComplete disabledReason={disabledReason} sendRefusal={sendRefusal}
     onConnect={onConnect} onClose={onClose} />);
   return { onConnect, onClose, user: userEvent.setup() };
 }
@@ -74,7 +74,7 @@ describe("FileWiringPad", () => {
       system_prompt: { blob_ref: "NEW-FILE", mode: "inline_content", sha256: "new-hash" },
       prompt_template: { blob_ref: "new-file", mode: "inline_content", sha256: "old-hash" },
     } }] } as unknown as CompositionState;
-    render(<FileWiringPad blob={blob} state={current} blobs={[blob]} disabledReason={null} onConnect={vi.fn()} onClose={vi.fn()} />);
+    render(<FileWiringPad blob={blob} state={current} blobs={[blob]} listComplete disabledReason={null} onConnect={vi.fn()} onClose={vi.fn()} />);
     expect(screen.getByRole("checkbox", { name: /System prompt/ })).toBeChecked();
     expect(screen.getByRole("checkbox", { name: /System prompt/ })).toBeDisabled();
     expect(screen.getByRole("checkbox", { name: /User prompt/ })).not.toBeChecked();
@@ -88,7 +88,7 @@ describe("FileWiringPad", () => {
       prompt_template: { blob_ref: "new-file", mode: "inline_content", sha256: "old-hash" },
       queries: [{ name: "gone", template: { blob_ref: "deleted", mode: "inline_content", sha256: "x" } }, { name: "typed", template: "Typed text." }],
     } }, { id: "empty", plugin: "llm", options: { prompt_template: "Inline." } }] } as unknown as CompositionState;
-    render(<FileWiringPad blob={blob} state={current} blobs={[blob, other]} disabledReason={null} onConnect={vi.fn()} onClose={vi.fn()} />);
+    render(<FileWiringPad blob={blob} state={current} blobs={[blob, other]} listComplete disabledReason={null} onConnect={vi.fn()} onClose={vi.fn()} />);
     const llm = within(step("llm"));
     expect(llm.getByRole("checkbox", { name: /System prompt/ })).toHaveAccessibleName(/Replaces rubric\.txt/);
     expect(llm.getByRole("checkbox", { name: /User prompt, query gone/ })).toHaveAccessibleName(/Replaces a file that is no longer in this session/);
@@ -119,13 +119,13 @@ describe("FileWiringPad", () => {
   });
 
   it("announces a refusal in the footer, and a repeat as a new announcement", () => {
-    const { rerender } = render(<FileWiringPad blob={blob} state={state} blobs={[blob]} disabledReason={null}
+    const { rerender } = render(<FileWiringPad blob={blob} state={state} blobs={[blob]} listComplete disabledReason={null}
       sendRefusal={{ message: "Composer did not take this request.", seq: 1 }} onConnect={vi.fn()} onClose={vi.fn()} />);
     const status = screen.getByRole("status");
     expect(status.closest("footer")).not.toBeNull();
     const first = status.firstElementChild;
     expect(first).toHaveTextContent("Composer did not take this request.");
-    rerender(<FileWiringPad blob={blob} state={state} blobs={[blob]} disabledReason={null}
+    rerender(<FileWiringPad blob={blob} state={state} blobs={[blob]} listComplete disabledReason={null}
       sendRefusal={{ message: "Composer did not take this request.", seq: 2 }} onConnect={vi.fn()} onClose={vi.fn()} />);
     expect(screen.getByRole("status")).toBe(status);
     expect(status.firstElementChild).not.toBe(first);
@@ -134,7 +134,7 @@ describe("FileWiringPad", () => {
 
   it("names the file in bold and lets a long name wrap at its separators", () => {
     const long = { id: "long", filename: "quarterly_programme_eligibility_criteria_v7.txt", content_hash: "h" } as BlobMetadata;
-    render(<FileWiringPad blob={long} state={state} blobs={[long]} disabledReason={null} onConnect={vi.fn()} onClose={vi.fn()} />);
+    render(<FileWiringPad blob={long} state={state} blobs={[long]} listComplete disabledReason={null} onConnect={vi.fn()} onClose={vi.fn()} />);
     const name = screen.getByRole("dialog").querySelector(".file-wiring-filename");
     expect(name).toHaveTextContent("quarterly_programme_eligibility_criteria_v7.txt");
     expect(name?.tagName).toBe("STRONG");

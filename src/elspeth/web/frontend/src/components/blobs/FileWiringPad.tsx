@@ -11,7 +11,8 @@ interface FileWiringPadProps {
   state: CompositionState | null;
   /** The active session's file list; only used to name the file a slot already reads. */
   blobs: readonly BlobMetadata[];
-  listComplete?: boolean;
+  /** Whether `blobs` is a complete read; only a complete list can show that a file is gone. */
+  listComplete: boolean;
   /** Why connecting is refused right now (session loading, Composer busy, file or graph changed); null when allowed. */
   disabledReason: string | null;
   /** Set when Composer did not take the last request; the pad stays open with the user's input intact. */
@@ -65,7 +66,7 @@ function wiringSlots(state: CompositionState | null, blob: BlobMetadata, blobs: 
  * ordinary chat request: Composer chooses and runs the audited wiring tools,
  * and their review cards and refusals apply as for any typed request.
  */
-export function FileWiringPad({ blob, state, blobs, listComplete = true, disabledReason, sendRefusal = null, onConnect, onClose }: FileWiringPadProps) {
+export function FileWiringPad({ blob, state, blobs, listComplete, disabledReason, sendRefusal = null, onConnect, onClose }: FileWiringPadProps) {
   const id = useId();
   const dialogRef = useRef<HTMLDivElement>(null);
   const [mode, setMode] = useState<"select" | "ai">("select");
