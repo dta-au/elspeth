@@ -6,6 +6,7 @@ in test_processor; importing those bindings preserves their object identity.
 
 from __future__ import annotations
 
+import builtins
 import json
 import threading
 from types import SimpleNamespace
@@ -17,11 +18,14 @@ import pytest
 from elspeth.contracts import NodeType, RowResult, TokenInfo, TransformResult
 from elspeth.contracts.enums import FrameKind, NodeStateStatus, RoutingMode, RunStatus, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import (
+    AuditIntegrityError,
     CapacityError,
     ExecutionError,
     MaxRetriesExceeded,
     OrchestrationInvariantError,
     PluginContractViolation,
+    PluginRetryableError,
+    RunWorkerEvictedError,
     SinkTransactionalInvariantError,
 )
 from elspeth.contracts.identity import LineageFrame
@@ -65,6 +69,103 @@ class TestExecuteTransformNoRetry:
 
         processor = _make_processor(factory, retry_manager=None)
         return db, factory, processor
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            InterruptedError("interrupted"),
+            PluginRetryableError("retryable", retryable=True),
+            ConnectionError("connection"),
+            TimeoutError("timeout"),
+            CapacityError(429, "capacity"),
+            PluginContractViolation("contract"),
+        ],
+        ids=["interrupted", "plugin_retryable", "connection", "timeout", "capacity", "contract"],
+    )
+    def test_live_row_scoped_tuple_matches_processor_conversion(self, failure: Exception) -> None:
+        from elspeth.contracts.errors import ROW_SCOPED_PLUGIN_ERRORS
+
+        assert set(ROW_SCOPED_PLUGIN_ERRORS) == {
+            InterruptedError,
+            PluginRetryableError,
+            ConnectionError,
+            TimeoutError,
+            CapacityError,
+            PluginContractViolation,
+        }
+        _, _factory, processor = self._setup()
+        transform = _make_mock_transform(node_id="t1", on_error="discard")
+        token = make_token_info(data={"value": 42})
+        ctx = make_context()
+        with patch.object(processor._transform_executor, "execute_transform", side_effect=failure):
+            result, _out_token, error_sink = processor._execute_transform_with_retry(
+                transform=transform, token=token, ctx=ctx, attempt_offset=0
+            )
+        assert result.status == "error"
+        assert error_sink == "discard"
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            RuntimeError("ordinary"),
+            AuditIntegrityError("integrity"),
+            RunWorkerEvictedError(run_id="run", worker_id="worker"),
+            SinkTransactionalInvariantError("sink integrity"),
+        ],
+        ids=["ordinary", "audit_integrity", "worker_evicted", "tier1_contract"],
+    )
+    def test_live_row_scoped_tuple_controls_propagate(self, failure: Exception) -> None:
+        _, _factory, processor = self._setup()
+        transform = _make_mock_transform(node_id="t1", on_error="discard")
+        token = make_token_info(data={"value": 42})
+        ctx = make_context()
+        with (
+            patch.object(processor._transform_executor, "execute_transform", side_effect=failure),
+            pytest.raises(type(failure)) as caught,
+        ):
+            processor._execute_transform_with_retry(transform=transform, token=token, ctx=ctx, attempt_offset=0)
+        assert caught.value is failure
+
+    def test_live_row_scoped_universe_matches_processor_conversion(self) -> None:
+        import elspeth.contracts.errors as contract_errors
+        from elspeth.contracts.errors import ROW_SCOPED_PLUGIN_ERRORS
+
+        concrete_rows = [
+            InterruptedError("interrupted"),
+            PluginRetryableError("retryable", retryable=True),
+            ConnectionError("connection"),
+            TimeoutError("timeout"),
+            CapacityError(429, "capacity"),
+            PluginContractViolation("contract"),
+        ]
+        universe: dict[type[Exception], Exception] = {}
+        skipped = 0
+        builtin_classes = {cls for cls in vars(builtins).values() if isinstance(cls, type) and issubclass(cls, Exception)}
+        for cls in sorted(builtin_classes | set(contract_errors.TIER_1_ERRORS), key=lambda item: item.__name__):
+            try:
+                universe[cls] = cls("parity probe")
+            except (TypeError, ValueError):
+                skipped += 1
+        universe.update((type(failure), failure) for failure in concrete_rows)
+        assert len(universe) >= 40, f"exception universe unexpectedly small: {len(universe)} (skipped {skipped})"
+
+        _, _factory, processor = self._setup()
+        transform = _make_mock_transform(node_id="t1", on_error="discard")
+        token = make_token_info(data={"value": 42})
+        ctx = make_context()
+        for cls, failure in universe.items():
+            converts = issubclass(cls, ROW_SCOPED_PLUGIN_ERRORS) and not issubclass(cls, contract_errors.TIER_1_ERRORS)
+            with patch.object(processor._transform_executor, "execute_transform", side_effect=failure):
+                if converts:
+                    result, _out_token, error_sink = processor._execute_transform_with_retry(
+                        transform=transform, token=token, ctx=ctx, attempt_offset=0
+                    )
+                    assert result.status == "error", cls.__name__
+                    assert error_sink == "discard", cls.__name__
+                else:
+                    with pytest.raises(cls) as caught:
+                        processor._execute_transform_with_retry(transform=transform, token=token, ctx=ctx, attempt_offset=0)
+                    assert caught.value is failure, cls.__name__
 
     def test_single_attempt_success(self) -> None:
         """Without retry_manager, executes single attempt."""

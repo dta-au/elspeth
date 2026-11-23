@@ -390,6 +390,17 @@ class BatchTransformMixin(BatchTransformRuntime):
                         reason="lease_lost_after_eviction",
                     )
                     return
+                if isinstance(result.exception, contract_errors.TIER_1_ERRORS):
+                    self._raise_orphaned_late_failure(result.exception, token, state_id)
+                if isinstance(result.exception, contract_errors.ROW_SCOPED_PLUGIN_ERRORS):
+                    _logger.debug(
+                        "late_result_discarded",
+                        token_id=token.token_id,
+                        state_id=state_id,
+                        reason="row_failure_after_eviction",
+                        exception_type=type(result.exception).__name__,
+                    )
+                    return
                 self._raise_orphaned_late_failure(result.exception, token, state_id)
             _logger.debug(
                 "late_result_discarded",
