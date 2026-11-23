@@ -416,6 +416,53 @@ describe("blobStore", () => {
       expect(listBlobs).toHaveBeenCalledTimes(2);
     });
 
+    it("discards the original read while the replacement read is still pending", async () => {
+      const original = deferred<BlobMetadata[]>();
+      const replacement = deferred<BlobMetadata[]>();
+      const uploaded = makeBlob({ id: "uploaded" });
+      const { listBlobs, uploadBlob } = await import("@/api/client");
+      vi.mocked(listBlobs).mockReturnValueOnce(original.promise).mockReturnValueOnce(replacement.promise);
+      vi.mocked(uploadBlob).mockResolvedValueOnce(uploaded);
+      const store = useBlobStore.getState();
+
+      const read = store.loadBlobs("session-1");
+      await store.uploadBlob("session-1", new File(["content"], "new.csv"));
+      original.resolve([makeBlob({ id: "stale" })]);
+      await read;
+
+      expect(useBlobStore.getState()).toMatchObject({ blobs: [uploaded], isLoading: true });
+      const refreshed = [uploaded, makeBlob({ id: "refreshed" })];
+      replacement.resolve(refreshed);
+      await replacement.promise;
+      expect(useBlobStore.getState()).toMatchObject({ blobs: refreshed, isLoading: false });
+    });
+
+    it("leaves the new session untouched when the previous session's replacement read resolves", async () => {
+      const original = deferred<BlobMetadata[]>();
+      const replacement = deferred<BlobMetadata[]>();
+      const uploaded = makeBlob({ id: "uploaded" });
+      const { listBlobs, uploadBlob } = await import("@/api/client");
+      vi.mocked(listBlobs).mockReturnValueOnce(original.promise).mockReturnValueOnce(replacement.promise);
+      vi.mocked(uploadBlob).mockResolvedValueOnce(uploaded);
+      const store = useBlobStore.getState();
+
+      const read = store.loadBlobs("session-1");
+      await store.uploadBlob("session-1", new File(["content"], "new.csv"));
+      expect(listBlobs).toHaveBeenNthCalledWith(2, "session-1");
+      expect(useBlobStore.getState().isLoading).toBe(true);
+      store.activateSession("session-2");
+      const newSessionState = useBlobStore.getState();
+      expect(newSessionState).toMatchObject({ activeSessionId: "session-2", blobs: [], isLoading: false });
+
+      replacement.resolve([uploaded]);
+      await replacement.promise;
+      expect(useBlobStore.getState()).toBe(newSessionState);
+
+      original.resolve([]);
+      await read;
+      expect(useBlobStore.getState()).toBe(newSessionState);
+    });
+
     it("keeps a delete refusal while an overlapping upload refreshes the list", async () => {
       const pendingList = deferred<BlobMetadata[]>();
       const refresh = deferred<BlobMetadata[]>();

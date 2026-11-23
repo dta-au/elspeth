@@ -107,7 +107,7 @@ describe("BlobManager selected-node highlighting", () => {
     expect(screen.queryByText(/attached file is not in this session/)).not.toBeInTheDocument();
   });
 
-  it("leaves the selected node's attachment summary empty after a failed list read", async () => {
+  it("omits attachment counts and the empty-file message after a failed list read", async () => {
     setBlobState([]);
     const list = vi.spyOn(api, "listBlobs").mockRejectedValueOnce(new Error("Network error"));
     onTestFinished(() => {
@@ -119,9 +119,28 @@ describe("BlobManager selected-node highlighting", () => {
 
     expect(await screen.findByRole("alert")).toHaveTextContent("Failed to load files.");
     expect(screen.getByRole("status")).toBeEmptyDOMElement();
+    expect(screen.queryByText(/No files yet/)).not.toBeInTheDocument();
   });
 
-  it.each(["upload", "delete"] as const)("keeps the truncation notice and hides attachment counts after a successful %s", async (action) => {
+  it("omits a reveal-miss claim when the requested file falls outside a truncated list", async () => {
+    const listedBlob = makeBlob({ id: "one", filename: "system.txt" });
+    const omittedBlob = makeBlob({ id: "two", filename: "user.txt" });
+    const truncation = new BlobListTruncatedError([listedBlob]);
+    setBlobState([listedBlob, omittedBlob]);
+    const list = vi.spyOn(api, "listBlobs").mockRejectedValueOnce(truncation);
+    onTestFinished(() => {
+      list.mockRestore();
+      useBlobStore.getState().reset();
+    });
+    useBlobStore.setState({ loadBlobs: useBlobStore.getInitialState().loadBlobs });
+    useBlobStore.getState().revealBlob("session-1", omittedBlob.id, omittedBlob.filename);
+    render(<BlobManager onUseAsInput={vi.fn()} />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(truncation.message);
+    expect(screen.queryByText(/is no longer in this session/)).not.toBeInTheDocument();
+  });
+
+  it.each(["upload", "delete"] as const)("hides attachment counts over a truncated list after a successful %s", async (action) => {
     setBlobState([]);
     const listedBlob = makeBlob({ id: "one", filename: "system.txt" });
     const truncation = new BlobListTruncatedError([listedBlob]);
@@ -712,6 +731,26 @@ describe("BlobManager file wiring", () => {
     useSessionStore.setState({ composeRequest: originalComposeRequest, sendMessage: originalSendMessage, compositionState: null,
       isComposing: false, compositionStateLoaded: false, composeRequests: new Map() });
     useBlobStore.setState({ fileManagerOpen: false });
+  });
+
+  it("shows an unavailable name for a prompt file outside the truncated list", async () => {
+    useSessionStore.setState({ compositionState: selectedState({
+      prompt_template: { blob_ref: "older", mode: "inline_content", sha256: "hash" },
+    }) });
+    const truncation = new BlobListTruncatedError(useBlobStore.getState().blobs);
+    const list = vi.spyOn(api, "listBlobs").mockRejectedValueOnce(truncation);
+    onTestFinished(() => {
+      list.mockRestore();
+      useBlobStore.getState().reset();
+    });
+    useBlobStore.setState({ loadBlobs: useBlobStore.getInitialState().loadBlobs });
+    render(<BlobManager onUseAsInput={vi.fn()} />);
+    expect(await screen.findByRole("alert")).toHaveTextContent(truncation.message);
+    await userEvent.setup().click(screen.getByRole("button", { name: "Wiring prompt.txt" }));
+
+    const slot = screen.getByRole("checkbox", { name: /User prompt/ });
+    expect(slot).toHaveAccessibleName(/File name unavailable/);
+    expect(slot).not.toHaveAccessibleName(/no longer in this session/);
   });
 
   it("opens the wiring pad beside the file actions and sends through the real compose lifecycle", async () => {

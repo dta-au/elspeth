@@ -17,8 +17,8 @@ export function useBlobFilename(blobId: string): string | null {
  * never read for this session. Selecting a session, each Composer turn and
  * each run already read it, so in the app this is a fallback that fires at
  * most once: the read itself marks the list as this session's, so neither a
- * re-render nor a second mounted caller reads again, and a file the read did
- * not list is reported as missing instead of being re-read.
+ * re-render nor a second mounted caller reads again. Only a complete list
+ * can establish that a file is missing.
  */
 export function useSessionFileList(needed: boolean): void {
   const sessionId = useSessionStore((state) => state.activeSessionId);
@@ -41,8 +41,10 @@ export function BlobFileName({ blobId, sha256, fallback, bare = false }: { blobI
       : undefined,
   );
   const loading = useBlobStore((state) => sessionId === null || state.activeSessionId !== sessionId || state.isLoading);
+  const listIncomplete = useBlobStore((state) => sessionId !== null && state.activeSessionId === sessionId && state.listError !== null);
   if (blob === undefined) {
-    return <span className="graph-config-empty-value" title={blobId}>{fallback ?? (loading ? "Loading file name…" : "File not in this session")}</span>;
+    const defaultName = loading ? "Loading file name…" : listIncomplete ? "File name unavailable" : "File not in this session";
+    return <span className="graph-config-empty-value" title={blobId}>{fallback ?? defaultName}</span>;
   }
   const changed = sha256 !== undefined && blob.content_hash !== null && sha256.toLowerCase() !== blob.content_hash.toLowerCase();
   return (

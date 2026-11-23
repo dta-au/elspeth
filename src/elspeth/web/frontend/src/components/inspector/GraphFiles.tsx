@@ -214,16 +214,17 @@ function FileMappingRow({ row, state, onShowNode, hidden, binding, unsaved, same
   pendingEvents: Parameters<typeof promptFileEditability>[0]["pendingEvents"];
 }): JSX.Element {
   const id = useId();
+  const listIncomplete = listError !== null;
   // The prompt editor's own rules decide (as in the inspector's prompt rows
   // and the file manager): a refused save still opens the editor read-only
   // with its reason; only a file with no prompt text to show stays shut. The
   // reason rides on title + an sr-only description, as in the file list.
-  const editability = binding && current && listReady && !listError
-    ? promptFileEditability({ state, blobs, pendingEvents, nodeId: binding.nodeId, fieldPath: binding.fieldPath, blobId: row.blobId })
+  const editability = binding && current && listReady && !listIncomplete
+    ? promptFileEditability({ state, blobs, listIncomplete, pendingEvents, nodeId: binding.nodeId, fieldPath: binding.fieldPath, blobId: row.blobId })
     : null;
   const editReason = !current ? "Open the current graph to edit its files."
     : !listReady ? "Wait for the file list to load."
-    : listError ? (retryOffered ? "File names are unavailable. Use Retry above." : "File names are unavailable.")
+    : listIncomplete ? (retryOffered ? "File names are unavailable. Use Retry above." : "File names are unavailable.")
     : binding === undefined ? "Only prompt files can be edited here."
     : editability?.editable === false ? editability.reason : null;
   const editBlocked = binding === undefined || editability === null || (!editability.editable && !editability.opens);
@@ -246,7 +247,7 @@ function FileMappingRow({ row, state, onShowNode, hidden, binding, unsaved, same
       </div>
     </td>
     <th scope="row" role="rowheader">{sameSession
-      ? <BlobFileName bare blobId={row.blobId} fallback={listError ? "File name unavailable" : undefined} />
+      ? <BlobFileName bare blobId={row.blobId} fallback={listIncomplete ? "File name unavailable" : undefined} />
       : <span title={row.blobId}>File reference</span>}</th>
     <td role="cell">{row.kind}: <code><BreakableName name={row.component} /></code>{unsaved && <> <span className="prompt-editor-tag">Unsaved changes</span></>}</td>
     <td role="cell" className="graph-files-fields">{row.fields.map((field) => <div key={field.path} title={field.path}>

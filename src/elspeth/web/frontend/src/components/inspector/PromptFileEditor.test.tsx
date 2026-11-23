@@ -42,17 +42,24 @@ beforeEach(() => {
 it.each([
   ["failed", new Error("Network error")],
   ["truncated", new BlobListTruncatedError(makeSessionBlobs("session-1", 1))],
-] as const)("shows an unavailable file name in the editor after a %s list read", async (_outcome, error) => {
+] as const)("shows file names as unavailable without a Read only tag after a %s list read", async (_outcome, error) => {
+  const options = { prompt_template: { mode: "inline_content", blob_ref: "blob-1", sha256: "a".repeat(64) } };
+  useSessionStore.setState({
+    compositionState: { sources: {}, outputs: [], nodes: [{ id: "first", plugin: "llm", options }] } as unknown as CompositionState,
+  });
   vi.mocked(listBlobs).mockRejectedValueOnce(error);
   const store = useBlobStore.getState();
   await store.loadBlobs("session-1");
   store.requestPromptEdit("first", "prompt_template");
 
-  render(<PromptFileEditors nodeId="first" options={{ prompt_template: { mode: "inline_content", blob_ref: "blob-1" } }} />);
+  render(<PromptFileEditors nodeId="first" options={options} />);
 
   const editor = await screen.findByRole("textbox", { name: /Edit prompt file/ });
   expect(editor).toHaveAccessibleName(/File name unavailable/);
   expect(editor).not.toHaveAccessibleName(/File not in this session/);
+  expect(screen.getByRole("note")).toHaveTextContent("File names are unavailable.");
+  expect(screen.queryByText("This file is not in this session.")).not.toBeInTheDocument();
+  expect(screen.queryByText("Read only")).not.toBeInTheDocument();
 });
 
 it("starts collapsed and opens the requested slot with keyboard focus", async () => {

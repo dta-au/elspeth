@@ -89,11 +89,12 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
   }, [compositionState, selectedNodeId]);
 
   const listBelongsToSession = blobSessionId === activeSessionId;
+  const listComplete = !isLoading && listBelongsToSession && listError === null;
   const matchedIds = useMemo(
     () => new Set(blobs.filter((blob) => attached.has(blob.id.toLowerCase())).map((blob) => blob.id.toLowerCase())),
     [attached, blobs],
   );
-  const missingCount = !isLoading && listBelongsToSession && listError === null ? attached.size - matchedIds.size : 0;
+  const missingCount = listComplete ? attached.size - matchedIds.size : 0;
   const promptBindings = useMemo(() => promptFileBindings(compositionState), [compositionState]);
   const wireFile = pendingWire ? blobs.find((blob) => blob.id === pendingWire.blob.id) : undefined;
   const wiringDisabledReason = !composeReady ? COMPOSE_LOADING_SESSION_MESSAGE
@@ -150,12 +151,12 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
       row.scrollIntoView?.({ block: "nearest" });
       row.focus({ preventScroll: true });
     } else {
-      setMissingRevealName(revealRequest.filename);
+      setMissingRevealName(listComplete ? revealRequest.filename : null);
       useBlobStore.setState({ focusedBlobId: null });
-      statusRef.current?.focus({ preventScroll: true });
+      if (listComplete) statusRef.current?.focus({ preventScroll: true });
     }
     useBlobStore.getState().consumeRevealRequest(revealRequest.seq);
-  }, [revealRequest, activeSessionId, isLoading, listBelongsToSession, blobs, fileFilter]);
+  }, [revealRequest, activeSessionId, isLoading, listBelongsToSession, listComplete, blobs, fileFilter]);
 
   useEffect(() => {
     if (selectedNodeId === null) {
@@ -299,7 +300,7 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
       </div>
 
       <p ref={statusRef} tabIndex={-1} className="blob-manager-attached-summary" role="status" aria-live="polite">
-        {missingRevealName ? `${missingRevealName} is no longer in this session` : selectedNodeId && attached.size > 0 && listBelongsToSession && listError === null ? <>
+        {missingRevealName && listComplete ? `${missingRevealName} is no longer in this session` : selectedNodeId && attached.size > 0 && listBelongsToSession && listError === null ? <>
           {isLoading ? `Checking files used by ${selectedNodeId}` : `${matchedIds.size} ${matchedIds.size === 1 ? "file" : "files"} used by ${selectedNodeId}`}
           {missingCount > 0 && ` · ${missingCount} attached ${missingCount === 1 ? "file is" : "files are"} not in this session`}
           {focusedBlobId && blobs.find((blob) => blob.id.toLowerCase() === focusedBlobId.toLowerCase()) && ` · Showing ${blobs.find((blob) => blob.id.toLowerCase() === focusedBlobId.toLowerCase())?.filename}.`}
@@ -333,7 +334,7 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
             Loading files…
           </div>
         ) : blobs.length === 0 ? (
-          <div className="blob-manager-empty">
+          listError === null && <div className="blob-manager-empty">
             No files yet. Upload a file to get started.
           </div>
         ) : visibleBlobs.length === 0 ? (
@@ -356,7 +357,7 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
                   const bindings = promptBindings.filter((binding) => binding.blobId === blob.id.toLowerCase());
                   const binding = bindings.find((candidate) => candidate.nodeId === selectedNodeId) ?? bindings[0];
                   const editability = binding ? promptFileEditability({ state: compositionState, blobs, pendingEvents: Object.values(pending ?? {}),
-                    nodeId: binding.nodeId, fieldPath: binding.fieldPath, blobId: blob.id }) : null;
+                    listIncomplete: listBelongsToSession && listError !== null, nodeId: binding.nodeId, fieldPath: binding.fieldPath, blobId: blob.id }) : null;
                   // A refused save still opens the editor read-only with its
                   // reason; only a file with no prompt text to show stays shut.
                   const opensEditor = editability !== null && (editability.editable || editability.opens);
@@ -408,6 +409,7 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
           blob={pendingWire.blob}
           state={compositionState}
           blobs={listBelongsToSession ? blobs : []}
+          listComplete={listComplete}
           disabledReason={wiringDisabledReason}
           sendRefusal={wireSendRefusal}
           onClose={() => setPendingWire(null)}

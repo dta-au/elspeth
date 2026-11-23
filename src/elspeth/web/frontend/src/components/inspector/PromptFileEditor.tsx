@@ -96,11 +96,12 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: Promp
   const shouldFocusRef = useRef(false);
   const editability = compositionState?.nodes.some((node) => node.id === nodeId)
     ? promptFileEditability({ state: compositionState, blobs: blobSessionId === sessionId ? blobs : [],
-      pendingEvents: Object.values(pending ?? {}), nodeId, fieldPath, blobId })
+      listIncomplete: listError !== null, pendingEvents: Object.values(pending ?? {}), nodeId, fieldPath, blobId })
     : null;
-  // Why the server would refuse a save right now. While set, the editor is
-  // read-only: the text is shown, Save is disabled and this reason is given.
-  const refusal = editability?.editable === false ? editability.reason : null;
+  const checkingFileList = filenameLoading && editability?.editable === false && editability.code === "prompt_file_not_found";
+  const fileListUncertain = checkingFileList || (editability?.editable === false && editability.code === "prompt_file_list_incomplete");
+  // Keep Save blocked and show the reason while the list cannot establish editability.
+  const refusal = checkingFileList ? "Checking files in this session." : editability?.editable === false ? editability.reason : null;
 
   // The draft no longer matches the file this slot reads: re-pointed to another
   // file, or the file changed underneath. Its text is kept and shown, and Save
@@ -363,7 +364,7 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: Promp
     <section className="graph-config-section prompt-editor">
       <div className="prompt-editor-heading">
         <label className="prompt-editor-label" htmlFor={fieldId}>Edit prompt file {shownName} ({slotLabel})</label>
-        {refusal !== null && <span className="prompt-editor-tag">Read only</span>}
+        {refusal !== null && !fileListUncertain && <span className="prompt-editor-tag">Read only</span>}
         {dirty && <span className="prompt-editor-tag">Unsaved changes</span>}
       </div>
       {refusal && (

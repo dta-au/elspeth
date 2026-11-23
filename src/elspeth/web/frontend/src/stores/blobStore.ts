@@ -305,14 +305,12 @@ export const useBlobStore = create<BlobState>((set, get) => ({
         return blob;
       }
       const refreshNeeded = current.isLoading;
-      const mutationSeq = ++blobLoadRequestSeq;
+      blobLoadRequestSeq++;
       // Keep loading set until the replacement read settles.
       set((state) => ({
         blobs: [blob, ...state.blobs.filter((item) => item.id !== blob.id)],
       }));
-      if (refreshNeeded && mutationSeq === blobLoadRequestSeq) {
-        void refreshBlobList(sessionId, false);
-      }
+      if (refreshNeeded) void refreshBlobList(sessionId, false);
       return blob;
     } catch (err) {
       const detail = uploadRefusalMessage(err);
@@ -353,13 +351,11 @@ export const useBlobStore = create<BlobState>((set, get) => ({
         return;
       }
       const refreshNeeded = current.isLoading;
-      const mutationSeq = ++blobLoadRequestSeq;
+      blobLoadRequestSeq++;
       set((state) => ({
         blobs: state.blobs.filter((b) => b.id !== blobId),
       }));
-      if (refreshNeeded && mutationSeq === blobLoadRequestSeq) {
-        void refreshBlobList(sessionId, false);
-      }
+      if (refreshNeeded) void refreshBlobList(sessionId, false);
     } catch (err) {
       const detail = (err as ApiError).detail || "Failed to delete file.";
       const current = get();

@@ -11,6 +11,7 @@ interface FileWiringPadProps {
   state: CompositionState | null;
   /** The active session's file list; only used to name the file a slot already reads. */
   blobs: readonly BlobMetadata[];
+  listComplete?: boolean;
   /** Why connecting is refused right now (session loading, Composer busy, file or graph changed); null when allowed. */
   disabledReason: string | null;
   /** Set when Composer did not take the last request; the pad stays open with the user's input intact. */
@@ -33,7 +34,7 @@ interface WiringSlot {
 
 const FILE_WIRING_INSTRUCTIONS_MAX_LENGTH = 4000;
 
-function wiringSlots(state: CompositionState | null, blob: BlobMetadata, blobs: readonly BlobMetadata[]): WiringSlot[] {
+function wiringSlots(state: CompositionState | null, blob: BlobMetadata, blobs: readonly BlobMetadata[], listComplete: boolean): WiringSlot[] {
   const blobId = blob.id.toLowerCase();
   return (state?.nodes ?? []).filter((node) => node.plugin === "llm").flatMap((node) => {
     const slots = promptFileSlots(node.options);
@@ -49,7 +50,8 @@ function wiringSlots(state: CompositionState | null, blob: BlobMetadata, blobs: 
         step: node.id,
         label: promptSlotLabel(slot.fieldPath, slot.queryName),
         current: sameFile ? `Replaces an earlier version of ${blob.filename}`
-          : marker ? markerFile ? `Replaces ${markerFile.filename}` : "Replaces a file that is no longer in this session"
+          : marker ? markerFile ? `Replaces ${markerFile.filename}`
+            : listComplete ? "Replaces a file that is no longer in this session" : "File name unavailable"
           : slot.value === undefined || slot.value === null ? "Not connected" : "Replaces the inline prompt",
         // Only the same file at its current hash counts as connected; a stale pin can be re-pointed.
         alreadyConnected: marker !== null && marker.blobId.toLowerCase() === blobId && marker.sha256 === blob.content_hash,
@@ -63,7 +65,7 @@ function wiringSlots(state: CompositionState | null, blob: BlobMetadata, blobs: 
  * ordinary chat request: Composer chooses and runs the audited wiring tools,
  * and their review cards and refusals apply as for any typed request.
  */
-export function FileWiringPad({ blob, state, blobs, disabledReason, sendRefusal = null, onConnect, onClose }: FileWiringPadProps) {
+export function FileWiringPad({ blob, state, blobs, listComplete = true, disabledReason, sendRefusal = null, onConnect, onClose }: FileWiringPadProps) {
   const id = useId();
   const dialogRef = useRef<HTMLDivElement>(null);
   const [mode, setMode] = useState<"select" | "ai">("select");
@@ -71,7 +73,7 @@ export function FileWiringPad({ blob, state, blobs, disabledReason, sendRefusal 
   const [instructions, setInstructions] = useState("");
   useFocusTrap(dialogRef);
 
-  const slots = useMemo(() => wiringSlots(state, blob, blobs), [state, blob, blobs]);
+  const slots = useMemo(() => wiringSlots(state, blob, blobs, listComplete), [state, blob, blobs, listComplete]);
   const [filter, setFilter] = useState("");
   const query = useDeferredValue(filter.trim().toLowerCase());
   // Slots grouped by step, in graph order; the filter matches the step or the prompt's name.
