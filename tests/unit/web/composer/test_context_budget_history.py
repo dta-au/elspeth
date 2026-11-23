@@ -182,7 +182,8 @@ def test_envelope_without_call_mapping_raises() -> None:
 def test_envelopes_of_another_kind_or_none_are_not_call_audits() -> None:
     row = _audit_row(1, _call(total_bytes=4000))
     other = replace(row, tool_calls=[{"_kind": "audit", "invocation": {}}, {"legacy": True}])
-    assert ContextBudgetHistory.from_records([row, other]) == ContextBudgetHistory.empty()
+    assert ContextBudgetHistory.from_records([other]) == ContextBudgetHistory.empty()
+    assert ContextBudgetHistory.from_records([row, other]) == ContextBudgetHistory.from_records([row])
 
 
 def test_a_real_stored_call_envelope_gives_its_shed_state() -> None:

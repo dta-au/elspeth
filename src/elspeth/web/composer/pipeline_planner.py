@@ -3508,7 +3508,8 @@ def _fit_planner_context_budget(
 
     ``model`` is the model this call requests (the planner's, or the escape
     hatch's on a hatch turn); only a same-model, same-dialect live call can
-    supply a provider-count anchor. Stored ratios are not admission inputs.
+    supply a provider-count anchor, and only a same-model, same-dialect call
+    (live, else stored in the session) a measured density for the byte rate.
 
     The decision is fed the request as it will be sent and checked: cache
     markers applied when ``mark_for_cache``, prompt-guard keys detached,
@@ -3621,6 +3622,7 @@ def _fit_planner_context_budget(
             # loop: the estimate decides what is left out, the provider judges
             # its own limit.
             on_over_estimate="send",
+            measured_bytes_per_token=history.measured_bytes_per_token(calls=earlier_calls, model=model, dialect=dialect),
         )
     except ContextBudgetRefusal as refusal:
         raise _planner_context_budget_exhausted(

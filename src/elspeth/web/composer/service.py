@@ -1836,6 +1836,9 @@ class ComposerServiceImpl:
                 # A message under the byte maximum always goes: the estimate
                 # decides what is left out, the provider judges its own limit.
                 on_over_estimate="send",
+                measured_bytes_per_token=frame.history.measured_bytes_per_token(
+                    calls=recorder.llm_calls, model=self._model, dialect=self._planner_dialect
+                ),
             )
         except ContextBudgetRefusal as refusal:
             raise self._context_budget_refusal(

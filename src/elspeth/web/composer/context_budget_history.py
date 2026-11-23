@@ -11,10 +11,15 @@ the budgeted composer calls (compose loop, planner, escape hatch). An advisor
 or auto-title call stores a null ``context_budget`` and gives no shed state.
 
 An absent ``context_budget`` key means the call predates context budgeting and
-is read exactly like a null value: no shedding was recorded. Admission uses
-live provider anchors or authored-prefix pricing with foreign bytes at one
-token each. Anchors come only from live private request captures, never
-persisted rows.
+is read exactly like a null value: no shedding was recorded. Anchors come only
+from live private request captures, never persisted rows.
+
+The session also retains, per model and tool dialect, the density measured on
+its newest successful budgeted call: the wire bytes that call sent over the
+provider's prompt count. That density prices the byte arm of admission and
+release (see :func:`decide_context_budget`), so it is the same on the first
+call of a turn, which has no live anchor, as on the calls after it. Only the
+stored counts and sizes are read, never content.
 """
 
 from __future__ import annotations
@@ -29,6 +34,10 @@ from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCal
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.prompt_guard import detach_prompt_guard_messages
 from elspeth.core.canonical import canonical_json
+from elspeth.web.composer.context_budget import (
+    CONTEXT_BUDGET_MAX_MEASURED_BYTES_PER_TOKEN,
+    CONTEXT_BUDGET_MIN_MEASURED_BYTES_PER_TOKEN,
+)
 from elspeth.web.sessions.protocol import ChatMessageRecord
 
 _LLM_CALL_AUDIT_KIND = "llm_call_audit"
@@ -126,16 +135,64 @@ def _history_key(index: int) -> str:
     return f"history:{index}"
 
 
+def _measured_density(prompt_tokens: object, wire_bytes: object) -> float | None:
+    """Sent wire bytes over the provider's prompt count, when both exist and the ratio is plausible."""
+    if type(prompt_tokens) is not int or prompt_tokens <= 0 or type(wire_bytes) is not int:
+        return None
+    density = wire_bytes / prompt_tokens
+    if not CONTEXT_BUDGET_MIN_MEASURED_BYTES_PER_TOKEN <= density <= CONTEXT_BUDGET_MAX_MEASURED_BYTES_PER_TOKEN:
+        return None
+    return density
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class MeasuredDensity:
+    """The density measured on a session's newest successful budgeted call of one model and tool dialect."""
+
+    model: str
+    dialect: ToolContractDialect | None
+    bytes_per_token: float
+
+
 @final
 @dataclass(frozen=True, slots=True)
 class ContextBudgetHistory:
-    """Previously shed history keys for one session."""
+    """Previously shed history keys for one session, and its measured densities, newest first."""
 
     previously_shed_history: frozenset[str]
+    measured: tuple[MeasuredDensity, ...] = ()
 
     @classmethod
     def empty(cls) -> ContextBudgetHistory:
         return cls(previously_shed_history=frozenset())
+
+    def measured_bytes_per_token(
+        self, *, calls: Sequence[ComposerLLMCall], model: str, dialect: ToolContractDialect | None
+    ) -> float | None:
+        """The density the byte rate is priced from, or ``None`` for the fallback rate.
+
+        The newest successful budgeted call of this model and dialect in this
+        exchange's ``calls`` wins; otherwise the session's stored one. A call
+        whose count is missing or implausible for its size gives none. A
+        different model or dialect never gives one: its tokens are another
+        tokenizer's.
+        """
+        for call in reversed(calls):
+            if (
+                call.context_budget is None
+                or call.model_requested != model
+                or call.tool_contract_dialect != dialect
+                or call.status is not ComposerLLMCallStatus.SUCCESS
+            ):
+                continue
+            density = _measured_density(call.prompt_tokens, call.context_budget.request_wire_bytes)
+            if density is not None:
+                return density
+        for measured in self.measured:
+            if measured.model == model and measured.dialect == dialect:
+                return measured.bytes_per_token
+        return None
 
     def shed_history_after(self, calls: Sequence[ComposerLLMCall]) -> frozenset[str]:
         """History state after the newest budgeted call, including an explicit release.
@@ -151,6 +208,7 @@ class ContextBudgetHistory:
     @classmethod
     def from_records(cls, records: Sequence[ChatMessageRecord]) -> ContextBudgetHistory:
         shed: frozenset[str] | None = None
+        measured: dict[tuple[str, ToolContractDialect | None], MeasuredDensity] = {}
         for row in reversed(records):
             if type(row) is not ChatMessageRecord:
                 raise AuditIntegrityError("Context budget history received a non-record row")
@@ -168,8 +226,11 @@ class ContextBudgetHistory:
                     continue
                 if shed is None:
                     shed = call.shed_history
+                if call.density is not None and (call.model, call.dialect) not in measured:
+                    measured[(call.model, call.dialect)] = MeasuredDensity(call.model, call.dialect, call.density)
         return cls(
             previously_shed_history=shed if shed is not None else frozenset(),
+            measured=tuple(measured.values()),
         )
 
 
@@ -179,6 +240,9 @@ class _BudgetedCall:
     """What the history needs from one stored budgeted call, parsed and validated."""
 
     shed_history: frozenset[str]
+    model: str
+    dialect: ToolContractDialect | None
+    density: float | None
 
 
 def _budgeted_call(call: Mapping[str, Any]) -> _BudgetedCall | None:
@@ -209,10 +273,22 @@ def _budgeted_call(call: Mapping[str, Any]) -> _BudgetedCall | None:
     indices = budget["shed_history_indices"]
     if not isinstance(indices, list | tuple) or not all(type(index) is int and index >= 0 for index in indices):
         raise AuditIntegrityError("Stored composer call context_budget.shed_history_indices is not a list of indices")
+    wire_bytes: int | None = None
     if "request_wire_bytes" in budget:
         wire_bytes = budget["request_wire_bytes"]
         if type(wire_bytes) is not int or wire_bytes < 0:
             raise AuditIntegrityError("Stored composer call context_budget.request_wire_bytes is not a non-negative integer")
+    # Records written before the dialect was stamped have no key; they match
+    # only a dialect-free route, never a stamped one.
+    dialect: ToolContractDialect | None = None
+    if "tool_contract_dialect" in call and call["tool_contract_dialect"] is not None:
+        raw_dialect = call["tool_contract_dialect"]
+        if type(raw_dialect) is not str or raw_dialect not in {member.value for member in ToolContractDialect}:
+            raise AuditIntegrityError("Stored composer call tool_contract_dialect is not a known dialect")
+        dialect = ToolContractDialect(raw_dialect)
     return _BudgetedCall(
         shed_history=frozenset(_history_key(index) for index in indices),
+        model=model,
+        dialect=dialect,
+        density=_measured_density(prompt_tokens, wire_bytes) if status == ComposerLLMCallStatus.SUCCESS.value else None,
     )
