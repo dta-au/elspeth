@@ -462,8 +462,10 @@ async def _approval_containment_refusal(
             f"This session requires approval for pipeline changes and this response carried {staged} pipeline-change "
             "calls. None of them was applied and no proposal was recorded: only one proposal can await the user at a "
             "time. Send the first change alone, then tell the user what follows; send each next change after the one "
-            "before it is accepted. A pipeline between changes does not have to validate: a change that leaves "
-            "errors is still recorded as a proposal, and the errors clear with the last change. "
+            "before it is accepted. A pipeline between narrow changes does not have to validate: a narrow change "
+            "that leaves errors is still recorded as a proposal, and the errors clear with the last change. "
+            "A set_pipeline replaces the whole pipeline and must validate on its own, or it is refused with no "
+            "proposal. "
             "create_blob is not a pipeline change: in an earlier response, create the file "
             "for the prompt; then send the one call carrying its marker.",
         )
