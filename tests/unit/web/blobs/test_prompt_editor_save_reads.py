@@ -11,9 +11,10 @@ from __future__ import annotations
 import asyncio
 from collections import Counter
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import select
@@ -31,7 +32,9 @@ from elspeth.web.sessions.prompt_file_approval import (
     _current_node_options,
     _current_snapshot,
     _read_custody_bytes,
+    record_prompt_file_approval,
 )
+from elspeth.web.sessions.prompt_file_review import resolve_prompt_review_snapshot
 from elspeth.web.sessions.protocol import CompositionStateData
 from tests.helpers.session_fences import fenced_operation_context
 from tests.unit.web._sync_asgi_client import SyncASGITestClient
@@ -165,43 +168,67 @@ def test_editor_save_custody_reads_grow_linearly_with_the_node_s_prompt_files(tm
     assert dict(large) == {"snapshots": 3, "custody_reads": 24}
 
 
-def test_reused_snapshot_applies_only_to_its_connection_node_and_options(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Inside the reuse block any other connection, node or option set resolves afresh, and so does every call after it."""
-    _client, _service, blob_service, session_id, _blobs = _approved_n_file_node(tmp_path, 2)
-    request = PromptFileApprovalRequest(
-        session_id=UUID(session_id),
-        node_id="first",
-        field_path="queries.q0.template",
-        blob_id=UUID(int=0),
-        content_sha256="0" * 64,
-        actor_user_id="alice",
-        trigger=PromptApprovalTrigger.EDITOR_SAVE,
-    )
-    resolves: list[str] = []
-    real_resolve = approval_module.resolve_prompt_review_snapshot
+def test_a_given_snapshot_is_used_only_for_its_own_node_and_must_hold_the_request_s_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``resolved_snapshot`` replaces the re-read, never the checks: another node's or session's snapshot, or one without the binding, is refused."""
+    _client, _service, blob_service, session_id, blobs = _approved_n_file_node(tmp_path, 2)
+    requests = [
+        PromptFileApprovalRequest(
+            session_id=UUID(session_id),
+            node_id="first",
+            field_path=f"queries.q{index}.template",
+            blob_id=UUID(blob["id"]),
+            content_sha256=blob["content_hash"],
+            actor_user_id="alice",
+            trigger=PromptApprovalTrigger.EDITOR_SAVE,
+        )
+        for index, blob in enumerate(blobs)
+    ]
+    now = datetime.now(UTC)
 
-    def counting_resolve(**kwargs: Any) -> Any:
-        resolves.append(kwargs["node_id"])
-        return real_resolve(**kwargs)
+    def read_blob(blob_id: UUID) -> tuple[Any, bytes]:
+        record = _blob_record(conn, UUID(session_id), blob_id)
+        return record, _read_custody_bytes(record)
 
-    with blob_service._engine.connect() as conn, blob_service._engine.connect() as other_conn:
-        options = _current_node_options(conn, request)
-        snapshot = _current_snapshot(conn, request, options)
-        changed_options = {**options, "queries": {"q0": options["queries"]["q0"]}}
+    def approval_count() -> int:
+        return len(
+            conn.execute(select(prompt_file_approvals_table.c.id).where(prompt_file_approvals_table.c.session_id == session_id)).all()
+        )
+
+    with blob_service._engine.connect() as conn:
+        options = _current_node_options(conn, requests[0])
+        snapshot = _current_snapshot(conn, requests[0], options)
+        only_q1 = _current_snapshot(conn, requests[0], {**options, "queries": {"q1": options["queries"]["q1"]}})
+        other_node = resolve_prompt_review_snapshot(session_id=UUID(session_id), node_id="other", options=options, read_blob=read_blob)
+        assert other_node is not None
+        # The resolver refuses another session's files, so this one is relabelled.
+        other_session = replace(snapshot, session_id=uuid4())
+        assert other_node.bindings == other_session.bindings == snapshot.bindings
+        before = approval_count()
+        resolves: list[str] = []
+        real_resolve = approval_module.resolve_prompt_review_snapshot
+
+        def counting_resolve(**kwargs: Any) -> Any:
+            resolves.append(kwargs["node_id"])
+            return real_resolve(**kwargs)
+
         monkeypatch.setattr(approval_module, "resolve_prompt_review_snapshot", counting_resolve)
-        # Through the module so this file still collects on a tree without the block.
-        with approval_module.reuse_resolved_prompt_snapshot(conn, request, snapshot):
-            assert _current_snapshot(conn, request, options) is snapshot
-            assert resolves == []
-            # The test engine shares one SQLite connection: end this one's read
-            # transaction before the other connection begins its own.
-            conn.rollback()
-            assert _current_snapshot(other_conn, request, options) is not snapshot
-            other_conn.rollback()
-            assert _current_snapshot(conn, request, changed_options).bindings != snapshot.bindings
+        for wrong in (only_q1, other_node, other_session):
             with pytest.raises(PromptFileApprovalStale):
-                # Another node: resolved afresh, and refused as having no prompt files.
-                _current_snapshot(conn, replace(request, node_id="other"), {})
-        assert resolves == ["first", "first", "other"]
-        assert _current_snapshot(conn, request, options) is not snapshot
-        assert resolves == ["first", "first", "other", "first"]
+                record_prompt_file_approval(conn, requests[0], now=now, resolved_snapshot=wrong)
+        with pytest.raises(TypeError):
+            record_prompt_file_approval(conn, requests[0], now=now, resolved_snapshot=snapshot.payload())
+        assert approval_count() == before
+        # The node's own snapshot is used for every binding without a re-read.
+        records = [record_prompt_file_approval(conn, request, now=now, resolved_snapshot=snapshot) for request in requests]
+        assert resolves == []
+        assert [record.field_path for record in records] == ["queries.q0.template", "queries.q1.template"]
+        assert {(record.review_anchor, record.effective_artifact_hash) for record in records} == {
+            (snapshot.anchor, snapshot.effective_artifact_hash)
+        }
+        assert approval_count() == before + 2
+        # Without it the writer resolves the snapshot itself, as before.
+        record_prompt_file_approval(conn, requests[1], now=now)
+        assert resolves == ["first"]
+        conn.rollback()

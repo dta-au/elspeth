@@ -272,7 +272,7 @@ def test_failed_carried_approval_rolls_back_bytes_state_and_every_row(tmp_path: 
     real_record = prompt_text_routes.record_prompt_file_approval
     recorded: list[str] = []
 
-    def fail_on_the_second_row(conn: Any, request: Any, *, now: Any) -> Any:
+    def fail_on_the_second_row(conn: Any, request: Any, *, now: Any, **_: Any) -> Any:
         if recorded:
             raise RuntimeError("fault on the carried approval")
         recorded.append(request.field_path)

@@ -51,7 +51,6 @@ from elspeth.web.sessions.prompt_file_approval import (
     assert_latest_prompt_file_approvals_attest_surface,
     editor_save_settles_pending_card,
     record_prompt_file_approval,
-    reuse_resolved_prompt_snapshot,
 )
 from elspeth.web.sessions.prompt_file_review import PromptFileReviewStale, PromptReviewSnapshot
 from elspeth.web.sessions.protocol import CompositionStateData, SessionCompositionStateCreation, SessionOperationMutationTransaction
@@ -334,23 +333,25 @@ def create_prompt_text_router() -> APIRouter:
                     # approved_at.
                     saved_snapshot = _current_snapshot(conn, approval_request, _current_node_options(conn, approval_request))
                     assert_editor_save_may_carry_approvals(conn, prior=attested_snapshot, saved=saved_snapshot, saved_blob_id=blob_id)
-                    # Each writer reuses this one snapshot instead of reading
-                    # every file of the node again (N squared reads per save).
-                    with reuse_resolved_prompt_snapshot(conn, approval_request, saved_snapshot):
-                        for file_binding in saved_snapshot.bindings:
-                            record_prompt_file_approval(
-                                conn,
-                                PromptFileApprovalRequest(
-                                    session_id=session_id,
-                                    node_id=node_id,
-                                    field_path=file_binding.field_path,
-                                    blob_id=file_binding.blob_id,
-                                    content_sha256=file_binding.content_sha256,
-                                    actor_user_id=user.user_id,
-                                    trigger=PromptApprovalTrigger.EDITOR_SAVE,
-                                ),
-                                now=now,
-                            )
+                    # Each row is checked against this one snapshot, resolved
+                    # above on this connection in this transaction, instead of
+                    # re-reading every file of the node per row (N squared
+                    # custody reads per save).
+                    for file_binding in saved_snapshot.bindings:
+                        record_prompt_file_approval(
+                            conn,
+                            PromptFileApprovalRequest(
+                                session_id=session_id,
+                                node_id=node_id,
+                                field_path=file_binding.field_path,
+                                blob_id=file_binding.blob_id,
+                                content_sha256=file_binding.content_sha256,
+                                actor_user_id=user.user_id,
+                                trigger=PromptApprovalTrigger.EDITOR_SAVE,
+                            ),
+                            now=now,
+                            resolved_snapshot=saved_snapshot,
+                        )
                     if pending_event is not None:
                         latest_row = conn.execute(
                             select(composition_states_table)

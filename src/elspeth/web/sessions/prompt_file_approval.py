@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import os
 import stat
-from collections.abc import Iterator, Mapping, Sequence
-from contextlib import contextmanager
-from contextvars import ContextVar
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -183,60 +181,7 @@ def _binding_marker(options: Mapping[str, Any], field_path: str) -> WidenedBlobR
     return marker
 
 
-@dataclass(frozen=True, slots=True)
-class _ResolvedSnapshot:
-    conn: Connection
-    session_id: UUID
-    node_id: str
-    options_hash: str
-    snapshot: PromptReviewSnapshot
-
-
-_RESOLVED_SNAPSHOT: ContextVar[_ResolvedSnapshot | None] = ContextVar("elspeth_prompt_file_resolved_snapshot", default=None)
-
-
-@contextmanager
-def reuse_resolved_prompt_snapshot(conn: Connection, request: PromptFileApprovalRequest, snapshot: PromptReviewSnapshot) -> Iterator[None]:
-    """Let the writers reuse one snapshot the caller resolved, for the duration of the block.
-
-    An editor save writes one approval per file binding of a node, and each
-    :func:`record_prompt_file_approval` call resolves the node's snapshot, so
-    one save read N files N times under the session lock. The save resolves
-    the snapshot once in its transaction, from the node's current options, and
-    opens this block around its per-binding writes. Inside the block a writer
-    reuses ``snapshot`` only on the same connection, session and node, and
-    only while the node's options still hash to the options read here when the
-    block opened; any other call resolves as usual. Each writer still checks the owner, its own blob row, marker,
-    snapshot binding and pending card per request. The only statements
-    between two writes are approval inserts and the pending-card supersede,
-    which no snapshot input reads, and the caller's session write lock keeps
-    other writers out for the whole transaction, as for the card writer below.
-    """
-    token = _RESOLVED_SNAPSHOT.set(
-        _ResolvedSnapshot(
-            conn=conn,
-            session_id=request.session_id,
-            node_id=request.node_id,
-            options_hash=stable_hash(_current_node_options(conn, request)),
-            snapshot=snapshot,
-        )
-    )
-    try:
-        yield
-    finally:
-        _RESOLVED_SNAPSHOT.reset(token)
-
-
 def _current_snapshot(conn: Connection, request: PromptFileApprovalRequest, options: Mapping[str, Any]) -> PromptReviewSnapshot:
-    resolved = _RESOLVED_SNAPSHOT.get()
-    if (
-        resolved is not None
-        and resolved.conn is conn
-        and resolved.session_id == request.session_id
-        and resolved.node_id == request.node_id
-        and resolved.options_hash == stable_hash(options)
-    ):
-        return resolved.snapshot
     records: dict[UUID, tuple[BlobRecord, bytes]] = {}
 
     def read_blob(blob_id: UUID) -> tuple[BlobRecord, bytes]:
@@ -264,6 +209,7 @@ def record_prompt_file_approval(
     request: PromptFileApprovalRequest,
     *,
     now: datetime,
+    resolved_snapshot: PromptReviewSnapshot | None = None,
 ) -> PromptFileApprovalRecord:
     """Record a server-computed approval in the caller's open transaction.
 
@@ -271,9 +217,21 @@ def record_prompt_file_approval(
     session owner, live binding, metadata, actual bytes, and current card
     snapshot before any insert. The editor-save trigger can mint evidence
     without a card event after its byte write has settled in this transaction.
+
+    ``resolved_snapshot`` is the node's snapshot as the caller already
+    resolved it on this connection, in this transaction and under the session
+    lock. When it is given it is used in place of resolving the snapshot again
+    (which reads every file bound on the node); every other check still runs,
+    and the request's own binding is checked against it. An editor save
+    passes the post-save snapshot it resolved once for all of the node's
+    bindings, as :func:`record_prompt_file_card_approvals` reuses its own;
+    re-resolving per binding made one save O(N^2) custody reads. When it is
+    ``None`` the writer resolves the snapshot itself.
     """
     if type(request) is not PromptFileApprovalRequest or type(now) is not datetime:
         raise TypeError("prompt-file approval requires an owned request and datetime")
+    if resolved_snapshot is not None and type(resolved_snapshot) is not PromptReviewSnapshot:
+        raise TypeError("prompt-file approval requires an owned snapshot")
     owner = conn.execute(select(sessions_table.c.user_id).where(sessions_table.c.id == str(request.session_id))).scalar_one_or_none()
     if owner != request.actor_user_id:
         raise PromptFileApprovalStale()
@@ -284,7 +242,12 @@ def record_prompt_file_approval(
     marker = _binding_marker(options, request.field_path)
     if marker.blob_id != request.blob_id or marker.sha256 != request.content_sha256:
         raise PromptFileApprovalStale()
-    snapshot = _current_snapshot(conn, request, options)
+    if resolved_snapshot is None:
+        snapshot = _current_snapshot(conn, request, options)
+    elif resolved_snapshot.session_id != request.session_id or resolved_snapshot.node_id != request.node_id:
+        raise PromptFileApprovalStale()
+    else:
+        snapshot = resolved_snapshot
     selected = next((binding for binding in snapshot.bindings if binding.field_path == request.field_path), None)
     if selected is None or selected.blob_id != request.blob_id or selected.content_sha256 != request.content_sha256:
         raise PromptFileApprovalStale()
