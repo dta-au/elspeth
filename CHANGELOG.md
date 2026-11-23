@@ -8,9 +8,9 @@ The full history is in the repository's releases and commit history.
 
 ---
 
-## Unreleased (0.8.17 integration branch)
+## Unreleased (0.8.18 integration branch)
 
-Work in progress on the 0.8.17 integration branch. This section grows as
+Work in progress on the 0.8.18 integration branch. This section grows as
 changes land and is not a release.
 
 ### Upgrade notes

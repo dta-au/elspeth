@@ -16,7 +16,7 @@
 # .claude/lanes/integration-book-copy/ (gitignored) so the Read tool can open it.
 # Prints nothing if no copy is found.
 
-TRUSTED_REFS="origin/main origin/integration/0817"
+TRUSTED_REFS="origin/main origin/integration/0818 origin/integration/0817"
 
 root=${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel 2>/dev/null)}
 [ -n "$root" ] || exit 0

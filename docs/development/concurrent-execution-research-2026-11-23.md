@@ -1,7 +1,7 @@
 # Concurrent execution in the web server: runs, rows, long-lived sinks, replicas
 
 Research and recommendation, 2026-11-23, for 0.8.17 (0.8.18 at the latest); scope item I13 in
-`docs/development/0.8.17-deferred-scope.md`. No build is implied until the maintainer rules on it.
+`docs/development/0.8.18-deferred-scope.md`. No build is implied until the maintainer rules on it.
 The tree was read at `06c9cd408`, read-only; nothing was executed except one library-default probe
 and searches. Paths are under `src/elspeth/` unless stated. "The run-status bridge redesign" refers
 to the separate fix that gives the bridge a 60 s give-up bound and hands unsettled runs to recovery.
@@ -9,6 +9,9 @@ to the separate fix that gives the bridge a 60 s give-up bound and hands unsettl
 Labels: **MEASURED** = read at the cited file:line, or a read-only command whose output is shown.
 **INFERRED** = a conclusion from measured facts or general platform knowledge, not executed.
 **OPEN** = not established; needs a measurement or a maintainer decision.
+
+Renumbered 2026-11-23, after this was written: the hotfix after 0.8.16 is 0.8.17, so "0.8.17" in
+this report means the release now called 0.8.18, and "0.8.18" means the one after it.
 
 ## Summary
 1. One run thread per process, server-wide (MEASURED `service.py:1286`). The server already holds many runs at once (one per session, each with its lease), but runs them one after another.
