@@ -16,17 +16,17 @@ note says so.
 
 **Read order for a new agent**
 
-[M 2026-11-23] "lets have that file added as a start hook".
-`.claude/hooks/session-start-integration-book.sh` puts the short version below
-into every session at start, resume, clear and compaction, with this book's
-path. At start and after a clear it asks for the whole book to be read before
-any work; on resume and after compaction it asks for the sections the next
-step needs. Only the short version is injected because Claude Code caps a
-hook's output at 10,000 characters. When the checkout has no copy of the
-book, the hook copies it from a fixed trusted ref (`origin/main`, then the
-current integration branch named in the script, as last fetched) to
-`.claude/lanes/integration-book-copy/` and points there. Update that ref when
-the integration branch changes.
+[M 2026-11-23] The maintainer asked for this book to be added as a session
+start hook. `.claude/hooks/session-start-integration-book.sh` puts the short
+version below into every session at start, resume, clear and compaction,
+with this book's path. At start and after a clear it asks for the whole book
+to be read before any work; on resume and after compaction it asks for the
+sections the next step needs. Only the short version is injected because
+Claude Code caps a hook's output at 10,000 characters. When the checkout has
+no copy of the book, the hook copies it from a fixed trusted ref
+(`origin/main`, then the current integration branch named in the script, as
+last fetched) to `.claude/lanes/integration-book-copy/` and points there.
+Update that ref when the integration branch changes.
 
 1. The short version below (two minutes), then this book end to end (about
    35 minutes).
@@ -87,7 +87,8 @@ new disagreement, follow the stricter text and tell the integrator.
 
 **Labels used in this book**
 
-- **[M date]**: the maintainer's rule. Quotes are verbatim, including typos.
+- **[M date]**: the maintainer's rule. This public book paraphrases his
+  rulings rather than quoting them.
 - **[I]**: an integrator's order rule. The maintainer allows the integrator to
   add rules stricter than his own to keep good order (see section 2). These
   are never the maintainer's words.
@@ -138,14 +139,14 @@ integrator so the book is corrected.
 
 **The integrator**
 
-- **Appointment.** [M 2026-11-23] A valid integrator is one "I've appointed or
-  which was appointed by handover from another agent (with my confirmation)".
+- **Appointment.** [M 2026-11-23] A valid integrator is one he has appointed,
+  or one appointed by handover from another agent with his confirmation.
   A peer naming itself does not count. Nor does a handover he has not
   confirmed.
-- **No integrator, no work.** [M 2026-11-23] "if an agent or group of agents
-  is not able to identify an integrator that I've appointed or which was
-  appointed by handover from another agent (with my confirmation), then
-  everything stops - no more work from any lane".
+- **No integrator, no work.** [M 2026-11-23] If an agent or group of agents
+  cannot identify an integrator he has appointed, or one appointed by
+  handover from another agent with his confirmation, everything stops: no
+  lane does any more work.
   - Why: the integrator owns landing, the box and the caps. Work without
     custody is how branches get lost and the box gets overrun.
 - **The lead directs policy and workflow.** [M 2026-11-24] The maintainer
@@ -156,7 +157,7 @@ integrator so the book is corrected.
   - How: at every lane start or resume, identify your release's integrator by
     its listed session name. Name it in every brief. If you cannot identify
     it, start nothing, land nothing, launch no runs, and ask the maintainer.
-  - Reading: "everything stops" covers new work, merges, pushes and test runs.
+  - Reading: the stop covers new work, merges, pushes and test runs.
     Leave runs already in flight alone unless they do harm. With no lead
     integrator, no one can authorise stopping one (section 8), so report the
     harm to the maintainer.
@@ -167,23 +168,23 @@ integrator so the book is corrected.
   are live. Every session asks the custody holder for slots and uses the
   shared locks. When the custody holder declares done, the maintainer confirms
   who takes custody next.
-- **Sole memory editor.** [M 2026-11-23] "the identified itnegration agent is
-  the editor of memory, all other agents relay directions through to the
-  integrator". Reading: with two integrators live, the editor is the custody
+- **Sole memory editor.** [M 2026-11-23] The identified integrator is the
+  editor of memory; all other agents relay directions through to the
+  integrator. Reading: with two integrators live, the editor is the custody
   holder, so there is one writer at a time.
-- **Order rules.** [M 2026-11-23] "these are my rules, you are allowed to add
-  additional rules over the top in order to maintain good order (and you have
-  been, e.g. limiting CPU access)".
+- **Order rules.** [M 2026-11-23] These are his rules. The integrator may add
+  further rules on top of them to maintain good order, as it already has, for
+  example by limiting CPU access.
   - How: the integrator may add stricter operating rules (core pinning, worker
     caps, locks, CI timing, stop files) without asking. It labels them as its
     own.
   - An added rule never loosens a maintainer rule. It never adds back an
     approval step the maintainer removed. If it would block work he ruled may
     go ahead, his ruling wins.
-- **No branch gets lost.** [M 2026-11-17] "do not let too much work backup,
-  slow down the workers if we end up with half a dozen branches to land, or
-  land more than one at a time. We do not let work get isolated or lost
-  because we had 40 branches of fixes and forgot half of them."
+- **No branch gets lost.** [M 2026-11-17] Do not let too much work back up.
+  If half a dozen branches are waiting to land, slow the workers down or land
+  more than one at a time. Work must never become isolated or lost because
+  40 branches of fixes piled up and half of them were forgotten.
   - How: keep a live inventory of every unlanded branch and worktree,
     measured from git. Keep the queue near six. Every branch ends merged,
     explicitly abandoned with the maintainer's say-so, or handed to an owner.
@@ -194,11 +195,12 @@ integrator so the book is corrected.
 
 **Lane leads**
 
-- [M 2026-11-17] "within the constraints of [the integrator], you are
-  authorised/required to deliver your scope - deconflict with other agents as
-  required and rely on [the integrator] to land your work cleanly".
-- [M 2026-11-18] "don't come to me, work autonomously with [the integrator]
-  to the extent possible, I will check in periodically for hard blockers".
+- [M 2026-11-17] Within the integrator's constraints, a lane lead is
+  authorised and required to deliver its scope, deconflicting with other
+  agents as required and relying on the integrator to land its work cleanly.
+- [M 2026-11-18] Do not come to the maintainer. Work autonomously
+  with the integrator as far as possible; he checks in periodically for hard
+  blockers.
   Settle sequencing and coordination with the integrator. Keep a short
   blocker list ready for the maintainer's check-in.
 - Hand each fix over on its own branch with a HANDOFF. Never merge into an
@@ -223,8 +225,8 @@ integrator so the book is corrected.
 - Raising CI runner count or CI parallelism.
 - Steering around a model provider's safety filter (section 9).
 
-**How to ask him.** [M 2026-11-23] "ask me questions inline, when you use the
-tool it hard blocks your session and stops integration". Put each question in
+**How to ask him.** [M 2026-11-23] Ask him questions inline: the question tool
+hard-blocks the session and stops integration. Put each question in
 your reply with the options and a recommendation, keep working on everything
 that does not depend on the answer, and treat his next message as the answer.
 Never use the question dialog tool.
@@ -233,13 +235,16 @@ Never use the question dialog tool.
 
 - **Quote rulings verbatim.** Record the exact words, who said them to whom,
   and when. Mark your reading separately ("Reading: ..."). For a broad
-  approval ("ok, lets do it"), record what it covers and which open questions
-  it does not settle.
+  approval, such as a one-line go-ahead, record what it covers and which
+  open questions it does not settle.
   - Why: paraphrases have been relayed as rulings and had to be withdrawn.
-- **Ambiguity is asked, not resolved.** When an approval is ambiguous
-  ("additional scope is approved"), ask which items it covers. Do not act on
-  an ambiguous remark. State your reading back to the maintainer and record
-  his confirmation. Before taking an item to him, check any earlier ruling on
+  - Where: [M 2026-11-24] exact words go only in private records (the
+    integration ledger, memory and lane notes). Public tracked text,
+    including this book, paraphrases them and keeps their dates.
+- **Ambiguity is asked, not resolved.** When an approval is ambiguous (for
+  example, a general approval of additional scope that names no items), ask
+  which items it covers. Do not act on an ambiguous remark. State your
+  reading back to the maintainer and record his confirmation. Before taking an item to him, check any earlier ruling on
   it against source and say what is missing.
 - **First-hand or relayed.** A ruling you heard only through another session
   is logged as "RELAYED by <listed name>; not confirmed first-hand". It
@@ -265,9 +270,9 @@ Never use the question dialog tool.
     their own copy. That split one rule into three files.
   - **Edit the existing file; never save your own copy.** Update the rule's
     existing file in place, and keep its index line to one line.
-- **Rewrites need two agents.** [M 2026-11-22] "the memory audit is a no lone
-  zone as well, since its a root and branch change to your memory - I don't
-  except general changes to memory to work this way, just overall rewrites".
+- **Rewrites need two agents.** [M 2026-11-22] The memory audit is also a no
+  lone zone, because it is a root-and-branch change to memory. He does not
+  intend general changes to memory to work this way, only overall rewrites.
   For an overall rewrite or audit, another session proposes or verifies and
   the integrator applies only the approved set. A single edit needs no second
   agent.
@@ -276,18 +281,18 @@ Never use the question dialog tool.
   same line." Every number carries one label: measured by me, measured by an
   agent (file named), computed, read, or unchecked summary. Say which view or
   configuration the instrument used.
-- **Address sessions by listed name.** [M 2026-11-22] "aim by name rather than
-  socket". Copy the exact name the agent list shows, never a socket path or a
-  remembered address. Names change, so list again when unsure. After a crash,
-  each session confirms its own identity and what it holds. Never infer
-  lineage from a new name; ask the session. If two live copies of one session
-  appear, the maintainer closes one, and runs that overlapped do not count as
-  results.
+- **Address sessions by listed name.** [M 2026-11-22] Address a session by its
+  name, not by its socket. Copy the exact name the agent list shows, never a
+  socket path or a remembered address. Names change, so list again when
+  unsure. After a crash, each session confirms its own identity and what it
+  holds. Never infer lineage from a new name; ask the session. If two live
+  copies of one session appear, the maintainer closes one, and runs that
+  overlapped do not count as results.
 - **Instructions to builders go on disk too.** For a teammate that misses
   messages, write the instruction to a lane file it reads, numbered and
   time-stamped (for example `FROM-COORDINATOR.md`), and point the message at
   it. [M 2026-11-23] He preferred these lane files over new coordination
-  infrastructure: "you already solved it cheaper".
+  infrastructure, because they had already solved the problem more cheaply.
 - **Re-verify status before you write it.** Before any status goes into a
   HANDOFF or handover, re-read the lane's latest report and logs, not a resume
   note. (AGENTS.md § Claims Must Be Measured.)
@@ -297,24 +302,24 @@ Never use the question dialog tool.
 **Release lines**
 
 - A closing release and the next one run side by side. Each has its own
-  integrator and branch. [M 2026-11-22] "we aren't going to stop, .17 will
-  start immediately, but we eventually do have to draw a line".
+  integrator and branch. [M 2026-11-22] Work does not stop: the next release
+  starts immediately, but a line does eventually have to be drawn.
 - The closing release gets a closing list set in advance, with its decision
   rules fixed before the runs. Nothing else blocks it.
 - The next release's branch advances to the released tip by fast-forward or
   merge, never by rebasing pushed commits.
 - Deferred scope is kept in a tracked, pushed scope document for the next
   release (`docs/development/<version>-deferred-scope.md`). [M 2026-11-22]
-  "make sure that we have a durable list of all the scope that we've pushed,
-  I don't want anything lost". Anything section 10 keeps out of tracked text
+  Make sure there is a durable list of all the scope that has been pushed;
+  he does not want anything lost. Anything section 10 keeps out of tracked text
   is recorded privately instead.
-- Only the maintainer moves items between releases ("we might pull scope
-  forward" is his call).
+- Only the maintainer moves items between releases; whether to pull scope
+  forward is his call.
 - **0.8.18 priority: the engine.** [M 2026-11-24] The engine is a key
   priority: prove its correctness first, then optimise it. Engine breaking
-  changes are open but not guaranteed. Correctness work lands before optimisation, and engine breaking
-  changes are permitted, not promised: each is stated in the upgrade notes,
-  and the bar below still protects what users can do today. The item list
+  changes are open but not guaranteed. Correctness work lands before
+  optimisation, and each engine breaking change is stated in the upgrade
+  notes; the bar below still protects what users can do today. The item list
   is section N of the 0.8.18 scope document.
 - **Peelable fixes.** An urgent fix is cut from the latest release tag, not
   from the integration branch, and merged into the integration branch in
@@ -327,22 +332,22 @@ Never use the question dialog tool.
 
 **The bar (standing for every release)**
 
-- [M 2026-11-21, locked 2026-11-23] "anything that goes to the core
-  functionality being broken goes to [the current release] - I'll defer
-  minor/non core fixes to [the next]"; and "the bar is set and locked now ...
-  that doesn't mean backwards compatability, but it does mean 'if it works now
-  it has to keep working'".
+- [M 2026-11-21, locked 2026-11-23] Anything that amounts to core
+  functionality being broken goes to the current release; he defers minor
+  and non-core fixes to the next. The bar is now set and locked: it does not
+  mean backwards compatibility, but it does mean that whatever works now has
+  to keep working.
   - How: broken core function, or anything harmful or embarrassing a user
     sees, is a priority for the current release. Minor and non-core fixes wait
     for the next one.
   - No accidental regressions. Before landing, ask: does anything a user can
     do today stop working or get worse? If so and it was not a deliberate
     design decision, it is a defect to fix before landing. [M 2026-11-23]
-    "this obviously doesn't extend to deliberate desing decisions". A
+    The bar plainly does not extend to deliberate design decisions. A
     deliberate change is stated in the HANDOFF and the upgrade notes.
   - Test what the user sees (for example, that card text renders), not only
     that a code path runs.
-- **If it's in, it has to work.** [M 2026-11-20] "if its in it has to work".
+- **If it's in, it has to work.** [M 2026-11-20] Anything shipped has to work.
   Do not scope a fix to the easy formats or modes and leave a shipped one
   broken.
 - **Never tailor the build to one installation.** [M 2026-11-21] Do not
@@ -353,45 +358,46 @@ Never use the question dialog tool.
 
 | | Freeze | Lock |
 |---|---|---|
-| Source | [M 2026-11-21] "scope is now frozen ... nothing new is being added unless you find a show stopper" | [M 2026-11-23] "no further changes will be considered" after the lock time; anything new found later is a fast fix for something the release's own work broke, or it goes to the next release |
+| Source | [M 2026-11-21] Scope is now frozen: nothing new is added unless a show-stopper is found | [M 2026-11-23] No further changes are considered after the lock time; anything new found later is a fast fix for something the release's own work broke, or it goes to the next release |
 | New features | No | No |
-| Necessary fixes, broken core function, harm to users | Yes: [M] "don't take my direction to freeze as guidance that blocks necessary changes, this patchj has to work first and foremost" | No, unless it is a fast fix of breakage this release caused |
+| Necessary fixes, broken core function, harm to users | Yes: [M] his direction to freeze is not guidance that blocks necessary changes; the patch has to work first and foremost | No, unless it is a fast fix of breakage this release caused |
 | Pre-existing defect found now | By severity | Next release, even if serious; raise a serious one with the maintainer rather than slip it in |
 
 - **A fast hotfix** is a small, quick correction of breakage the release's own
   work caused. It is not a feature, and not a pre-existing defect found late.
-- **The deferral bar.** [M 2026-11-22] "we'll lean to defer but if its
-  sersious we'll reassess". Late findings default to the next release.
+- **The deferral bar.** [M 2026-11-22] Lean towards deferring, but reassess
+  anything serious. Late findings default to the next release.
   Reading (the integrator's, not his words): serious means wrong results, an
-  audit gap, data loss, or stuck or refused work. A serious finding goes to the maintainer before the merge.
-  A fix may be built off the green candidate for evaluation; [M 2026-11-22]
-  "that's not a yes yet".
-- **Bias to finishing.** [M 2026-11-21] "you can still use your own judgment
-  to surface scope or bring it in, but lets generally assume we want to put
-  this to bed". [M 2026-11-20] "I'd rather land what we need first, if there's
-  budget at the end we can look at more".
-- **Finish in flight before starting new.** [M 2026-11-15] "the prioritiy is
-  completing work over failing fast, do not keep adding new work just because
-  you're idle". Drive each in-flight lane to merged before you brief another.
+  audit gap, data loss, or stuck or refused work. A serious finding goes to
+  the maintainer before the merge. A fix may be built off the green
+  candidate for evaluation; [M 2026-11-22] that is not yet a yes.
+- **Bias to finishing.** [M 2026-11-21] Agents can still use their own
+  judgement to surface scope or bring it in, but the general assumption is
+  that the release should be put to bed. [M 2026-11-20] He would rather land
+  what is needed first; if budget remains at the end, more can be considered.
+- **Finish in flight before starting new.** [M 2026-11-15] The priority is
+  completing work over failing fast; do not keep adding new work just because
+  you are idle. Drive each in-flight lane to merged before you brief another.
   Why: wide work in progress delays every landing and once drove the shared
   machine into the kernel's out-of-memory killer.
 
 **Fail forward and compatibility**
 
-- **Fail forward.** [M 2026-11-22] "no, we fail forward". Do not revert or
+- **Fail forward.** [M 2026-11-22] The project fails forward. Do not revert or
   contort a fix to keep older in-flight runs or graphs working. State the
   break plainly in the upgrade notes: what refuses, and what the operator
   does.
-- **Compatibility policy.** [M 2026-11-23] "sorry, there's no backwards
-  compatability - that's the policy" and "There will be full backwards compat
-  at 1.0". He may make a one-off variation for a specific need; that does not
-  change the policy. Reading: before 1.0, write no migration code or
-  compatibility shims for stores or records the current release refuses, and
-  say in the release notes what stops carrying over. This does not cover a
-  store the current release still opens: that store must read every shape its
-  writers legitimately produced (see "Corrupt stored data" below).
-- **Pipeline YAML.** [M 2026-11-15] "yaml is the lowest level extraction
-  language, its the only one that 'must not' break". [M 2026-11-16] A
+- **Compatibility policy.** [M 2026-11-23] There is no backwards
+  compatibility; that is the policy. There will be full backwards
+  compatibility at 1.0. He may make a one-off variation for a specific need;
+  that does not change the policy. Reading: before 1.0, write no migration
+  code or compatibility shims for stores or records the current release
+  refuses, and say in the release notes what stops carrying over. This does
+  not cover a store the current release still opens: that store must read
+  every shape its writers legitimately produced (see "Corrupt stored data"
+  below).
+- **Pipeline YAML.** [M 2026-11-15] YAML is the lowest-level extraction
+  language, and the only one that must not break. [M 2026-11-16] A
   deliberate, documented plugin upgrade that refuses a YAML which ran with
   silently wrong behaviour is acceptable, with an upgrade note. Whether this
   line still stands as its own rule under the 2026-11-23 policy is not
@@ -405,8 +411,8 @@ Never use the question dialog tool.
   - every break is stated in the upgrade notes;
   - nothing a user can do today breaks by accident.
   Ask the integrator whether a change needs compatibility work.
-- **Epoch and CHECK changes go ahead when required.** [M 2026-11-23] "no,
-  they can go ahead if they're required, regulard review processes apply."
+- **Epoch and CHECK changes go ahead when required.** [M 2026-11-23] They
+  can go ahead if they are required; regular review processes apply.
   From 0.8.18, a change to the session schema epoch or to a database CHECK
   constraint needs no separate approval when the work requires it. The
   hand-off names it, the reviewer checks it is needed, and the upgrade notes
@@ -414,8 +420,8 @@ Never use the question dialog tool.
   an operator must do. Wiping, resetting, migrating or downgrading a store
   still needs the maintainer. Before 0.8.18 each such change needed his
   explicit approval.
-- **Corrupt stored data fails closed.** [M 2026-11-22] "if its corrupted its a
-  bug and the system shouldn't proceed in a buggy stae." In a store the
+- **Corrupt stored data fails closed.** [M 2026-11-22] Corrupted data is a
+  bug, and the system should not proceed in a buggy state. In a store the
   current release opens, a shape an earlier writer legitimately produced is
   not corruption: it must still read.
 
@@ -472,9 +478,9 @@ Never use the question dialog tool.
 
 **Reviewing a HANDOFF (the integrator)**
 
-- **"Cleared" means scope only.** [M 2026-11-15] "sorry I mean scope cleared,
-  you should still quality check it". Do not dispute a cleared scope, but
-  still check quality.
+- **"Cleared" means scope only.** [M 2026-11-15] He meant that the scope was
+  cleared; the work should still be quality-checked. Do not dispute a
+  cleared scope, but still check quality.
 - Read the production diff in full.
 - Check the red-on-base log fails at an assertion, not at import.
 - Check the decisive claims from the evidence (logs, a failing assertion, a
@@ -501,11 +507,11 @@ Never use the question dialog tool.
   Exit 1 means stop.
 - `git merge --no-ff <sha>` with the message `merge <branch>: <summary>` and
   your session's trailers. Never rewrite history; merge forward.
-- **Stack, then one gate.** [M 2026-11-19] "lets land all the code on the
-  integration branch and land it, we don't have the resources to do a full
-  test suite for each individual fix"; "they can do unit and relevant other
-  tests". Lanes land with scoped evidence. The integrator runs one wide run
-  and one full gate on the stack.
+- **Stack, then one gate.** [M 2026-11-19] Land all the code on the
+  integration branch and land it from there; there are not the resources to
+  run a full test suite for each individual fix. Unit tests and other
+  relevant tests can still be run. Lanes land with scoped evidence. The
+  integrator runs one wide run and one full gate on the stack.
 - **When the tip goes red, nothing else lands** until it is green. [I] If the
   wide run on a merged tree fails, the lane is not landed: undo the local,
   unpushed merge (`git reset --keep`) and send the lane back for a fix round.
@@ -540,9 +546,9 @@ Never use the question dialog tool.
 
 **Pushing**
 
-- [M 2026-11-15] "you have a standing auth to push, get any and all ready
-  code off the box onto github". [M 2026-11-21] "I just meant publish the
-  release branch itself the work that's already done should not be lost".
+- [M 2026-11-15] There is standing authority to push: get any and all ready
+  code off the box onto GitHub. [M 2026-11-21] He meant only publishing
+  the release branch itself; the work already done should not be lost.
 - How: after each verified merge, push the candidate and release branches to
   origin. Plain push only: no force, no PR, not `main`, not another session's
   branch. Ask for anything else. This is stricter than AGENTS.md's leave to
@@ -563,13 +569,14 @@ Never use the question dialog tool.
 - Opening a PR starts a second full CI run. Count it before telling peers CI
   has finished. A full CI run takes about 2.5 hours.
 - Merging to main, and tagging, happen only when the maintainer authorises it
-  for that release ([M 2026-11-22] "you're authorised to get it onto main
-  now"). Before the merge: the fixes have landed, a leak review of the whole
-  release delta and a README and CHANGELOG review have run and their fixes are
-  applied, CI is green on the PR head, and the tutorial gate is clean.
-- **Ordinary merge, faithful history.** [M 2026-11-22] "we'll do a full merge,
-  part of the project is 'a rapid prototype of AI driven devleopment' so we
-  wnat it to be faithful where possible". No squash, no history rewrite to
+  for that release ([M 2026-11-22] for example, his authorisation to get a
+  release onto main at that point). Before the merge: the fixes have landed,
+  a leak review of the whole release delta and a README and CHANGELOG
+  review have run and their fixes are applied, CI is green on the PR head,
+  and the tutorial gate is clean.
+- **Ordinary merge, faithful history.** [M 2026-11-22] Use a full merge: part
+  of the project is a rapid prototype of AI-driven development, so history
+  should be faithful where possible. No squash, no history rewrite to
   tidy messages. Auto-merge with the merge method works once checks pass.
 - `gh pr edit` fails on PR bodies; use
   `gh api -X PATCH repos/<owner>/<repo>/pulls/<n>`.
@@ -583,21 +590,23 @@ Never use the question dialog tool.
   edits are made at tag time.
 - **Closing order.** [M 2026-11-22] Merge, then tag, then hygiene, then a full
   handover to the next integrator, then declare done to all peers.
-  - Hygiene: [M] "clean up worktrees, branches, make sure any dependabot stuff
-    lands, and generally do hygiene". Use `scripts/worktree-cleanup.sh`. Land
-    Dependabot through CI. Merged and read-only worktrees and branches go
-    to the lead integrator for verification (section 8). List anything dirty, unmerged or holding
-    unlanded work for the maintainer; do not remove it.
+  - Hygiene: [M] clean up worktrees and branches, make sure any Dependabot
+    updates land, and do general hygiene. Use `scripts/worktree-cleanup.sh`.
+    Land Dependabot through CI. Merged and read-only worktrees and branches
+    go to the lead integrator for verification (section 8). List anything
+    dirty, unmerged or holding unlanded work for the maintainer; do not
+    remove it.
 
 ## 6. Testing
 
 **Scope**
 
 - **Scoped tests per lane; the full gate on the release branch.** [M
-  2026-11-15] "before a merge, do only the subset of relevant tests, we'll do
-  the full tests on the release branch when a collection of work lands".
-  [M 2026-11-22] "make sure they'r enot running the full test suite, they can
-  just run relevant tests and then a full green before we pu sh".
+  2026-11-15] Before a merge, run only the subset of relevant tests; the full
+  tests run on the release branch when a collection of work lands.
+  [M 2026-11-22] Make sure lanes are not running the full test suite: they
+  can run just the relevant tests, and then a full green run comes before
+  the push.
 - A scoped set is: tests for the touched modules, the new tests, ruff and
   mypy on changed files, and every whole-tree gate whose inputs the change
   could alter. State the selection and its exit codes in the HANDOFF.
@@ -664,10 +673,10 @@ missed)
 
 **Flaky means diagnose**
 
-- [M 2026-11-22] "on flakey tests, I want a bit more effort put into them on
-  this case - I'm mindful that we were seeing a lot of flakey tests that were
-  that real worker error you retired". Then: "it was a flaky test but also it
-  was a real system bug".
+- [M 2026-11-22] He wants a bit more effort put into flaky tests in this
+  case, mindful that many of the flaky tests seen earlier were the real
+  worker error that was later retired. Then: that one was a flaky test, but
+  also a real system bug.
 - How: never accept "passes at `-n 0`" or "passes on rerun" alone. Read the
   traceback, name the failure mode, and check it against known real defect
   classes (lease loss, worker death, eviction, deadline races, teardown leaks).
@@ -675,8 +684,8 @@ missed)
   each flake as test-only (with evidence), production, or undetermined.
   Undetermined stays open.
 - A known flake fix may wait for the next release only if the release CI
-  passes. [M 2026-11-22] "push the fix to 17 as long as we can get it through
-  CI, otherwise fix it now".
+  passes. [M 2026-11-22] Push the fix to the next release as long as it
+  can get through CI; otherwise fix it now.
 - A fixed wall-clock deadline loses to a loaded runner. Make the deadline
   event-driven, not longer.
 - A failure is environmental only when measured so (the same failure on an
@@ -684,21 +693,21 @@ missed)
 
 **Pins**
 
-- **Clean as you go.** [M 2026-11-22] "this isn't a 'remove everything' unless
-  that's the most sensible way to do it, its 'clean as you go'". When your
-  work touches a pin, apply the keep test and say in the HANDOFF whether you
-  kept, narrowed or deleted it.
+- **Clean as you go.** [M 2026-11-22] This is not a matter of removing
+  everything, unless that is the most sensible way to do it; it is cleaning
+  as you go. When your work touches a pin, apply the keep test and say in
+  the HANDOFF whether you kept, narrowed or deleted it.
 - Keep a pin only if it guards a property with no behavioural form, a change
   needs a human to think, and its key holds only what matters (names or
   fingerprints, not line numbers; a ceiling, not exact bytes).
 - Never put a pin in front of the behaviour check it protects.
 - Do not unwind pins inside a closing release; an open lane re-pins as normal.
-- **Rebaseline by measurement.** [M 2026-11-18] "there's no hard caps, take
-  the easy wins and rebaseline". A size or count pin a change legitimately
+- **Rebaseline by measurement.** [M 2026-11-18] There are no hard caps: take
+  the easy wins and rebaseline. A size or count pin a change legitimately
   moves is moved by the measured amount and reported. It is never a review
   finding or a blocker. Gates that check behaviour are unaffected.
-- For composer instruction text: [M 2026-11-19] "there's a cap in test to stop
-  it bloating out, however that doesn't mean never add anything". Add the
+- For composer instruction text: [M 2026-11-19] A test cap exists to stop the
+  text bloating, but that does not mean nothing may ever be added. Add the
   guidance the model needs, keep it tight, move the pin, report it. If a
   builder trimmed guidance to fit a pin, the HANDOFF says so.
 
@@ -719,8 +728,8 @@ missed)
 
 **Environment**
 
-- [M 2026-11-21] "you'er authorsied to install and configure as needed to get
-  the tests to reflect the corret enviornment". Install the way CI does (for
+- [M 2026-11-21] Agents are authorised to install and configure as needed so
+  that the tests reflect the correct environment. Install the way CI does (for
   example `npm ci` in the frontend directory, `npx playwright install
   chromium`) and say what you installed.
 - This never covers `uv pip install` or `uv sync` in a worktree: that clobbers
@@ -744,8 +753,8 @@ missed)
   `ELSPETH_WEB__COMPOSER_PROMPT_GUARD_MODE=debug-when-unconfigured` in its own
   start script or process environment, never in a tracked file. Say in the
   run report which guard mode the server ran in.
-- [M 2026-11-22] The maintainer runs live tests on DeepSeek partly because "its
-  more chatty and we can see its reasoning". Quote a few of the model's own
+- [M 2026-11-22] The maintainer runs live tests on DeepSeek partly because it
+  is more chatty and its reasoning is visible. Quote a few of the model's own
   statements in run reports.
 
 ## 7. The box
@@ -795,7 +804,7 @@ the integrator's order rules [I] unless marked [M].
 
 **Temp and disk**
 
-- [M 2026-11-19] "lets get rid of the tmpfs and just use the SSD". Every test
+- [M 2026-11-19] Get rid of the tmpfs and just use the SSD. Every test
   or tool run, and every brief, exports `TMPDIR=~/.pt/<session>/<lane>`.
   Pytest `--basetemp` and exported base trees go there or in the lane folder.
   Nothing new goes under `/tmp`.
@@ -856,8 +865,8 @@ the integrator's order rules [I] unless marked [M].
   the maintainer. Prefer more workers per job over more concurrent jobs.
 - While the full gate or a release's CI runs, peers stay at `-n 2`, one run at
   a time, with no broad runs, no Playwright suites and no new Codex launches.
-- [M, recorded for one release] "when you push it that all local testing must
-  stop until the CI clears". Ask the custody holder whether this applies to
+- [M, recorded for one release] When it is pushed, all local testing must
+  stop until CI clears. Ask the custody holder whether this applies to
   the push you are making.
 - The shared venv's editable install can be re-pointed silently (a Playwright
   web server's `uv run` in a worktree does it). Check that `elspeth.__file__`
@@ -867,13 +876,13 @@ the integrator's order rules [I] unless marked [M].
 
 **The two-person rule**
 
-- [M 2026-11-19] "agents must get independent verification from a peer before
-  terminating processes".
-- [M 2026-11-23] "if an agent can convince a peer that a process destructive
-  change (i.e. one that is relatively easily reversed in any case) is valid,
-  and gets authority to kill they are allowed to do so". It "was always the
-  rule, i.e not limited to tests".
-- [M 2026-11-23] "yes all process kills go via the lead integrator". So a kill
+- [M 2026-11-19] Agents must get independent verification from a peer before
+  terminating processes.
+- [M 2026-11-23] An agent that can convince a peer that a process-destructive
+  change (one that is relatively easily reversed in any case) is valid, and
+  gets authority to kill, is allowed to do so. This was always the rule, and
+  it is not limited to tests.
+- [M 2026-11-23] All process kills go through the lead integrator. So a kill
   needs a case made to the **lead integrator** (a session, never your own
   subagent) and its explicit authority; any other peer is not enough. Then no
   maintainer approval is needed. With no identifiable lead integrator,
@@ -882,30 +891,31 @@ the integrator's order rules [I] unless marked [M].
   or, for the lead integrator's own kills, cancels, deletions and closes, the
   most relevant agent available or a fresh independent reviewer (see "The
   lead integrator's own close-outs" below).
-- **CI is a process.** [M 2026-11-23] "I don't see how locally hosted CI is not
-  part of that". A CI cancel on the self-hosted runners falls under this rule;
-  do not ask the maintainer.
-- **End-of-work cleanup.** [M 2026-11-23] "extend the deletion rule to
-  include ordinary deletion of worktrees/branches at the end of a line of
-  effort when the work has merged into the release branch or was a read only
-  activity. (the no lone zone rule)", and [M 2026-11-23] "modify the rule so
-  its explicitly the lead integrator that' sthe peer, this aligns with the 'no
-  lead integrator means all stop'". So make the case to the **lead
+- **CI is a process.** [M 2026-11-23] He does not see how locally hosted CI
+  could be anything other than part of that. A CI cancel on the self-hosted
+  runners falls under this rule; do not ask the maintainer.
+- **End-of-work cleanup.** [M 2026-11-23] The deletion rule (the no lone zone
+  rule) extends to ordinary deletion of worktrees and branches at the end of
+  a line of effort, when the work has merged into the release branch or was
+  a read-only activity. [M 2026-11-23] The rule names the lead integrator
+  explicitly as the peer, in line with the rule that no lead integrator
+  means everything stops. So make the case to the **lead
   integrator** and get its explicit authority; any other peer is not enough.
   With no identifiable lead integrator, nothing is deleted.
 - **Merged means durable anywhere.** [M 2026-11-23], asked whether this covers
-  the integration branch: "yes, if its branches that are no longer requierd
-  because the work is durable in another branch we don't need to double up
-  and triple up". Reading (the lead integrator's): durable means pushed to
+  the integration branch: yes; branches that are no longer required, because
+  the work is durable in another branch, need not be kept in duplicate or
+  triplicate. Reading (the lead integrator's): durable means pushed to
   origin. A containing branch that exists only locally does not count.
-- **The lead integrator's own close-outs.** [M 2026-11-23] "ok, when the lead
-  integrator wants to close out a position (process, run, whatever), they get
-  agreeement from the most relevant agent available (or spin up a new one and
-  have it review it independently) - the intent here is to stop accidental
-  error, there's no presumption the agent is hostile". So for its own kills,
-  cancels, deletions and closes, the lead integrator gets agreement from the
-  most relevant agent available, or from a fresh independent reviewer. Keep it
-  proportionate: the check catches mistakes; it does not police.
+- **The lead integrator's own close-outs.** [M 2026-11-23] When the lead
+  integrator wants to close out a position (a process, a run or anything
+  else), it gets agreement from the most relevant agent available, or starts
+  a new one to review it independently. The intent is to stop accidental
+  error; there is no presumption that the agent is hostile. So for its own
+  kills, cancels, deletions and closes, the lead integrator gets agreement
+  from the most relevant agent available, or from a fresh independent
+  reviewer. Keep it proportionate: the check catches mistakes; it does not
+  police.
 - **What the lead integrator checks before a deletion.** Reading (the lead
   integrator's): it checks
   - merged: the tip is an ancestor of a pushed branch that holds the work
@@ -952,22 +962,23 @@ the integrator's order rules [I] unless marked [M].
 - Exact PIDs only. Never walk from a parent: an orphan's parent is PID 1.
   Never kill by pattern (`pkill -f`). Refuse any PID at or below 1 and any
   agent harness process.
-- **The Bash guard.** [M 2026-11-23] "yes please block those shapes as well
-  with a message saying to speak to the lead integrator for authorisation".
+- **The Bash guard.** [M 2026-11-23] Block those shapes as well, with a
+  message saying to speak to the lead integrator for authorisation.
   `.claude/hooks/bash_guard.py`, run before every Bash tool command, refuses
   `pkill`, `killall`, `kill -1`, `kill 0`, `kill -- -PGID`, `kill $(...)`,
   `xargs kill` and `killpg`, including behind wrappers such as `sudo`,
   `timeout`, `bash -c` or `eval`, and points here. It also refuses
-  `git commit --amend` and, [M 2026-11-23] "lets block git check yeah - we
-  had a few losses like that early on", both `git checkout -- <path>` and
-  `git checkout <ref> -- <path>`, which overwrite uncommitted work. It checks only what the shell
-  would run: quoted text, heredoc bodies and comments are ignored, so a
-  commit message or a grep that mentions these commands still runs. A kill
-  of explicit numeric PIDs (`kill -TERM 12345`) still runs. The guard is a
-  backstop for slips, not a lock: it does not see Codex, scripts that stop
-  their own children, or commands typed by hand, so this procedure still
-  applies to all of them. If the script is missing, commands run unguarded
-  with a warning ([M 2026-11-23] "warning is fine"). A refused kill is never retried in another form; take it to
+  `git commit --amend` and, [M 2026-11-23] blocked at his request because a
+  few early losses happened that way, both `git checkout -- <path>` and
+  `git checkout <ref> -- <path>`, which overwrite uncommitted work. It checks
+  only what the shell would run: quoted text, heredoc bodies and comments
+  are ignored, so a commit message or a grep that mentions these commands
+  still runs. A kill of explicit numeric PIDs (`kill -TERM 12345`) still
+  runs. The guard is a backstop for slips, not a lock: it does not see
+  Codex, scripts that stop their own children, or commands typed by hand, so
+  this procedure still applies to all of them. If the script is missing,
+  commands run unguarded with a warning ([M 2026-11-23] a warning is
+  acceptable). A refused kill is never retried in another form; take it to
   the checker. If the guard refuses something that is not a kill, tell the
   lead integrator so the guard can be fixed.
 - For an orphan, stop its shell first, then pytest, so its cleanup step
@@ -988,10 +999,9 @@ the integrator's order rules [I] unless marked [M].
   Cancelling the first blocks the merge; cancelling the second blocks the
   image publish. Both are undoable (`gh run rerun <id> --failed`), but a
   re-run costs up to about 2.5 hours. Cancel them only when the box must shed
-  load, with the checker's authority, and re-run before merging or tagging. [I; the
-  maintainer replied to this alignment on 2026-11-23: "yes, these are my
-  rules, you are allowed to add additional rules over the top in order to
-  maintain good order"]
+  load, with the checker's authority, and re-run before merging or tagging.
+  [I; on 2026-11-23 the maintainer replied to this alignment with the
+  order-rules ruling in section 2]
   - This replaced "never cancel push CI on a PR head or main". The cost
     advice behind that rule still stands.
   - Why: a cancelled push run on a PR head once left the PR blocked with "5 of
@@ -1002,12 +1012,11 @@ the integrator's order rules [I] unless marked [M].
 
 **The current model rule**
 
-- [M 2026-11-21] "complex review only, regular work is opus and codex does
-  hands and feet". The top-tier review model (named in memory) is for complex
+- [M 2026-11-21] The top-tier review model (named in memory) is for complex
   review only. Regular work (ordinary review, coordination) runs on Claude
   Opus. Building and running runs on Codex.
-- **Design and wording.** [M 2026-11-23] "wording still counts as design and
-  should be done by the 'design agent of the time'". Which agent that is
+- **Design and wording.** [M 2026-11-23] Wording still counts as design and
+  should be done by the design agent of the time. Which agent that is
   depends on available tokens: an external agent, Opus, or a higher-tier
   model. Composer instruction text (skill, tool descriptions, hints) is design
   work. When unsure which design agent is current, ask.
@@ -1103,11 +1112,11 @@ bodies, issues, and summary lists of entry titles.
   memory) before it goes into tracked text. Private sources are not always
   marked, so check each item. When unsure, list the entry ids and ask the
   release integrator or the maintainer.
-- **Defensive and protective controls.** [M 2026-11-22] "there's a meaningful
-  split there between a defensive control which reflects a standard that we
-  are accountable for and must not deviate from and a protective control
-  which exists to maintain a standadr someone else is accountable for but we
-  can help out".
+- **Defensive and protective controls.** [M 2026-11-22] There is a meaningful
+  split between a defensive control, which reflects a standard the project
+  is accountable for and must not deviate from, and a protective control,
+  which exists to maintain a standard someone else is accountable for but
+  which the project can help with.
   - Defensive (authorisation, path containment, review cards, audit
     integrity): no deviation; gaps are must-fix; findings stay private until
     fixed.
@@ -1136,13 +1145,13 @@ bodies, issues, and summary lists of entry titles.
   Until then, leave signature churn recorded in the HANDOFF and stage
   nothing. [M 2026-11-23] An expected-failure (xfail) signature test is not
   a defect to fix; leave it as it is.
-- [M 2026-11-21] "there's a key in the .env for agentic use". Agents may load
-  the provider key from the main checkout's `.env`. Never print, paste, log
-  or commit its value; refer to it by variable name. It draws on the same
+- [M 2026-11-21] There is a key in the `.env` file for agent use. Agents may
+  load the provider key from the main checkout's `.env`. Never print, paste,
+  log or commit its value; refer to it by variable name. It draws on the same
   budget as acceptance runs. Other environment files stay off-limits.
 - The secret scanner rescans every line of a touched file. Mark a false
-  positive with `# secret-scan: allow-this-line`. [M 2026-11-20] "no verify by
-  permission only": never pass `--no-verify` unless the maintainer has
+  positive with `# secret-scan: allow-this-line`. [M 2026-11-20] No-verify is
+  by permission only: never pass `--no-verify` unless the maintainer has
   permitted it for that commit. When a hook fails for an environmental reason,
   fix the environment (`scripts/worktree-cleanup.sh --execute --link-venv`).
 - Build credential-shaped test values from parts at run time; never write the
@@ -1155,12 +1164,12 @@ and there are no tutorial-special paths. Read them there.
 
 - Any latency or cost change on the rootless or tutorial entry path gets
   per-transition provider-call scrutiny before it lands (AGENTS.md).
-- [M 2026-11-20] "I want to make sure we aren' tbreaking our tutorial because
-  its very compelling as is". The tutorial is the acceptance gate for every
-  skill-text or tool-surface change (section 6). A tutorial failure is a
-  composer defect, never a reason for a tutorial-only path.
-- [M 2026-11-18] "make sure all changes include appropriate guidance in the
-  composer". Every HANDOFF names its composer guidance diff, and the skill
+- [M 2026-11-20] He wants to make sure the tutorial is not being broken,
+  because it is very compelling as it is. The tutorial is the acceptance gate
+  for every skill-text or tool-surface change (section 6). A tutorial
+  failure is a composer defect, never a reason for a tutorial-only path.
+- [M 2026-11-18] Make sure all changes include appropriate guidance in the
+  composer. Every HANDOFF names its composer guidance diff, and the skill
   tool-inventory drift check passes. Guidance teaches; it never authors
   structure.
 - Model-facing text is written by the design agent of the time (section 9),
