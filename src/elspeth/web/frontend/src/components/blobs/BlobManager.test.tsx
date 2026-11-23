@@ -122,12 +122,14 @@ describe("BlobManager selected-node highlighting", () => {
     expect(screen.queryByText(/No files yet/)).not.toBeInTheDocument();
   });
 
-  it("focuses the unavailable file status when a reveal misses over a truncated list", async () => {
+  it("focuses the unavailable file status on a truncated reveal miss and restores the summary on reload", async () => {
     const listedBlob = makeBlob({ id: "one", filename: "system.txt" });
     const omittedBlob = makeBlob({ id: "two", filename: "user.txt" });
     const truncation = new BlobListTruncatedError([listedBlob]);
     setBlobState([listedBlob, omittedBlob]);
-    const list = vi.spyOn(api, "listBlobs").mockRejectedValueOnce(truncation);
+    const list = vi.spyOn(api, "listBlobs")
+      .mockRejectedValueOnce(truncation)
+      .mockResolvedValueOnce([listedBlob, omittedBlob]);
     onTestFinished(() => {
       list.mockRestore();
       useBlobStore.getState().reset();
@@ -141,6 +143,10 @@ describe("BlobManager selected-node highlighting", () => {
     expect(status).toHaveTextContent(/^File name unavailable$/);
     expect(document.activeElement).toBe(status);
     expect(screen.queryByText(/is no longer in this session/)).not.toBeInTheDocument();
+
+    act(() => { void useBlobStore.getState().loadBlobs("session-1"); });
+    expect(await screen.findByText("2 files used by llm")).toBe(status);
+    expect(screen.queryByText("File name unavailable")).not.toBeInTheDocument();
   });
 
   it.each(["upload", "delete"] as const)("hides attachment counts over a truncated list after a successful %s", async (action) => {
@@ -252,15 +258,52 @@ describe("BlobManager reveal request", () => {
     } finally { Element.prototype.scrollIntoView = original; }
   });
 
-  it("waits for loading and focuses the status when the requested file has disappeared", () => {
-    useBlobStore.setState({ isLoading: true });
-    useBlobStore.getState().revealBlob("session-1", "missing", "missing.txt");
+  it.each(["failed", "truncated"] as const)("clears a complete-list reveal miss before a %s reload settles", async (outcome) => {
+    const listedBlob = makeBlob({ id: "one", filename: "system.txt" });
+    const truncation = new BlobListTruncatedError([listedBlob]);
+    const list = vi.spyOn(api, "listBlobs")
+      .mockResolvedValueOnce([listedBlob])
+      .mockRejectedValueOnce(outcome === "failed" ? new Error("Network error") : truncation);
+    onTestFinished(() => {
+      list.mockRestore();
+      useBlobStore.getState().reset();
+    });
+    useBlobStore.setState({ loadBlobs: useBlobStore.getInitialState().loadBlobs });
+    await act(async () => { render(<BlobManager onUseAsInput={vi.fn()} />); });
+    act(() => useBlobStore.getState().revealBlob("session-1", "missing", "missing.txt"));
+    const status = screen.getByRole("status");
+    expect(status).toHaveTextContent("missing.txt is no longer in this session");
+
+    act(() => { void useBlobStore.getState().loadBlobs("session-1"); });
+    expect(screen.getByText("Loading files…")).toBeInTheDocument();
+    expect(status).not.toHaveTextContent("missing.txt is no longer in this session");
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      outcome === "failed" ? "Failed to load files." : truncation.message,
+    );
+    expect(status).not.toHaveTextContent("missing.txt is no longer in this session");
+  });
+
+  it("waits for loading and focuses the status when the requested file has disappeared", async () => {
+    let finishRead: (blobs: BlobMetadata[]) => void = () => undefined;
+    const pendingRead = new Promise<BlobMetadata[]>((resolve) => { finishRead = resolve; });
+    const list = vi.spyOn(api, "listBlobs").mockReturnValueOnce(pendingRead);
+    onTestFinished(() => {
+      list.mockRestore();
+      useBlobStore.getState().reset();
+    });
+    useBlobStore.setState({ loadBlobs: useBlobStore.getInitialState().loadBlobs });
     const { container } = render(<BlobManager onUseAsInput={vi.fn()} />);
+    expect(screen.getByText("Loading files…")).toBeInTheDocument();
+    act(() => useBlobStore.getState().revealBlob("session-1", "missing", "missing.txt"));
     expect(useBlobStore.getState().revealRequest).not.toBeNull();
-    act(() => useBlobStore.setState({ isLoading: false }));
+    expect(screen.queryByText("missing.txt is no longer in this session")).not.toBeInTheDocument();
+
+    await act(async () => { finishRead([makeBlob({ id: "one", filename: "system.txt" })]); });
     expect(container.querySelector(".blob-row-item--focused")).not.toBeInTheDocument();
     expect(screen.getByRole("status")).toHaveTextContent("missing.txt is no longer in this session");
     expect(screen.getByRole("status")).toHaveFocus();
+    expect(useBlobStore.getState().revealRequest).toBeNull();
   });
 
   it("waits for a pending list before focusing an arriving file", () => {

@@ -121,6 +121,10 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
   }, [activeSessionId, loadBlobs]);
 
   useLayoutEffect(() => {
+    if (isLoading && listBelongsToSession) setRevealMissMessage(null);
+  }, [isLoading, listBelongsToSession]);
+
+  useLayoutEffect(() => {
     // Read loading from the store, not this render's closure: the mount-time
     // loadBlobs above runs first in this same commit and flips isLoading
     // synchronously. Acting on the stale `false` would focus a cached row the
