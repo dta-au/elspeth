@@ -1982,6 +1982,7 @@ class ComposerServiceImpl:
         budget_frame: _ContextBudgetFrame,
         provider_owner: ProviderInvocationOwner | None = None,
         turn_evidence: TurnEvidence | None = None,
+        last_chance: bool = False,
     ) -> _CallModelOutcome:
         """Phase P1 of the compose loop — one LLM call with cap enforcement.
 
@@ -2003,6 +2004,12 @@ class ComposerServiceImpl:
         on this call can report it (R2-F9). It is ``None`` on the first loop
         iteration and whenever the loop runs without a session, because no
         turn has been persisted yet.
+
+        ``last_chance`` is the B-4D-3 call made once the composition budget is
+        spent: the same fit, send and size resend, but the caller enforces the
+        cap and confirms the delivery itself, so the carrier returns the
+        delivery instead. No tool runs again on a resend; the round's changes
+        are already saved.
         """
         await emit_progress(progress, model_call_progress_event(message))
         # Set for the one retry after a provider's context-limit rejection.
@@ -2081,6 +2088,8 @@ class ComposerServiceImpl:
                     ),
                 ) from rejection
             break
+        if last_chance:
+            return _CallModelOutcome(completion=completion, delivery=delivery)
         assistant_tool_calls = completion.tool_batch.calls
         self._enforce_tool_call_cap(
             assistant_tool_calls=assistant_tool_calls,
@@ -2802,36 +2811,30 @@ class ComposerServiceImpl:
             new_composition_turns_used = composition_turns_used + 1
             if new_composition_turns_used >= self._max_composition_turns:
                 # B-4D-3 fix: give the LLM one last chance to see the
-                # tool results and produce a text response.
-                await emit_progress(progress, model_call_progress_event(message))
-                selected_final_messages, selected_final_tools, final_delivery, final_budget_record = await self._prepare_primary_delivery(
-                    messages=llm_messages,
+                # tool results and produce a text response. A size rejection
+                # is resent once with the earlier turns left out, as on every
+                # other compose-loop call.
+                last_chance_call = await self._call_model_turn(
+                    llm_messages=llm_messages,
                     tools=tools,
-                    recorder=recorder,
-                    turn_evidence=turn_evidence,
-                    budget_frame=budget_frame,
                     state=state,
                     initial_version=initial_version,
-                    composition_turns_used=new_composition_turns_used,
-                    discovery_turns_used=discovery_turns_used,
-                    failed_turn=failed_turn,
-                    progress=progress,
-                )
-                completion = await self._call_llm_before_deadline(
-                    selected_final_messages,
-                    selected_final_tools,
-                    state,
-                    initial_version,
-                    deadline,
+                    deadline=deadline,
                     recorder=recorder,
+                    progress=progress,
+                    message=message,
                     # The relevant counter has already been charged; a timeout
                     # on the terminal call must report that same total.
                     composition_turns_used=new_composition_turns_used,
                     discovery_turns_used=discovery_turns_used,
                     failed_turn=failed_turn,
+                    budget_frame=budget_frame,
                     provider_owner=provider_owner,
-                    context_budget=final_budget_record,
+                    turn_evidence=turn_evidence,
+                    last_chance=True,
                 )
+                completion = last_chance_call.completion
+                final_delivery = last_chance_call.delivery
                 recovery_result = self._terminal_recovery_result(
                     completion, state, recorder, prior_tools_persisted=persisted_tool_call_turn
                 )
