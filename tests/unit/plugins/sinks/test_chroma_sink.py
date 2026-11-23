@@ -72,11 +72,24 @@ def _telemetry_emit(event: TelemetryEvent) -> None:
 def _make_chroma_collection_double() -> Any:
     """Create a Chroma collection double specced to the SDK collection API.
 
-    Its metadata carries the default ``hnsw:space`` so ``on_start``'s
+    Its configuration and legacy metadata carry the default space, as
+    chromadb reports for a collection the sink created, so ``on_start``'s
     distance-function check sees a collection built as configured.
     """
     collection = create_autospec(chromadb.Collection, instance=True, spec_set=True)
+    collection.configuration_json = {"hnsw": {"space": "cosine"}, "spann": None}
     collection.metadata = {"hnsw:space": "cosine"}
+    return collection
+
+
+def _migrated_collection_double(legacy_space: str) -> Any:
+    """Reduced to the keys the parser reads, from the measured 1.5.5 migrated shape.
+
+    The review opened chromadb 0.6.3 cosine and ip corpora with chromadb 1.5.5.
+    """
+    collection = create_autospec(chromadb.Collection, instance=True, spec_set=True)
+    collection.configuration_json = {"hnsw": {"space": "l2"}, "spann": None}
+    collection.metadata = {"hnsw:space": legacy_space}
     return collection
 
 
@@ -211,6 +224,22 @@ class TestChromaSinkCompletionTelemetry:
 
 
 class TestChromaSinkOnStart:
+    @pytest.mark.parametrize("legacy_space", ["cosine", "ip"])
+    @pytest.mark.parametrize("matches_legacy", [True, False])
+    def test_migrated_collection_uses_legacy_metric(self, legacy_space: str, matches_legacy: bool) -> None:
+        requested_space = legacy_space if matches_legacy else "l2"
+        collection = _migrated_collection_double(legacy_space)
+        client = _make_chroma_client_double()
+        client.get_or_create_collection.return_value = collection
+        sink = ChromaSink(_make_config(distance_function=requested_space))
+        with patch("elspeth.plugins.sinks.chroma_sink.chromadb.PersistentClient", return_value=client):
+            if matches_legacy:
+                sink.on_start(_make_lifecycle_ctx())
+                assert sink._collection is collection
+            else:
+                with pytest.raises(ValueError, match=f"already exists with distance_function='{legacy_space}'"):
+                    sink.on_start(_make_lifecycle_ctx())
+
     def test_constructs_persistent_client(self) -> None:
         sink = inject_write_failure(ChromaSink(_make_config()))
         ctx = _make_lifecycle_ctx()
@@ -429,6 +458,7 @@ def _chroma_effect_context() -> RestrictedSinkEffectContext:
 class _RecoverableChromaCollection:
     def __init__(self) -> None:
         # Read by ChromaSink.on_start's distance-function check.
+        self.configuration_json: dict[str, object] = {"hnsw": {"space": "cosine"}, "spann": None}
         self.metadata: dict[str, object] = {"hnsw:space": "cosine"}
         self.documents: dict[str, tuple[str, dict[str, object] | None]] = {}
         self.upsert_count_by_id: dict[str, int] = {}

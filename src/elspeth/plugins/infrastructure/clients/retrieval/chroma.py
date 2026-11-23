@@ -115,46 +115,100 @@ class ChromaSearchProviderConfig(BaseModel):
         )
 
 
+def _collection_distance_space(*, collection_configuration: Any, collection_metadata: Any, collection_name: str) -> str:
+    """Parse and reconcile the SDK's configured metric and legacy metadata."""
+    configured_space = _configured_distance_space(collection_configuration=collection_configuration, collection_name=collection_name)
+    legacy_space = _legacy_metadata_distance_space(collection_metadata=collection_metadata, collection_name=collection_name)
+    if configured_space is not None and legacy_space is not None and configured_space != legacy_space and configured_space != "l2":
+        raise RetrievalError(
+            f"Chroma collection {collection_name!r}: configuration and legacy metadata declare different distance functions (disagree).",
+            retryable=False,
+        )
+    # Chroma 1.x reports its l2 migration default for some pre-1.0 indexes,
+    # while legacy metadata retains the metric used by the persisted index.
+    actual_space = legacy_space if configured_space == "l2" and legacy_space is not None else configured_space or legacy_space
+    if actual_space is None:
+        raise RetrievalError(
+            f"Chroma collection {collection_name!r} names no distance function in configuration or legacy metadata.",
+            retryable=False,
+        )
+    return actual_space
+
+
 @trust_boundary(
     tier=3,
-    source="chromadb Collection.metadata as returned by the Chroma SDK / server for an existing collection",
+    source="chromadb Collection.configuration_json as returned by the Chroma SDK / server",
+    source_param="collection_configuration",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns only an allowed declared space or None for no index; raises RetrievalError(retryable=False) "
+        "for non-mapping configuration or index, conflicting indexes, missing or malformed space; never substitutes a default"
+    ),
+    test_ref="tests/unit/plugins/infrastructure/clients/retrieval/test_chroma.py::test_configured_distance_space_fails_closed_on_unrecognised_shape",
+    test_fingerprint="8a777a37b90ff81d593b5a34b1901e193bd65cfd7ea402c18e51c0e5959c43ff",
+)
+def _configured_distance_space(*, collection_configuration: Any, collection_name: str) -> str | None:
+    """Admit the SDK's collection configuration; an absent index may use legacy metadata."""
+    if not isinstance(collection_configuration, Mapping):
+        raise RetrievalError(
+            f"Chroma collection {collection_name!r} returned malformed configuration: expected a mapping.", retryable=False
+        )
+    hnsw = collection_configuration.get("hnsw")
+    spann = collection_configuration.get("spann")
+    if hnsw is not None and spann is not None:
+        raise RetrievalError(f"Chroma collection {collection_name!r} configures both 'hnsw' and 'spann' indexes.", retryable=False)
+    if hnsw is None and spann is None:
+        return None
+    index_name, index = ("hnsw", hnsw) if hnsw is not None else ("spann", spann)
+    if not isinstance(index, Mapping):
+        raise RetrievalError(f"Chroma collection {collection_name!r} has malformed {index_name!r} index configuration.", retryable=False)
+    if "space" not in index:
+        raise RetrievalError(
+            f"Chroma collection {collection_name!r} has no 'space' in {index_name!r} index configuration.", retryable=False
+        )
+    space = index["space"]
+    if not isinstance(space, str):
+        raise RetrievalError(
+            f"Chroma collection {collection_name!r} has non-string 'space' in {index_name!r} index configuration.", retryable=False
+        )
+    if space not in {"cosine", "l2", "ip"}:
+        raise RetrievalError(
+            f"Chroma collection {collection_name!r} has unrecognised 'space' in {index_name!r} index configuration.", retryable=False
+        )
+    return space
+
+
+@trust_boundary(
+    tier=3,
+    source="chromadb Collection.metadata as returned by the Chroma SDK / server",
     source_param="collection_metadata",
     suppresses=("R5",),
     invariant=(
-        "raises RetrievalError(retryable=False) when the metadata is not a Mapping, carries no 'hnsw:space', "
-        "or its 'hnsw:space' is not a str; never substitutes a default distance function"
+        "returns only an allowed legacy space or None when metadata has no declaration; "
+        "raises RetrievalError(retryable=False) for non-mapping metadata or malformed or unsupported space"
     ),
-    test_ref="tests/unit/plugins/infrastructure/clients/retrieval/test_chroma.py::test_collection_distance_space_rejects_non_mapping_metadata",
-    test_fingerprint="aea5f064c296f13717d3bcd56351bf114f2e951151ea7492e77c5250122f6374",
+    test_ref="tests/unit/plugins/infrastructure/clients/retrieval/test_chroma.py::test_legacy_metadata_distance_space_rejects_non_mapping_metadata",
+    test_fingerprint="b4da388a4f17e85d593d2faf0470e95d8be2eb4d6c3ba5fd6b82dc32945a3158",
 )
-def _collection_distance_space(collection_metadata: Any, collection_name: str) -> str:
-    """Parse the distance function an existing Chroma collection was built with.
-
-    Score normalization is only meaningful against the collection's real
-    ``hnsw:space``; a missing or malformed value must fail startup rather than
-    fall back to a guess. ``collection_name`` is only used for the message.
-    """
+def _legacy_metadata_distance_space(*, collection_metadata: Any, collection_name: str) -> str | None:
+    """Admit an optional legacy metric when the SDK returns collection metadata."""
+    if collection_metadata is None:
+        return None
     if not isinstance(collection_metadata, Mapping):
         raise RetrievalError(
-            f"Chroma collection {collection_name!r} returned malformed metadata. "
-            "Score normalization requires an exact metadata mapping containing 'hnsw:space'.",
+            f"Chroma collection {collection_name!r} returned malformed metadata: expected a mapping.",
             retryable=False,
         )
     if "hnsw:space" not in collection_metadata:
-        raise RetrievalError(
-            f"Chroma collection {collection_name!r} has no 'hnsw:space' "
-            f"in metadata. Score normalization cannot proceed without a "
-            f"known distance function.",
-            retryable=False,
-        )
+        return None
     actual_space = collection_metadata["hnsw:space"]
     if not isinstance(actual_space, str):
         raise RetrievalError(
-            f"Chroma collection {collection_name!r} has a non-string 'hnsw:space' "
-            f"({type(actual_space).__name__}) in metadata. Score normalization requires "
-            f"a named distance function.",
+            f"Chroma collection {collection_name!r} has non-string 'hnsw:space' in metadata.",
             retryable=False,
         )
+    if actual_space not in {"cosine", "l2", "ip"}:
+        raise RetrievalError(f"Chroma collection {collection_name!r} has unrecognised 'hnsw:space' in metadata.", retryable=False)
     return actual_space
 
 
@@ -258,7 +312,11 @@ class ChromaSearchProvider:
             ) from exc
 
         # Validate distance function matches what the collection was created with.
-        actual_space = _collection_distance_space(self._collection.metadata, config.collection)
+        actual_space = _collection_distance_space(
+            collection_configuration=self._collection.configuration_json,
+            collection_metadata=self._collection.metadata,
+            collection_name=config.collection,
+        )
         if actual_space != config.distance_function:
             raise RetrievalError(
                 f"Chroma collection {config.collection!r} exists with "
