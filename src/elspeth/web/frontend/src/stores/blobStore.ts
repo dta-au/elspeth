@@ -16,6 +16,13 @@ interface BlobState {
   isLoading: boolean;
   error: string | null;
   listError: string | null;
+  /**
+   * A list read for this activation has settled (success, truncation, or
+   * failure) since the last event that could make it stale. Before then,
+   * the rows may be placeholders, upload-only, or older than the graph
+   * and cannot establish file absence.
+   */
+  listCurrent: boolean;
   /** The file-list read failed and can be retried. */
   listLoadFailed: boolean;
   /** Session whose rows may be published into this store instance. */
@@ -45,6 +52,7 @@ interface BlobState {
   returnToRevealTrigger: () => void;
 
   activateSession: (sessionId: string | null) => void;
+  markListStale: (sessionId: string) => void;
   invalidateBlobForEpoch: (
     sessionId: string,
     activationEpoch: number,
@@ -74,6 +82,7 @@ const initialState = {
   isLoading: false,
   error: null as string | null,
   listError: null as string | null,
+  listCurrent: false,
   listLoadFailed: false,
   activeSessionId: null as string | null,
   activationEpoch: 0,
@@ -150,7 +159,7 @@ async function refreshBlobList(sessionId: string, publishError: boolean): Promis
   try {
     const blobs = await api.listBlobs(sessionId);
     if (requestSeq !== blobLoadRequestSeq) return;
-    set({ blobs, listError: null, isLoading: false });
+    set({ blobs, listError: null, listCurrent: true, isLoading: false });
   } catch (err) {
     if (requestSeq !== blobLoadRequestSeq) return;
     if (err instanceof BlobListTruncatedError) {
@@ -159,6 +168,7 @@ async function refreshBlobList(sessionId: string, publishError: boolean): Promis
       set({
         blobs: err.blobs,
         listError: err.message,
+        listCurrent: true,
         listLoadFailed: false,
         isLoading: false,
         ...(publishError ? { error: err.message } : {}),
@@ -168,6 +178,7 @@ async function refreshBlobList(sessionId: string, publishError: boolean): Promis
     const message = "Failed to load files.";
     set({
       listError: message,
+      listCurrent: true,
       listLoadFailed: true,
       isLoading: false,
       ...(publishError ? { error: message } : {}),
@@ -233,6 +244,7 @@ export const useBlobStore = create<BlobState>((set, get) => ({
       isLoading: false,
       error: null,
       listError: null,
+      listCurrent: false,
       listLoadFailed: false,
       activeSessionId: sessionId,
       activationEpoch: state.activationEpoch + 1,
@@ -244,6 +256,15 @@ export const useBlobStore = create<BlobState>((set, get) => ({
     });
     revealTrigger = null;
     stopReturnObserver();
+  },
+
+  markListStale(sessionId) {
+    const state = get();
+    if (state.activeSessionId !== sessionId) return;
+    // A read dispatched before the change cannot establish currentness.
+    if (state.isLoading) blobLoadRequestSeq++;
+    set({ listCurrent: false });
+    if (state.isLoading) void refreshBlobList(sessionId, false);
   },
 
   invalidateBlobForEpoch(
@@ -282,6 +303,7 @@ export const useBlobStore = create<BlobState>((set, get) => ({
     if (get().activeSessionId === null) {
       set((state) => ({
         activeSessionId: sessionId,
+        listCurrent: false,
         activationEpoch: state.activationEpoch + 1,
       }));
     }
@@ -331,6 +353,7 @@ export const useBlobStore = create<BlobState>((set, get) => ({
     if (get().activeSessionId === null) {
       set((state) => ({
         activeSessionId: sessionId,
+        listCurrent: false,
         activationEpoch: state.activationEpoch + 1,
       }));
     }
@@ -409,6 +432,7 @@ export const useBlobStore = create<BlobState>((set, get) => ({
       isLoading: false,
       error: null,
       listError: null,
+      listCurrent: false,
       listLoadFailed: false,
       activeSessionId: null,
       activationEpoch: state.activationEpoch + 1,

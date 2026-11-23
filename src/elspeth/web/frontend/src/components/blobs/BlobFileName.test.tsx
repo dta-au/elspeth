@@ -4,7 +4,8 @@ import * as api from "@/api/client";
 import { useBlobStore } from "@/stores/blobStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import type { BlobMetadata } from "@/types/api";
-import { BlobFileName } from "./BlobFileName";
+import { makeSessionBlobs } from "@/test/blobListRouteDouble";
+import { BlobFileName, useSessionFileList } from "./BlobFileName";
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -14,7 +15,7 @@ beforeEach(() => {
 
 it("shows only the filename and keeps identifiers in attributes", () => {
   const id = "f976fd8b-4432-4f8f-bbc3-2d8a9f2114e0";
-  useBlobStore.setState({ activeSessionId: "session-1", blobs: [{ id, filename: "prompt.md", content_hash: "a".repeat(64) } as BlobMetadata] });
+  useBlobStore.setState({ activeSessionId: "session-1", listCurrent: true, blobs: [{ id, filename: "prompt.md", content_hash: "a".repeat(64) } as BlobMetadata] });
   render(<BlobFileName blobId={id} sha256={"a".repeat(64)} />);
   const name = screen.getByText(/prompt\.md/);
   expect(name).toHaveAttribute("data-blob-id", id);
@@ -27,9 +28,9 @@ it("distinguishes loading, missing, and another session", () => {
   useBlobStore.setState({ activeSessionId: "session-1", isLoading: true });
   const { rerender } = render(<BlobFileName blobId="missing" />);
   expect(screen.getByText("Loading file name…")).toBeInTheDocument();
-  act(() => useBlobStore.setState({ isLoading: false }));
+  act(() => useBlobStore.setState({ isLoading: false, listCurrent: true }));
   expect(screen.getByText("File not in this session")).toBeInTheDocument();
-  act(() => useBlobStore.setState({ activeSessionId: "session-2", blobs: [{ id: "missing", filename: "wrong.md" } as BlobMetadata] }));
+  act(() => useBlobStore.setState({ activeSessionId: "session-2", listCurrent: true, blobs: [{ id: "missing", filename: "wrong.md" } as BlobMetadata] }));
   rerender(<BlobFileName blobId="missing" />);
   expect(screen.getByText("Loading file name…")).toBeInTheDocument();
   expect(screen.queryByText("wrong.md")).not.toBeInTheDocument();
@@ -44,4 +45,53 @@ it("uses the unavailable name as the default fallback after a failed list read",
 
   expect(screen.getByText("File name unavailable")).toBeInTheDocument();
   expect(screen.queryByText("File not in this session")).not.toBeInTheDocument();
+});
+
+it("shows a bound name as loading after a chat upload into an unread activation", async () => {
+  const [uploaded] = makeSessionBlobs("session-1", 1);
+  const upload = vi.spyOn(api, "uploadBlob").mockResolvedValueOnce(uploaded);
+  const list = vi.spyOn(api, "listBlobs");
+  onTestFinished(() => { upload.mockRestore(); list.mockRestore(); });
+  useBlobStore.getState().activateSession("session-1");
+  await useBlobStore.getState().uploadBlob("session-1", new File(["rows"], "upload.csv"));
+
+  render(<BlobFileName blobId="bound-file" />);
+
+  expect(list).not.toHaveBeenCalled();
+  expect(screen.queryByText("File not in this session")).not.toBeInTheDocument();
+  expect(screen.queryByText("This file is not in this session.")).not.toBeInTheDocument();
+  expect(screen.getByText("Loading file name…")).toBeInTheDocument();
+});
+
+function FileListCaller({ needed = true }: { needed?: boolean }) {
+  useSessionFileList(needed);
+  return <BlobFileName blobId="bound-file" />;
+}
+
+it("starts one read for two callers and skips running, failed and completed reads", async () => {
+  let failRead!: (error: Error) => void;
+  const firstRead = new Promise<BlobMetadata[]>((_resolve, reject) => { failRead = reject; });
+  const list = vi.spyOn(api, "listBlobs").mockReturnValueOnce(firstRead);
+  onTestFinished(() => { list.mockRestore(); });
+  useBlobStore.getState().activateSession("session-1");
+
+  const view = render(<><FileListCaller /><FileListCaller /></>);
+  expect(list).toHaveBeenCalledTimes(1);
+  expect(list).toHaveBeenCalledWith("session-1");
+  view.rerender(<><FileListCaller /><FileListCaller /><FileListCaller /></>);
+  expect(list).toHaveBeenCalledTimes(1);
+
+  await act(async () => { failRead(new Error("Network error")); });
+  expect(screen.getAllByText("File name unavailable")).toHaveLength(3);
+  view.rerender(<><FileListCaller needed={false} /><FileListCaller /></>);
+  view.rerender(<><FileListCaller /><FileListCaller /></>);
+  expect(list).toHaveBeenCalledTimes(1);
+  view.unmount();
+
+  list.mockResolvedValueOnce([]);
+  await useBlobStore.getState().loadBlobs("session-1");
+  list.mockClear();
+  render(<FileListCaller />);
+  expect(list).not.toHaveBeenCalled();
+  expect(screen.getByText("File not in this session")).toBeInTheDocument();
 });

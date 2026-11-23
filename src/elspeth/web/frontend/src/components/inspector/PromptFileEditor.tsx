@@ -54,7 +54,7 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: Promp
   // never the list index the slot path uses.
   const slotLabel = queryName === undefined ? optionLabel(fieldPath) : `User prompt, query ${queryName}`;
   const sessionId = useSessionStore((state) => state.activeSessionId);
-  const filenameLoading = useBlobStore((state) => sessionId === null || state.activeSessionId !== sessionId || state.isLoading);
+  const filenameLoading = useBlobStore((state) => sessionId === null || state.activeSessionId !== sessionId || !state.listCurrent || state.isLoading);
   const listError = useBlobStore((state) => state.activeSessionId === sessionId ? state.listError : null);
   const blobSessionId = useBlobStore((state) => state.activeSessionId);
   const blobs = useBlobStore((state) => state.blobs);

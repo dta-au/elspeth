@@ -51,7 +51,7 @@ describe("GraphFiles", () => {
   beforeEach(() => {
     useBlobStore.getState().reset();
     loadBlobs = vi.fn<(sessionId: string) => Promise<void>>().mockResolvedValue(undefined);
-    useBlobStore.setState({ activeSessionId: "session-1", isLoading: false, error: null, loadBlobs,
+    useBlobStore.setState({ activeSessionId: "session-1", listCurrent: true, isLoading: false, error: null, loadBlobs,
       blobs: [blob("input", "input.csv"), blob("shared", "shared.txt"), blob("criteria", "criteria.txt"), blob("solo", "solo.txt")] });
     useSessionStore.setState({ activeSessionId: "session-1", compositionState: state, selectedNodeId: null, isComposing: false });
     useInterpretationEventsStore.setState({ pendingBySession: { "session-1": {} } });
@@ -75,6 +75,17 @@ describe("GraphFiles", () => {
     view.rerender(<GraphFiles state={{ ...state, id: "repaired-state" }} onShowNode={vi.fn()} />);
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     expect(screen.getByRole("table")).toBeInTheDocument();
+  });
+
+  it("asks the user to wait for the list when this session owns an unread list", async () => {
+    useBlobStore.setState({ listCurrent: false, blobs: [blob("input", "input.csv")] });
+    render(<GraphFiles state={state} onShowNode={vi.fn()} />);
+    await userEvent.setup().click(screen.getByText(filesSummary()));
+
+    const edit = screen.getByRole("button", { name: "Edit file for solo" });
+    expect(edit).toHaveAccessibleDescription("Wait for the file list to load.");
+    expect(screen.queryByText("File not in this session")).not.toBeInTheDocument();
+    expect(screen.queryByText("This file is not in this session.")).not.toBeInTheDocument();
   });
 
   it("groups each file's fields by component, including sources, multi-prompts and sinks", async () => {
@@ -207,7 +218,7 @@ describe("GraphFiles", () => {
   });
 
   it("offers Retry for a failed list read, re-issuing the same read", async () => {
-    useBlobStore.setState({ blobs: [], error: "Failed to load files.", listError: "Failed to load files.", listLoadFailed: true });
+    useBlobStore.setState({ blobs: [], listCurrent: true, error: "Failed to load files.", listError: "Failed to load files.", listLoadFailed: true });
     render(<GraphFiles state={state} onShowNode={vi.fn()} />);
     await userEvent.setup().click(screen.getByText(filesSummary()));
     loadBlobs.mockClear();
@@ -221,7 +232,7 @@ describe("GraphFiles", () => {
     ["a truncated list (nothing to retry)", truncatedMessage, truncatedMessage, false, "File names are unavailable."],
     ["an action refusal", "Download failed.", null, false, null],
   ] as const)("gates Edit on the list state after %s", async (_case, error, listError, listLoadFailed, reason) => {
-    useBlobStore.setState({ error, listError, listLoadFailed });
+    useBlobStore.setState({ listCurrent: true, error, listError, listLoadFailed });
     render(<GraphFiles state={state} onShowNode={vi.fn()} />);
     await userEvent.setup().click(screen.getByText(filesSummary()));
     const edit = screen.getByRole("button", { name: "Edit file for solo" });
@@ -405,7 +416,7 @@ describe("GraphFiles", () => {
 
   it("does not borrow another session's filenames or edit its files", async () => {
     useSessionStore.setState({ activeSessionId: "other-session" });
-    useBlobStore.setState({ activeSessionId: "other-session", blobs: [blob("solo", "other-session-secret.txt")] });
+    useBlobStore.setState({ activeSessionId: "other-session", listCurrent: true, blobs: [blob("solo", "other-session-secret.txt")] });
     render(<GraphFiles state={state} onShowNode={vi.fn()} />);
     await userEvent.setup().click(screen.getByText(filesSummary()));
     expect(loadBlobs).not.toHaveBeenCalled();

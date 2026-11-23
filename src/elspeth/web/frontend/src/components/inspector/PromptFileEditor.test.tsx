@@ -117,7 +117,7 @@ it("blocks Save before a request when a pending review has an inline sibling", a
   const marker = { mode: "inline_content", blob_ref: "blob-1", sha256: "a".repeat(64) };
   const options = { prompt_template: marker, system_prompt: "You are helpful." };
   useSessionStore.setState({ compositionState: { nodes: [{ id: "first", plugin: "llm", options }], sources: {}, outputs: [] } as unknown as CompositionState });
-  useBlobStore.setState({ activeSessionId: "session-1", blobs: [{ id: "blob-1", filename: "prompt.md", status: "ready", mime_type: "text/plain", content_hash: null } as BlobMetadata] });
+  useBlobStore.setState({ activeSessionId: "session-1", listCurrent: true, blobs: [{ id: "blob-1", filename: "prompt.md", status: "ready", mime_type: "text/plain", content_hash: null } as BlobMetadata] });
   useInterpretationEventsStore.setState({ pendingBySession: { "session-1": { card: { choice: "pending", kind: "llm_prompt_template", affected_node_id: "first" } as InterpretationEvent } } });
   render(<PromptFileEditors nodeId="first" options={options} />);
   const editor = await screen.findByRole("textbox", { name: /Edit prompt file/ });
@@ -130,7 +130,7 @@ it("blocks Save before a request when a pending review has an inline sibling", a
 });
 
 it("names the file and human prompt slot in editor labels", async () => {
-  useBlobStore.setState({ activeSessionId: "session-1", blobs: [{ id: "blob-1", filename: "prompt.md" } as BlobMetadata] });
+  useBlobStore.setState({ activeSessionId: "session-1", listCurrent: true, blobs: [{ id: "blob-1", filename: "prompt.md" } as BlobMetadata] });
   render(<PromptFileEditors nodeId="first" options={{
     system_prompt: { mode: "inline_content", blob_ref: "blob-1" },
     queries: [{ template: { mode: "inline_content", blob_ref: "blob-1" } }],
@@ -243,7 +243,7 @@ it("says the pipeline changed on prompt_file_binding_changed, and Refresh pipeli
 });
 
 it("says a slot that no longer reads this file without asking for a reload, and offers Refresh pipeline", async () => {
-  useBlobStore.setState({ activeSessionId: "session-1", isLoading: false, blobs: [
+  useBlobStore.setState({ activeSessionId: "session-1", listCurrent: true, isLoading: false, blobs: [
     { id: "blob-1", filename: "old.md", status: "ready", mime_type: "text/plain", content_hash: null } as BlobMetadata,
     { id: "blob-2", filename: "new.md", status: "ready", mime_type: "text/plain", content_hash: null } as BlobMetadata,
   ] });
@@ -271,7 +271,7 @@ const FILE_B = { mode: "inline_content", blob_ref: "blob-b", sha256: "b".repeat(
 const TWO_FILE_OPTIONS = { prompt_template: FILE_A, system_prompt: FILE_B };
 
 function seedTwoFileStep(options: Record<string, unknown> = TWO_FILE_OPTIONS) {
-  useBlobStore.setState({ editRequest: null, activeSessionId: "session-1", isLoading: false, blobs: [
+  useBlobStore.setState({ editRequest: null, activeSessionId: "session-1", listCurrent: true, isLoading: false, blobs: [
     { id: "blob-a", filename: "user.md", status: "ready", mime_type: "text/plain", content_hash: null } as BlobMetadata,
     { id: "blob-b", filename: "system.md", status: "ready", mime_type: "text/plain", content_hash: null } as BlobMetadata,
   ] });
@@ -435,7 +435,7 @@ it("does not show a hash mismatch after save repins the marker and reloads metad
   const oldState = { nodes: [{ options: { prompt_template: oldMarker } }] } as unknown as CompositionState;
   const newState = { nodes: [{ options: { prompt_template: newMarker } }] } as unknown as CompositionState;
   useSessionStore.setState({ compositionState: oldState });
-  useBlobStore.setState({ activeSessionId: "session-1", blobs: [{ id: "blob-1", filename: "prompt.md", content_hash: oldMarker.sha256 } as BlobMetadata] });
+  useBlobStore.setState({ activeSessionId: "session-1", listCurrent: true, blobs: [{ id: "blob-1", filename: "prompt.md", content_hash: oldMarker.sha256 } as BlobMetadata] });
   vi.mocked(fetchCompositionState).mockResolvedValue(newState);
   const loadBlobs = vi.spyOn(useBlobStore.getState(), "loadBlobs").mockImplementation(async () => {
     useBlobStore.setState({ blobs: [{ id: "blob-1", filename: "prompt.md", content_hash: newMarker.sha256 } as BlobMetadata] });
@@ -471,7 +471,7 @@ it("does not reload the file list when the save is refused", async () => {
 it("opens a list-form query's editor from the inspector Edit control, labelled by the query name", async () => {
   const marker = { mode: "inline_content", blob_ref: "blob-1", sha256: "a".repeat(64) };
   const options = { system_prompt: "You are a classifier.", queries: [{ name: "classify", template: marker }] };
-  useBlobStore.setState({ editRequest: null, activeSessionId: "session-1", isLoading: false,
+  useBlobStore.setState({ editRequest: null, activeSessionId: "session-1", listCurrent: true, isLoading: false,
     blobs: [{ id: "blob-1", filename: "prompt.md", status: "ready", mime_type: "text/plain", content_hash: null } as BlobMetadata] });
   useSessionStore.setState({ compositionState: { nodes: [{ id: "first", plugin: "llm", options }], sources: {}, outputs: [] } as unknown as CompositionState });
   render(<PromptFileEditors nodeId="first" options={options} />);
@@ -486,7 +486,7 @@ it("does not let a post-save refetch from an earlier activation replace a newer 
   const options = { prompt_template: marker };
   const stateAt = (version: number) => ({ version, nodes: [{ id: "first", plugin: "llm", options }], sources: {}, outputs: [] }) as unknown as CompositionState;
   useSessionStore.setState({ compositionState: stateAt(1) });
-  useBlobStore.setState({ activeSessionId: "session-1", isLoading: false,
+  useBlobStore.setState({ activeSessionId: "session-1", listCurrent: true, isLoading: false,
     blobs: [{ id: "blob-1", filename: "prompt.md", status: "ready", mime_type: "text/plain", content_hash: null } as BlobMetadata] });
   let resolveFetch!: (state: CompositionState) => void;
   vi.mocked(fetchCompositionState).mockReturnValue(new Promise((resolve) => { resolveFetch = resolve; }));
@@ -510,7 +510,7 @@ it.each([
   ["mapping form (control)", { queries: { classify: { template: { mode: "inline_content", blob_ref: "blob-1", sha256: "a".repeat(64) } } } }, "queries.classify.template"],
 ])("saves a %s query file from the inspector Edit with the server's slot path", async (_form, queryOptions, expectedPath) => {
   const options = { system_prompt: "You are a classifier.", ...queryOptions };
-  useBlobStore.setState({ editRequest: null, activeSessionId: "session-1", isLoading: false,
+  useBlobStore.setState({ editRequest: null, activeSessionId: "session-1", listCurrent: true, isLoading: false,
     blobs: [{ id: "blob-1", filename: "prompt.md", status: "ready", mime_type: "text/plain", content_hash: null } as BlobMetadata] });
   useSessionStore.setState({ compositionState: { nodes: [{ id: "first", plugin: "llm", options }], sources: {}, outputs: [] } as unknown as CompositionState });
   vi.spyOn(useBlobStore.getState(), "loadBlobs").mockResolvedValue();
@@ -735,7 +735,7 @@ it("still opens a file-backed slot that no row shows, when it is opened from the
 
 it("mounts no editor and no shared-file note where the host passes no editor", () => {
   const options = { prompt_template: STEP_FILE, queries: [{ name: "alpha" }, { name: "beta" }] };
-  useBlobStore.setState({ editRequest: null, activeSessionId: "session-1", isLoading: false,
+  useBlobStore.setState({ editRequest: null, activeSessionId: "session-1", listCurrent: true, isLoading: false,
     blobs: [{ id: "blob-a", filename: "user.md", status: "ready", mime_type: "text/plain", content_hash: null } as BlobMetadata] });
   render(<OptionRows options={options} ariaLabel="inspector options" plugin={{ kind: "transform", name: "llm" }} slotActions={{ nodeId: "first" }} />);
   act(() => useBlobStore.getState().requestPromptEdit("first", "prompt_template"));

@@ -55,7 +55,7 @@ const editor = () => screen.findByRole("textbox", { name: /Edit prompt file/ });
 beforeEach(() => {
   vi.clearAllMocks();
   useBlobStore.getState().reset();
-  useBlobStore.setState({ activeSessionId: "session-1", isLoading: false, error: null,
+  useBlobStore.setState({ activeSessionId: "session-1", listCurrent: true, isLoading: false, error: null,
     blobs: [blob("file-a", "score.txt"), blob("file-b", "score-v2.txt"), blob("file-c", "other.txt")] });
   useSessionStore.setState({ activeSessionId: "session-1", isComposing: false, compositionState: graph(), selectedNodeId: "score" });
   useInterpretationEventsStore.setState({ pendingBySession: {} });
@@ -181,7 +181,7 @@ describe("unsaved prompt text survives the editor unmounting", () => {
     await typeDraft("session one only");
     act(() => {
       useSessionStore.setState({ activeSessionId: "session-2", selectedNodeId: null, compositionState: { ...graph(), session_id: "session-2" } as CompositionState });
-      useBlobStore.setState({ activeSessionId: "session-2" });
+      useBlobStore.setState({ activeSessionId: "session-2", listCurrent: true });
     });
     act(() => useSessionStore.getState().selectNode("score"));
     expect(screen.queryByText("Unsaved changes")).not.toBeInTheDocument();

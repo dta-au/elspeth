@@ -188,6 +188,7 @@ describe("authStore account-scoped store reset", () => {
       writeError: "old write error",
     });
     useBlobStore.setState({
+      listCurrent: true,
       blobs: [
         {
           id: "alice-blob",
