@@ -148,6 +148,11 @@ integrator so the book is corrected.
   everything stops - no more work from any lane".
   - Why: the integrator owns landing, the box and the caps. Work without
     custody is how branches get lost and the box gets overrun.
+- **The lead directs policy and workflow.** [M 2026-11-24] The maintainer
+  endorsed the 0.8.18 lead integrator to every lane: lanes follow its
+  directions on policy and workflow, and this book. Lanes take workflow questions to the lead, not to the maintainer.
+  Moving scope between releases, configuration changes, and the
+  hard-to-reverse actions in section 8 still go to him.
   - How: at every lane start or resume, identify your release's integrator by
     its listed session name. Name it in every brief. If you cannot identify
     it, start nothing, land nothing, launch no runs, and ask the maintainer.
@@ -305,6 +310,20 @@ Never use the question dialog tool.
   is recorded privately instead.
 - Only the maintainer moves items between releases ("we might pull scope
   forward" is his call).
+- **0.8.18 priority: the engine.** [M 2026-11-24] The engine is a key
+  priority: prove its correctness first, then optimise it. Engine breaking
+  changes are open but not guaranteed. Correctness work lands before optimisation, and engine breaking
+  changes are permitted, not promised: each is stated in the upgrade notes,
+  and the bar below still protects what users can do today. The item list
+  is section N of the 0.8.18 scope document.
+- **Peelable fixes.** An urgent fix is cut from the latest release tag, not
+  from the integration branch, and merged into the integration branch in
+  urgency order. If a patch release is needed, the same branches merge into a
+  release branch off main; nothing is cherry-picked. A fix that changes
+  stored shape (epoch, CHECK, schema) lands on the integration branch only
+  and cannot be peeled.
+  - Why: the integration branch carries refactors and process changes a
+    patch must not, so its prefix is not a shippable patch.
 
 **The bar (standing for every release)**
 
@@ -898,8 +917,12 @@ the integrator's order rules [I] unless marked [M].
   - every tree: clean `git status`, ignored content inspected and not needed,
     and not in use.
   Then use `scripts/worktree-cleanup.sh`, or a plain `git worktree remove` (no
-  force) and `git branch -d` (`-D` only for a verified squash or rebuild), and
-  report each tip hash.
+  force), then delete the branch with `git branch -D` gated in the same
+  command by a fresh fetch and `git merge-base --is-ancestor <tip>
+  origin/<branch>`, and report each tip hash.
+  - Why: `git branch -d` tests against the checkout's own HEAD or the
+    branch's upstream, not the branch that holds the work, so it refuses a
+    lane branch whose tip is in the integration branch.
 - **Hard to reverse stays with the maintainer:** deleting data or volumes,
   deleting unmerged or dirty work, deleting an unmerged published remote
   branch, wiping shared state, and anything the lead integrator, or for its
