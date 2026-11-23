@@ -75,12 +75,10 @@ class TestEndToEndPipelineExecution:
             SourceSpec,
         )
         from elspeth.web.config import WebSettings
-        from elspeth.web.execution import service as execution_service
         from elspeth.web.sessions.protocol import CompositionStateData
 
         patched_version = "sha256-rfc8785-test"
         monkeypatch.setattr(hashing, "CANONICAL_VERSION", patched_version)
-        monkeypatch.setattr(execution_service, "CANONICAL_VERSION", patched_version)
         settings = WebSettings(
             data_dir=work_dir,
             landscape_url=f"sqlite:///{work_dir}/runs/audit.db",

@@ -15,10 +15,10 @@ from typing import Annotated, ClassVar, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, StrictStr, field_validator, model_validator
 
+from elspeth.contracts import hashing
 from elspeth.contracts.enums import NodeType, RunMode
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
-from elspeth.contracts.hashing import CANONICAL_VERSION
 from elspeth.contracts.json_parser import parse_json_strict
 from elspeth.contracts.security import secret_fingerprint
 from elspeth.core.canonical import stable_hash
@@ -233,7 +233,7 @@ def admit_power_automate_archive(factory: LandscapeReadRepositories, source_run_
     source = factory.run_lifecycle.get_run(source_run_id)
     if source is None or source.status not in (RunStatus.COMPLETED, RunStatus.COMPLETED_WITH_FAILURES, RunStatus.EMPTY):
         raise AuditIntegrityError("power_automate_archive_not_completed")
-    if source.canonical_version != CANONICAL_VERSION:
+    if source.canonical_version != hashing.CANONICAL_VERSION:
         raise AuditIntegrityError("power_automate_archive_canonical_version_invalid")
     settings, error = parse_json_strict(source.settings_json)
     if error is not None or type(settings) is not dict or stable_hash(settings) != source.config_hash:

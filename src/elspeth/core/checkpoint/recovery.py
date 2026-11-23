@@ -23,13 +23,13 @@ from elspeth.contracts import (
     ResumePoint,
     RunStatus,
     SchemaContract,
+    hashing,
 )
 from elspeth.contracts.barrier_scalars import BarrierScalars
 from elspeth.contracts.checkpoint import ResumeRefusalCause
 from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import AuditIntegrityError, EmptyResumeStateError
 from elspeth.contracts.freeze import freeze_fields
-from elspeth.contracts.hashing import CANONICAL_VERSION
 from elspeth.core.checkpoint.compatibility import CheckpointCompatibilityValidator
 from elspeth.core.checkpoint.manager import CheckpointCorruptionError, CheckpointManager
 from elspeth.core.checkpoint.serialization import checkpoint_loads
@@ -205,10 +205,10 @@ def check_run_canonical_version_resumable(db: LandscapeDB, run_id: str) -> Resum
     run = _fetch_run(db, run_id)
     if run is None:
         return ResumeCheck(can_resume=False, reason=f"Run {run_id} not found", cause=ResumeRefusalCause.RUN_NOT_FOUND)
-    if run.canonical_version != CANONICAL_VERSION:
+    if run.canonical_version != hashing.CANONICAL_VERSION:
         return ResumeCheck(
             can_resume=False,
-            reason=f"canonical version changed from {run.canonical_version!r} to {CANONICAL_VERSION!r}",
+            reason=f"canonical version changed from {run.canonical_version!r} to {hashing.CANONICAL_VERSION!r}",
             cause=ResumeRefusalCause.CANONICAL_VERSION_CHANGED,
         )
     return ResumeCheck(can_resume=True)

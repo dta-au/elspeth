@@ -17,7 +17,7 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from elspeth.contracts import RunStatus
+from elspeth.contracts import RunStatus, hashing
 from elspeth.contracts import errors as contract_errors
 from elspeth.contracts.coordination import (
     DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
@@ -25,7 +25,6 @@ from elspeth.contracts.coordination import (
     mint_worker_id,
 )
 from elspeth.contracts.errors import JoinNotReadyError, JoinRefusedError
-from elspeth.contracts.hashing import CANONICAL_VERSION
 from elspeth.core.canonical import stable_hash
 from elspeth.core.config import resolve_config
 from elspeth.core.landscape.factory import LandscapeReadRepositories, RecorderFactory
@@ -56,10 +55,10 @@ class JoinAdmissionService:
         *,
         defer_to_admission_on_dead_leader: bool = True,
     ) -> None:
-        if run.canonical_version != CANONICAL_VERSION:
+        if run.canonical_version != hashing.CANONICAL_VERSION:
             raise JoinRefusedError(
                 run_id,
-                f"canonical version changed from {run.canonical_version!r} to {CANONICAL_VERSION!r}",
+                f"canonical version changed from {run.canonical_version!r} to {hashing.CANONICAL_VERSION!r}",
             )
         recorded_edges = read_factory.data_flow.get_edges(run_id)
         expected_edge_count = len(graph.get_edges())

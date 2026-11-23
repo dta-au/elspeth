@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from elspeth.contracts import hashing
 from elspeth.contracts.coordination import WorkerMembershipToken
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.events import RunStarted
@@ -843,7 +844,7 @@ def test_guardrail_live_owner_persists_four_calls_before_forwarding_telemetry_an
     tmp_path: Path, failure_mode: str | None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     patched_version = "sha256-rfc8785-test"
-    monkeypatch.setattr(bedrock, "CANONICAL_VERSION", patched_version, raising=False)
+    monkeypatch.setattr(hashing, "CANONICAL_VERSION", patched_version)
     from elspeth.plugins.transforms.aws.guardrail_profiles import BedrockGuardrailProfileSettings
     from elspeth.plugins.transforms.aws.guardrails_live_check import run_guardrail_live_check
     from tests.unit.plugins.transforms.aws.test_guardrails_client import CONTENT_FILTERS, response
