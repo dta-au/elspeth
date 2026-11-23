@@ -651,12 +651,20 @@ async def test_retained_history_read_consumes_original_deadline_before_dispatch(
     session = await sessions.create_session("alice", "Existing title", "local")
     authority = app.state.composer_async_operation_authority
     original = authority.list_failure_outcomes
+    original_remaining = composer_turn.ComposerBudgetAnchor.remaining_seconds
+    after_read = False
+
+    def aged(self, *, monotonic_now: float) -> float:
+        return original_remaining(self, monotonic_now=monotonic_now + (1000.0 if after_read else 0.0))
+
+    monkeypatch.setattr(composer_turn.ComposerBudgetAnchor, "remaining_seconds", aged)
     remaining_at_read = []
-    async with _running_job(app, sessions, session.id, kind="compose_message", content="Explain", budget_seconds=0.3) as job:
+    async with _running_job(app, sessions, session.id, kind="compose_message", content="Explain") as job:
 
         def delayed_read(**kwargs):
+            nonlocal after_read
             remaining_at_read.append(job.budget_anchor.remaining_seconds(monotonic_now=time.monotonic()))
-            time.sleep(0.35)
+            after_read = True
             return original(**kwargs)
 
         monkeypatch.setattr(authority, "list_failure_outcomes", delayed_read)
@@ -3049,15 +3057,31 @@ async def test_spent_budget_before_auto_commit_is_the_settlement_timeout_504(tmp
     )
     assert row.pipeline_metadata is not None
     intent = PipelineCommitIntent(proposal_id=row.id, draft_hash=row.pipeline_metadata.draft_hash)
+    original_remaining = composer_turn.ComposerBudgetAnchor.remaining_seconds
+    after_dispatch = False
+
+    def aged(self, *, monotonic_now: float) -> float:
+        return original_remaining(self, monotonic_now=monotonic_now + (1000.0 if after_dispatch else 0.0))
+
+    monkeypatch.setattr(composer_turn.ComposerBudgetAnchor, "remaining_seconds", aged)
+    settlement_calls: list[dict[str, Any]] = []
+    real_settle = composer_turn.settle_auto_commit_intent
+
+    async def spy_settle(**kwargs: Any) -> Any:
+        settlement_calls.append(kwargs)
+        return await real_settle(**kwargs)
+
+    monkeypatch.setattr(composer_turn, "settle_auto_commit_intent", spy_settle)
 
     class _SlowComposer:
         async def compose(self, *args: Any, **kwargs: Any) -> ComposerResult:
+            nonlocal after_dispatch
             del args, kwargs
-            await asyncio.sleep(0.5)
+            after_dispatch = True
             return ComposerResult(message="Too slow.", state=_EMPTY_STATE, pipeline_commit_intent=intent)
 
     app.state.composer_service = _SlowComposer()
-    async with _running_job(app, service, session_id, kind="compose_message", content="Build.", budget_seconds=0.3) as job:
+    async with _running_job(app, service, session_id, kind="compose_message", content="Build.") as job:
         with pytest.raises(HTTPException) as timed_out:
             await _run(app, job)
         assert (await _row(job)).status == "running"
@@ -3065,6 +3089,7 @@ async def test_spent_budget_before_auto_commit_is_the_settlement_timeout_504(tmp
         assert job.observation.audit_cohort_durable is False
 
     assert (timed_out.value.status_code, timed_out.value.detail) == (504, composer_turn._SETTLEMENT_TIMEOUT_DETAIL)
+    assert settlement_calls == []
     assert [proposal.status for proposal in await service.list_composition_proposals(session_id)] == ["pending"]
 
 
