@@ -238,14 +238,13 @@ Never use the question dialog tool.
   approval, such as a one-line go-ahead, record what it covers and which
   open questions it does not settle.
   - Why: paraphrases have been relayed as rulings and had to be withdrawn.
-  - Where: exact words go only in private records (the integration ledger,
-    memory and lane notes). Public tracked text, including this book,
-    paraphrases them and keeps the date [M 2026-11-24].
+  - Where: [M 2026-11-24] exact words go only in private records (the
+    integration ledger, memory and lane notes). Public tracked text,
+    including this book, paraphrases them and keeps their dates.
 - **Ambiguity is asked, not resolved.** When an approval is ambiguous (for
   example, a general approval of additional scope that names no items), ask
-  which items it covers. Do not act on
-  an ambiguous remark. State your reading back to the maintainer and record
-  his confirmation. Before taking an item to him, check any earlier ruling on
+  which items it covers. Do not act on an ambiguous remark. State your
+  reading back to the maintainer and record his confirmation. Before taking an item to him, check any earlier ruling on
   it against source and say what is missing.
 - **First-hand or relayed.** A ruling you heard only through another session
   is logged as "RELAYED by <listed name>; not confirmed first-hand". It
@@ -548,8 +547,8 @@ Never use the question dialog tool.
 **Pushing**
 
 - [M 2026-11-15] There is standing authority to push: get any and all ready
-  code off the box onto GitHub. [M 2026-11-21] He meant publishing the
-  release branch itself, so that work already done is not lost.
+  code off the box onto GitHub. [M 2026-11-21] He meant only publishing
+  the release branch itself; the work already done should not be lost.
 - How: after each verified merge, push the candidate and release branches to
   origin. Plain push only: no force, no PR, not `main`, not another session's
   branch. Ask for anything else. This is stricter than AGENTS.md's leave to
