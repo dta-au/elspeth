@@ -1331,7 +1331,11 @@ def test_a_planner_refusal_names_the_tool_round_whose_arguments_dominate() -> No
 
 
 def _fit_hatch_request(
-    transcript: AdvisorVisibleTranscript, *, earlier_calls: tuple[ComposerLLMCall, ...], policy: ContextBudgetPolicy | None = None
+    transcript: AdvisorVisibleTranscript,
+    *,
+    earlier_calls: tuple[ComposerLLMCall, ...],
+    policy: ContextBudgetPolicy | None = None,
+    shed_all_history: bool = False,
 ) -> tuple[list[dict[str, Any]], ComposerContextBudgetRecord, ContextBudgetPolicy]:
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": "skill"},
@@ -1357,6 +1361,7 @@ def _fit_hatch_request(
         model="test/advisor",
         earlier_calls=earlier_calls,
         mark_for_cache=False,
+        shed_all_history=shed_all_history,
     )
     assert messages == before  # the caller's messages are never shed in place
     return applied, record, policy
@@ -1400,6 +1405,19 @@ def test_transcript_events_shed_on_an_earlier_call_of_the_request_stay_shed_betw
     assert sticky[3]["content"] == _HATCH_TRANSCRIPT_HEADER + transcript.without_events(frozenset({0, 1})).provider_json
     # The rebuilt message's prompt-guard parts describe the content it now carries.
     assert "".join(part.text for part in sticky[3][PROMPT_GUARD_CONTENT_PARTS_KEY]) == sticky[3]["content"]
+
+
+def test_provider_rejection_refit_leaves_out_every_earlier_hatch_event() -> None:
+    transcript, _ = _hatch_message(_AWKWARD_EVENTS, ["authenticated_persisted_history_not_supplied"])
+
+    applied, record, _ = _fit_hatch_request(transcript, earlier_calls=(), shed_all_history=True)
+
+    assert record.shed_hatch_event_indices == transcript.sheddable_event_indices()
+    assert record.retry_after_provider_rejection is True
+    assert (
+        applied[3]["content"]
+        == _HATCH_TRANSCRIPT_HEADER + transcript.without_events(frozenset(transcript.sheddable_event_indices())).provider_json
+    )
 
 
 def test_an_escape_heavy_hatch_event_that_fits_once_shed_is_shed_not_refused() -> None:

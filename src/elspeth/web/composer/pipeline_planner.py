@@ -3488,6 +3488,7 @@ def _fit_planner_context_budget(
     model: str,
     earlier_calls: Sequence[ComposerLLMCall],
     mark_for_cache: bool,
+    shed_all_history: bool = False,
     dialect: ToolContractDialect | None = None,
     shipped_skill_bytes: int = 0,
 ) -> tuple[list[dict[str, Any]], ComposerContextBudgetRecord]:
@@ -3613,6 +3614,9 @@ def _fit_planner_context_budget(
             # Keys no segment carries (a ``tool:`` key, or a ``hatch:`` key of an
             # event of this turn, recorded before those stopped being segments) are inert.
             previously_shed=previously_shed_keys(history, earlier_calls),
+            # After the provider rejected the request as too large, every
+            # earlier turn is left out; nothing of the turn in progress is a segment.
+            held=frozenset(segment.key for segment in segments) if shed_all_history else frozenset(),
             # A request under the byte maximum always goes, as on the compose
             # loop: the estimate decides what is left out, the provider judges
             # its own limit.
@@ -3643,6 +3647,7 @@ def _fit_planner_context_budget(
     shed = frozenset(decision.shed_keys)
     record = replace(
         record,
+        retry_after_provider_rejection=True if shed_all_history else None,
         pricing_mode=decision.pricing.mode,
         authored_bytes=decision.pricing.authored_bytes,
         authored_refuted=decision.pricing.authored_refuted,
@@ -4054,6 +4059,7 @@ async def _plan_pipeline_inner(
         reasoning_effort: str | None = None,
         attempt_phase_hint: ComposerPlannerAttemptPhase = ComposerPlannerAttemptPhase.RESPONSE,
         provider_custody: ProviderCallCustody | None = None,
+        shed_all_history: bool = False,
     ) -> tuple[Any, tuple[_ParsedToolCall, ...], ComposerLLMCall]:
         nonlocal total_calls, total_cost, pending_delivery
         pending_delivery = None
@@ -4089,6 +4095,7 @@ async def _plan_pipeline_inner(
             model=effective_model,
             earlier_calls=recorder.llm_calls,
             mark_for_cache=supports_anthropic_prompt_cache_markers(effective_model),
+            shed_all_history=shed_all_history,
             dialect=effective_dialect,
             shipped_skill_bytes=shipped_skill_bytes,
         )
@@ -4391,6 +4398,35 @@ async def _plan_pipeline_inner(
                     # a first-party fault must retain its original type.
                     raise
                 if is_context_length_rejection(exc):
+                    unshed_history = request_conversation_context is not None and (
+                        any(
+                            request.history_index not in context_budget.shed_history_indices
+                            for request in request_conversation_context.prior_user_requests
+                        )
+                        or any(
+                            reply.history_index not in context_budget.shed_history_indices
+                            for reply in request_conversation_context.prior_assistant_messages
+                        )
+                    )
+                    unshed_hatch = hatch_transcript is not None and any(
+                        index not in context_budget.shed_hatch_event_indices for index in hatch_transcript.sheddable_event_indices()
+                    )
+                    if (unshed_history or unshed_hatch) and not shed_all_history:
+                        # The provider judged the request too large while an
+                        # earlier turn was still in it: fit the request again
+                        # with every earlier turn left out and send once more,
+                        # as a new call with its own record and manifest. Its
+                        # own ordinary retries are counted afresh; the provider
+                        # call cap and the deadline still bound it.
+                        return await call_model_body(
+                            model_override=model_override,
+                            tools_override=tools_override,
+                            allow_text_reply=allow_text_reply,
+                            reasoning_effort=reasoning_effort,
+                            attempt_phase_hint=attempt_phase_hint,
+                            provider_custody=provider_custody,
+                            shed_all_history=True,
+                        )
                     # The gateway or the model refused the request as over its
                     # context limit. That is the size refusal it is, naming the
                     # provider as the ceiling, never a provider outage; sized on

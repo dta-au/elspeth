@@ -3,8 +3,9 @@
 The token estimate decides what the planner leaves out, never whether its
 request is sent: the byte maximum is the only limit that stops it, as on the
 compose loop. When the model gateway rejects a sent request as over the
-model's context limit, the planner raises the context budget refusal naming
-the provider as the ceiling, and the rejected call is recorded by its closed
+model's context limit, the planner leaves out any earlier turns and resends
+once. A further rejection raises the context budget refusal naming the
+provider as the ceiling, and each rejected call is recorded by its closed
 reason. A rejection that is not recognised as size stays a provider failure.
 
 Each test drives the real planner against a scripted ``litellm.acompletion``
@@ -35,7 +36,7 @@ from elspeth.web.composer.pipeline_planner import PipelinePlannerError, PlannerD
 from elspeth.web.composer.tools import ToolContext
 from elspeth.web.sessions.routes._helpers import _FREEFORM_PLANNER_FAILURE_HTTP, _freeform_planner_failure_code
 from tests.unit.web.composer.test_pipeline_planner import _context_policy, _plan, _ScriptedCompletion, _text_response
-from tests.unit.web.composer.test_planner_context_budget import _context, _decline, _sent_bytes
+from tests.unit.web.composer.test_planner_context_budget import _context, _decline, _payload, _sent_bytes, _sent_matches_record
 
 _FALLBACK_RATIO = 1.0  # ``_context_policy`` prices every byte at one token
 _OVERSIZED_INTENT = "Build this: " + "z" * 150_000
@@ -216,7 +217,7 @@ _LENGTH_REJECTIONS = [
 async def test_a_gateway_length_rejection_on_the_planner_path_is_the_size_refusal_naming_the_provider(
     tmp_path: Path, tool_context: ToolContext, rejection: Callable[[], BaseException]
 ) -> None:
-    completion = _ScriptedCompletion(rejection(), _text_response("Must not be retried."))
+    completion = _ScriptedCompletion(rejection(), rejection())
     recorder = BufferingRecorder()
 
     refusal = await _plan_once(tmp_path, tool_context, completion, recorder)
@@ -224,10 +225,9 @@ async def test_a_gateway_length_rejection_on_the_planner_path_is_the_size_refusa
     assert refusal.code == ComposerPlannerCode.CONTEXT_BUDGET_EXHAUSTED.value
     assert refusal.detail_codes[0] == "context_ceiling_provider"
     assert refusal.detail_codes[1].startswith("largest_component_")
-    # Sent once and not retried: a length rejection is not transient.
-    assert len(completion.requests) == 1
-    (call,) = recorder.llm_calls
-    assert call.status is ComposerLLMCallStatus.BAD_REQUEST_ERROR
+    assert len(completion.requests) == 2
+    call = recorder.llm_calls[-1]
+    assert all(row.status is ComposerLLMCallStatus.BAD_REQUEST_ERROR for row in recorder.llm_calls)
     # Recorded by its closed reason, never by provider text.
     assert call.error_message == "context_length_exceeded"
     assert call.context_budget is not None and call.context_budget.over_estimate is False
@@ -235,6 +235,46 @@ async def test_a_gateway_length_rejection_on_the_planner_path_is_the_size_refusa
     assert _CANARY not in canonical_json(call.to_dict())
     # The user is given the size refusal (the route picks the provider sentence for this ceiling).
     assert _freeform_planner_failure_code(refusal) == "context_budget_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_planner_resends_size_rejection_with_all_earlier_turns_left_out(tmp_path: Path, tool_context: ToolContext) -> None:
+    rejection = ContextWindowExceededError(message="prompt is too long", model="test-model", llm_provider="anthropic")
+    completion = _ScriptedCompletion(rejection, _text_response("Which output format do you want?"))
+    recorder = BufferingRecorder()
+
+    with pytest.raises(PlannerDeclined):
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            recorder=recorder,
+            conversation_context=_context(users={0: "Build CSV to JSON."}, assistants={1: "Keep every row."}),
+            model_overrides={"max_api_attempts": 1},
+        )
+
+    assert len(completion.requests) == len(recorder.llm_calls) == 2
+    assert _payload(completion.requests[0])["conversation_context"]["prior_user_requests"]
+    resent_context = _payload(completion.requests[1])["conversation_context"]
+    assert resent_context["prior_user_requests"] == []
+    assert "prior_assistant_messages" not in resent_context
+    assert recorder.llm_calls[1].context_budget is not None
+    assert recorder.llm_calls[1].context_budget.shed_history_indices == (0, 1)
+    for request, call in zip(completion.requests, recorder.llm_calls, strict=True):
+        _sent_matches_record(request, call)
+
+
+@pytest.mark.asyncio
+async def test_planner_size_rejection_without_earlier_turns_is_not_resent(tmp_path: Path, tool_context: ToolContext) -> None:
+    rejection = ContextWindowExceededError(message="prompt is too long", model="test-model", llm_provider="anthropic")
+    completion = _ScriptedCompletion(rejection)
+    recorder = BufferingRecorder()
+
+    with pytest.raises(PipelinePlannerError) as caught:
+        await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, recorder=recorder)
+
+    assert caught.value.code == ComposerPlannerCode.CONTEXT_BUDGET_EXHAUSTED.value
+    assert len(completion.requests) == 1
 
 
 @pytest.mark.asyncio
