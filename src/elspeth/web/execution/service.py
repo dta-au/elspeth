@@ -24,12 +24,13 @@ from collections.abc import Callable, Coroutine, Mapping, Sequence
 from concurrent.futures import CancelledError as FutureCancelledError
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path, PurePath
-from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
+from types import CoroutineType, MappingProxyType
+from typing import TYPE_CHECKING, Any, Final, Literal, TypeVar, cast
 from uuid import UUID
 
 import structlog
@@ -229,7 +230,7 @@ from elspeth.web.sessions.protocol import (
     SessionRunStatus,
     SessionServiceProtocol,
 )  # B1: canonical definition
-from elspeth.web.sessions.telemetry import _SessionsTelemetry
+from elspeth.web.sessions.telemetry import _Counter, _SessionsTelemetry
 
 if TYPE_CHECKING:
     from elspeth.core.landscape.database import LandscapeDB
@@ -552,6 +553,95 @@ def _build_web_plugin_policy_evidence(
 
 
 T = TypeVar("T")
+
+#: How long one wait on the event loop lasts before the bridge rechecks that the loop is still running.
+_LOOP_BRIDGE_SLICE_SECONDS: Final[float] = 0.25
+#: A bridged call still waiting after this long is counted once in telemetry.
+_LOOP_BRIDGE_SLOW_SECONDS: Final[float] = 30.0
+#: A bridged call still waiting after this long is given up on. The pipeline
+#: thread then stops work on the run and writes nothing more; run recovery
+#: settles the run from the audit store. Changing the bound changes only this value.
+_LOOP_BRIDGE_GIVE_UP_SECONDS: Final[float] = 60.0
+
+
+class RunBridgeUnsettledError(RuntimeError):
+    """A call from a pipeline thread to the event loop ended with its outcome unknown.
+
+    ``reason`` is ``"gave_up"`` (the loop was alive and the call outlasted
+    ``_LOOP_BRIDGE_GIVE_UP_SECONDS``) or ``"loop_stopped"``. Whether the call
+    took effect is not known, so the thread must not act as if it failed.
+
+    Deliberately not an ``OSError`` or ``TimeoutError``: the failure-path
+    handlers treat those as a transient store fault and carry on writing.
+    """
+
+    def __init__(self, reason: Literal["gave_up", "loop_stopped"], *, operation: str) -> None:
+        self.reason = reason
+        self.operation = operation
+        cause = "was still running when the wait was given up" if reason == "gave_up" else "was cut off when the event loop stopped"
+        super().__init__(f"{operation} {cause}; whether it took effect is unknown")
+
+
+@dataclass(slots=True)
+class _BridgedRun:
+    """What the bridge knows about the run its calling thread is working on."""
+
+    run_id: str
+    #: Set by the first call that ends unsettled. Every later call for this run is refused unsent.
+    unsettled: RunBridgeUnsettledError | None = None
+
+
+#: The run whose pipeline thread is making bridged calls. Other threads have none.
+_BRIDGED_RUN: ContextVar[_BridgedRun | None] = ContextVar("elspeth_bridged_run", default=None)
+
+
+def _bridged_operation_name(coro: Coroutine[Any, Any, Any]) -> str:
+    if type(coro) is CoroutineType:
+        return coro.__qualname__
+    return type(coro).__name__
+
+
+def _run_on_loop[R](coro: Coroutine[Any, Any, R], loop: asyncio.AbstractEventLoop, slow_calls: _Counter) -> R:
+    """Schedule ``coro`` on ``loop`` from another thread and wait for its real end.
+
+    The wait is not abandoned for being slow. It ends without a result in two
+    cases only, both with ``RunBridgeUnsettledError``: the loop stopped, or the
+    call outlasted the give-up bound. Either way the future is cancelled, and
+    the run is marked so that no later call for it is sent.
+    """
+    run = _BRIDGED_RUN.get()
+    operation = _bridged_operation_name(coro)
+    if run is not None and run.unsettled is not None:
+        coro.close()
+        raise RunBridgeUnsettledError(run.unsettled.reason, operation=operation) from run.unsettled
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
+    started = time.monotonic()
+    slow_reported = False
+    while True:
+        try:
+            return future.result(timeout=_LOOP_BRIDGE_SLICE_SECONDS)
+        except TimeoutError:
+            if future.done():
+                # The awaited call ended with a timeout of its own; this
+                # re-raises it. Only a slice that ran out means "still running".
+                return future.result()
+        waited = time.monotonic() - started
+        reason: Literal["gave_up", "loop_stopped"] | None = None
+        if loop.is_closed() or not loop.is_running():
+            reason = "loop_stopped"
+        elif waited >= _LOOP_BRIDGE_GIVE_UP_SECONDS:
+            reason = "gave_up"
+        if reason is not None:
+            if future.done():
+                return future.result()
+            future.cancel()
+            unsettled = RunBridgeUnsettledError(reason, operation=operation)
+            if run is not None:
+                run.unsettled = unsettled
+            raise unsettled
+        if not slow_reported and waited >= _LOOP_BRIDGE_SLOW_SECONDS:
+            slow_reported = True
+            slow_calls.add(1, attributes={"run_id": "" if run is None else run.run_id, "operation": operation})
 
 
 def _state_has_secret_ref_sites(state: CompositionState, env_ref_names: frozenset[str]) -> bool:
@@ -1905,12 +1995,15 @@ class ExecutionServiceImpl:
         in a ThreadPoolExecutor worker thread. This helper schedules the
         coroutine on the main event loop and blocks until it completes.
 
-        R6 fix: 30-second timeout prevents indefinite hangs if the event loop
-        cannot run the scheduled coroutine during shutdown or another
-        infrastructure stall.
+        The wait lasts as long as the loop can still run the call. A caller
+        that gave up while the coroutine kept running would act on a result it
+        never saw: the pipeline thread would record the run as failed and the
+        abandoned call could still write its own outcome afterwards. The wait
+        ends without a result only when the loop is closed or stopped, or
+        after ``_LOOP_BRIDGE_GIVE_UP_SECONDS``, with ``RunBridgeUnsettledError``.
+        A wait past ``_LOOP_BRIDGE_SLOW_SECONDS`` is counted once and continues.
         """
-        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return future.result(timeout=30.0)
+        return _run_on_loop(coro, self._loop, self._telemetry.execution_loop_bridge_slow_total)
 
     def get_live_run_ids(self) -> frozenset[str]:
         """Return run IDs still owned by an executor thread.
@@ -3719,6 +3812,10 @@ class ExecutionServiceImpl:
         prompt_snapshots: tuple[PromptReviewSnapshot, ...] = ()
         outputs_finalized = False
         terminal_event_persisted = False
+        # Not reset: this thread runs pipelines only, the cleanup below still
+        # bridges calls for this run, and the next run sets its own.
+        bridged_run = _BridgedRun(run_id)
+        _BRIDGED_RUN.set(bridged_run)
         try:
             session_operation_lease.guard_external_effect()
             approval_inputs: ApprovalGateInputs | None = None
@@ -4890,6 +4987,12 @@ class ExecutionServiceImpl:
             return None
 
         except GracefulShutdownError as gse:
+            if bridged_run.unsettled is not None:
+                # A call to the session store ended with its outcome unknown.
+                # Whatever reached this handler, and however it was wrapped on
+                # the way, this thread must not record an outcome for the run:
+                # recovery settles it from the audit store.
+                raise
             # Orchestrator detected shutdown during processing and raised
             # after flushing in-progress work. Finalize → status → broadcast.
             outputs_finalized = self._finalize_output_blobs(
@@ -4934,6 +5037,9 @@ class ExecutionServiceImpl:
             return _RUN_PIPELINE_GRACEFUL_SHUTDOWN_HANDLED
 
         except BaseException as exc:
+            if bridged_run.unsettled is not None:
+                # As above: no failure handling while a call's outcome is unknown.
+                raise
             if admission_refusal_pending:
                 # The terminal refusal is already durable; preserve its pending
                 # reconciliation marker so a peer retries failed cleanup.

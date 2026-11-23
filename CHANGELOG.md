@@ -544,6 +544,15 @@ Behaviour you will see:
   finalization members are copied only when recovery rebinds their ordinal and
   their output data is frozen once; gates hand their input token on instead of
   copying it.
+- Fixed: a web run whose final status write to the session store took
+  longer than 30 seconds could be recorded as failed although its pipeline
+  had completed. The run thread now waits for the write's real result. If a
+  write has still not finished after 60 seconds, or the server's event loop
+  has stopped, the thread records nothing further for that run and the
+  existing run recovery sets the status from the audit trail, at the next
+  recovery pass or at startup. Until then the run shows as running. A new
+  telemetry counter, `execution.loop_bridge_slow_total`, counts waits over 30
+  seconds.
 
 ### Operations and LLM gateway
 
