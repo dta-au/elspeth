@@ -1,7 +1,10 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, expect, it, vi } from "vitest";
-import { fetchCompositionState, readPromptFileText, savePromptFile } from "@/api/client";
+import { fetchCompositionState, listBlobs, readPromptFileText, savePromptFile } from "@/api/client";
+import { BlobListTruncatedError } from "@/api/blobListing";
+import { makeSessionBlobs } from "@/test/blobListRouteDouble";
 import { useBlobStore } from "@/stores/blobStore";
+import { usePromptDraftStore } from "@/stores/promptDraftStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import type { BlobMetadata } from "@/types/api";
 import type { CompositionState } from "@/types/api";
@@ -18,6 +21,7 @@ function PromptFileEditors({ nodeId, options }: { nodeId: string; options: Recor
 
 vi.mock("@/api/client", () => ({
   fetchCompositionState: vi.fn(),
+  listBlobs: vi.fn(),
   readPromptFileText: vi.fn(),
   savePromptFile: vi.fn(),
 }));
@@ -32,6 +36,54 @@ beforeEach(() => {
   vi.mocked(readPromptFileText).mockResolvedValue({ text: "first line\n  second line\n", sha256: "a".repeat(64) });
   vi.mocked(savePromptFile).mockResolvedValue({ changed: true, content_sha256: "b".repeat(64) });
   vi.mocked(fetchCompositionState).mockResolvedValue(null);
+  // Background list reads fail unless a test stubs them, as before listBlobs was mocked here.
+  vi.mocked(listBlobs).mockRejectedValue(new Error("listBlobs not stubbed"));
+});
+
+it.each([
+  ["failed", new Error("Network error")],
+  ["truncated", new BlobListTruncatedError(makeSessionBlobs("session-1", 1))],
+] as const)("shows file names as unavailable without a Read only tag after a %s list read", async (_outcome, error) => {
+  const options = { prompt_template: { mode: "inline_content", blob_ref: "blob-1", sha256: "a".repeat(64) } };
+  useSessionStore.setState({
+    compositionState: { sources: {}, outputs: [], nodes: [{ id: "first", plugin: "llm", options }] } as unknown as CompositionState,
+  });
+  vi.mocked(listBlobs).mockRejectedValueOnce(error);
+  const store = useBlobStore.getState();
+  await store.loadBlobs("session-1");
+  store.requestPromptEdit("first", "prompt_template");
+
+  render(<PromptFileEditors nodeId="first" options={options} />);
+
+  const editor = await screen.findByRole("textbox", { name: /Edit prompt file/ });
+  expect(editor).toHaveAccessibleName(/File name unavailable/);
+  expect(editor).not.toHaveAccessibleName(/File not in this session/);
+  expect(screen.getByRole("note")).toHaveTextContent("File names are unavailable.");
+  expect(screen.queryByText("This file is not in this session.")).not.toBeInTheDocument();
+  expect(screen.queryByText("Read only")).not.toBeInTheDocument();
+});
+
+it("blocks saving an unsaved draft while checking files in the session", async () => {
+  const blobId = "blob-1";
+  const baseSha256 = "a".repeat(64);
+  const baseText = "first line\n  second line\n";
+  const slot = { sessionId: "session-1", nodeId: "first", fieldPath: "prompt_template" };
+  const options = { prompt_template: { mode: "inline_content", blob_ref: blobId, sha256: baseSha256 } };
+  useSessionStore.setState({
+    compositionState: { sources: {}, outputs: [], nodes: [{ id: slot.nodeId, plugin: "llm", options }] } as unknown as CompositionState,
+  });
+  useBlobStore.setState({ activeSessionId: slot.sessionId, blobs: [], isLoading: true, editRequest: null });
+  usePromptDraftStore.getState().edit(slot, { blobId, baseSha256, baseText }, "my draft");
+
+  await act(async () => {
+    render(<PromptFileEditors nodeId={slot.nodeId} options={options} />);
+  });
+
+  expect(screen.getByRole("textbox", { name: /Edit prompt file/ })).toHaveValue("my draft");
+  expect(screen.getByRole("note")).toHaveTextContent("Checking files in this session.");
+  expect(screen.queryByText("Read only")).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+  expect(screen.queryByText("This file is not in this session.")).not.toBeInTheDocument();
 });
 
 it("starts collapsed and opens the requested slot with keyboard focus", async () => {

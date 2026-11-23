@@ -1,5 +1,6 @@
 import { act, render, screen } from "@testing-library/react";
-import { beforeEach, expect, it, vi } from "vitest";
+import { beforeEach, expect, it, onTestFinished, vi } from "vitest";
+import * as api from "@/api/client";
 import { useBlobStore } from "@/stores/blobStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import type { BlobMetadata } from "@/types/api";
@@ -32,4 +33,15 @@ it("distinguishes loading, missing, and another session", () => {
   rerender(<BlobFileName blobId="missing" />);
   expect(screen.getByText("Loading file name…")).toBeInTheDocument();
   expect(screen.queryByText("wrong.md")).not.toBeInTheDocument();
+});
+
+it("uses the unavailable name as the default fallback after a failed list read", async () => {
+  const list = vi.spyOn(api, "listBlobs").mockRejectedValueOnce(new Error("Network error"));
+  onTestFinished(() => { list.mockRestore(); });
+  await useBlobStore.getState().loadBlobs("session-1");
+
+  render(<BlobFileName blobId="missing" />);
+
+  expect(screen.getByText("File name unavailable")).toBeInTheDocument();
+  expect(screen.queryByText("File not in this session")).not.toBeInTheDocument();
 });

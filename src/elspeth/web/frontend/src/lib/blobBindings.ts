@@ -130,14 +130,15 @@ export function isPromptTextMimeType(mimeType: string): boolean {
 }
 
 /**
- * Display mirror of the save route's refusals (blobs/prompt_text_routes.py);
- * the server remains the save authority. Not mirrored, because only the
- * server can see it: whether the step's last approvals still cover its whole
- * prompt surface (`prompt_file_stale` on save).
+ * Display pre-check for the save route's refusals (blobs/prompt_text_routes.py).
+ * An incomplete list is a client-only refusal. The server remains the save
+ * authority and alone can tell whether the step's last approvals still cover
+ * its whole prompt surface (`prompt_file_stale` on save).
  */
-export function promptFileEditability({ state, blobs, pendingEvents, nodeId, fieldPath, blobId }: {
+export function promptFileEditability({ state, blobs, listIncomplete, pendingEvents, nodeId, fieldPath, blobId }: {
   state: CompositionState | null;
   blobs: readonly BlobMetadata[];
+  listIncomplete: boolean;
   pendingEvents: readonly InterpretationEvent[];
   nodeId: string;
   fieldPath: string;
@@ -146,7 +147,11 @@ export function promptFileEditability({ state, blobs, pendingEvents, nodeId, fie
   const refuse = (code: string, reason: string, opens = true): PromptFileEditability => ({ editable: false, code, reason, opens });
   const id = blobId.toLowerCase();
   const blob = blobs.find((item) => item.id.toLowerCase() === id);
-  if (!blob) return refuse("prompt_file_not_found", "This file is not in this session.", false);
+  if (!blob) {
+    return listIncomplete
+      ? refuse("prompt_file_list_incomplete", "File names are unavailable.", false)
+      : refuse("prompt_file_not_found", "This file is not in this session.", false);
+  }
   if (blob.status !== "ready") return refuse("prompt_file_not_ready", "This file is still being processed.", false);
   if (!EDITABLE_MIME_TYPES.has(blob.mime_type)) return refuse("prompt_file_not_text", "Only UTF-8 text files can be edited here.", false);
   if (state === null) return { editable: true };

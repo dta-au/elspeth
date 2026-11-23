@@ -257,6 +257,23 @@ describe("file-backed option values", () => {
     expect(useBlobStore.getState().revealRequest).toBeNull();
   });
 
+  it("names a bound prompt file as unavailable after a failed list read", async () => {
+    const list = vi.spyOn(api, "listBlobs").mockRejectedValueOnce(new Error("Network error"));
+    onTestFinished(() => { list.mockRestore(); });
+    const options = { prompt_template: { blob_ref: FILE_ID, mode: "inline_content", sha256: FILE_HASH } };
+    useSessionStore.setState({
+      compositionState: { sources: {}, outputs: [], nodes: [{ id: "llm", plugin: "llm", options }] } as unknown as CompositionState,
+    });
+    await useBlobStore.getInitialState().loadBlobs("session-1");
+    render(<OptionRows options={options} ariaLabel="inspector options" plugin={{ kind: "transform", name: "llm" }} slotActions={{ nodeId: "llm" }} />);
+
+    const show = screen.getByRole("button", { name: "Show in files: File name unavailable (User prompt)" });
+    const edit = screen.getByRole("button", { name: "Edit File name unavailable (User prompt)" });
+    expect(show).toHaveAccessibleDescription("File names are unavailable.");
+    expect(edit).toHaveAccessibleDescription("File names are unavailable.");
+    expect(screen.queryByText("This file is not in this session.")).not.toBeInTheDocument();
+  });
+
   it("describes an in-flight file lookup without prematurely claiming the file is missing", () => {
     useBlobStore.setState({ activeSessionId: "session-1", blobs: [], isLoading: true });
     render(<OptionRows options={{ prompt_template: { blob_ref: FILE_ID, mode: "inline_content", sha256: FILE_HASH } }}

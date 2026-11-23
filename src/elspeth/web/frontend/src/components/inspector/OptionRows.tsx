@@ -213,6 +213,7 @@ function PromptSlotActions({ value, nodeId, fieldPath, label, showInFiles }: {
   const blobs = useBlobStore((state) => state.blobs);
   const blobSessionId = useBlobStore((state) => state.activeSessionId);
   const isLoading = useBlobStore((state) => state.isLoading);
+  const listError = useBlobStore((state) => state.activeSessionId === sessionId ? state.listError : null);
   const pending = useInterpretationEventsStore((state) => sessionId ? state.pendingBySession[sessionId] : undefined);
   // Show in files needs a mounted file manager to reveal into: a host
   // registers itself (ChatPanel, wherever it can render BlobManager). The
@@ -221,20 +222,22 @@ function PromptSlotActions({ value, nodeId, fieldPath, label, showInFiles }: {
   if (!isRecord(value) || value.mode !== "inline_content" || typeof value.blob_ref !== "string" || sessionId === null) return null;
   return <BoundPromptActions blobId={value.blob_ref} nodeId={nodeId} fieldPath={fieldPath} label={label}
     sessionId={sessionId} state={compositionState} blobs={blobSessionId === sessionId ? blobs : []}
-    loading={blobSessionId !== sessionId || isLoading} pendingEvents={Object.values(pending ?? {})}
+    loading={blobSessionId !== sessionId || isLoading} listIncomplete={listError !== null} pendingEvents={Object.values(pending ?? {})}
     showInFiles={showInFiles && fileManagerReachable} />;
 }
 
-function BoundPromptActions({ blobId, nodeId, fieldPath, label, sessionId, state, blobs, loading, pendingEvents, showInFiles }: {
+function BoundPromptActions({ blobId, nodeId, fieldPath, label, sessionId, state, blobs, loading, listIncomplete, pendingEvents, showInFiles }: {
   blobId: string; nodeId: string; fieldPath: string; label: string; sessionId: string; showInFiles: boolean;
   state: ReturnType<typeof useSessionStore.getState>["compositionState"];
   blobs: ReturnType<typeof useBlobStore.getState>["blobs"];
   loading: boolean;
+  listIncomplete: boolean;
   pendingEvents: ReturnType<typeof useInterpretationEventsStore.getState>["resolvedBySession"][string];
 }): JSX.Element {
-  const filename = useBlobFilename(blobId) ?? (loading ? "Loading file name…" : "File not in this session");
+  const filename = useBlobFilename(blobId) ?? (loading ? "Loading file name…"
+    : listIncomplete ? "File name unavailable" : "File not in this session");
   const present = blobs.some((blob) => blob.id.toLowerCase() === blobId.toLowerCase());
-  const editability = promptFileEditability({ state, blobs, pendingEvents, nodeId, fieldPath, blobId });
+  const editability = promptFileEditability({ state, blobs, listIncomplete, pendingEvents, nodeId, fieldPath, blobId });
   const checking = loading && !present;
   const editReason = checking ? "Checking files in this session." : editability.editable ? null : editability.reason;
   // Edit is a no-op only when there is no prompt text to show (file missing,
@@ -257,7 +260,7 @@ function BoundPromptActions({ blobId, nodeId, fieldPath, label, sessionId, state
         onClick={(event) => { if (present) useBlobStore.getState().revealBlob(sessionId, blobId, filename, event.currentTarget); }}>
         Show in files
       </Button>
-      {!present && <span id={missingReasonId} className="prompt-slot-reason">{loading ? "Checking files in this session." : "This file is not in this session."}</span>}
+      {!present && <span id={missingReasonId} className="prompt-slot-reason">{editReason}</span>}
     </>}
     {/* data-prompt-edit-slot: the editor returns focus here when it closes. */}
     <Button type="button" variant="ghost" compact aria-label={`Edit ${filename} (${label})`}
