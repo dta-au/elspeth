@@ -43,7 +43,8 @@ it("starts collapsed and opens the requested slot with keyboard focus", async ()
   expect(document.querySelector(".prompt-editor")).toBeNull();
   act(() => useBlobStore.getState().requestPromptEdit("first", "prompt_template"));
   const editor = await screen.findByRole("textbox", { name: /Edit prompt file/ });
-  expect(editor).toHaveFocus();
+  // The textarea appears disabled while the file loads; focus follows the loaded text.
+  await waitFor(() => expect(editor).toHaveFocus());
   expect(useBlobStore.getState().editRequest).toBeNull();
   fireEvent.click(screen.getByRole("button", { name: "Close" }));
   expect(screen.queryByRole("textbox", { name: /Edit prompt file/ })).not.toBeInTheDocument();
