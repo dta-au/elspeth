@@ -978,6 +978,37 @@ async def test_advisor_size_resend_of_a_format_reprompt_keeps_the_reprompt(tmp_p
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "script",
+    [["size", "junk", "junk", "ok"], ["junk", "size", "junk", "ok"], ["size", "junk", "size", "ok"]],
+    ids=["resend-then-two-rejected-texts", "resend-of-the-reprompt-rejected", "second-size-rejection"],
+)
+async def test_an_advisor_pass_makes_at_most_three_provider_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, script: list[str]
+) -> None:
+    # Two ordinary attempts and one size resend. A fourth call would succeed,
+    # so only the loop's own bound stops it; the pass record schema allows 3.
+    from elspeth.web.composer import advisor_checkpoint
+    from tests.unit.web.composer._helpers import _empty_state
+
+    records: list[Any] = []
+
+    async def capture(**kwargs: Any) -> None:
+        records.append(kwargs["record"])
+
+    monkeypatch.setattr(advisor_checkpoint, "persist_advisor_checkpoint_pass", capture)
+    sent = _scripted_advisor(monkeypatch, script)
+    verdict = await _owner(tmp_path)._run_advisor_checkpoint(
+        phase="end", state=_empty_state(), session_id=None, recorder=BufferingRecorder(), publication_review=_review(_probe(8))
+    )
+
+    assert verdict.ok is False
+    assert len(sent) == 3
+    (record,) = records
+    assert record.provider_attempts == 3
+
+
+@pytest.mark.asyncio
 async def test_an_editing_turn_over_its_estimate_sends_the_review_and_publishes_the_admitted_reply(
     monkeypatch: pytest.MonkeyPatch, make_service: Any, simple_state: Any
 ) -> None:
