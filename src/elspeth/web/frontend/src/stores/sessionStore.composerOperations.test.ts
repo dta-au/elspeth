@@ -1,10 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createElement } from "react";
+import { act, render, screen } from "@testing-library/react";
 import { useSessionStore } from "./sessionStore";
 import { useAuthStore } from "./authStore";
+import { useBlobStore } from "./blobStore";
 import { COMPOSER_STOP_KEY, COMPOSER_CUSTODY_KEY, COMPOSER_CUSTODY_LIFETIME_MS, attachComposerObserver, settleComposerCustody, acquireComposerOperationCustody, authenticateComposerCustody, findComposerOperationCustody, purgeComposerCustody } from "./composerOperationCustody";
 import { detachComposerObservers } from "@/api/composerOperationObserver";
 import { advanceAuthGeneration } from "@/api/authSession";
 import { compositionStateAuthorityFields } from "@/test/composerFixtures";
+import { makeSessionBlobs } from "@/test/blobListRouteDouble";
+import { BlobFileName } from "@/components/blobs/BlobFileName";
+import type { BlobMetadata } from "@/types/api";
 import type { ComposerOperationSnapshot, ComposerOperationFailureOutcome, ComposerOperationFailurePage } from "@/types/composerOperations";
 import type { ChatMessage, CompositionState, CompositionProposal } from "@/types/index";
 vi.mock("@/api/client", () => ({ submitComposerOperation: vi.fn(), fetchComposerOperation: vi.fn(), fetchComposerOperationFailures: vi.fn(), cancelComposerOperation: vi.fn(), fetchComposerOperationStream: vi.fn(), apiErrorFromBody: vi.fn(), composerActiveOperation: vi.fn(), isDefinitiveComposerRefusal: vi.fn(), fetchMessages: vi.fn(), fetchCompositionState: vi.fn(), fetchCompositionProposals: vi.fn(), fetchComposerPreferences: vi.fn(), revertToVersion: vi.fn(), fetchStateVersions: vi.fn(), fetchSessions: vi.fn(), fetchCurrentUser: vi.fn(), fetchAuthConfig: vi.fn(), listBlobs: vi.fn(), listInterpretationEvents: vi.fn() }));
@@ -131,6 +137,60 @@ describe("authenticated retained operation outcomes", () => {
 });
 
 describe("terminal publication before optional reads", () => {
+  it("withholds file absence claims until the post-terminal list read settles", async () => {
+    const [prompt] = makeSessionBlobs(sid, 1);
+    await useBlobStore.getState().loadBlobs(sid);
+    const wasCurrent = useBlobStore.getState().listCurrent;
+    expect(api.listBlobs).toHaveBeenCalledTimes(1);
+    vi.mocked(api.listBlobs).mockClear();
+    const next = { ...composition(2), id: userId };
+    next.nodes = [{
+      id: "classify", node_type: "transform", plugin: "llm", input: "rows", on_success: "out", on_error: null,
+      options: { prompt_template: { blob_ref: prompt.id, mode: "inline_content", sha256: prompt.content_hash } },
+    }];
+    vi.mocked(api.fetchComposerOperation).mockImplementation(async (_session, operationId) => ({
+      ...snapshot(operationId), result: { message: assistant, state: next, proposals: [] },
+    }));
+    let releaseRefreshes!: () => void;
+    let proposalsStarted!: () => void;
+    const holdRefreshes = new Promise<void>((resolve) => { releaseRefreshes = resolve; });
+    const readingProposals = new Promise<void>((resolve) => { proposalsStarted = resolve; });
+    vi.mocked(api.fetchMessages).mockImplementationOnce(async () => { await holdRefreshes; return [assistant]; });
+    vi.mocked(api.fetchCompositionState).mockImplementationOnce(async () => { await holdRefreshes; return next; });
+    vi.mocked(api.fetchCompositionProposals).mockImplementationOnce(async () => {
+      proposalsStarted();
+      await holdRefreshes;
+      return [];
+    });
+
+    let resolveList!: (blobs: BlobMetadata[]) => void;
+    const pendingList = new Promise<BlobMetadata[]>((resolve) => { resolveList = resolve; });
+    vi.mocked(api.listBlobs).mockReturnValueOnce(pendingList);
+    const sending = useSessionStore.getState().sendMessage("Attach a new prompt");
+
+    try {
+      await readingProposals;
+      expect(useSessionStore.getState().compositionState).toEqual(next);
+      render(createElement(BlobFileName, { blobId: prompt.id }));
+      expect(screen.queryByText("File not in this session")).not.toBeInTheDocument();
+      expect(screen.getByText("Loading file name…")).toBeInTheDocument();
+      expect(wasCurrent).toBe(true);
+      expect(useBlobStore.getState().listCurrent).toBe(false);
+      expect(api.listBlobs).not.toHaveBeenCalled();
+
+      await act(async () => { releaseRefreshes(); await sending; });
+      expect(api.listBlobs).toHaveBeenCalledTimes(1);
+      expect(api.listBlobs).toHaveBeenCalledWith(sid);
+
+      await act(async () => { resolveList([prompt]); });
+      expect(screen.getByText(`File: ${prompt.filename}`)).toBeInTheDocument();
+      expect(useBlobStore.getState().listCurrent).toBe(true);
+      expect(api.listBlobs).toHaveBeenCalledTimes(1);
+    } finally {
+      await act(async () => { releaseRefreshes(); resolveList([prompt]); await sending; });
+    }
+  });
+
   it.each(["failed", "completed"] as const)("rejects a stale attached winner's %s terminal after navigation", async (status) => {
     const winnerId = "66666666-6666-4666-8666-666666666666";
     const refusal = { status: 409, error_type: "composer_operation_active", operation_id: winnerId, kind: "compose_message" };

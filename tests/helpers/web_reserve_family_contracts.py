@@ -1133,7 +1133,7 @@ def _renew_contract():
                                                 n("renewed"),
                                                 await_(
                                                     call(
-                                                        "run_stream_read_in_worker",
+                                                        "run_lease_upkeep_in_worker",
                                                         a(s("_authority"), "renew"),
                                                         s("_context"),
                                                         lease_seconds=s("_lease_seconds"),
@@ -1216,7 +1216,7 @@ def _renew_contract():
                                         n("renewed"),
                                         await_(
                                             call(
-                                                "run_stream_read_in_worker",
+                                                "run_lease_upkeep_in_worker",
                                                 a(s("_authority"), "renew_fork_child_lease"),
                                                 s("_fork_authority"),
                                                 lease_seconds=s("_lease_seconds"),

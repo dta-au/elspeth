@@ -550,6 +550,7 @@ async function runDurableComposerTurn(descriptor: OperationCustody, localMessage
   }
   // An authenticated terminal is already known. Optional reads may enrich it,
   // but neither a slow graph nor a proposal fetch can postpone its publication.
+  if (current()) useBlobStore.getState().markListStale(sessionId);
   publish("terminal");
   // Only changes after this publication compete with the newly dispatched read.
   messagesAtReadDispatch = useSessionStore.getState().messages;

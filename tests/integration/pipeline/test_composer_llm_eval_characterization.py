@@ -1475,6 +1475,7 @@ async def test_final_completion_claim_is_augmented_with_runtime_preflight_failur
     result = await composer._completion._finalize_no_tool_response(
         content=model_prose,
         state=changed_state,
+        turn_start_state=state,
         initial_version=state.version,
         user_id=EVAL_USER_ID,
         session_id=SCENARIO_2_SESSION_ID,

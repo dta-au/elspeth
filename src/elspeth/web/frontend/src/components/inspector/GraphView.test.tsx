@@ -484,7 +484,7 @@ describe("GraphView", () => {
       useSessionStore.setState({ activeSessionId: "session-1", selectedNodeId: "step", compositionState: makeState({
         nodes: [makeNode({ id: "step", plugin: "llm", options: { prompt_template: marker } }), makeNode({ id: "other", plugin: "llm" })],
       }) });
-      useBlobStore.setState({ activeSessionId: "session-1", isLoading: false, error: null, loadBlobs: vi.fn().mockResolvedValue(undefined),
+      useBlobStore.setState({ activeSessionId: "session-1", listCurrent: true, isLoading: false, error: null, loadBlobs: vi.fn().mockResolvedValue(undefined),
         blobs: [{ id: "prompt-file", filename: "prompt.txt", session_id: "session-1", mime_type: "text/plain", status: "ready", content_hash: SHA,
           size_bytes: 20, created_at: "2026-01-01T00:00:00Z", created_by: "user", source_description: null, creation_modality: "verbatim",
           created_from_message_id: null, creating_model_identifier: null, creating_model_version: null, creating_provider: null,
@@ -754,7 +754,7 @@ describe("GraphView", () => {
 
   it("names a bound prompt file in the inspector without exposing its marker", async () => {
     const blobId = "f976fd8b-4432-4f8f-bbc3-2d8a9f2114e0";
-    useBlobStore.setState({ activeSessionId: "session-1", fileManagerHosts: 1, blobs: [{ id: blobId, filename: "prompt.md", content_hash: "a".repeat(64), status: "ready", mime_type: "text/plain" } as BlobMetadata] });
+    useBlobStore.setState({ activeSessionId: "session-1", listCurrent: true, fileManagerHosts: 1, blobs: [{ id: blobId, filename: "prompt.md", content_hash: "a".repeat(64), status: "ready", mime_type: "text/plain" } as BlobMetadata] });
     useSessionStore.setState({ activeSessionId: "session-1", compositionState: makeState({ nodes: [makeNode({
       id: "classify", plugin: "llm", options: { prompt_template: { blob_ref: blobId, mode: "inline_content", sha256: "a".repeat(64) } },
     })] }) });
@@ -769,7 +769,7 @@ describe("GraphView", () => {
 
   it("omits Show in files in the modal graph, whose focus trap hides the file manager", async () => {
     const blobId = "f976fd8b-4432-4f8f-bbc3-2d8a9f2114e0";
-    useBlobStore.setState({ activeSessionId: "session-1", fileManagerHosts: 1, blobs: [{ id: blobId, filename: "prompt.md", content_hash: "a".repeat(64), status: "ready", mime_type: "text/plain" } as BlobMetadata] });
+    useBlobStore.setState({ activeSessionId: "session-1", listCurrent: true, fileManagerHosts: 1, blobs: [{ id: blobId, filename: "prompt.md", content_hash: "a".repeat(64), status: "ready", mime_type: "text/plain" } as BlobMetadata] });
     useSessionStore.setState({ activeSessionId: "session-1", compositionState: makeState({ nodes: [makeNode({
       id: "classify", plugin: "llm", options: { prompt_template: { blob_ref: blobId, mode: "inline_content", sha256: "a".repeat(64) } },
     })] }) });

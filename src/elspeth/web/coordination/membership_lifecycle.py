@@ -25,7 +25,7 @@ import structlog
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
 from elspeth.web.application_finalizers import ApplicationFinalizerKind, ApplicationFinalizerOwner
-from elspeth.web.async_workers import run_application_finalizer_in_worker, run_sync_in_worker
+from elspeth.web.async_workers import run_application_finalizer_in_worker, run_lease_upkeep_in_worker, run_sync_in_worker
 from elspeth.web.coordination.membership_authority import (
     RepositoryWebInstanceMembershipAuthority,
     WebInstanceIdentity,
@@ -173,7 +173,7 @@ class RegisteredWebInstanceMembership(WebInstanceMembership):
         while True:
             await asyncio.sleep(self._interval_seconds)
             try:
-                await run_sync_in_worker(self._authority.heartbeat, self._identity.instance_id, lease_seconds=self._lease_seconds)
+                await run_lease_upkeep_in_worker(self._authority.heartbeat, self._identity.instance_id, lease_seconds=self._lease_seconds)
                 consecutive_failures = 0
             except OperationalError as exc:
                 # Only OperationalError is retried, and only a bounded number

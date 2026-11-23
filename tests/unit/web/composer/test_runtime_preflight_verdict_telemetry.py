@@ -21,6 +21,7 @@ halves of the same finalize-tail contract and must not drift apart.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -194,9 +195,11 @@ class TestPreflightInvalidFinalizeTelemetry:
         # cases below need "no preflight ever ran this turn" (None) while the
         # patched validator still has to return something, and collapsing the
         # two would make that shape unreachable.
+        current_state = _non_empty_state() if state is None else state
         result = await service._completion._surface_and_finalize_no_tools(
             assistant_message=_AdmittedAssistantMessage(content="Here is what I attempted."),
-            state=_non_empty_state() if state is None else state,
+            state=current_state,
+            turn_start_state=replace(current_state, version=1),
             session_id=None,
             current_state_id=None,
             progress=None,

@@ -1010,6 +1010,18 @@ For local file sinks (`csv`, `json`, `text`), `options.collision_policy` can mak
 | `dataverse` | Write to Microsoft Dataverse via OData v4 REST API |
 | `chroma_sink` | Write to a ChromaDB vector database |
 
+**Chroma sink known limits.** When a collection reports `l2` in its Chroma
+configuration but a different metric in legacy `hnsw:space` metadata, the sink
+uses the metadata. A Chroma 1.x collection whose configuration sets `hnsw`
+options without `space` while legacy `hnsw:space` metadata names another metric
+is read as the metadata metric, although Chroma built an `l2` index, so a sink
+configured for the metadata metric writes into an `l2` index (as in v0.8.17).
+If `hnsw:space` was removed from a migrated pre-1.0 collection, Chroma's state does not expose the
+original metric; the sink reads the reported `l2` configuration, so a pipeline
+configured `l2` opens against a cosine or ip index. A non-`l2` configuration
+that disagrees with legacy metadata is refused at startup; rebuild the
+collection or correct its metadata.
+
 ### Text sink contract
 
 The `text` sink requires `path`, `schema`, and `field`. The named field must be
@@ -1381,6 +1393,18 @@ other than `query` or `row`, and fields declared beyond `query_field` when
 the template never reads `row`; under every declaration it refuses the row
 used as an object, as above. Declare only the fields the query uses: the
 query field needs no declaration.
+
+**Chroma RAG retrieval known limits.** When a collection reports `l2` in its
+Chroma configuration but a different metric in legacy `hnsw:space` metadata,
+retrieval uses the metadata. A Chroma 1.x collection whose configuration sets
+`hnsw` options without `space` while legacy `hnsw:space` metadata names another
+metric is read as the metadata metric, although Chroma built an `l2` index;
+scores are then normalised for the wrong metric (as in v0.8.17). If
+`hnsw:space` was removed from a migrated pre-1.0 collection, Chroma's state
+cannot reveal the original metric; retrieval reads the reported `l2`
+configuration, so a pipeline configured `l2` opens against a cosine or ip
+index. A non-`l2` configuration that disagrees with legacy metadata is refused
+at startup; rebuild the collection or correct its metadata.
 
 `provider: azure` adds:
 

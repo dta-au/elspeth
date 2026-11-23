@@ -2382,6 +2382,42 @@ class TestComposerMultiTurnToolCalls:
         assert result.state.version == 3  # two mutations
 
     @pytest.mark.asyncio
+    async def test_failed_first_build_after_metadata_finalizes_with_tool_blocker(self) -> None:
+        service, session_id = _composer_service_with_session(_mock_catalog(), _make_settings())
+        initial = _empty_state()
+        metadata = _make_llm_response(
+            tool_calls=[{"id": "call_metadata", "name": "set_metadata", "arguments": {"patch": {"name": "Battery pipeline"}}}],
+        )
+        refused_pipeline = _make_llm_response(
+            tool_calls=[
+                {
+                    "id": "call_pipeline",
+                    "name": "set_pipeline",
+                    "arguments": {
+                        "source": {"plugin": "csv", "on_success": "battery_out", "on_validation_failure": ""},
+                        "nodes": [],
+                        "edges": [],
+                        "outputs": [],
+                    },
+                }
+            ],
+        )
+        reply = _make_llm_response(content="I saved the name and need to choose how to handle invalid rows before building.")
+        with patch.object(
+            service._provider_gateway, "_call_llm", new_callable=AsyncMock, side_effect=[metadata, refused_pipeline, reply]
+        ) as mock_llm:
+            result = await service.compose("Build a pipeline named Battery pipeline.", [], initial, session_id=session_id)
+
+        assert mock_llm.await_count == 3
+        assert result.state.metadata.name == "Battery pipeline"
+        assert result.state.version == initial.version + 1
+        assert not result.state.sources and not result.state.outputs
+        assert "The pipeline is still empty — the composer did not complete a valid build this turn." in result.message
+        assert "Cause: set_pipeline returned success=false" in result.message
+        assert "on_validation_failure requires an explicit non-empty failure choice" in result.message
+        assert "The pipeline is now empty. Add a source and an output to continue." not in result.message
+
+    @pytest.mark.asyncio
     async def test_flagged_to_clean_repair_cycle_elides_advisor_exchange_before_finalize_call(self) -> None:
         """R2-F12 Step 3 (elspeth-bff8fe6864, belt-and-braces): once a repair
         tool call has landed following a FLAGGED END advisor pass, the
@@ -8649,6 +8685,7 @@ class TestComposerRuntimePreflightFinalGate:
                 result = await service._completion._finalize_no_tool_response(
                     content="The pipeline is complete and valid.",
                     state=changed_state,
+                    turn_start_state=state,
                     initial_version=state.version,
                     user_id="user-1",
                     session_id=None,
@@ -8707,6 +8744,7 @@ class TestComposerRuntimePreflightFinalGate:
             result = await service._completion._finalize_no_tool_response(
                 content=model_prose,
                 state=changed_state,
+                turn_start_state=state,
                 initial_version=state.version,
                 user_id="user-1",
                 session_id=None,
@@ -8732,6 +8770,7 @@ class TestComposerRuntimePreflightFinalGate:
             result = await service._completion._finalize_no_tool_response(
                 content="I can help with that.",
                 state=state,
+                turn_start_state=state,
                 initial_version=state.version,
                 user_id="user-1",
                 session_id=None,
@@ -8777,6 +8816,7 @@ class TestComposerRuntimePreflightFinalGate:
             result = await service._completion._finalize_no_tool_response(
                 content="The pipeline is complete and valid.",
                 state=state,
+                turn_start_state=state,
                 initial_version=state.version,
                 user_id="user-1",
                 session_id=None,
@@ -8809,6 +8849,7 @@ class TestComposerRuntimePreflightFinalGate:
             result = await service._completion._finalize_no_tool_response(
                 content="The pipeline is complete and valid.",
                 state=state,
+                turn_start_state=state,
                 initial_version=state.version,
                 user_id="user-1",
                 session_id=None,
@@ -8835,6 +8876,7 @@ class TestComposerRuntimePreflightFinalGate:
             result = await service._completion._finalize_no_tool_response(
                 content="The pipeline is complete and valid.",
                 state=changed_state,
+                turn_start_state=state,
                 initial_version=state.version,
                 user_id="user-1",
                 session_id=None,
@@ -8862,6 +8904,7 @@ class TestComposerRuntimePreflightFinalGate:
             await service._completion._finalize_no_tool_response(
                 content="The pipeline is complete.",
                 state=changed_state,
+                turn_start_state=state,
                 initial_version=state.version,
                 user_id="user-1",
                 session_id=None,
@@ -9215,6 +9258,7 @@ class TestEmptyStateFinalizePassthrough:
             result = await service._completion._finalize_no_tool_response(
                 content=marker + model_prose,
                 state=state,
+                turn_start_state=state,
                 initial_version=state.version,
                 user_id="user-1",
                 session_id=None,
@@ -9274,6 +9318,7 @@ class TestEmptyStateFinalizePassthrough:
             result = await service._completion._finalize_no_tool_response(
                 content=model_prose,
                 state=state,
+                turn_start_state=state,
                 initial_version=state.version,
                 user_id="user-1",
                 session_id=None,
@@ -9324,6 +9369,7 @@ class TestEmptyStateFinalizePassthrough:
             result = await service._completion._finalize_no_tool_response(
                 content="Model prose explaining the gap.",
                 state=bumped_state,
+                turn_start_state=state,
                 initial_version=state.version,
                 user_id="user-1",
                 session_id=None,
@@ -9394,6 +9440,7 @@ class TestEmptyStateFinalizePassthrough:
             result = await service._completion._finalize_no_tool_response(
                 content=marker + model_prose,
                 state=bumped_state,
+                turn_start_state=state,
                 initial_version=state.version,
                 user_id="user-1",
                 session_id=None,
@@ -9472,6 +9519,7 @@ class TestEmptyStateFinalizePassthrough:
             result = await service._completion._finalize_no_tool_response(
                 content="",
                 state=bumped_state,
+                turn_start_state=state,
                 initial_version=state.version,
                 user_id="user-1",
                 session_id=None,
@@ -9507,6 +9555,7 @@ class TestEmptyStateFinalizePassthrough:
             result = await service._completion._finalize_no_tool_response(
                 content="All good.",
                 state=state,
+                turn_start_state=state,
                 initial_version=state.version,
                 user_id="user-1",
                 session_id=None,

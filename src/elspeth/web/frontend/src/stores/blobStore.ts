@@ -16,6 +16,18 @@ interface BlobState {
   isLoading: boolean;
   error: string | null;
   listError: string | null;
+  /**
+   * A list read for this activation has settled (success, truncation, or
+   * failure) since the last event that could make it stale. Before then,
+   * the rows may be placeholders, upload-only, or older than the graph
+   * and cannot establish file absence.
+   */
+  listCurrent: boolean;
+  /**
+   * The list was read for this activation and has gone stale since (a
+   * Composer turn). Its rows can still be shown; absence claims cannot.
+   */
+  listStale: boolean;
   /** The file-list read failed and can be retried. */
   listLoadFailed: boolean;
   /** Session whose rows may be published into this store instance. */
@@ -45,6 +57,7 @@ interface BlobState {
   returnToRevealTrigger: () => void;
 
   activateSession: (sessionId: string | null) => void;
+  markListStale: (sessionId: string) => void;
   invalidateBlobForEpoch: (
     sessionId: string,
     activationEpoch: number,
@@ -74,6 +87,8 @@ const initialState = {
   isLoading: false,
   error: null as string | null,
   listError: null as string | null,
+  listCurrent: false,
+  listStale: false,
   listLoadFailed: false,
   activeSessionId: null as string | null,
   activationEpoch: 0,
@@ -138,6 +153,47 @@ interface BlobMutationOwnership {
   ownsStore: boolean;
 }
 
+async function refreshBlobList(sessionId: string, publishError: boolean): Promise<void> {
+  const requestSeq = ++blobLoadRequestSeq;
+  const set = useBlobStore.setState;
+  set({
+    isLoading: true,
+    listError: null,
+    listLoadFailed: false,
+    ...(publishError ? { error: null } : {}),
+  });
+  try {
+    const blobs = await api.listBlobs(sessionId);
+    if (requestSeq !== blobLoadRequestSeq) return;
+    set({ blobs, listError: null, listCurrent: true, listStale: false, isLoading: false });
+  } catch (err) {
+    if (requestSeq !== blobLoadRequestSeq) return;
+    if (err instanceof BlobListTruncatedError) {
+      // Past the client's ceiling: show the newest files and say that
+      // older ones are not listed, instead of dropping them silently.
+      set({
+        blobs: err.blobs,
+        listError: err.message,
+        listCurrent: true,
+        listStale: false,
+        listLoadFailed: false,
+        isLoading: false,
+        ...(publishError ? { error: err.message } : {}),
+      });
+      return;
+    }
+    const message = "Failed to load files.";
+    set({
+      listError: message,
+      listCurrent: true,
+      listStale: false,
+      listLoadFailed: true,
+      isLoading: false,
+      ...(publishError ? { error: message } : {}),
+    });
+  }
+}
+
 export const useBlobStore = create<BlobState>((set, get) => ({
   ...initialState,
   // Not part of initialState: hosts are mounted components, so reset() on
@@ -196,6 +252,8 @@ export const useBlobStore = create<BlobState>((set, get) => ({
       isLoading: false,
       error: null,
       listError: null,
+      listCurrent: false,
+      listStale: false,
       listLoadFailed: false,
       activeSessionId: sessionId,
       activationEpoch: state.activationEpoch + 1,
@@ -207,6 +265,17 @@ export const useBlobStore = create<BlobState>((set, get) => ({
     });
     revealTrigger = null;
     stopReturnObserver();
+  },
+
+  markListStale(sessionId) {
+    const state = get();
+    if (state.activeSessionId !== sessionId) return;
+    // A read dispatched before the change cannot establish currentness.
+    if (state.isLoading) blobLoadRequestSeq++;
+    // A read list keeps its rows (true for every file the turn did not
+    // delete); only absence claims wait for the next read.
+    set({ listCurrent: false, listStale: state.listCurrent || state.listStale });
+    if (state.isLoading) void refreshBlobList(sessionId, false);
   },
 
   invalidateBlobForEpoch(
@@ -233,33 +302,8 @@ export const useBlobStore = create<BlobState>((set, get) => ({
 
   async loadBlobs(sessionId: string) {
     get().activateSession(sessionId);
-    const requestSeq = ++blobLoadRequestSeq;
-    set({ isLoading: true, error: null, listError: null, listLoadFailed: false });
-    try {
-      const blobs = await api.listBlobs(sessionId);
-      if (requestSeq !== blobLoadRequestSeq) {
-        return;
-      }
-      set({ blobs, listError: null, isLoading: false });
-    } catch (err) {
-      if (requestSeq !== blobLoadRequestSeq) {
-        return;
-      }
-      if (err instanceof BlobListTruncatedError) {
-        // Past the client's ceiling: show the newest files and say that
-        // older ones are not listed, instead of dropping them silently.
-        set({
-          blobs: err.blobs,
-          error: err.message,
-          listError: err.message,
-          listLoadFailed: false,
-          isLoading: false,
-        });
-        return;
-      }
-      const message = "Failed to load files.";
-      set({ error: message, listError: message, listLoadFailed: true, isLoading: false });
-    }
+    // Explicit reads still mirror list errors into the shared banner state.
+    await refreshBlobList(sessionId, true);
   },
 
   async uploadBlob(
@@ -270,6 +314,8 @@ export const useBlobStore = create<BlobState>((set, get) => ({
     if (get().activeSessionId === null) {
       set((state) => ({
         activeSessionId: sessionId,
+        listCurrent: false,
+        listStale: false,
         activationEpoch: state.activationEpoch + 1,
       }));
     }
@@ -292,11 +338,13 @@ export const useBlobStore = create<BlobState>((set, get) => ({
       ) {
         return blob;
       }
+      const refreshNeeded = current.isLoading;
       blobLoadRequestSeq++;
+      // Keep loading set until the replacement read settles.
       set((state) => ({
         blobs: [blob, ...state.blobs.filter((item) => item.id !== blob.id)],
-        isLoading: false,
       }));
+      if (refreshNeeded) void refreshBlobList(sessionId, false);
       return blob;
     } catch (err) {
       const detail = uploadRefusalMessage(err);
@@ -317,6 +365,8 @@ export const useBlobStore = create<BlobState>((set, get) => ({
     if (get().activeSessionId === null) {
       set((state) => ({
         activeSessionId: sessionId,
+        listCurrent: false,
+        listStale: false,
         activationEpoch: state.activationEpoch + 1,
       }));
     }
@@ -336,13 +386,14 @@ export const useBlobStore = create<BlobState>((set, get) => ({
       ) {
         return;
       }
+      const refreshNeeded = current.isLoading;
       blobLoadRequestSeq++;
       set((state) => ({
         blobs: state.blobs.filter((b) => b.id !== blobId),
-        isLoading: false,
       }));
+      if (refreshNeeded) void refreshBlobList(sessionId, false);
     } catch (err) {
-      const detail = (err as ApiError).detail ?? "Failed to delete file.";
+      const detail = (err as ApiError).detail || "Failed to delete file.";
       const current = get();
       if (
         ownership.ownsStore &&
@@ -355,6 +406,12 @@ export const useBlobStore = create<BlobState>((set, get) => ({
   },
 
   async downloadBlob(sessionId: string, blobId: string) {
+    const ownerState = get();
+    const ownership: BlobMutationOwnership = {
+      sessionId,
+      ownerEpoch: ownerState.activationEpoch,
+      ownsStore: ownerState.activeSessionId === sessionId,
+    };
     try {
       const { data, filename } = await api.downloadBlobContent(
         sessionId,
@@ -370,7 +427,14 @@ export const useBlobStore = create<BlobState>((set, get) => ({
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
     } catch {
-      set({ error: "Download failed." });
+      const current = get();
+      if (
+        ownership.ownsStore &&
+        current.activeSessionId === ownership.sessionId &&
+        current.activationEpoch === ownership.ownerEpoch
+      ) {
+        set({ error: "Download failed." });
+      }
     }
   },
 
@@ -381,6 +445,8 @@ export const useBlobStore = create<BlobState>((set, get) => ({
       isLoading: false,
       error: null,
       listError: null,
+      listCurrent: false,
+      listStale: false,
       listLoadFailed: false,
       activeSessionId: null,
       activationEpoch: state.activationEpoch + 1,
