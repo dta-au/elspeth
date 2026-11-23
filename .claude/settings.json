@@ -1,12 +1,22 @@
 {
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "f=\"$CLAUDE_PROJECT_DIR/.claude/hooks/session-start-integration-book.sh\"; if [ -f \"$f\" ]; then sh \"$f\"; fi; exit 0"
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "Bash",
         "hooks": [
           {
             "type": "command",
-            "command": "jq -r \".tool_input.command // empty\" | grep -Eq \"commit --amend|pkill -f|checkout -- \" && { echo \"BLOCKED: dangerous git/proc command (commit --amend, pkill -f, checkout --) \u2014 refused by the PreToolUse guard in .claude/settings.json\" >&2; exit 2; } || exit 0"
+            "command": "f=\"$CLAUDE_PROJECT_DIR/.claude/hooks/bash_guard.py\"; if [ -f \"$f\" ]; then python3 -I \"$f\"; else echo \"WARNING: $f is missing, so this command ran without the Bash guard. Tell the lead integrator; restore the file with the Write tool from the copy on the integration branch.\" >&2; exit 1; fi"
           }
         ]
       }
