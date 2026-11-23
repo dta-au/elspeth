@@ -238,6 +238,9 @@ Never use the question dialog tool.
   approval, such as a one-line go-ahead, record what it covers and which
   open questions it does not settle.
   - Why: paraphrases have been relayed as rulings and had to be withdrawn.
+  - Where: exact words go only in private records (the integration ledger,
+    memory and lane notes). Public tracked text, including this book,
+    paraphrases them and keeps the date [M 2026-11-24].
 - **Ambiguity is asked, not resolved.** When an approval is ambiguous (for
   example, a general approval of additional scope that names no items), ask
   which items it covers. Do not act on
