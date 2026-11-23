@@ -4,9 +4,11 @@ The advisor receives the text of a prompt file the user did not write. Each
 file's text is one prompt-guard unit, and the guard never splits a unit, so a
 unit longer than ``PROMPT_GUARD_MAX_TEXT_CHARACTERS`` would make the whole
 advisor request unscreenable and every checkpoint would fail while the file
-stays bound. Such a file is stated with ``text=unavailable:too_long_to_screen``
-and its text is left out, in every environment, so the advisor gets the same
-input whether or not limits are enforced. Text that fits is still sent whole.
+stays bound. Where the guard enforces its character limits (a guard is
+mounted, or the mode is ``required``), such a file is stated with
+``text=unavailable:too_long_to_screen`` and its text is left out. Where the
+limits are not enforced the text is sent whole, as before. Text that fits is
+always sent whole.
 
 The tests drive the checkpoint producer path (stored file -> authorship ->
 rendered evidence -> guard parts -> guard request) and, at the end, a
@@ -52,7 +54,6 @@ from tests.unit.web.composer.test_advisor_prompt_files import (
     _marker,
     _node_line,
     _PromptFileStore,
-    _service,
     _state,
 )
 from tests.unit.web.composer.test_prompt_guard_admission import authority as _authority
@@ -127,21 +128,39 @@ def _query_node(marker: dict[str, str]) -> Any:
     return _llm_node({"queries": {"q1": {"input_fields": {"colour": "colour"}, "template": marker}}})
 
 
+def _mode_service(
+    store: _PromptFileStore, monkeypatch: pytest.MonkeyPatch, *, mode: str = "required"
+) -> tuple[ComposerServiceImpl, _CapturedAdvisor]:
+    """A composer service over ``store`` whose advisor guard runs in ``mode`` with no mount; the provider call is captured."""
+    service = ComposerServiceImpl.for_trained_operator(
+        catalog=_mock_catalog(), settings=_make_settings(composer_prompt_guard_mode=mode), blob_service=store
+    )
+    advisor = _CapturedAdvisor()
+    monkeypatch.setattr(service._advisor_checkpoint, "_call_advisor_with_audit", advisor)
+    return service, advisor
+
+
+def _position(position: str, record: Any) -> tuple[Any, str]:
+    if position == "prompt_template":
+        return _llm_node({"prompt_template": _marker(record)}), "prompt_template"
+    return _query_node(_marker(record)), "queries.q1.template"
+
+
 # --------------------------------------------------------------------------- producer path
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("position", ["prompt_template", "query_template"])
 @pytest.mark.parametrize("author", sorted(_SENT_AUTHORS))
-async def test_a_file_too_long_to_screen_is_stated_and_the_request_stays_screenable(tmp_path: Path, author: str, position: str) -> None:
+async def test_a_file_too_long_to_screen_is_stated_and_the_request_stays_screenable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, author: str, position: str
+) -> None:
+    """Limits enforced (mode required): the file is stated, not sent."""
     store = _PromptFileStore(root=tmp_path)
-    service, advisor = _service(store)
+    service, advisor = _mode_service(store, monkeypatch)
     text = _body(12_000)
     record = _store_file(store, author, text)
-    if position == "prompt_template":
-        node, key = _llm_node({"prompt_template": _marker(record)}), "prompt_template"
-    else:
-        node, key = _query_node(_marker(record)), "queries.q1.template"
+    node, key = _position(position, record)
     arguments, _message = await _checkpoint(service, advisor, _state(node), context=_context())
     message, supported, units = _guard_request(arguments)
     line = _node_line(message)
@@ -159,15 +178,13 @@ async def test_a_file_too_long_to_screen_is_stated_and_the_request_stays_screena
 @pytest.mark.asyncio
 @pytest.mark.parametrize("position", ["prompt_template", "query_template"])
 @pytest.mark.parametrize("author", sorted(_SENT_AUTHORS))
-async def test_a_file_that_fits_is_still_sent_whole(tmp_path: Path, author: str, position: str) -> None:
+async def test_a_file_that_fits_is_still_sent_whole(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, author: str, position: str) -> None:
+    """Limits enforced (mode required): a file that fits is sent whole."""
     store = _PromptFileStore(root=tmp_path)
-    service, advisor = _service(store)
+    service, advisor = _mode_service(store, monkeypatch)
     text = _body(9_000)
     record = _store_file(store, author, text)
-    if position == "prompt_template":
-        node, key = _llm_node({"prompt_template": _marker(record)}), "prompt_template"
-    else:
-        node, key = _query_node(_marker(record)), "queries.q1.template"
+    node, key = _position(position, record)
     arguments, _message = await _checkpoint(service, advisor, _state(node), context=_context())
     message, supported, _units = _guard_request(arguments)
     line = _node_line(message)
@@ -180,10 +197,10 @@ async def test_a_file_that_fits_is_still_sent_whole(tmp_path: Path, author: str,
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("characters", [9_000, 12_000])
-async def test_a_user_file_is_never_sent_at_any_length(tmp_path: Path, characters: int) -> None:
-    """Control: a file the user wrote is stated not_sent whatever its length."""
+async def test_a_user_file_is_never_sent_at_any_length(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, characters: int) -> None:
+    """Control: a file the user wrote is stated not_sent whatever its length (limits enforced)."""
     store = _PromptFileStore(root=tmp_path)
-    service, advisor = _service(store)
+    service, advisor = _mode_service(store, monkeypatch)
     text = _body(characters)
     record = store.add(text.encode(), filename="mine.md", created_by="user", source_description="uploaded")
     arguments, _message = await _checkpoint(service, advisor, _state(_llm_node({"prompt_template": _marker(record)})), context=_context())
@@ -198,7 +215,7 @@ async def test_a_user_file_is_never_sent_at_any_length(tmp_path: Path, character
 # --------------------------------------------------------------------------- the boundary
 
 
-def _sweep_case(text: str, *, key: str) -> tuple[str, bool, str]:
+def _sweep_case(text: str, *, key: str, enforced: bool = True) -> tuple[str, bool, str]:
     """Render one composer-written file through the checkpoint arguments; return its text state, screenability and message."""
     body = text.encode()
     marker = {"blob_ref": str(uuid4()), "mode": "inline_content", "sha256": hashlib.sha256(body).hexdigest()}
@@ -207,6 +224,7 @@ def _sweep_case(text: str, *, key: str) -> tuple[str, bool, str]:
     files = AdvisorPromptFiles(
         files={prompt_file_key(widened): AdvisorPromptFile(filename="prompt.md", size_bytes=len(body), author="composer", text=text)},
         read=True,
+        screen_limits_enforced=enforced,
     )
     if key == "prompt_template":
         options: dict[str, Any] = {"prompt_template": marker}
@@ -252,24 +270,86 @@ def test_text_that_grows_in_the_summary_fence_is_measured_as_sent() -> None:
 
 
 @pytest.mark.asyncio
-async def test_the_same_input_is_rendered_whether_or_not_limits_are_enforced(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The decision never consults the guard mode: an environment that does not enforce limits gets the same marker."""
-    messages: dict[str, str] = {}
-    for mode in ("debug-when-unconfigured", "required"):
-        store = _PromptFileStore(root=tmp_path / mode)
-        (tmp_path / mode).mkdir()
-        record = _store_file(store, "composer", _body(12_000))
-        service = ComposerServiceImpl.for_trained_operator(
-            catalog=_mock_catalog(), settings=_make_settings(composer_prompt_guard_mode=mode), blob_service=store
-        )
-        advisor = _CapturedAdvisor()
-        monkeypatch.setattr(service._advisor_checkpoint, "_call_advisor_with_audit", advisor)
-        _arguments, message = await _checkpoint(
-            service, advisor, _state(_llm_node({"prompt_template": _marker(record)})), context=_context()
-        )
-        messages[mode] = message.replace(str(record.id), "<id>")
-        assert f"text={_TOO_LONG})" in message and _CANARY not in message, mode
-    assert messages["debug-when-unconfigured"] == messages["required"]
+@pytest.mark.parametrize("position", ["prompt_template", "query_template"])
+async def test_where_limits_are_enforced_a_long_file_is_stated_not_sent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, position: str
+) -> None:
+    """Mode required, no mount: the checkpoint owner passes the enforcing decision to every site."""
+    store = _PromptFileStore(root=tmp_path)
+    service, advisor = _mode_service(store, monkeypatch, mode="required")
+    record = _store_file(store, "composer", _body(12_000))
+    node, key = _position(position, record)
+    arguments, message = await _checkpoint(service, advisor, _state(node), context=_context())
+    line = _node_line(message)
+
+    assert arguments["schema_excerpt"]
+    assert f'{key}=(prompt held in a file: file="composer.md" bytes=12000 author=composer text={_TOO_LONG})' in line
+    assert _CANARY not in message
+    assert "not analysed (text in file): 1 prompt(s)" in line
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("position", ["prompt_template", "query_template"])
+async def test_where_limits_are_not_enforced_a_long_file_is_sent_whole_as_before(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, position: str
+) -> None:
+    """Explicit unconfigured debug mode, no mount: no limit applies, so the text is sent whole and analysed, as before."""
+    store = _PromptFileStore(root=tmp_path)
+    service, advisor = _mode_service(store, monkeypatch, mode="debug-when-unconfigured")
+    text = _body(12_000)
+    record = _store_file(store, "composer", text)
+    node, key = _position(position, record)
+    _arguments, message = await _checkpoint(service, advisor, _state(node), context=_context())
+    line = _node_line(message)
+
+    assert f"{key}={_fact(file='composer.md', size=len(text), author='composer', text='sent')}" in line
+    assert f"{key}_untrusted_json={json.dumps(text)}" in line
+    assert _TOO_LONG not in line
+    assert "named row field references: [colour]]" in line
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mounted", "mode", "enforced"),
+    [
+        (False, "debug-when-unconfigured", False),
+        (False, "required", True),
+        (True, "debug-when-unconfigured", True),
+        (True, "required", True),
+    ],
+)
+async def test_the_owner_decides_from_its_own_guard_mount_and_mode(tmp_path: Path, mounted: bool, mode: str, enforced: bool) -> None:
+    """The decision handed to the renderer is the guard's own: limits apply with a mount or in required mode."""
+    guard_settings = PromptGuardSettings(endpoint="https://advisor-shield.example.test", subscription_key="offline-advisor-shield")
+    mount = (
+        PromptGuardMount(AzurePromptGuardClient(guard_settings, http_transport=httpx.MockTransport(lambda _request: httpx.Response(500))))
+        if mounted
+        else None
+    )
+    store = _PromptFileStore(root=tmp_path)
+    record = _store_file(store, "composer", _body(100))
+    owner = AdvisorCheckpointOwner(
+        settings=_make_settings(composer_prompt_guard_mode=mode),
+        composer_skill_text="Synthetic Advisor policy.",
+        advisor_endpoint_base_url=None,
+        advisor_endpoint_api_key=None,
+        sessions_service=None,
+        chargeable_admission=ComposerChargeableAdmission(None),
+        prompt_guard_mount=mount,
+        blob_service=cast(BlobServiceProtocol, store),
+    )
+    for state in (_state(_llm_node({"prompt_template": _marker(record)})), _state(_llm_node({"prompt_template": "plain"}))):
+        files = await owner._advisor_prompt_files(state, _context())
+        assert files.read is True
+        assert files.screen_limits_enforced is enforced
+
+
+@pytest.mark.parametrize("key", ["prompt_template", "queries.q1.template"])
+def test_where_limits_are_not_enforced_no_length_is_withheld(key: str) -> None:
+    """The same sweep with limits not enforced: every length is sent."""
+    for characters in (9_000, PROMPT_GUARD_MAX_TEXT_CHARACTERS - 40, PROMPT_GUARD_MAX_TEXT_CHARACTERS + 40, 40_000):
+        state_text, _supported, _message = _sweep_case(_body(characters), key=key, enforced=False)
+        assert state_text == "sent", characters
 
 
 # --------------------------------------------------------------------------- checkpoint with a mounted guard

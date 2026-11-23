@@ -62,9 +62,10 @@ PromptFileUnavailable = Literal[
 ]
 """Why the file's facts or text could not be read or sent; the text is then not reviewed.
 
-``too_long_to_screen`` is decided where the evidence is rendered, not here:
-the text was read, but as rendered at its prompt position it is one prompt
-guard unit longer than the guard can screen in one piece, so it is not sent.
+``too_long_to_screen`` is decided where the evidence is rendered, not here,
+and only when the guard enforces its character limits: the text was read,
+but as rendered at its prompt position it is one prompt guard unit longer
+than the guard can screen in one piece, so it is not sent.
 """
 
 PromptFileKey = tuple[UUID, str, str]
@@ -141,12 +142,22 @@ class AdvisorPromptFiles:
     ``unavailable:no_reader``. When ``read`` is True a marker absent from
     ``files`` means the collector and the renderer disagree on a prompt
     position, which is a composer defect, and the lookup raises.
+
+    ``screen_limits_enforced`` is whether the prompt guard that will check
+    the advisor request applies its per-text character limits. The checkpoint
+    owner sets it from its own guard mount and mode. Only when it is True is a
+    file whose text the guard cannot screen in one piece stated
+    ``unavailable:too_long_to_screen`` instead of sent; otherwise the text is
+    sent whole.
     """
 
     files: Mapping[PromptFileKey, AdvisorPromptFile] = field(default_factory=dict)
     read: bool = False
+    screen_limits_enforced: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.screen_limits_enforced) is not bool:
+            raise ValueError("AdvisorPromptFiles: screen_limits_enforced is an exact boolean")
         freeze_fields(self, "files")
 
     def file(self, marker: WidenedBlobRefShape) -> AdvisorPromptFile:
