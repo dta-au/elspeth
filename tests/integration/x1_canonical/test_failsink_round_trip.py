@@ -9,6 +9,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from sqlalchemy import func, select
 from tests.fixtures.base_classes import as_sink
 from tests.fixtures.landscape import leader_coordination_token
 from tests.fixtures.sink_effects import DuplicateObservableTarget, PartitioningObservableSink
@@ -22,11 +23,79 @@ from tests.integration.pipeline.test_builtin_sink_effect_recovery import (
 )
 
 from elspeth.contracts import RoutingMode
+from elspeth.contracts.audit import NodeStateOpen
+from elspeth.contracts.diversion import RowDiversion
+from elspeth.contracts.enums import NodeStateStatus
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.core.canonical import normalize_for_canonical, stable_hash
 from elspeth.core.landscape.database import LandscapeDB
+from elspeth.core.landscape.schema import node_states_table, sink_effects_table
 from elspeth.engine.executors.sink import SinkExecutor
 from elspeth.engine.spans import SpanFactory
+
+
+@pytest.mark.parametrize("nonfinite", [float("nan"), float("inf")], ids=["nan", "infinity"])
+def test_noncanonical_diversion_refused_before_failsink_state(tmp_path: Path, nonfinite: float) -> None:
+    db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
+    try:
+        factory, run_id, source_id = _begin(db)
+        failsink_id = _register_sink(factory, run_id, name="quarantine", plugin_name="json")
+        (token,) = _tokens(factory, run_id=run_id, source_id=source_id, rows=[{"id": 1}])
+        failsink = _json_sink(tmp_path / "failsink.jsonl")
+        failsink.node_id = failsink_id
+        state = NodeStateOpen(
+            state_id="primary-state",
+            token_id=token.token_id,
+            node_id=source_id,
+            step_index=0,
+            attempt=0,
+            status=NodeStateStatus.OPEN,
+            input_hash="0" * 64,
+            started_at=datetime.now(UTC),
+        )
+        executor = SinkExecutor(
+            factory.execution,
+            factory.data_flow,
+            SpanFactory(),
+            run_id,
+            factory=factory,
+            worker_id="worker-a",
+            coordination_token=leader_coordination_token(factory, run_id),
+        )
+        ctx = PluginContext(run_id=run_id, config={}, landscape=factory.plugin_audit_writer(), node_id=failsink_id)
+        with pytest.raises(AuditIntegrityError, match="non-canonical sink-boundary input") as exc_info:
+            executor._handle_failsink_effect_diversions(
+                failsink=as_sink(failsink),
+                failsink_name="quarantine",
+                failsink_effect_mode="write",
+                failsink_edge_id="failsink-edge",
+                primary_effect_id_by_token={},
+                primary_divert_states=[(token, 0, state)],
+                diversion_by_index={0: RowDiversion(row_index=0, reason="diverted", row_data={"id": 1, "value": nonfinite})},
+                diversion_error_hashes={0: "0" * 16},
+                diversion_reason_hashes={0: "0" * 64},
+                sink_name="primary",
+                step_in_pipeline=1,
+                ctx=ctx,
+                on_token_written=None,
+            )
+        assert isinstance(exc_info.value.__cause__, ValueError)
+        with db.engine.connect() as conn:
+            failsink_effects = conn.execute(
+                select(func.count())
+                .select_from(sink_effects_table)
+                .where(sink_effects_table.c.run_id == run_id, sink_effects_table.c.role == "failsink")
+            ).scalar_one()
+            failsink_states = conn.execute(
+                select(func.count())
+                .select_from(node_states_table)
+                .where(node_states_table.c.run_id == run_id, node_states_table.c.node_id == failsink_id)
+            ).scalar_one()
+        assert failsink_effects == 0
+        assert failsink_states == 0
+    finally:
+        db.close()
 
 
 @pytest.mark.parametrize(

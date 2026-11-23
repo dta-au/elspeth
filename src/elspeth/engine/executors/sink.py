@@ -1164,7 +1164,12 @@ class SinkExecutor:
                 "__diverted_from": sink_name,
                 "__diversion_timestamp": stable_timestamp,
             }
-            row = normalize_for_canonical(raw_row)
+            try:
+                row = normalize_for_canonical(raw_row)
+            except (TypeError, ValueError) as exc:
+                raise AuditIntegrityError(
+                    f"Sink effect lineage audit integrity violation: member {token.token_id!r} has non-canonical sink-boundary input"
+                ) from exc
             enriched_rows.append(row)
             enriched_by_token[token.token_id] = row
             diverted_tokens.append(token)
