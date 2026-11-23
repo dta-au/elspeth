@@ -488,6 +488,8 @@ class AdvisorCheckpointOwner:
         on_provider_dispatch: Callable[[], None] | None = None,
         provider_custody: ProviderCallCustody | None = None,
         continuation_budget: PlannerContinuationBudget | None = None,
+        leave_out_all_earlier: bool = False,
+        on_earlier_turn_sent: Callable[[bool], None] | None = None,
     ) -> tuple[str, dict[str, Any]]:
         """Phone the configured advisor (frontier) model for a hint.
 
@@ -592,7 +594,11 @@ class AdvisorCheckpointOwner:
                     detach_prompt_guard_evidence([message for index, message in enumerate(messages) if index != 1]).messages, None
                 )[2].total_bytes,
                 recorder=recorder,
+                leave_out_all_earlier=leave_out_all_earlier,
             )
+            if on_earlier_turn_sent is not None:
+                counts = sent_transcript.history_by_age
+                on_earlier_turn_sent(counts is not None and counts.whole + counts.request_only > 0)
             if sent_transcript is not transcript:
                 key, value = bound(sent_transcript)
                 arguments = {**unshaped, key: value}
@@ -798,6 +804,7 @@ class AdvisorCheckpointOwner:
         render: Callable[[AdvisorVisibleTranscript], str],
         fixed_bytes: int,
         recorder: BufferingRecorder | None,
+        leave_out_all_earlier: bool = False,
     ) -> AdvisorVisibleTranscript:
         """The transcript to send: earlier turns by age, priced; under pressure fewer.
 
@@ -830,9 +837,12 @@ class AdvisorCheckpointOwner:
             )
 
         shaped = transcript.by_age()
+        if leave_out_all_earlier and shaped.history_by_age is not None:
+            maximum = shaped.history_by_age
+            shaped = transcript.by_age(older_left_out=maximum.request_only, whole_left_out=maximum.whole)
         estimate = priced(shaped)
         counts = shaped.history_by_age
-        if estimate.anchored and estimate.tokens > limit and counts is not None:
+        if not leave_out_all_earlier and estimate.anchored and estimate.tokens > limit and counts is not None:
             # Leaving out one more request or turn only ever shrinks the request,
             # so the fewest steps that fit are found by bisection.
             older = counts.request_only
@@ -865,6 +875,8 @@ class AdvisorCheckpointOwner:
         structured_output: bool = False,
         on_provider_dispatch: Callable[[], None] | None = None,
         continuation_budget: PlannerContinuationBudget | None = None,
+        leave_out_all_earlier: bool = False,
+        on_earlier_turn_sent: Callable[[bool], None] | None = None,
     ) -> tuple[str, dict[str, Any]]:
         return await self._call_advisor_with_audit_body(
             arguments,
@@ -873,6 +885,8 @@ class AdvisorCheckpointOwner:
             structured_output=structured_output,
             on_provider_dispatch=on_provider_dispatch,
             continuation_budget=continuation_budget,
+            leave_out_all_earlier=leave_out_all_earlier,
+            on_earlier_turn_sent=on_earlier_turn_sent,
         )
 
     async def _call_advisor_with_audit(
@@ -885,6 +899,8 @@ class AdvisorCheckpointOwner:
         on_provider_dispatch: Callable[[], None] | None = None,
         provider_owner: ProviderInvocationOwner | None = None,
         continuation_budget: PlannerContinuationBudget | None = None,
+        leave_out_all_earlier: bool = False,
+        on_earlier_turn_sent: Callable[[bool], None] | None = None,
     ) -> tuple[str, dict[str, Any]]:
         if provider_owner is None:
             return await self._call_advisor_with_audit_legacy(
@@ -894,6 +910,8 @@ class AdvisorCheckpointOwner:
                 structured_output=structured_output,
                 on_provider_dispatch=on_provider_dispatch,
                 continuation_budget=continuation_budget,
+                leave_out_all_earlier=leave_out_all_earlier,
+                on_earlier_turn_sent=on_earlier_turn_sent,
             )
         provider_custody = self._new_advisor_custody(provider_owner)
         async with provider_call_scope(provider_custody):
@@ -905,6 +923,8 @@ class AdvisorCheckpointOwner:
                 on_provider_dispatch=on_provider_dispatch,
                 provider_custody=provider_custody,
                 continuation_budget=continuation_budget,
+                leave_out_all_earlier=leave_out_all_earlier,
+                on_earlier_turn_sent=on_earlier_turn_sent,
             )
 
     def _build_checkpoint_arguments(
@@ -1562,7 +1582,14 @@ class AdvisorCheckpointOwner:
             provider_attempts += 1
             format_reprompt_sent = format_reprompt_sent or format_reprompt_pending
 
-        for _ in range(attempts):
+        normal_attempts_used = 0
+        size_resend_pending = False
+        leave_out_all_earlier = False
+        while normal_attempts_used < attempts or size_resend_pending:
+            if size_resend_pending:
+                size_resend_pending = False
+            else:
+                normal_attempts_used += 1
             if format_reprompt_pending:
                 # The format instruction can change rendered budget overhead.
                 # Refit the same complete saved graph, never a fitted prefix.
@@ -1592,6 +1619,14 @@ class AdvisorCheckpointOwner:
                         raise _AdvisorCheckpointComposeDeadlineExpired
                     break
             attempt_call_offset = len(recorder.llm_calls) if recorder is not None else 0
+            # A size resend repeats this request, format instruction included, with the earlier turns left out.
+            sent_arguments, sent_format_reprompt = call_arguments, format_reprompt_pending
+            sent_earlier_turn = False
+
+            def note_earlier_turn_sent(sent: bool) -> None:
+                nonlocal sent_earlier_turn
+                sent_earlier_turn = sent
+
             try:
                 if remaining is None:
                     guidance, _meta = await self._call_advisor_with_audit(
@@ -1601,6 +1636,8 @@ class AdvisorCheckpointOwner:
                         on_provider_dispatch=provider_dispatched,
                         provider_owner=provider_owner,
                         continuation_budget=continuation_budget,
+                        leave_out_all_earlier=leave_out_all_earlier,
+                        on_earlier_turn_sent=note_earlier_turn_sent,
                     )
                 else:
                     guidance, _meta = await self._call_advisor_with_audit(
@@ -1611,6 +1648,8 @@ class AdvisorCheckpointOwner:
                         on_provider_dispatch=provider_dispatched,
                         provider_owner=provider_owner,
                         continuation_budget=continuation_budget,
+                        leave_out_all_earlier=leave_out_all_earlier,
+                        on_earlier_turn_sent=note_earlier_turn_sent,
                     )
             except PromptGuardRefused as exc:
                 raise exc.with_evidence(
@@ -1631,8 +1670,15 @@ class AdvisorCheckpointOwner:
                     if provider_attempts == 1:
                         first_attempt_schema_valid = False
                         first_attempt_accepted = False
-                    call_arguments = _advisor_policy.advisor_arguments_with_format_reprompt(arguments, schema_valid=False)
-                    format_reprompt_pending = True
+                    # The format re-prompt answers rejected text of the first attempt.
+                    # Text first seen on a later call (after the first was rejected
+                    # for size) gets a plain retry, so the pass record stays true.
+                    format_reprompt_pending = first_attempt_accepted is False
+                    call_arguments = (
+                        _advisor_policy.advisor_arguments_with_format_reprompt(arguments, schema_valid=False)
+                        if format_reprompt_pending
+                        else arguments
+                    )
                 else:
                     call_arguments = arguments
                     format_reprompt_pending = False
@@ -1653,6 +1699,11 @@ class AdvisorCheckpointOwner:
                     )
                 if continuation_budget is not None and not continuation_budget.has_cost_headroom():
                     return continuation_withheld(provider_failure=last_request_failure)
+                if is_context_length_rejection(exc) and sent_earlier_turn and not leave_out_all_earlier:
+                    leave_out_all_earlier = True
+                    size_resend_pending = True
+                    call_arguments, format_reprompt_pending = sent_arguments, sent_format_reprompt
+                    continue
                 last_failure_retryable = failure is None or failure.retryable
                 if not last_failure_retryable:
                     # The primary path uses this same value-free policy.
@@ -1679,10 +1730,13 @@ class AdvisorCheckpointOwner:
             last_exc = None
             last_response_unparseable = True
             last_cut_off_cap = cut_off_cap(attempt_call_offset)
-            call_arguments = _advisor_policy.advisor_arguments_with_format_reprompt(
-                arguments, schema_valid=verdict.response_schema_valid is True
+            # As for malformed text above: the re-prompt answers the first attempt's rejected text only.
+            format_reprompt_pending = first_attempt_accepted is False
+            call_arguments = (
+                _advisor_policy.advisor_arguments_with_format_reprompt(arguments, schema_valid=verdict.response_schema_valid is True)
+                if format_reprompt_pending
+                else arguments
             )
-            format_reprompt_pending = True
         if last_response_unparseable:
             # The advisor was REACHABLE on the final attempt and still returned
             # no verdict. That is MALFORMED, not unavailable — the distinction

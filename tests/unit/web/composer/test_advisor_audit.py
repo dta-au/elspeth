@@ -213,7 +213,7 @@ class TestRecords:
     @pytest.mark.parametrize(
         "changes",
         [
-            {"provider_attempts": 3},
+            {"provider_attempts": 4},
             {"provider_attempts": 0},
             {"first_attempt_schema_valid": None},
             {"first_attempt_accepted": None},
@@ -243,6 +243,8 @@ class TestRecords:
             (2, None, None, False, "flagged", "model", True),
             (2, False, False, True, "flagged", "model", True),
             (2, True, False, True, "flagged", "model", True),
+            (3, None, None, False, "flagged", "model", True),
+            (3, False, False, True, "flagged", "model", True),
             (2, False, False, True, "unavailable", "model", False),
             (1, False, False, False, "malformed", "model", False),
         ],

@@ -2615,45 +2615,94 @@ class ComposerServiceImpl:
                             session_operation_context=session_operation_context,
                         )
                     else:
-                        await emit_progress(
-                            progress,
-                            ComposerProgressEvent(
-                                phase="calling_model",
-                                headline="I'm asking the model to prepare your reply.",
-                                evidence=("Review cards are staged; the model is preparing an explanation without changing the pipeline.",),
-                                likely_next="ELSPETH will save the reply and show the current review and validation status.",
-                            ),
-                        )
-                        # After the stage's announcement, so the notice is the latest progress during the call.
-                        if first_history_shed_of_turn(reply_budget_record, recorder.llm_calls):
-                            await emit_progress(progress, context_reduced_progress_event())
-                        try:
-                            completion = await self._provider_gateway._call_llm_with_audit(
-                                selected_reply_messages,
-                                selected_reply_tools,
-                                timeout=remaining,
-                                recorder=recorder,
-                                provider_custody=self._new_primary_custody(provider_owner),
-                                context_budget=reply_budget_record,
+                        reply_completion: _AdmittedLLMCompletion | None = None
+                        reply_timeout = remaining
+                        # Set for the one resend after a provider's context-limit rejection.
+                        reply_resent = False
+                        while True:
+                            await emit_progress(
+                                progress,
+                                ComposerProgressEvent(
+                                    phase="calling_model",
+                                    headline="I'm asking the model to prepare your reply.",
+                                    evidence=(
+                                        "Review cards are staged; the model is preparing an explanation without changing the pipeline.",
+                                    ),
+                                    likely_next="ELSPETH will save the reply and show the current review and validation status.",
+                                ),
                             )
-                        except provider_failures:
-                            # The call audit retains the failure; a trusted notice
-                            # below reports the unavailable reply to the user.
-                            reply = None
-                        else:
+                            # After the stage's announcement, so the notice is the latest progress during the call.
+                            if first_history_shed_of_turn(reply_budget_record, recorder.llm_calls):
+                                await emit_progress(progress, context_reduced_progress_event())
+                            try:
+                                reply_completion = await self._provider_gateway._call_llm_with_audit(
+                                    selected_reply_messages,
+                                    selected_reply_tools,
+                                    timeout=reply_timeout,
+                                    recorder=recorder,
+                                    provider_custody=self._new_primary_custody(provider_owner),
+                                    context_budget=reply_budget_record,
+                                )
+                            except _BadRequestLLMError as rejection:
+                                unshed_history = any(
+                                    kind is not None and chat_index not in reply_budget_record.shed_history_indices
+                                    for chat_index, kind in budget_frame.history_entries
+                                )
+                                reply_timeout = deadline - asyncio.get_event_loop().time()
+                                if (
+                                    reply_resent
+                                    or not unshed_history
+                                    or not is_context_length_rejection(rejection.__cause__)
+                                    or reply_timeout <= 0
+                                ):
+                                    # The call audit retains the failure; a trusted
+                                    # notice below reports the unavailable reply.
+                                    break
+                                # The provider judged the reply request too large while an
+                                # earlier turn was still in it: leave out every earlier turn
+                                # and send once more. Only smaller than the request already
+                                # admitted, so the budget cannot refuse it.
+                                reply_resent = True
+                                (
+                                    selected_reply_messages,
+                                    selected_reply_tools,
+                                    reply_delivery,
+                                    reply_budget_record,
+                                ) = await self._prepare_primary_delivery(
+                                    messages=llm_messages,
+                                    tools=recovery_tool_definitions(self._planner_dialect),
+                                    recorder=recorder,
+                                    turn_evidence=turn_evidence,
+                                    budget_frame=budget_frame,
+                                    state=state,
+                                    initial_version=initial_version,
+                                    composition_turns_used=composition_turns_used,
+                                    discovery_turns_used=discovery_turns_used,
+                                    failed_turn=failed_turn,
+                                    progress=None,
+                                    reply_stage=True,
+                                    shed_all_history=True,
+                                )
+                                continue
+                            except provider_failures:
+                                # The call audit retains the failure; a trusted notice
+                                # below reports the unavailable reply to the user.
+                                break
+                            break
+                        if reply_completion is not None:
                             recovery_result = self._terminal_recovery_result(
-                                completion, state, recorder, prior_tools_persisted=persisted_tool_call_turn
+                                reply_completion, state, recorder, prior_tools_persisted=persisted_tool_call_turn
                             )
                             if recovery_result is not None:
                                 return _ClassifyOutcome(action="return", result=recovery_result)
-                            reply = completion.message
+                            reply = reply_completion.message
                             if _reply_only_protocol_echo(
                                 reply.content or "",
                                 history_has_tool_protocol=any(row["role"] == "tool" or "tool_calls" in row for row in llm_messages),
                                 user_message=message,
                             ):
                                 reply = None
-                            if reply is not None and not completion.tool_batch.calls and reply_delivery is not None:
+                            if reply is not None and not reply_completion.tool_batch.calls and reply_delivery is not None:
                                 turn_evidence.confirm_delivery(reply_delivery, recorder.llm_calls)
                 advisor_gate = None
                 if reply is not None:

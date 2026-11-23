@@ -833,6 +833,151 @@ async def test_a_provider_rejection_of_a_request_over_its_estimate_is_an_ordinar
 
 
 @pytest.mark.asyncio
+async def test_advisor_size_rejection_resends_with_earlier_turns_disclosed_as_omitted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from litellm.exceptions import BadRequestError
+
+    from tests.unit.web.composer._helpers import _empty_state
+
+    _require_age_api()
+    successful = _transport(monkeypatch)
+    complete = provider_gateway._litellm_acompletion
+    sent: list[dict[str, Any]] = []
+
+    async def rejected_once(**kwargs: Any) -> Any:
+        sent.append(copy.deepcopy(kwargs))
+        if len(sent) == 1:
+            await admit_provider_attempt(model=kwargs["model"])
+            if kwargs.get("on_provider_dispatch") is not None:
+                kwargs["on_provider_dispatch"]()
+            raise BadRequestError(
+                "PRIVATE_PROVIDER_BODY", model=kwargs["model"], llm_provider="openai", body={"code": "context_length_exceeded"}
+            )
+        return await complete(**kwargs)
+
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", rejected_once)
+    recorder = BufferingRecorder()
+    verdict = await _owner(tmp_path)._run_advisor_checkpoint(
+        phase="end", state=_empty_state(), session_id=None, recorder=recorder, publication_review=_review(_probe(8))
+    )
+
+    assert verdict.ok is True
+    assert len(sent) == len(recorder.llm_calls) == 2
+    assert len(successful) == 1
+    first = _sent_transcript(sent[0]["messages"][1]["content"])
+    second = _sent_transcript(sent[1]["messages"][1]["content"])
+    assert _labels(first) != _NOW
+    assert _labels(second) == _NOW
+    assert _counts(second)["not_shown"] == 8
+    assert _NOT_SHOWN_GAP in second["availability_gaps"]
+
+
+@pytest.mark.asyncio
+async def test_advisor_size_resend_is_available_after_the_last_ordinary_attempt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from litellm.exceptions import BadRequestError
+
+    from tests.unit.web.composer._helpers import _empty_state
+
+    _transport(monkeypatch)
+    complete = provider_gateway._litellm_acompletion
+    sent: list[dict[str, Any]] = []
+
+    async def fail_then_succeed(**kwargs: Any) -> Any:
+        sent.append(copy.deepcopy(kwargs))
+        if len(sent) < 3:
+            await admit_provider_attempt(model=kwargs["model"])
+            if kwargs.get("on_provider_dispatch") is not None:
+                kwargs["on_provider_dispatch"]()
+            if len(sent) == 1:
+                raise TimeoutError("advisor provider timed out")
+            raise BadRequestError(
+                "PRIVATE_PROVIDER_BODY", model=kwargs["model"], llm_provider="openai", body={"code": "context_length_exceeded"}
+            )
+        return await complete(**kwargs)
+
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fail_then_succeed)
+    verdict = await _owner(tmp_path)._run_advisor_checkpoint(
+        phase="end", state=_empty_state(), session_id=None, recorder=BufferingRecorder(), publication_review=_review(_probe(8))
+    )
+
+    assert verdict.ok is True
+    assert len(sent) == 3
+    assert _labels(_sent_transcript(sent[2]["messages"][1]["content"])) == _NOW
+
+
+def _scripted_advisor(monkeypatch: pytest.MonkeyPatch, script: list[str]) -> list[dict[str, Any]]:
+    """Each call takes the next step: ``size`` (rejected as over the context limit), ``junk`` (text that is no verdict) or ``ok``."""
+    from litellm.exceptions import BadRequestError
+
+    _transport(monkeypatch)
+    complete = provider_gateway._litellm_acompletion
+    sent: list[dict[str, Any]] = []
+
+    async def scripted(**kwargs: Any) -> Any:
+        sent.append(copy.deepcopy(kwargs))
+        step = script[len(sent) - 1]
+        if step == "ok":
+            return await complete(**kwargs)
+        await admit_provider_attempt(model=kwargs["model"])
+        if kwargs.get("on_provider_dispatch") is not None:
+            kwargs["on_provider_dispatch"]()
+        if step == "size":
+            raise BadRequestError(
+                "PRIVATE_PROVIDER_BODY", model=kwargs["model"], llm_provider="openai", body={"code": "context_length_exceeded"}
+            )
+        return ModelResponse(
+            id="advisor-junk",
+            model=kwargs["model"],
+            choices=[{"message": {"role": "assistant", "content": "no verdict here", "tool_calls": None}}],
+            usage=Usage(prompt_tokens=100, completion_tokens=5, total_tokens=105),
+        )
+
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", scripted)
+    return sent
+
+
+@pytest.mark.asyncio
+async def test_advisor_text_first_seen_after_a_size_resend_gets_a_plain_retry_and_a_true_pass_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The first attempt was rejected for size, so it carried no text. A
+    # format re-prompt would claim the first attempt's text was rejected;
+    # the pass record refuses that claim, so the retry is plain.
+    from tests.unit.web.composer._helpers import _empty_state
+
+    sent = _scripted_advisor(monkeypatch, ["size", "junk", "ok"])
+    verdict = await _owner(tmp_path)._run_advisor_checkpoint(
+        phase="end", state=_empty_state(), session_id=None, recorder=BufferingRecorder(), publication_review=_review(_probe(8))
+    )
+
+    assert verdict.ok is True
+    assert len(sent) == 3
+    assert all("publication_verdict=ADMIT|WITHHOLD" not in request["messages"][1]["content"] for request in sent)
+
+
+@pytest.mark.asyncio
+async def test_advisor_size_resend_of_a_format_reprompt_keeps_the_reprompt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from tests.unit.web.composer._helpers import _empty_state
+
+    sent = _scripted_advisor(monkeypatch, ["junk", "size", "ok"])
+    verdict = await _owner(tmp_path)._run_advisor_checkpoint(
+        phase="end", state=_empty_state(), session_id=None, recorder=BufferingRecorder(), publication_review=_review(_probe(8))
+    )
+
+    assert verdict.ok is True
+    assert len(sent) == 3
+    first, reprompt, resend = (request["messages"][1]["content"] for request in sent)
+    assert reprompt != first
+    assert _labels(_sent_transcript(resend)) == _NOW
+    # The resend is the re-prompt with the earlier turns left out, not the original request.
+    assert _labels(_sent_transcript(reprompt)) != _NOW
+    assert "publication_verdict=ADMIT|WITHHOLD" in reprompt
+    assert "publication_verdict=ADMIT|WITHHOLD" in resend
+    assert "publication_verdict=ADMIT|WITHHOLD" not in first
+
+
+@pytest.mark.asyncio
 async def test_an_editing_turn_over_its_estimate_sends_the_review_and_publishes_the_admitted_reply(
     monkeypatch: pytest.MonkeyPatch, make_service: Any, simple_state: Any
 ) -> None:
