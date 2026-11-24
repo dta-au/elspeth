@@ -7,14 +7,15 @@ from uuid import uuid4
 import pytest
 import structlog
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import delete, text
+from sqlalchemy import delete, select, text
 
 from elspeth.contracts.blobs import BlobForkFenceLostError, BlobForkWriteFence
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.web.blobs import service as blob_service
 from elspeth.web.blobs.service import _require_live_fork_write_fence
 from elspeth.web.coordination.contracts import SessionOperationKind
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import session_operation_receipt_events_table
+from elspeth.web.sessions.models import session_operation_receipt_events_table, session_operation_receipts_table
 from elspeth.web.sessions.operation_receipts import operation_receipt_request_hash
 from elspeth.web.sessions.protocol import (
     OperationReceiptActive,
@@ -194,7 +195,7 @@ async def test_terminal_receipt_refuses_missing_immutable_event(tmp_path) -> Non
 
 
 @pytest.mark.asyncio
-async def test_fork_blob_write_requires_exact_neutral_receipt_lease(tmp_path) -> None:
+async def test_fork_blob_write_requires_exact_neutral_receipt_lease(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     engine = create_session_engine(f"sqlite:///{tmp_path / 'fork-fence.db'}")
     initialize_session_schema(engine)
     with engine.begin() as conn:
@@ -229,6 +230,19 @@ async def test_fork_blob_write_requires_exact_neutral_receipt_lease(tmp_path) ->
                 _require_live_fork_write_fence(conn, BlobForkWriteFence(parent.id, uuid4(), "fork-1", live.lease_token, live.attempt))
             with pytest.raises(BlobForkFenceLostError):
                 _require_live_fork_write_fence(conn, BlobForkWriteFence(parent.id, child.id, "fork-1", "forged", live.attempt))
+            # Liveness is judged by the database clock a receipt takeover reads
+            # (``database_now``), not transaction-start time: at the exact
+            # expiry instant the lease is no longer live.
+            lease_expires_at = conn.execute(
+                select(session_operation_receipts_table.c.lease_expires_at).where(
+                    session_operation_receipts_table.c.operation_id == "fork-1"
+                )
+            ).scalar_one()
+            with monkeypatch.context() as patch:
+                patch.setattr(blob_service, "database_now", lambda _conn: lease_expires_at, raising=False)
+                with pytest.raises(BlobForkFenceLostError):
+                    _require_live_fork_write_fence(conn, live)
+            _require_live_fork_write_fence(conn, live)
         await service.fail_operation_receipt(
             claimed.fence, failure_code="operation_failed", actor="test", session_operation_context=context
         )
