@@ -26,6 +26,7 @@ from elspeth.web.coordination.contracts import (
     SessionOperationFenceLost,
     SessionOperationKind,
 )
+from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.coordination.repository import PostgresSessionOperationRepository, SessionOperationConflictError
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.sessions.models import (
@@ -600,8 +601,16 @@ def _expire_receipt(engine, *, operation_id: str) -> None:
         conn.execute(
             update(session_operation_receipts_table)
             .where(session_operation_receipts_table.c.operation_id == operation_id)
-            .values(lease_expires_at=datetime.now(UTC) - timedelta(hours=1))
+            .values(lease_expires_at=database_now(conn) - timedelta(hours=1))
         )
+
+
+def _stage_child(engine, *, session_id: str) -> datetime:
+    """Archive a session the way fork construction stages its child; returns archived_at."""
+    archived_at = datetime.now(UTC) - timedelta(minutes=1)
+    with engine.begin() as conn:
+        conn.execute(update(sessions_table).where(sessions_table.c.id == session_id).values(archived_at=archived_at))
+    return archived_at
 
 
 def test_sqlite_archive_soft_archives_past_own_expired_receipt_and_refuses_its_retry(engine) -> None:
@@ -609,11 +618,13 @@ def test_sqlite_archive_soft_archives_past_own_expired_receipt_and_refuses_its_r
 
     The parent is archived rather than removed, the receipt stays as history
     naming its staged child, the archived parent refuses the fence a client
-    retry would need, and the child's own delete is still refused.
+    retry would need, and the staged child (archived from construction, as
+    fork construction leaves it) refuses any operation fence and stays archived.
     """
     authority = SQLiteLocalSessionOperationAuthority(engine)
     target = _created(authority)
     child = _created(authority)
+    _stage_child(engine, session_id=str(child.id))
     operation_id = str(uuid4())
     _seed_fork_operation(engine, session_id=str(target.id), operation_id=operation_id, result_session_id=str(child.id))
     _expire_receipt(engine, operation_id=operation_id)
@@ -648,25 +659,28 @@ def test_sqlite_archive_soft_archives_past_own_expired_receipt_and_refuses_its_r
             owner_instance_id="sqlite-retry",
             lease_seconds=30,
         )
-    child_context = authority.acquire(
-        session_id=child.id,
-        operation_kind=SessionOperationKind.ARCHIVE,
-        owner_instance_id="sqlite-owner",
-        lease_seconds=30,
-    )
-    with pytest.raises(SessionReceiptInProgressError):
-        authority.mutate(
-            child_context,
-            lambda transaction: transaction.session.decide_and_soft_archive(archived_at=datetime.now(UTC)),
-        )
-    authority.release(child_context)
     with engine.connect() as conn:
         child_archived_at = conn.execute(select(sessions_table.c.archived_at).where(sessions_table.c.id == str(child.id))).scalar_one()
-    assert child_archived_at is None
+    with pytest.raises(SessionOperationFenceLost):
+        authority.acquire(
+            session_id=child.id,
+            operation_kind=SessionOperationKind.ARCHIVE,
+            owner_instance_id="sqlite-owner",
+            lease_seconds=30,
+        )
+    with engine.connect() as conn:
+        assert (
+            conn.execute(select(sessions_table.c.archived_at).where(sessions_table.c.id == str(child.id))).scalar_one() == child_archived_at
+        )
 
 
 def test_sqlite_archive_still_refuses_an_expired_incoming_fork(engine) -> None:
-    """An incoming fork's child is still staged; a retried fork would reactivate it."""
+    """Reader only: an expired incoming fork still refuses the receipt check.
+
+    The child here is active, which fork construction never produces (a staged
+    child is archived until settlement and so refuses any operation fence);
+    this pins the incoming reader itself, not a reachable user flow.
+    """
     authority = SQLiteLocalSessionOperationAuthority(engine)
     target = _created(authority)
     parent = _created(authority)

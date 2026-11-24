@@ -59,6 +59,7 @@ from elspeth.web.blobs.service import (
     content_hash,
     sanitize_filename,
 )
+from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import (
     blobs_table,
@@ -3823,8 +3824,11 @@ class TestCopyBlobsForFork:
         if fork_status == "in_progress":
             values.update(lease_token="lease", lease_expires_at=now + timedelta(hours=1))
         elif fork_status == "in_progress_expired":
-            # An abandoned fork whose lease lapsed no longer retains the parent's blobs.
-            values.update(lease_token="lease", lease_expires_at=now - timedelta(hours=1))
+            # An abandoned fork whose lease lapsed, by the database clock, no
+            # longer retains the parent's blobs.
+            with db_engine.connect() as conn:
+                database_time = database_now(conn)
+            values.update(lease_token="lease", lease_expires_at=database_time - timedelta(hours=1))
         elif fork_status == "completed":
             values.update(
                 settled_at=now,
@@ -3846,11 +3850,13 @@ class TestCopyBlobsForFork:
             with pytest.raises(BlobNotFoundError):
                 await blob_service.read_blob_content(source.id, session_operation_context=compose_context)
 
-    def test_fork_retention_lookup_sees_only_a_live_fork_lease(self, db_engine, session_id: UUID) -> None:
+    def test_fork_retention_lookup_sees_only_a_live_fork_lease(self, db_engine, session_id: UUID, monkeypatch: pytest.MonkeyPatch) -> None:
         """The fork-cleanup retention check judges the receipt lease by the database clock."""
+        from elspeth.web.blobs import service as blob_service_module
         from elspeth.web.blobs.service import _in_progress_session_fork_operation_id
 
-        now = datetime.now(UTC)
+        with db_engine.connect() as conn:
+            now = database_now(conn)
         operation_id = str(uuid4())
         with db_engine.begin() as conn:
             conn.execute(
@@ -3877,6 +3883,10 @@ class TestCopyBlobsForFork:
             )
         with db_engine.connect() as conn:
             assert _in_progress_session_fork_operation_id(conn, str(session_id)) == operation_id
+            # The decision follows ``database_now``, the clock a receipt takeover
+            # reads: at the exact expiry instant the fork no longer retains.
+            monkeypatch.setattr(blob_service_module, "database_now", lambda _conn: now + timedelta(hours=1), raising=False)
+            assert _in_progress_session_fork_operation_id(conn, str(session_id)) is None
 
     @pytest.mark.asyncio
     async def test_partial_prior_success_resumes_without_duplicate(
