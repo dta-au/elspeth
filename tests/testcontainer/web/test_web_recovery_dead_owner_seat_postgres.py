@@ -231,7 +231,9 @@ def _landscape_snapshot(landscape_url: str, run_id: str) -> dict[str, Any]:
             ).one_or_none()
     return {
         "landscape_status": None if run is None else run.status.value,
-        "seat_holder": repr(leader),
+        "seat_holder": None
+        if leader is None
+        else {"leader_worker_id": leader.leader_worker_id, "leader_epoch": leader.leader_epoch, "seat_live": leader.seat_live},
         "nodes": nodes,
         "source_rows": rows,
         "checkpoint_sequences": [row.sequence_number for row in checkpoints],
@@ -271,17 +273,18 @@ def _offered_to_recovery(session_url: str, run_id: str) -> bool:
         engine.dispose()
 
 
-async def _settle(app: Any, session_url: str, run_ids: list[str] | None = None) -> dict[str, list[str]]:
+async def _settle(app: Any, session_url: str, run_ids: list[str]) -> dict[str, list[str]]:
     """Wait, with a bound, until no run thread is live in this app and each run's saga is closed.
 
     A run leaves the live set before its worker closes the saga (a fenced write
     scheduled back onto this app's loop), so an empty live set alone does not
     mean the run has finished; leaving the lifespan in that window would refuse
-    the close. ``run_ids`` defaults to the runs live when the wait starts. The
-    saga reads run in a thread so this loop stays free to serve the close.
+    the close. The caller names the runs from its own earlier observation: a
+    live-set snapshot taken here could miss a run that left the set in between.
+    The saga reads run in a thread so this loop stays free to serve the close.
     """
     seen = sorted(app.state.execution_service.get_live_run_ids())
-    awaited = seen if run_ids is None else sorted(run_ids)
+    awaited = sorted(run_ids)
     loop = asyncio.get_running_loop()
     deadline = loop.time() + _SETTLE_BOUND_SECONDS
     while app.state.execution_service.get_live_run_ids() and loop.time() < deadline:
@@ -309,7 +312,7 @@ async def _app_cycle(
         app = create_app(settings=pg_http_settings(session_url, landscape_url, data_dir), process_watchdog_factory=OwnedTestProcessWatchdog)
         async with app.router.lifespan_context(app):
             observed["live_after_startup"] = sorted(app.state.execution_service.get_live_run_ids())
-            observed["settled_after_startup"] = await _settle(app, session_url)
+            observed["settled_after_startup"] = await _settle(app, session_url, observed["live_after_startup"])
             if execute:
                 provider = app.state.auth_provider
                 assert isinstance(provider, LocalAuthProvider)
@@ -348,7 +351,8 @@ def test_dead_owner_run_resumes_whether_its_seat_was_released_or_lapsed(recovery
     assert at_kill["source_lifecycle"] == ["exhausted"]
     assert at_kill["checkpoint_sequences"] == [0]
     assert at_kill["source_rows"] == 2
-    assert "seat_live=True" in at_kill["seat_holder"]
+    assert at_kill["seat_holder"] is not None
+    assert at_kill["seat_holder"]["seat_live"] is True
     assert record["web_at_kill"]["status"] == "running"
 
     _expire_dead_owner(session_url, session_id, held["owner"])
@@ -387,9 +391,10 @@ def test_dead_owner_run_resumes_whether_its_seat_was_released_or_lapsed(recovery
         record[name] = observed
 
     if seat == "released":
-        assert record["before_app1"]["seat_holder"] == "None"
+        assert record["before_app1"]["seat_holder"] is None
     else:
-        assert "seat_live=False" in record["before_app1"]["seat_holder"]
+        # Same incumbent as at the kill, no longer live.
+        assert record["before_app1"]["seat_holder"] == {**at_kill["seat_holder"], "seat_live": False}
     assert record["before_app1"]["offered_to_recovery"] is True
     # App 1's sweep resumes the run in that app (recover_run -> engine resume; the
     # seat epoch moves from 1 to 2) to completion, writing the held sink output once.
