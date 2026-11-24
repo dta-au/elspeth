@@ -13,8 +13,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
-# peer-flood-stalled: the owner's first accept resumes this long before its startup deadline.
-STALL_EDGE_NS = 250_000_000
+# peer-flood-stalled: the owner's first accept resumes this long before its startup deadline. Half the
+# startup window: the flood waits in the listen queue while the owner is not running, and the owner keeps
+# a second, not a tight margin, to refuse the peer over its limit on a loaded host.
+STALL_RESUME_BEFORE_DEADLINE_NS = 1_000_000_000
 
 
 def event(directory: Path, name: str) -> None:
@@ -83,14 +85,13 @@ def supervise(directory: Path, mode: str, speed: int, ignored_chld: bool) -> int
             stalled = False
 
             def accept(self):
-                # The first accept blocks until STALL_EDGE_NS before the startup deadline, so the
-                # whole flood waits in the listen queue and the owner refuses the peer over its
-                # limit in the time left. The owner checks its startup deadline before it selects,
-                # so an accept due at the deadline never runs.
+                # The first accept blocks until STALL_RESUME_BEFORE_DEADLINE_NS before the startup
+                # deadline, so the whole flood waits in the listen queue and the owner refuses the
+                # peer over its limit in the time left.
                 if not StalledSocket.stalled:
                     StalledSocket.stalled = True
                     assert first_reading is not None
-                    resume_at = first_reading + namespace["STARTUP_NS"] - STALL_EDGE_NS
+                    resume_at = first_reading + namespace["STARTUP_NS"] - STALL_RESUME_BEFORE_DEADLINE_NS
                     time.sleep(max(0, resume_at - time.monotonic_ns()) / 1e9)
                 return super().accept()
 

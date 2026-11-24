@@ -393,8 +393,10 @@ def test_authentication_and_partial_startup_fail_closed(tmp_path, mode):
     assert receipt["failed"] and receipt["reaped"] and not receipt["completed"]
     assert not (tmp_path / "authenticated").exists()
     if mode in ("peer-flood", "peer-flood-stalled"):
-        # The child saw the owner close accept attempt PEER_LIMIT + 1 while the first
-        # PEER_LIMIT stayed open; stalled, the owner first ran shortly before its startup deadline.
+        # The child saw the owner close accept attempt PEER_LIMIT + 1 while the first PEER_LIMIT
+        # stayed open. Stalled, the owner first runs a second before its startup deadline; it needs
+        # that time, because each loop checks the startup deadline before it selects, so an accept
+        # still queued at the deadline never runs and the child is killed without the witness.
         assert (tmp_path / "peer-limit-refused").exists()
 
 
