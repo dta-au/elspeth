@@ -4591,14 +4591,18 @@ class TestDeploymentStateModeStartup:
         monkeypatch.setattr(engine, "dispose", dispose)
         monkeypatch.setattr(app_module, "create_session_engine", lambda *_args, **_kwargs: engine)
         # The upkeep pool joins the same stand-in; the PostgreSQL-only connect
-        # timeout does not apply to it.
-        monkeypatch.setattr(
-            app_module,
-            "create_lease_upkeep_engine",
-            lambda url, *, connect_timeout_seconds=None: real_create_lease_upkeep_engine(url),
-        )
+        # timeout does not apply to it, but the external branch must pass the
+        # main engine's timeout through.
+        upkeep_connect_timeouts: list[int | None] = []
+
+        def create_upkeep_stand_in(url: str, *, connect_timeout_seconds: int | None = None) -> Engine | None:
+            upkeep_connect_timeouts.append(connect_timeout_seconds)
+            return real_create_lease_upkeep_engine(url)
+
+        monkeypatch.setattr(app_module, "create_lease_upkeep_engine", create_upkeep_stand_in)
         monkeypatch.setattr(external_state_startup_module, "validate_only_schema_or_raise", lambda *_args, **_kwargs: None)
         app = create_app(settings)
+        assert upkeep_connect_timeouts == [external_state_startup_module._CONNECT_TIMEOUT_SECONDS]
 
         # The audit engine now starts before services. Model the externally
         # provisioned Landscape alongside the provisioned Sessions stand-in;

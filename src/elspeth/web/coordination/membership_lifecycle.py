@@ -31,6 +31,7 @@ from elspeth.web.coordination.membership_authority import (
     WebInstanceIdentity,
     WebInstanceMembershipLost,
 )
+from elspeth.web.coordination.upkeep_engine import lease_upkeep_authority
 from elspeth.web.process_recovery import ProcessRecovery
 
 _HEARTBEAT_MAX_CONSECUTIVE_FAILURES = 5
@@ -133,9 +134,7 @@ class RegisteredWebInstanceMembership(WebInstanceMembership):
             raise TypeError("identity must be a WebInstanceIdentity")
         super().__init__(instance_draining=instance_draining)
         self._authority = authority
-        # create_app always wires the upkeep sibling; the fallback is for bare test authorities.
-        upkeep = authority.lease_upkeep_authority
-        self._heartbeat_authority = authority if upkeep is None else upkeep
+        self._heartbeat_authority = lease_upkeep_authority(authority)
         self._identity = identity
         self._lease_seconds = lease_seconds
         resolved_interval = heartbeat_interval_seconds(lease_seconds) if interval_seconds is None else interval_seconds

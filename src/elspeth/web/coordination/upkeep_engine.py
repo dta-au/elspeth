@@ -8,6 +8,14 @@ ordinary work holding every main connection cannot make upkeep wait at checkout.
 The invariant is one connection per upkeep worker thread: the pool has exactly
 ``LEASE_UPKEEP_MAX_WORKERS`` connections and no overflow, and a checkout from any
 thread the upkeep executor did not start is refused.
+
+One exemption, at construction only: for file SQLite, ``create_session_engine``
+opens a probe connection on the creating thread before it returns, so before
+the guard can be attached. The engine is not yet published to any other code
+at that point; every checkout after ``create_lease_upkeep_engine`` returns is
+guarded. The guard detects wiring defects loudly; it does not make them free,
+because a refused checkout has already taken a pool slot (and may have
+connected) before the listener runs.
 """
 
 from __future__ import annotations
@@ -21,6 +29,7 @@ from elspeth.web.async_workers import LEASE_UPKEEP_MAX_WORKERS, on_lease_upkeep_
 from elspeth.web.sessions.engine import create_session_engine
 
 if TYPE_CHECKING:
+    from elspeth.web.coordination.membership_authority import RepositoryWebInstanceMembershipAuthority
     from elspeth.web.sessions.protocol import SessionOperationAuthority
 
 
@@ -75,18 +84,25 @@ def create_lease_upkeep_engine(url: str, *, connect_timeout_seconds: int | None 
     return engine
 
 
-def lease_upkeep_authority(authority: SessionOperationAuthority) -> SessionOperationAuthority:
-    """Return the authority that lease renewal and plain release on the upkeep workers run on.
+def lease_upkeep_authority[A: (SessionOperationAuthority, RepositoryWebInstanceMembershipAuthority)](authority: A) -> A:
+    """Return the authority that lease upkeep on the upkeep workers runs on.
 
-    Production wiring always supplies a sibling bound to the upkeep pool, and
-    the app tests assert that every upkeep call site resolves to it. The
-    fallback to ``authority`` itself is for bare test authorities only:
-    protocol doubles, and repositories that tests build without a sibling.
+    This is the single resolver for every upkeep call site: session lease
+    renewal, fork-child renewal, plain release, the two acquire-cleanup
+    releases, and the membership heartbeat. Production wiring always supplies
+    a sibling bound to the upkeep pool, and the app tests assert that every
+    upkeep call site resolves to it. The fallback to ``authority`` itself is
+    for bare test authorities only: protocol doubles, and repositories that
+    tests build without a sibling.
     """
-    # Deferred: the repository imports the coordination package, whose
+    # Deferred: both authority modules import the coordination package, whose
     # lifecycle module imports this one.
+    from elspeth.web.coordination.membership_authority import RepositoryWebInstanceMembershipAuthority
     from elspeth.web.coordination.repository import _SessionOperationAuthorityRepository
 
-    if isinstance(authority, _SessionOperationAuthorityRepository) and authority.lease_upkeep_authority is not None:
+    if (
+        isinstance(authority, (_SessionOperationAuthorityRepository, RepositoryWebInstanceMembershipAuthority))
+        and authority.lease_upkeep_authority is not None
+    ):
         return authority.lease_upkeep_authority
     return authority

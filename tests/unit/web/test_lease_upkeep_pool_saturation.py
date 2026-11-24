@@ -1,4 +1,4 @@
-"""Lease renewal advances its database deadline while the main session pool is exhausted.
+"""Lease renewal and release reach the database while the main session pool is exhausted.
 
 Driven through ``create_app`` so the production wiring decides which pool
 renewal checks out from. Only names that also exist before the dedicated
@@ -24,6 +24,7 @@ from elspeth.web import app as app_module
 from elspeth.web import async_workers
 from elspeth.web.app import create_app
 from elspeth.web.config import WebSettings
+from elspeth.web.coordination.contracts import SessionOperationLeaseDisposition
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import session_operation_fences_table
@@ -61,6 +62,14 @@ def _fence_expiry(engine: Engine, session_id: UUID) -> datetime:
         return expiry
 
 
+def _released_at(engine: Engine, session_id: UUID) -> datetime | None:
+    with engine.connect() as conn:
+        released: datetime | None = conn.execute(
+            select(session_operation_fences_table.c.released_at).where(session_operation_fences_table.c.session_id == str(session_id))
+        ).scalar_one()
+        return released
+
+
 async def _wait_until(predicate: Callable[[], bool], *, seconds: float = 3) -> None:
     async with asyncio.timeout(seconds):
         while not predicate():
@@ -95,7 +104,7 @@ async def _occupied_shared_pool() -> AsyncIterator[None]:
 @pytest.mark.asyncio
 @pytest.mark.timing_sensitive
 @pytest.mark.timeout(90, method="thread")
-async def test_renewal_advances_deadline_with_main_session_pool_exhausted(
+async def test_renewal_and_release_reach_the_database_with_main_session_pool_exhausted(
     tmp_path: Path, observer: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # One main-pool connection, no overflow, and a checkout wait far longer
@@ -120,15 +129,21 @@ async def test_renewal_advances_deadline_with_main_session_pool_exhausted(
             renew_interval_seconds=0.1,
         )
         try:
-            before = _fence_expiry(observer, session_id)
             # Holds the only main connection without a transaction, so no
             # database lock is involved: only the pool checkout can block.
             holder = main_engine.connect()
             try:
                 async with _occupied_shared_pool():
+                    # Baseline taken with both capacities held, so a renewal
+                    # already in flight on the main pool cannot satisfy it.
+                    before = _fence_expiry(observer, session_id)
                     await _poll_until(lambda: _fence_expiry(observer, session_id) > before or lease.renewal_error is not None, seconds=2)
                     assert lease.renewal_error is None
                     assert _fence_expiry(observer, session_id) > before
+                    # The plain release runs with both capacities still held.
+                    await asyncio.wait_for(lease.close(), timeout=5)
+                    assert lease.disposition is SessionOperationLeaseDisposition.RELEASED
+                    assert _released_at(observer, session_id) is not None
             finally:
                 holder.close()
         finally:
