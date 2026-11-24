@@ -16,6 +16,8 @@ Value objects threaded through the leader/follower coordination protocol
   leader derives its own through ``CoordinationToken.membership``.
 - :class:`LeaderInfo` — read-only seat snapshot (``seat_holder``); the
   slice-4 entry-guard precision upgrade consumes it.
+- :class:`LiveLeader` — a leader seat that is live (``live_leader``); it has
+  no liveness flag, so its presence is the liveness decision.
 - :class:`CoordinationSnapshot` — returned by an admitted ``worker_heartbeat`` so
   followers learn of seat handover on their existing cadence (§A.3;
   consumed by the slice-4 heartbeat thread).
@@ -39,6 +41,7 @@ __all__ = [
     "CoordinationSnapshot",
     "CoordinationToken",
     "LeaderInfo",
+    "LiveLeader",
     "RegisteredWorker",
     "WorkerMembershipLost",
     "WorkerMembershipToken",
@@ -157,6 +160,21 @@ class LeaderInfo:
     leader_epoch: int
     leader_heartbeat_expires_at: datetime
     seat_live: bool
+
+
+@dataclass(frozen=True, slots=True)
+class LiveLeader:
+    """A run's leader seat that is live at the Landscape database clock (``live_leader``).
+
+    There is no liveness flag: an instance exists only for a live seat, so
+    ``live_leader(...) is not None`` is the liveness decision. Use
+    ``seat_holder`` for the incumbent whatever its liveness.
+    """
+
+    run_id: str
+    leader_worker_id: str
+    leader_epoch: int
+    leader_heartbeat_expires_at: datetime
 
 
 @dataclass(frozen=True, slots=True)

@@ -4972,7 +4972,7 @@ class ExecutionServiceImpl:
             refusal_reason = exc.reason if isinstance(exc, _RunRecoveryRequired) else RecoveryRequiredReason.COMPATIBILITY_MISMATCH
             if landscape_db is not None:
                 repositories = RecorderFactory(landscape_db)
-                if repositories.run_coordination.seat_holder(run_id=run_id) is not None:
+                if repositories.run_coordination.live_leader(run_id=run_id) is not None:
                     return None
             self._call_async(
                 run_sync_in_worker(

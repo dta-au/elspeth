@@ -60,11 +60,11 @@ def observe_run(landscape_url: str, run_id: str, *, create_tables: bool, passphr
             return RecoveryObservation(None, False, None)
         entries = _run_token_usage_entries(db, landscape_run_id=run_id)
         if run.status == RunStatus.RUNNING:
-            return RecoveryObservation(run.status, repositories.run_coordination.seat_holder(run_id=run_id) is not None, None, entries)
+            return RecoveryObservation(run.status, repositories.run_coordination.live_leader(run_id=run_id) is not None, None, entries)
         if run.status in {RunStatus.FAILED, RunStatus.INTERRUPTED}:
             return RecoveryObservation(
                 run.status,
-                repositories.run_coordination.seat_holder(run_id=run_id) is not None,
+                repositories.run_coordination.live_leader(run_id=run_id) is not None,
                 load_run_accounting_from_db(db, landscape_run_id=run_id),
                 entries,
             )

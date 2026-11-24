@@ -39,6 +39,7 @@ register_run_leader_on      slice 2/3: ``begin_run`` (uniformity rule, epoch 1)
 acquire_run_leadership      slice 2/3: ``resume()``'s first durable act (§B.4)
 release_seat                slice 2/3: run/resume teardown + ceremony arms (LEADER-fenced)
 seat_holder                 implemented now; WIRED in slice 4 (entry-guard precision)
+live_leader                 web run recovery: a live seat only (liveness decisions)
 record_fence_refusal        slice 2: every fenced verb's refusal path
 verify_and_extend_fence     slice 2: finalize/run-status/checkpoint/barrier/ingest
 worker_heartbeat            slice 4: the dedicated heartbeat thread (§A.3) (MEMBER-fenced)
@@ -73,6 +74,7 @@ from elspeth.contracts.coordination import (
     CoordinationSnapshot,
     CoordinationToken,
     LeaderInfo,
+    LiveLeader,
     RegisteredWorker,
     WorkerMembershipLost,
     WorkerMembershipToken,
@@ -1237,6 +1239,22 @@ class RunCoordinationRepository:
             leader_epoch=int(seat.leader_epoch),
             leader_heartbeat_expires_at=_utc(seat.leader_heartbeat_expires_at),
             seat_live=bool(seat.seat_live),
+        )
+
+    def live_leader(self, *, run_id: str) -> LiveLeader | None:
+        """The run's leader seat only while it is live; None when vacant or lapsed.
+
+        For liveness decisions. ``seat_holder`` returns the incumbent of a
+        lapsed seat too, which is not evidence that its owner is alive.
+        """
+        holder = self.seat_holder(run_id=run_id)
+        if holder is None or not holder.seat_live:
+            return None
+        return LiveLeader(
+            run_id=holder.run_id,
+            leader_worker_id=holder.leader_worker_id,
+            leader_epoch=holder.leader_epoch,
+            leader_heartbeat_expires_at=holder.leader_heartbeat_expires_at,
         )
 
     # ── eventing ─────────────────────────────────────────────────────────

@@ -58,6 +58,7 @@ _CLOCK_AUTHORITY_VERBS = frozenset(
         "fenced_leader_transaction",
         "fenced_write",
         "heartbeat_lease",
+        "live_leader",
         "seat_holder",
         "peer_active_leases",
         "recover_expired_leases",
