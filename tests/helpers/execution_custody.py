@@ -404,6 +404,9 @@ class CanonicalExecutionAuthorityObservation:
         self.renew_allowed = threading.Event()
         self.renew_allowed.set()
         self.renew_error: BaseException | None = None
+        # Raised once each, oldest first, before ``renew_error`` is considered.
+        self.renew_errors_once: list[BaseException] = []
+        self.renew_attempts = 0
         original_advance, original_transaction = authority._advance_exclusive_fence_on_connection, authority._locked_transaction
         self.original_advance, self.original_transaction = original_advance, original_transaction
         pending_contexts = {}
@@ -428,8 +431,11 @@ class CanonicalExecutionAuthorityObservation:
                 if self.release_error is not None:
                     raise self.release_error
             elif producer is _SessionOperationAuthorityRepository.renew.__code__:
+                self.renew_attempts += 1
                 self.renew_called.set()
                 assert self.renew_allowed.wait(5), "actual renewal SQL fixture gate was never opened"
+                if self.renew_errors_once:
+                    raise self.renew_errors_once.pop(0)
                 if self.renew_error is not None:
                     raise self.renew_error
             context = None

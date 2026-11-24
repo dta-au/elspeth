@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any, Literal, Never, cast, final
 from uuid import UUID
 
 import structlog
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
 from elspeth.contracts import errors as contract_errors
 from elspeth.contracts.errors import ComposerOwnedSettlementFailure
@@ -124,6 +124,12 @@ _SLOW_RENEWAL_LOG_SECONDS = 2.0
 # end). Logging only; touched only on the event loop; bounded oldest-first.
 _RENEWAL_FINISHED_AT: dict[tuple[str, str, int], float] = {}
 _RENEWAL_FINISHED_RETAINED = 1_024
+# A plain-branch renewal that raises ``OperationalError`` (transient database
+# contention) is retried while the next attempt still starts inside the lease,
+# and only this many times in a row: the same bound as the membership
+# heartbeat and the orphan sweeper. Every other renewal error loses the lease
+# at once.
+_RENEWAL_MAX_CONSECUTIVE_TRANSIENT_FAILURES = 5
 
 slog = structlog.get_logger()
 type ArchiveLifecycleCallback = Callable[[], Awaitable[None]]
@@ -480,6 +486,7 @@ class SessionOperationLease:
         "_execution_obligation",
         "_finish_mode",
         "_fork_authority",
+        "_lease_extended_at",
         "_lease_seconds",
         "_lost_event",
         "_owned_tasks",
@@ -503,7 +510,13 @@ class SessionOperationLease:
         fork_authority: SessionForkAuthority | None = None,
         required_work: RequiredWorkCoordinator | None = None,
         execution_obligation: ExecutionAcquisitionObligation | None = None,
+        lease_extended_at: float | None = None,
     ) -> None:
+        # ``lease_extended_at`` is the monotonic time read before the SQL that
+        # last set this lease's expiry, or ``None`` when that time is unknown
+        # (an adopted lease); renewal tolerates no transient failure until it
+        # knows when the lease expires. No statement may precede the guards:
+        # the required-work reserve contract pins them first.
         if required_work is not None:
             if type(required_work) is not RequiredWorkCoordinator:
                 raise contract_errors.AuditIntegrityError("Lease requires an owned required-work coordinator")
@@ -521,6 +534,7 @@ class SessionOperationLease:
         self._upkeep_authority = lease_upkeep_authority(authority)
         self._context = context
         self._lease_seconds = lease_seconds
+        self._lease_extended_at = lease_extended_at
         self._renew_interval_seconds = renew_interval_seconds
         self._fork_authority = fork_authority
         self._stop_renewal = asyncio.Event()
@@ -571,6 +585,9 @@ class SessionOperationLease:
                 authority, session_id=session_id, owner_instance_id=owner_instance_id, lease_seconds=lease_seconds
             )
             return await cls._acquire_execution(authority, execution_obligation, interval)
+        # Read before the acquire SQL: the database stamps the expiry later,
+        # so the lease lasts at least lease_seconds from this reading.
+        lease_extended_at = time.monotonic()
         # Held in a list so the finished task (whose repr carries its result or
         # exception) can be dropped from this frame on every path before a
         # failure escapes; a plain local cannot be deleted on one branch only.
@@ -646,6 +663,7 @@ class SessionOperationLease:
             context,
             lease_seconds=lease_seconds,
             renew_interval_seconds=interval,
+            lease_extended_at=lease_extended_at,
         )
 
     @classmethod
@@ -654,6 +672,8 @@ class SessionOperationLease:
     ) -> SessionOperationLease:
         if cls is not SessionOperationLease:
             raise contract_errors.AuditIntegrityError("EXECUTE lease constructor must retain its owned concrete type")
+        # Read before the acquire SQL is submitted; see ``acquire``.
+        lease_extended_at = time.monotonic()
         outcome = await run_execution_lease_sql_finish_once(obligation.acquire_submission)
         cancellations = list(outcome.deferred_cancellations)
         if isinstance(outcome, RequiredSQLRaised):
@@ -681,6 +701,7 @@ class SessionOperationLease:
                 lease_seconds=obligation.lease_seconds,
                 renew_interval_seconds=interval,
                 execution_obligation=obligation,
+                lease_extended_at=lease_extended_at,
             )
         except BaseException as original:
             obligation.record_construction_failure(original)
@@ -985,6 +1006,8 @@ class SessionOperationLease:
                 raise contract_errors.AuditIntegrityError("EXECUTE renewal lacks actual Task ownership")
             obligation.bind_actual_renewal_task(self, actual_task)
             self._renewal_task = actual_task
+        renewed_at = self._lease_extended_at
+        transient_failures = 0
         while not self._stop_renewal.is_set():
             with suppress(TimeoutError):
                 await asyncio.wait_for(
@@ -993,6 +1016,7 @@ class SessionOperationLease:
                 )
             if self._stop_renewal.is_set():
                 return
+            attempt_started_at = time.monotonic()
             try:
                 if self._fork_authority is None:
                     if self._required_work is None:
@@ -1040,8 +1064,44 @@ class SessionOperationLease:
                 self._record_renewal_error(renewal_error)
                 return
             except Exception as renewal_error:
+                transient_failures += 1
+                if self._retries_transient_renewal_failure(renewal_error, renewed_at=renewed_at, consecutive_failures=transient_failures):
+                    continue
                 self._record_renewal_error(renewal_error)
                 return
+            else:
+                renewed_at = attempt_started_at
+                transient_failures = 0
+
+    def _retries_transient_renewal_failure(self, error: Exception, *, renewed_at: float | None, consecutive_failures: int) -> bool:
+        """True when a plain-branch renewal may try again after ``error``.
+
+        Only ``OperationalError`` models transient contention. The next
+        attempt must start inside the lease, measured from the reading taken
+        before the SQL that last extended it, so the lease is never held past
+        its database expiry by this loop. A required-work renewal is never
+        retried: its failed ticket stays with the coordinator.
+        """
+        if not isinstance(error, OperationalError) or self._required_work is not None or renewed_at is None:
+            return False
+        if consecutive_failures >= _RENEWAL_MAX_CONSECUTIVE_TRANSIENT_FAILURES:
+            return False
+        seconds_since_renewal = time.monotonic() - renewed_at
+        if seconds_since_renewal + self._renew_interval_seconds >= self._lease_seconds:
+            return False
+        # exc_info is deliberately omitted: SQLAlchemy cause chains carry the
+        # database URL.
+        slog.warning(
+            "session_operation.renewal_retrying",
+            session_id=self._context.fence.session_id,
+            operation_id=self._context.fence.operation_id,
+            operation_epoch=self._context.fence.operation_epoch,
+            operation_kind=self._context.operation_kind.value,
+            exc_class=type(error).__name__,
+            consecutive_failures=consecutive_failures,
+            seconds_since_renewal=round(seconds_since_renewal, 3),
+        )
+        return True
 
     async def _run_required_renewal_attempt(
         self, attempt: _RenewalAttemptObservation, ticket: RequiredWorkTicket

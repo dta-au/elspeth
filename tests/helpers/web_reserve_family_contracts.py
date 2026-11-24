@@ -811,9 +811,9 @@ def _lease_contracts():
     return {
         "SessionOperationLease.__init__": (
             ("self", "authority", "context"),
-            ("lease_seconds", "renew_interval_seconds", "fork_authority", "required_work", "execution_obligation"),
+            ("lease_seconds", "renew_interval_seconds", "fork_authority", "required_work", "execution_obligation", "lease_extended_at"),
             (),
-            (None, None, c(None), c(None), c(None)),
+            (None, None, c(None), c(None), c(None), c(None)),
             False,
             (),
             [
@@ -850,6 +850,7 @@ def _lease_contracts():
                 assign(s("_upkeep_authority"), call("lease_upkeep_authority", n("authority"))),
                 assign(s("_context"), n("context")),
                 assign(s("_lease_seconds"), n("lease_seconds")),
+                assign(s("_lease_extended_at"), n("lease_extended_at")),
                 assign(s("_renew_interval_seconds"), n("renew_interval_seconds")),
                 assign(s("_fork_authority"), n("fork_authority")),
                 assign(s("_stop_renewal"), call(a(n("asyncio"), "Event"))),
@@ -1104,6 +1105,8 @@ def _renew_contract():
                     assign(s("_renewal_task"), n("actual_task")),
                 ],
             ),
+            assign(n("renewed_at"), s("_lease_extended_at")),
+            assign(n("transient_failures"), c(0)),
             while_(
                 neg(call(a(s("_stop_renewal"), "is_set"))),
                 [
@@ -1122,6 +1125,7 @@ def _renew_contract():
                         ],
                     ),
                     iff(call(a(s("_stop_renewal"), "is_set")), [ret()]),
+                    assign(n("attempt_started_at"), call(a(n("time"), "monotonic"))),
                     try_(
                         [
                             iff(
@@ -1241,8 +1245,26 @@ def _renew_contract():
                                 "renewal_error",
                                 [expr(call(s("_record_renewal_error"), n("renewal_error"))), ret()],
                             ),
-                            handler(n("Exception"), "renewal_error", [expr(call(s("_record_renewal_error"), n("renewal_error"))), ret()]),
+                            handler(
+                                n("Exception"),
+                                "renewal_error",
+                                [
+                                    aug(n("transient_failures")),
+                                    iff(
+                                        call(
+                                            s("_retries_transient_renewal_failure"),
+                                            n("renewal_error"),
+                                            renewed_at=n("renewed_at"),
+                                            consecutive_failures=n("transient_failures"),
+                                        ),
+                                        [ast.Continue()],
+                                    ),
+                                    expr(call(s("_record_renewal_error"), n("renewal_error"))),
+                                    ret(),
+                                ],
+                            ),
                         ],
+                        [assign(n("renewed_at"), n("attempt_started_at")), assign(n("transient_failures"), c(0))],
                     ),
                 ],
             ),
@@ -1315,9 +1337,9 @@ def _lease_constructor(unit):
     if not _signature(
         fn,
         ("self", "authority", "context"),
-        ("lease_seconds", "renew_interval_seconds", "fork_authority", "required_work", "execution_obligation"),
+        ("lease_seconds", "renew_interval_seconds", "fork_authority", "required_work", "execution_obligation", "lease_extended_at"),
         (),
-        (None, None, c(None), c(None), c(None)),
+        (None, None, c(None), c(None), c(None), c(None)),
     ):
         failures.append("lease constructor: source argument binding changed")
     error = a(n("contract_errors"), "AuditIntegrityError")
@@ -1891,6 +1913,7 @@ def family_local_contracts(units):
                     "_execution_obligation",
                     "_finish_mode",
                     "_fork_authority",
+                    "_lease_extended_at",
                     "_lease_seconds",
                     "_lost_event",
                     "_owned_tasks",
