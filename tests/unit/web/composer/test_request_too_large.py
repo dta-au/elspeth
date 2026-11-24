@@ -18,10 +18,12 @@ context-limit rejection is.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import httpx
 import litellm
 import pytest
+from litellm.exceptions import APIError as LiteLLMAPIError
 from litellm.litellm_core_utils.exception_mapping_utils import exception_type
 from litellm.llms.anthropic.common_utils import AnthropicError
 from litellm.llms.base_llm.chat.transformation import BaseLLMException
@@ -31,11 +33,13 @@ from litellm.llms.openai.common_utils import OpenAIError
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.provider_rejection import SafeRequestRejection
 from elspeth.web.composer import audit as composer_audit
+from elspeth.web.composer import provider_gateway
 from elspeth.web.composer.audit import llm_call_audit_envelope
 from elspeth.web.composer.protocol import ComposerConvergenceError
 from elspeth.web.composer.provider_errors import classify_provider_failure, request_size_rejection
 from elspeth.web.composer.provider_gateway import _BadRequestLLMError
 from tests.unit.web.composer.test_compose_loop_llm_audit import _make_llm_response
+from tests.unit.web.composer.test_endpoint_affordance import _service as _text_service
 from tests.unit.web.composer.test_gateway_capacity_rejection import _GENEROUS_SETTING, _compose, _ScriptedProvider, _service
 from tests.unit.web.composer.test_gateway_capacity_rejection import (
     _advisor_end_gate_clean as _advisor_end_gate_clean_fixture,
@@ -214,3 +218,47 @@ async def test_a_413_with_a_specific_retained_code_is_not_resent_with_earlier_tu
 
     assert len(provider.requests) == 1
     assert _history_in(provider.requests[0]) == list(_HISTORY_TEXTS)
+
+
+# --- The gateway's text path (run diagnostics) ------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", SIZE_413_ROUTES)
+async def test_a_413_on_the_gateway_text_path_is_the_rejected_request_carrier(
+    route: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # OpenAI-compatible routes raise APIError(413), Bedrock BadRequestError(413): both
+    # leave the text path as the bad-request carrier, never as an outage.
+    rejection = mapped_provider_error(route, 413)
+
+    async def refuse(**_kwargs: object) -> object:
+        raise rejection
+
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", refuse)
+
+    with pytest.raises(_BadRequestLLMError) as caught:
+        await _text_service(tmp_path)._provider_gateway._call_text_llm([{"role": "user", "content": "hi"}])
+
+    assert caught.value.__cause__ is rejection
+    assert caught.value.provider_status_code == 413
+    assert request_size_rejection(caught.value.__cause__) == _TOO_LARGE
+
+
+@pytest.mark.asyncio
+async def test_control_another_api_error_on_the_gateway_text_path_is_not_the_rejected_request_carrier(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The same exception class with another status leaves the text path unchanged.
+    failure = mapped_provider_error("openai", 418)
+    assert isinstance(failure, LiteLLMAPIError)
+
+    async def fail(**_kwargs: object) -> object:
+        raise failure
+
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fail)
+
+    with pytest.raises(LiteLLMAPIError) as caught:
+        await _text_service(tmp_path)._provider_gateway._call_text_llm([{"role": "user", "content": "hi"}])
+
+    assert caught.value is failure
