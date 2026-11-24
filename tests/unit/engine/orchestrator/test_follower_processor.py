@@ -970,6 +970,92 @@ class TestFollowerMembershipFenceRefusalMidDrain:
         assert len(coord_repo.depart_calls) == 1
 
 
+_TERMINAL_STATUSES = [status for status in RunStatus if status is not RunStatus.RUNNING]
+
+
+class TestFollowerReturnsTheTerminalStatusItRead:
+    """A clean follower exit returns the terminal run status it read, so join can report it.
+
+    ``test_real_follower_probing_after_finalize_and_seat_release_exits_cleanly``
+    and ``test_real_follower_probing_a_released_seat_of_a_running_run_reports_seat_dead``
+    in tests/e2e/recovery/test_follower_join_and_drain.py drive the before-claim
+    leader probe on the real path; these cover the top-of-loop probe and every
+    terminal status.
+    """
+
+    @pytest.mark.parametrize("status", _TERMINAL_STATUSES, ids=lambda status: status.value)
+    def test_terminal_run_at_loop_top_returns_its_status(self, status: RunStatus) -> None:
+        processor = _CountingDrainProcessor()
+        factory = _StubFactory(running=True)
+        factory.run_lifecycle.get_run_results = [_RunStatusRecord(status=status)]
+        follower = FollowerProcessor(
+            processor=processor,
+            member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID),
+            run_coordination=_StubRunCoordRepo(),
+            factory=factory,
+            wait_fn=lambda _: None,
+        )
+
+        with patch("elspeth.engine.orchestrator.follower.RunHeartbeatThread", return_value=_StubHeartbeat(evicted=False)):
+            outcome = follower.run(ctx=_ctx())
+
+        assert outcome is status
+        assert processor.drain_calls == []
+
+    def test_absent_run_returns_no_status(self) -> None:
+        factory = _StubFactory(running=True)
+        factory.run_lifecycle.get_run_results = [None]
+        follower = FollowerProcessor(
+            processor=_CountingDrainProcessor(),
+            member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID),
+            run_coordination=_StubRunCoordRepo(),
+            factory=factory,
+            wait_fn=lambda _: None,
+        )
+
+        with patch("elspeth.engine.orchestrator.follower.RunHeartbeatThread", return_value=_StubHeartbeat(evicted=False)):
+            assert follower.run(ctx=_ctx()) is None
+
+    @pytest.mark.parametrize("status", _TERMINAL_STATUSES, ids=lambda status: status.value)
+    def test_dead_seat_with_terminal_run_returns_its_status(self, status: RunStatus) -> None:
+        coord_repo = _StubRunCoordRepo(seat_present=False)
+        factory = _StubFactory(running=True)
+        # Top-of-loop read: RUNNING; the loop-top leader probe then finds no seat.
+        # Recheck after the dead seat: terminal.
+        factory.run_lifecycle.get_run_results = [_RunStatusRecord(status=RunStatus.RUNNING), _RunStatusRecord(status=status)]
+        follower = FollowerProcessor(
+            processor=_CountingDrainProcessor(),
+            member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID),
+            run_coordination=coord_repo,
+            factory=factory,
+            wait_fn=lambda _: None,
+        )
+
+        with patch("elspeth.engine.orchestrator.follower.RunHeartbeatThread", return_value=_StubHeartbeat(evicted=False)):
+            outcome = follower.run(ctx=_ctx())
+
+        assert outcome is status
+        assert len(coord_repo.depart_calls) == 1
+
+    def test_dead_seat_with_running_run_is_still_seat_dead(self) -> None:
+        coord_repo = _StubRunCoordRepo(seat_present=False)
+        follower = FollowerProcessor(
+            processor=_CountingDrainProcessor(),
+            member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID),
+            run_coordination=coord_repo,
+            factory=_StubFactory(running=True),
+            wait_fn=lambda _: None,
+        )
+
+        with (
+            patch("elspeth.engine.orchestrator.follower.RunHeartbeatThread", return_value=_StubHeartbeat(evicted=False)),
+            pytest.raises(FollowerSeatDeadError),
+        ):
+            follower.run(ctx=_ctx())
+
+        assert len(coord_repo.depart_calls) == 1
+
+
 # ---------------------------------------------------------------------------
 # Tests: stop condition — SIGINT
 # ---------------------------------------------------------------------------
