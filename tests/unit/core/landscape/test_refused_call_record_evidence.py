@@ -7,12 +7,16 @@ it must carry enough to identify the call and its usage.
 """
 
 import json
-from dataclasses import dataclass, replace
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, replace
 from decimal import Decimal
 from typing import Any, ClassVar
 
 import pytest
 from sqlalchemy import func, select
+from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.exc import OperationalError
 
 from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.call_data import RawCallPayload
@@ -22,6 +26,9 @@ from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.core.canonical import stable_hash
+from elspeth.core.landscape import run_coordination_repository
+from elspeth.core.landscape.database import begin_write
+from elspeth.core.landscape.lease_deadlines import DeadlineKey
 from elspeth.core.landscape.scheduler.payload_codec import serialize_row_payload
 from elspeth.core.landscape.schema import calls_table, run_coordination_events_table, token_work_items_table
 from tests.fixtures.landscape import RecorderSetup, make_recorder_with_run, register_test_node
@@ -301,8 +308,6 @@ def test_refused_call_record_lost_to_a_db_fault_is_logged_with_its_identity(
     """When the audit store cannot hold the refusal either, the last-resort log names the call."""
     from sqlalchemy.exc import OperationalError
 
-    from elspeth.core.landscape import run_coordination_repository
-
     setup = _setup()
     with setup.recorder.db.write_connection() as conn:
         conn.execute(
@@ -379,7 +384,6 @@ def test_refused_call_with_a_value_canonical_json_refuses_keeps_the_refusal_and_
     caplog: pytest.LogCaptureFixture, latency_ms: float, token_usage: TokenUsage, logged: tuple[str, str]
 ) -> None:
     """A provider value the contracts admit but the audit store cannot hold must not replace the fence's refusal."""
-    from elspeth.core.landscape import run_coordination_repository
 
     setup = _setup()
     with setup.recorder.db.write_connection() as conn:
@@ -957,22 +961,35 @@ def _hash_trap_index(trap_on_use: int) -> int:
     return _HashTrapIndex(0)
 
 
-@pytest.mark.parametrize("trap_on_use", [1, 2], ids=["first_use", "second_use"])
+class _HashTrapStr(str):
+    def __hash__(self) -> int:
+        raise RuntimeError("the parent id's own hash ran")
+
+
+@pytest.mark.parametrize("trap", ["index_first_use", "index_second_use", "parent"])
 @pytest.mark.parametrize("fence", ["item", "membership", "leader"])
-def test_call_index_subclass_cannot_replace_a_fence_refusal(fence: str, trap_on_use: int) -> None:
-    """The reservation bookkeeping keys on an exact copy of the index, so the index's own hash never runs."""
+def test_reservation_keys_cannot_replace_a_fence_refusal(fence: str, trap: str) -> None:
+    """The bookkeeping keys on exact copies of the parent id and index, so neither's own hash runs.
+
+    The caller reserved the index first; the refused call still releases that reservation.
+    """
     setup = _setup()
     repo = setup.recorder.execution
-    index = _hash_trap_index(trap_on_use)
-    before = len(_fence_refusals(setup))
+    token = setup.recorder.coordination_token
     payloads = (CallType.LLM, CallStatus.SUCCESS, RawCallPayload(_REQUEST), RawCallPayload(_RESPONSE))
 
+    def keys(parent_id: str, reserved: int) -> tuple[str, int]:
+        if trap == "parent":
+            return _HashTrapStr(parent_id), reserved
+        return parent_id, _hash_trap_index(1 if trap == "index_first_use" else 2)
+
     if fence == "leader":
-        token = setup.recorder.coordination_token
         operation_id = _begin_operation(setup)
+        parent, index = keys(operation_id, repo.allocate_operation_call_index(operation_id, coordination_token=token))
+        before = len(_fence_refusals(setup))
         with pytest.raises(RunLeadershipLostError):
             repo.record_operation_call(
-                operation_id,
+                parent,
                 *payloads,
                 latency_ms=12.5,
                 token_usage=_USAGE,
@@ -982,6 +999,7 @@ def test_call_index_subclass_cannot_replace_a_fence_refusal(fence: str, trap_on_
             )
         expected: tuple[str | None, str | None] = (None, operation_id)
     else:
+        parent, index = keys(setup.state_id, repo.allocate_call_index(setup.state_id, member_token=setup.member, work_item=setup.item))
         refusal: type[Exception]
         if fence == "item":
             _terminate_item(setup)
@@ -989,9 +1007,10 @@ def test_call_index_subclass_cannot_replace_a_fence_refusal(fence: str, trap_on_
         else:
             setup.recorder.factory.run_coordination.depart_worker(member_token=setup.member)
             refusal = RunMembershipLostError
+        before = len(_fence_refusals(setup))
         with pytest.raises(refusal):
             repo.record_call(
-                setup.state_id,
+                parent,
                 index,
                 *payloads,
                 latency_ms=12.5,
@@ -1002,6 +1021,7 @@ def test_call_index_subclass_cannot_replace_a_fence_refusal(fence: str, trap_on_
             )
         expected = (setup.state_id, None)
 
+    assert index == 0
     assert _call_count(setup) == 0
     refused = _fence_refusals(setup)[before:][-1]
     assert refused["fence"] == fence
@@ -1081,3 +1101,118 @@ def test_item_fence_refusal_is_built_from_the_exact_work_item_id() -> None:
     assert len(refusals) == 1
     assert refusals[0]["work_item_id"] == setup.item.work_item_id
     _assert_refused_call(refusals[0]["refused_call"], call_id="attempt-late-1", state_id=setup.state_id, operation_id=None)
+
+
+def _fail_the_fenced_commit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every fenced transaction runs its body, then fails to commit (an ordinary database fault)."""
+
+    @contextmanager
+    def body_then_commit_failure(engine: Engine) -> Iterator[Connection]:
+        with begin_write(engine) as conn:
+            yield conn
+            raise OperationalError("COMMIT", {}, Exception("disk I/O error"))
+
+    monkeypatch.setattr(run_coordination_repository, "begin_write", body_then_commit_failure)
+
+
+def test_state_index_allocation_whose_transaction_fails_releases_its_reservation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The reservation is taken in the transaction's body; a commit that then fails leaves nothing reserved."""
+    setup = _setup()
+    _fail_the_fenced_commit(monkeypatch)
+
+    with pytest.raises(OperationalError):
+        setup.recorder.execution.allocate_call_index(setup.state_id, member_token=setup.member, work_item=setup.item)
+
+    assert _pending_reservations(setup) == (set(), set())
+
+
+def test_operation_index_allocation_whose_transaction_fails_releases_its_reservation(monkeypatch: pytest.MonkeyPatch) -> None:
+    setup = _setup()
+    operation_id = _begin_operation(setup)
+    _fail_the_fenced_commit(monkeypatch)
+
+    with pytest.raises(OperationalError):
+        setup.recorder.execution.allocate_operation_call_index(operation_id, coordination_token=setup.recorder.coordination_token)
+
+    assert _pending_reservations(setup) == (set(), set())
+
+
+def test_operation_index_allocation_refused_after_its_body_releases_its_reservation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The leader fence renews its deadline after the body, so a refusal there comes after the index was reserved.
+
+    The call is still recorded as refused without an index, and the reservation is released.
+    """
+    setup = _setup()
+    token = setup.recorder.coordination_token
+    operation_id = _begin_operation(setup)
+
+    def renewal_refused(conn: Connection, *, key: DeadlineKey) -> bool:
+        raise RunLeadershipLostError(
+            run_id=token.run_id, worker_id=token.worker_id, leader_epoch=token.leader_epoch, verb="allocate_operation_call_index"
+        )
+
+    monkeypatch.setattr(run_coordination_repository, "has_issued_deadline", renewal_refused)
+    before = len(_fence_refusals(setup))
+
+    with pytest.raises(RunLeadershipLostError):
+        setup.recorder.execution.record_operation_call(
+            operation_id,
+            CallType.HTTP,
+            CallStatus.SUCCESS,
+            RawCallPayload(_REQUEST),
+            RawCallPayload(_RESPONSE),
+            latency_ms=12.5,
+            coordination_token=token,
+        )
+
+    assert _pending_reservations(setup) == (set(), set())
+    assert _call_count(setup) == 0
+    refused = _fence_refusals(setup)[before:][-1]
+    assert refused["verb"] == "allocate_operation_call_index"
+    refused_call = refused["refused_call"]
+    assert isinstance(refused_call, dict)
+    assert refused_call["call_index"] is None
+
+
+def _construction_counting_item(base: TokenWorkItem, on_second_construction: str, constructions: list[int]) -> TokenWorkItem:
+    """A work item subclass whose constructor fails, or changes the attempt, if it ever runs a second time."""
+
+    class _ConstructionCountingItem(TokenWorkItem):
+        __slots__ = ()
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            constructions.append(1)
+            if len(constructions) > 1:
+                if on_second_construction == "fail":
+                    raise RuntimeError("the work item was constructed again")
+                kwargs["attempt"] = kwargs["attempt"] + 1
+            super().__init__(*args, **kwargs)
+
+    return _ConstructionCountingItem(**asdict(base))
+
+
+@pytest.mark.parametrize("on_second_construction", ["fail", "alter_attempt"])
+def test_item_fence_uses_the_work_item_as_given(on_second_construction: str) -> None:
+    """The fence reads the claimed id and attempt from the item it is given; it never constructs the item again."""
+    setup = _setup()
+    repo = setup.recorder.execution
+    constructions: list[int] = []
+    item = _construction_counting_item(setup.item, on_second_construction, constructions)
+    index = repo.allocate_call_index(setup.state_id, member_token=setup.member, work_item=item)
+
+    recorded = repo.record_call(
+        setup.state_id,
+        index,
+        CallType.LLM,
+        CallStatus.SUCCESS,
+        RawCallPayload(_REQUEST),
+        RawCallPayload(_RESPONSE),
+        latency_ms=12.5,
+        token_usage=_USAGE,
+        member_token=setup.member,
+        work_item=item,
+    )
+
+    assert recorded.call_index == index
+    assert _call_count(setup) == 1
+    assert len(constructions) == 1

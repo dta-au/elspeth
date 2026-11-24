@@ -191,15 +191,28 @@ class CallAuditRepository:
         self._source_parent_index_limit = 16
 
     def allocate_call_index(self, state_id: str, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> int:
-        """Allocate a proposal only for this worker's current claimed state."""
-        with fenced_item_transaction(
-            self._db.engine,
-            member_token=member_token,
-            work_item=work_item,
-            verb="allocate_call_index",
-        ) as conn:
-            self._verify_state_parent(conn, state_id=state_id, run_id=member_token.run_id, token_id=work_item.token_id)
-            return self._allocate_call_index_on(conn, state_id)
+        """Allocate a proposal only for this worker's current claimed state.
+
+        The reservation stands only if the fenced transaction completes: a failure
+        after it was taken releases it before the error propagates.
+        """
+        reserved: int | None = None
+        try:
+            with fenced_item_transaction(
+                self._db.engine,
+                member_token=member_token,
+                work_item=work_item,
+                verb="allocate_call_index",
+            ) as conn:
+                self._verify_state_parent(conn, state_id=state_id, run_id=member_token.run_id, token_id=work_item.token_id)
+                reserved = self._allocate_call_index_on(conn, state_id)
+                return reserved
+        except BaseException:
+            if reserved is not None:
+                self._finish_allocation(
+                    parent_id=_exact_parent_key(state_id), proposed_index=reserved, recorded_index=None, operation=False
+                )
+            raise
 
     def _allocate_call_index_on(self, conn: Connection, state_id: str) -> int:
         """Allocate next call index for a state_id (thread-safe).
@@ -258,15 +271,29 @@ class CallAuditRepository:
             return idx
 
     def allocate_operation_call_index(self, operation_id: str, *, coordination_token: CoordinationToken) -> int:
-        """Allocate a proposal for an operation in the current leader's run."""
-        with fenced_leader_transaction(
-            self._db.engine,
-            token=coordination_token,
-            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
-            verb="allocate_operation_call_index",
-        ) as conn:
-            self._verify_operation_parent(conn, operation_id=operation_id, run_id=coordination_token.run_id)
-            return self._allocate_operation_call_index_on(conn, operation_id)
+        """Allocate a proposal for an operation in the current leader's run.
+
+        The reservation stands only if the fenced transaction completes, including
+        the leader deadline renewal that follows the body: a failure after it was
+        taken releases it before the error propagates.
+        """
+        reserved: int | None = None
+        try:
+            with fenced_leader_transaction(
+                self._db.engine,
+                token=coordination_token,
+                window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+                verb="allocate_operation_call_index",
+            ) as conn:
+                self._verify_operation_parent(conn, operation_id=operation_id, run_id=coordination_token.run_id)
+                reserved = self._allocate_operation_call_index_on(conn, operation_id)
+                return reserved
+        except BaseException:
+            if reserved is not None:
+                self._finish_allocation(
+                    parent_id=_exact_parent_key(operation_id), proposed_index=reserved, recorded_index=None, operation=True
+                )
+            raise
 
     def _allocate_operation_call_index_on(self, conn: Connection, operation_id: str) -> int:
         """Allocate next call index for an operation_id (thread-safe).
@@ -659,9 +686,6 @@ class CallAuditRepository:
                 latency_ms=latency_ms,
             )
             refused_work_item = RefusedCallWorkItem(work_item_id=work_item.work_item_id, attempt=work_item.attempt)
-            # The item fence judges, and names in its refusal, the work item's id
-            # and attempt: it gets the normalised copies.
-            fence_work_item = replace(work_item, work_item_id=refused_work_item.work_item_id, attempt=refused_work_item.attempt)
 
             values: dict[str, object] = {
                 "call_id": call_id,
@@ -695,7 +719,7 @@ class CallAuditRepository:
                 with fenced_item_transaction(
                     self._db.engine,
                     member_token=member_token,
-                    work_item=fence_work_item,
+                    work_item=work_item,
                     verb="record_call",
                 ) as conn:
                     self._verify_state_parent(conn, state_id=state_id, run_id=member_token.run_id, token_id=work_item.token_id)
@@ -734,7 +758,7 @@ class CallAuditRepository:
             try:
                 self._record_call_payload_refs(
                     member_token=member_token,
-                    work_item=fence_work_item,
+                    work_item=work_item,
                     state_id=state_id,
                     call_id=call_id,
                     request_ref=request_ref,
