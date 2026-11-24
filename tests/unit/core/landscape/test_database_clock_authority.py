@@ -186,7 +186,10 @@ _AUTHORITY_SCOPE_PREFIXES = (
 # SchedulerLeaseRepository.verify_resume_coverage. Re-derived by RUNNING the gate.
 # RunCoordinationRepository.live_leader renamed seat_holder: aecd8513… → the value
 # below, same identity count, symbol text only. Re-derived by RUNNING the gate.
-_CLOCK_BOUNDARY_DIGEST = "0449862bc8c6e8e1cd5b23621f14650e3a66b72a9358aa7b58be86d63ae61fcb"
+# RunCoordinationRepository.live_leader admitted (a delegation facade over
+# seat_holder; no clock read of its own): 0449862b… → the value below, +1
+# identity. Re-derived by RUNNING the gate.
+_CLOCK_BOUNDARY_DIGEST = "930ed753d27e851444728c45e7a6ebeb0878280cff6484f710f16d8a9f1f08f1"
 
 
 def _name_has_clock_marker(name: str) -> bool:
@@ -320,6 +323,7 @@ _REVIEWED_CLOCK_BOUNDARY_IDENTITIES = frozenset(
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.dead_non_leader_workers"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.evict_worker"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.seat_holder"),
+        ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.live_leader"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.register_run_leader_on"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.release_seat"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.worker_heartbeat"),
@@ -414,6 +418,7 @@ _REQUIRED_AUTHORITY_PUBLIC_SURFACE = frozenset(
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.acquire_run_leadership"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.admit_follower"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.seat_holder"),
+        ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.live_leader"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.worker_heartbeat"),
         ("src/elspeth/core/landscape/scheduler/fencing.py", "fenced_write"),
         ("src/elspeth/core/landscape/scheduler_repository.py", "TokenSchedulerRepository.claim_pending_sink"),
