@@ -351,3 +351,35 @@ async def test_a_request_sent_over_the_estimate_and_rejected_for_another_reason_
     assert record.over_estimate is True
     assert record.max_prompt_tokens == policy.max_prompt_tokens
     assert _CANARY not in canonical_json(call.to_dict())
+
+
+@pytest.mark.asyncio
+async def test_a_size_shaped_failure_after_the_response_is_recorded_as_an_api_error_without_a_size_reason(
+    tmp_path: Path, tool_context: ToolContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A failure while recording a received response is recorded as API_ERROR. Even
+    # a size-shaped exception there is not a rejected request, so its call record
+    # carries no size reason or source (the record admits a source only on a
+    # BAD_REQUEST_ERROR call) and the planner's own failure stands.
+    from elspeth.web.composer import pipeline_planner
+
+    size_shaped = ContextWindowExceededError(message=f"prompt is too long {_CANARY}", model="test-model", llm_provider="anthropic")
+    original = pipeline_planner.build_llm_call_record
+
+    def build(**kwargs: object) -> object:
+        if kwargs["status"] is ComposerLLMCallStatus.SUCCESS:
+            raise size_shaped
+        return original(**kwargs)
+
+    monkeypatch.setattr(pipeline_planner, "build_llm_call_record", build)
+    completion = _ScriptedCompletion(_text_response("Which output format do you want?"))
+    recorder = BufferingRecorder()
+
+    with pytest.raises(ContextWindowExceededError) as caught:
+        await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, recorder=recorder)
+
+    assert caught.value is size_shaped
+    (call,) = recorder.llm_calls
+    assert call.status is ComposerLLMCallStatus.API_ERROR
+    assert call.error_message == "ContextWindowExceededError"
+    assert call.rejection_reason_source is None

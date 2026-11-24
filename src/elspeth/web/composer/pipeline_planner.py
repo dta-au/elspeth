@@ -4175,7 +4175,8 @@ async def _plan_pipeline_inner(
             # Preserve the historical validated-success accumulator. Unknown
             # earlier transport cost cannot become free END allowance.
             continuation_cost_known = False
-            size_rejection = request_size_rejection(exc)
+            # A size rejection is a rejected request: named only on a call recorded as one.
+            size_rejection = request_size_rejection(exc) if status is ComposerLLMCallStatus.BAD_REQUEST_ERROR else None
             failed_call = build_llm_call_record(
                 model_requested=effective_model,
                 pricing_model=effective_pricing_model,
