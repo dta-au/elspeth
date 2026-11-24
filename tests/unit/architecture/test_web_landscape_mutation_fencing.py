@@ -802,7 +802,11 @@ _EXPECTED_DML_COUNT = 166
 # _EXPECTED_DML_COUNT.
 # QR merged with release/0.8.1: 6a08f651… (release) -> the value below, the one
 # arrival named at _EXPECTED_DML_COUNT.
-_EXPECTED_DML_INVENTORY_SHA256 = "913e9295eafa5185df205e3c5920242d66753d5c21e4ad0eaf8aa9a230ac88b0"
+# The item fence compares exact copies of the claimed work item id and attempt:
+# fenced_item_transaction's token_work_items update moves 604cf90ec1a6c2d4 ->
+# b9c5b2e0c7e8f6e8. Measured by the gate's scanner against git archives of
+# 9ef3350d9 and the fence change: one moved, no arrivals/departures, write set unchanged.
+_EXPECTED_DML_INVENTORY_SHA256 = "3e6ec85b9f2ffe2e502d6a3b2547b94c47b48b1a6d3d6f4180a4e527b441e621"
 _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
     {
         ("aggregation_result_members", "insert"),
@@ -1056,7 +1060,12 @@ _EXPECTED_SUBORDINATE_EDGE_COUNT = 154
 # Measured by the gate's scanner against 49c184508: one moved, no arrivals/departures.
 # Durable quota accounting forwards preserve_call_id=explicit_call_id through
 # the existing record_call/record_operation_call -> _insert_allocated_call edges.
-_EXPECTED_SUBORDINATE_EDGE_SHA256 = "99e14aae3b82aca256018fc9c4c58da2db08a76ccc8724e47d7291d19d16e94b"
+# Call recording passes the exact reservation parent to _insert_allocated_call:
+# record_call's edge moves 63156560466dddd0 -> bc9259abf3b8ab82 and
+# record_operation_call's f52090af30050563 -> 9a5bac204144c859. Measured by the
+# gate's scanner against git archives of 9ef3350d9 and the change: two moved,
+# no arrivals/departures.
+_EXPECTED_SUBORDINATE_EDGE_SHA256 = "f804c04dbc2ba798bf2d0439d9b8a5c83b78e5f1fbe9d55f05eccff0634d6400"
 # X1 join admission records departure after a post-admission refusal:
 # JoinAdmissionService.join_run -> depart_worker joins the existing admit_follower call.
 # Measured against a02f25747: 43/0ff714e7… -> 44/a980dd0f…; one arrival.
@@ -3936,7 +3945,7 @@ class _AuthorityProof:
         if (
             not isinstance(observation, ast.Call)
             or not isinstance(observation.func, ast.Attribute)
-            or observation.func.attr != "live_leader"
+            or observation.func.attr != "seat_holder"
         ):
             return False
         observation_args = _exact_keyword_arguments(observation)
@@ -3950,7 +3959,7 @@ class _AuthorityProof:
         if (
             observed_reader is None
             or (observed_reader[1].unit.path, _symbol(observed_reader[0]))
-            != ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.live_leader")
+            != ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.seat_holder")
             or not self._callback_function_unmodified(observed_reader[0])
         ):
             return False
@@ -5863,7 +5872,7 @@ _reserve_CANCEL_ROUTE_SHA256 = "084791796bc88481d879d0a09b7ab43e8f483c378d56cff6
 _reserve_CANCEL_CONSUMERS = {
     "src/elspeth/web/composer_watch_reads.py": "099b7e92f3617d5d9f39b479c1f21f229375e24e20208d294c822d7099cf6e3f",
     "src/elspeth/web/sessions/composer_turn.py": "b0a326ae16a369285d785d58bc57f6f5f1fba5b5c88f1d6201e3eefcc223ae5e",
-    "src/elspeth/web/sessions/composer_async_worker.py": "d7dba5e6b9f8ff9101f9b70aaad33f634625593d66f4233d8470bb092732c98f",
+    "src/elspeth/web/sessions/composer_async_worker.py": "b5990c3971990c924f0288eefd543a607151fb7c0db5def4e9a02a36f7422a0a",
 }
 
 
@@ -10348,7 +10357,7 @@ def _reserve_sink_effect_disjoint_receipts(units):
         (
             "src/elspeth/web/coordination/lifecycle.py",
             "SessionOperationLease",
-            "5db1e5db8648cd82d1f8ee669ec699fb95a98197aa5737696143e42e670c5037",
+            "3b879168cad5ac6c6edf6fc2d310933a8ce6e8e27bcd6cf97bee7cc8f9c79e4e",
         ),
         (
             "src/elspeth/web/coordination/lifecycle.py",
@@ -10363,7 +10372,7 @@ def _reserve_sink_effect_disjoint_receipts(units):
         (
             "src/elspeth/web/coordination/repository.py",
             "_SessionOperationAuthorityRepository",
-            "a8ef7555cd323d75eb412270d4c1e080a060b44154780465b2ca13ccb3972fa2",
+            "962faaad6deb4145db6ef45e4b1301cd4d446b5c6375a81ab06df9ff2ae0f5b2",
         ),
         (
             "src/elspeth/web/coordination/repository.py",
@@ -17794,7 +17803,7 @@ def materialize_cancelled_permit(self, binding: RunStartPermitBinding, config: M
     admission = RunStartAdmissionRepository(self._db).observe(binding)
     if admission is None or admission.state is not RunStartAdmissionState.PREPARED:
         raise AuditIntegrityError('Cancellation materialization requires a prepared admission')
-    leader = self._coordination_repo.live_leader(run_id=binding.run_id)
+    leader = self._coordination_repo.seat_holder(run_id=binding.run_id)
     if leader is not None and leader.leader_worker_id == worker_id:
         token = CoordinationToken(binding.run_id, worker_id, leader.leader_epoch)
     else:
@@ -17927,9 +17936,9 @@ def _cancelled_permit_caller_is_proven(unit: SourceUnit, call: ast.Call, proof: 
 # connection broke a concurrent sink-effect heartbeat's BEGIN. It is still one
 # fresh database sample and one seat read on one connection.
 _COORDINATION_FINALIZATION_RECIPES[
-    ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.live_leader")
+    ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.seat_holder")
 ] = """
-def live_leader(self, *, run_id: str) -> LeaderInfo | None:
+def seat_holder(self, *, run_id: str) -> LeaderInfo | None:
     with _maybe_serialize_shared_connection(self._engine), self._engine.connect() as conn:
         database_now = read_landscape_decision_time(conn)
         seat = conn.execute(select(run_coordination_table.c.leader_worker_id, run_coordination_table.c.leader_epoch, run_coordination_table.c.leader_heartbeat_expires_at, (run_coordination_table.c.leader_heartbeat_expires_at >= database_now).label('seat_live')).where(run_coordination_table.c.run_id == run_id)).one_or_none()
@@ -17938,7 +17947,7 @@ def live_leader(self, *, run_id: str) -> LeaderInfo | None:
     return LeaderInfo(run_id=run_id, leader_worker_id=seat.leader_worker_id, leader_epoch=int(seat.leader_epoch), leader_heartbeat_expires_at=_utc(seat.leader_heartbeat_expires_at), seat_live=bool(seat.seat_live))
 """
 _COORDINATION_FINALIZATION_DEPENDENCIES[
-    ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.live_leader")
+    ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.seat_holder")
 ] = {
     "LeaderInfo": "elspeth.contracts.coordination.LeaderInfo",
     "_maybe_serialize_shared_connection": "elspeth.core.landscape.database._maybe_serialize_shared_connection",
@@ -18444,7 +18453,7 @@ def test_finalization_current_writer_delegation_and_factory_returns(finalization
     [
         (
             "src/elspeth/core/landscape/run_coordination_repository.py",
-            "RunCoordinationRepository.live_leader",
+            "RunCoordinationRepository.seat_holder",
             "leader_epoch=int(seat.leader_epoch)",
             "leader_epoch=1",
         ),
@@ -27392,7 +27401,7 @@ def _prepared_callback_fixture_units(before=None, after=None):
     prepared = """            if run_start_permit is None:
                 token = CoordinationToken(run_id=run.run_id, worker_id=worker_id, leader_epoch=1)
             else:
-                leader = factory.run_coordination.live_leader(run_id=run.run_id)
+                leader = factory.run_coordination.seat_holder(run_id=run.run_id)
                 if leader is not None and leader.leader_worker_id == worker_id:
                     token = CoordinationToken(run_id=run.run_id, worker_id=worker_id, leader_epoch=leader.leader_epoch)
                 else:
@@ -27412,7 +27421,7 @@ def _prepared_callback_fixture_units(before=None, after=None):
 
     repository = """from elspeth.contracts.coordination import CoordinationToken
 class RunCoordinationRepository:
-    def live_leader(self, *, run_id):
+    def seat_holder(self, *, run_id):
         return None
     def acquire_run_leadership(self, *, run_id, worker_id, window_seconds, entry_point):
         return self._acquire_run_leadership_on(conn, run_id=run_id, worker_id=worker_id, window_seconds=window_seconds, entry_point=entry_point)
@@ -27442,7 +27451,7 @@ def test_prepared_callback_proves_all_three_token_origins():
         ("leader.leader_worker_id == worker_id", "leader.leader_worker_id != worker_id"),
         ("leader_epoch=leader.leader_epoch", "leader_epoch=1"),
         ("leader_epoch=leader.leader_epoch", "leader_epoch=foreign.leader_epoch"),
-        ("live_leader(run_id=run.run_id)", "live_leader(run_id=foreign)"),
+        ("seat_holder(run_id=run.run_id)", "seat_holder(run_id=foreign)"),
         ("run_start_permit is None", "run_start_permit is not None"),
         ("run_start_permit=run_start_permit", "run_start_permit=foreign"),
         ("acquire_run_leadership(run_id=run.run_id", "acquire_run_leadership(run_id=foreign"),
@@ -27641,7 +27650,7 @@ def test_prepared_callback_refuses_replaced_observation_reader():
     units = _prepared_callback_fixture_units()
     replacement = _parse_source(
         "src/elspeth/replace_reader.py",
-        "from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository\nRunCoordinationRepository.live_leader = unknown\n",
+        "from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository\nRunCoordinationRepository.seat_holder = unknown\n",
     )
     assert not _callback_fixture_admitted((*units, replacement))
 

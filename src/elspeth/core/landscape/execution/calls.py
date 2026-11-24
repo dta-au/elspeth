@@ -14,9 +14,10 @@ import json
 from collections import OrderedDict
 from collections.abc import Collection, Iterator
 from concurrent.futures import Future
+from dataclasses import replace
 from datetime import datetime
 from threading import Lock
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Literal, NamedTuple
 
 import structlog
 from sqlalchemy import func, or_, select
@@ -28,7 +29,7 @@ from elspeth.contracts.audit import CallVerification, validate_approved_prompt_a
 from elspeth.contracts.call_data import CallPayload, LLMCallResponse
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.enums import RunMode, RunStatus
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.errors import AuditIntegrityError, RunLeadershipLostError, RunMembershipLostError, SchedulerLeaseLostError
 from elspeth.contracts.hashing import canonical_json_loads
 from elspeth.contracts.payload_store import IntegrityError as PayloadIntegrityError
 from elspeth.contracts.payload_store import PayloadNotFoundError
@@ -43,7 +44,12 @@ from elspeth.core.landscape.execution.sink_effect_identity import MAX_LINEAGE_DE
 from elspeth.core.landscape.item_fencing import fenced_item_transaction
 from elspeth.core.landscape.model_loaders import CallLoader
 from elspeth.core.landscape.row_data import CallDataResult, CallDataState
-from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
+from elspeth.core.landscape.run_coordination_repository import (
+    RefusedCallRecord,
+    RefusedCallWorkItem,
+    fenced_leader_transaction,
+    record_refused_call,
+)
 from elspeth.core.landscape.schema import (
     call_verifications_table,
     calls_table,
@@ -100,6 +106,56 @@ class _LineageEvidence(NamedTuple):
     has_frame: bool
 
 
+def _refused_call_record(
+    *,
+    call_id: str | None,
+    state_id: str | None,
+    operation_id: str | None,
+    call_index: int | None,
+    call_type: CallType,
+    status: CallStatus,
+    prepared: _PreparedCallData,
+    token_usage: TokenUsage,
+    latency_ms: float | None,
+) -> RefusedCallRecord:
+    """The call's identity and usage, kept by the refusal event if a fence refuses its row."""
+    return RefusedCallRecord(
+        call_id=call_id,
+        state_id=state_id,
+        operation_id=operation_id,
+        call_index=call_index,
+        call_type=call_type,
+        status=status,
+        request_hash=prepared.request_hash,
+        response_hash=prepared.response_hash,
+        prompt_tokens=token_usage.prompt_tokens,
+        completion_tokens=token_usage.completion_tokens,
+        cached_prompt_tokens=token_usage.cached_prompt_tokens,
+        reasoning_tokens=token_usage.reasoning_tokens,
+        latency_ms=latency_ms,
+    )
+
+
+def _exact_parent_key(parent_id: str) -> str:
+    """A call parent id as an exact ``str``, for the index-reservation bookkeeping.
+
+    Reservations are keyed by ``(parent id, index)`` in sets and dicts, so a
+    subclass's own ``__hash__``/``__eq__`` would run on every lookup, including
+    the release that runs while a fence refusal propagates. Judged from the type
+    alone (as ``_exact_builtin`` judges), then copied through ``str.__str__``.
+    """
+    if issubclass(type(parent_id), str):
+        return str.__str__(parent_id)
+    raise TypeError(f"call parent id holds {type(parent_id).__qualname__}, not str")
+
+
+def _exact_index_key(call_index: int) -> int:
+    """A call index as an exact ``int``, for the index-reservation bookkeeping (see :func:`_exact_parent_key`)."""
+    if issubclass(type(call_index), int):
+        return int.__int__(call_index)
+    raise TypeError(f"call_index holds {type(call_index).__qualname__}, not int")
+
+
 def _reject_non_finite_json_constant(value: str) -> None:
     raise ValueError(f"non-finite JSON constant {value!r}")
 
@@ -135,17 +191,27 @@ class CallAuditRepository:
         self._source_parent_index_limit = 16
 
     def allocate_call_index(self, state_id: str, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> int:
-        """Allocate a proposal only for this worker's current claimed state."""
-        with fenced_item_transaction(
-            self._db.engine,
-            member_token=member_token,
-            work_item=work_item,
-            verb="allocate_call_index",
-        ) as conn:
-            self._verify_state_parent(conn, state_id=state_id, run_id=member_token.run_id, token_id=work_item.token_id)
-            return self._allocate_call_index_on(conn, state_id)
+        """Allocate a proposal only for this worker's current claimed state.
 
-    def _allocate_call_index_on(self, conn: Connection, state_id: str) -> int:
+        The reservation stands only if the fenced transaction completes: a failure
+        after it was taken releases it before the error propagates.
+        """
+        reservation: list[tuple[str, int]] = []
+        try:
+            with fenced_item_transaction(
+                self._db.engine,
+                member_token=member_token,
+                work_item=work_item,
+                verb="allocate_call_index",
+            ) as conn:
+                self._verify_state_parent(conn, state_id=state_id, run_id=member_token.run_id, token_id=work_item.token_id)
+                return self._allocate_call_index_on(conn, state_id, reservation=reservation)
+        except BaseException:
+            for parent_id, index in reservation:
+                self._finish_allocation(parent_id=parent_id, proposed_index=index, recorded_index=None, operation=False)
+            raise
+
+    def _allocate_call_index_on(self, conn: Connection, state_id: str, *, reservation: list[tuple[str, int]]) -> int:
         """Allocate next call index for a state_id (thread-safe).
 
         Provides centralized call index allocation ensuring UNIQUE(state_id, call_index)
@@ -168,6 +234,8 @@ class CallAuditRepository:
 
         Args:
             state_id: Node state ID to allocate index for
+            reservation: Receives the reserved (state_id, index) before it is
+                marked pending, for the caller to release if its transaction fails
 
         Returns:
             Sequential call index (0-based), unique within this state_id
@@ -181,6 +249,8 @@ class CallAuditRepository:
             http_client.post(...)  # allocates index 0
             llm_client.query(...)   # allocates index 1 (not 0!)
         """
+        # Reservations are keyed by exact copies (see _exact_parent_key).
+        state_id = _exact_parent_key(state_id)
         with self._call_index_lock:
             if state_id not in self._call_indices:
                 # Slow path (once per state_id): seed from database to survive
@@ -196,21 +266,35 @@ class CallAuditRepository:
             # Fast path: allocate from in-memory counter (no DB access)
             idx = self._call_indices[state_id]
             self._call_indices[state_id] += 1
+            # Recorded for the caller before the reservation exists, so whatever
+            # interrupts from here on, the caller can release it.
+            reservation.append((state_id, idx))
             self._pending_call_indices.add((state_id, idx))
             return idx
 
     def allocate_operation_call_index(self, operation_id: str, *, coordination_token: CoordinationToken) -> int:
-        """Allocate a proposal for an operation in the current leader's run."""
-        with fenced_leader_transaction(
-            self._db.engine,
-            token=coordination_token,
-            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
-            verb="allocate_operation_call_index",
-        ) as conn:
-            self._verify_operation_parent(conn, operation_id=operation_id, run_id=coordination_token.run_id)
-            return self._allocate_operation_call_index_on(conn, operation_id)
+        """Allocate a proposal for an operation in the current leader's run.
 
-    def _allocate_operation_call_index_on(self, conn: Connection, operation_id: str) -> int:
+        The reservation stands only if the fenced transaction completes, including
+        the leader deadline renewal that follows the body: a failure after it was
+        taken releases it before the error propagates.
+        """
+        reservation: list[tuple[str, int]] = []
+        try:
+            with fenced_leader_transaction(
+                self._db.engine,
+                token=coordination_token,
+                window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+                verb="allocate_operation_call_index",
+            ) as conn:
+                self._verify_operation_parent(conn, operation_id=operation_id, run_id=coordination_token.run_id)
+                return self._allocate_operation_call_index_on(conn, operation_id, reservation=reservation)
+        except BaseException:
+            for parent_id, index in reservation:
+                self._finish_allocation(parent_id=parent_id, proposed_index=index, recorded_index=None, operation=True)
+            raise
+
+    def _allocate_operation_call_index_on(self, conn: Connection, operation_id: str, *, reservation: list[tuple[str, int]]) -> int:
         """Allocate next call index for an operation_id (thread-safe).
 
         Provides process-local call index proposals within each operation.
@@ -220,10 +304,14 @@ class CallAuditRepository:
 
         Args:
             operation_id: Operation ID to allocate index for
+            reservation: Receives the reserved (operation_id, index) before it is
+                marked pending, for the caller to release if its transaction fails
 
         Returns:
             Sequential call index (0-based), unique within this operation_id
         """
+        # Reservations are keyed by exact copies (see _exact_parent_key).
+        operation_id = _exact_parent_key(operation_id)
         with self._call_index_lock:  # Reuse existing lock
             if operation_id not in self._operation_call_indices:
                 # Slow path (once per operation_id): seed from database to survive
@@ -235,6 +323,7 @@ class CallAuditRepository:
             # Fast path: allocate from in-memory counter (no DB access)
             idx = self._operation_call_indices[operation_id]
             self._operation_call_indices[operation_id] += 1
+            reservation.append((operation_id, idx))
             self._pending_operation_call_indices.add((operation_id, idx))
             return idx
 
@@ -552,90 +641,117 @@ class CallAuditRepository:
             Invalid state_id will raise IntegrityError due to foreign key constraint.
             Call indices should be allocated via allocate_call_index() for coordination.
         """
-        # Validate the cross-DB prompt-hash anchor BEFORE inserting. The Call
-        # dataclass enforces the same invariant in __post_init__, but that runs
-        # AFTER execute_insert — a bad hash would commit to `calls` and only then
-        # raise. Checking here keeps the audit trail pristine (Tier 1): a bad
-        # hash leaves zero rows (elspeth-a94e626a36).
-        validate_approved_prompt_artifact_hash(call_type, approved_prompt_artifact_hash)
-        if not isinstance(token_usage, TokenUsage):
-            raise TypeError("token_usage must be TokenUsage")
-
-        explicit_call_id = call_id is not None
-        if explicit_call_id and (type(call_id) is not str or not call_id or len(call_id) > 64):
-            raise ValueError("Explicit call_id must be a non-empty string of at most 64 characters")
-        if explicit_call_id and (call_type is not CallType.LLM or source_call_id is not None):
-            raise ValueError("Explicit call_id is reserved for physical LLM outcomes")
-        call_id = generate_id() if call_id is None else call_id
-        returned_model = response_data.model if isinstance(response_data, LLMCallResponse) else None
-        if created_at is not None and (type(created_at) is not datetime or created_at.tzinfo is None):
-            raise ValueError("Explicit call created_at must be an aware datetime")
-        timestamp = now() if created_at is None else created_at
-        prepared = self._prepare_call_payloads(
-            request_data,
-            response_data,
-            error,
-            request_ref,
-            response_ref,
-        )
-
-        values: dict[str, object] = {
-            "call_id": call_id,
-            "state_id": state_id,
-            "operation_id": None,  # State call, not operation call
-            "call_index": call_index,
-            "call_type": call_type,
-            "status": status,
-            "request_hash": prepared.request_hash,
-            "request_ref": prepared.request_ref,
-            "response_hash": prepared.response_hash,
-            "response_ref": prepared.response_ref,
-            "returned_model": returned_model,
-            "source_call_id": source_call_id,
-            "approved_prompt_artifact_hash": approved_prompt_artifact_hash,
-            "prompt_tokens": token_usage.prompt_tokens,
-            "completion_tokens": token_usage.completion_tokens,
-            "cached_prompt_tokens": token_usage.cached_prompt_tokens,
-            "reasoning_tokens": token_usage.reasoning_tokens,
-            "error_json": prepared.error_json,
-            "latency_ms": latency_ms,
-            "created_at": timestamp,
-        }
-
-        proposed_call_index = call_index
-        allocation_is_owned = self._allocation_context(
-            parent_id=state_id,
-            call_index=proposed_call_index,
-            operation=False,
-        )
+        # The caller may hold a reservation for this (state, index) from allocate_call_index:
+        # release it when the call ends, whether it is recorded, refused by a fence or
+        # refused at entry, by the exact key the allocator stored.
+        reservation_parent = _exact_parent_key(state_id)
+        reservation_index = _exact_index_key(call_index)
         recorded_index: int | None = None
         try:
-            with fenced_item_transaction(
-                self._db.engine,
-                member_token=member_token,
-                work_item=work_item,
-                verb="record_call",
-            ) as conn:
-                self._verify_state_parent(conn, state_id=state_id, run_id=member_token.run_id, token_id=work_item.token_id)
-                self._verify_source_call(conn, source_call_id=source_call_id, current_run_id=member_token.run_id, call_type=call_type)
-                values = self._insert_allocated_call(
-                    conn,
-                    values,
-                    parent_column="state_id",
-                    parent_id=state_id,
-                    allocation_is_owned=allocation_is_owned,
-                    preserve_call_id=explicit_call_id,
-                )
-            call_id = str(values["call_id"])
-            recorded_value = values["call_index"]
-            if type(recorded_value) is not int:
-                raise FrameworkBugError("inserted state call returned a non-integer call_index")
-            recorded_index = recorded_value
-            call_index = recorded_index
+            # Validate the cross-DB prompt-hash anchor BEFORE inserting. The Call
+            # dataclass enforces the same invariant in __post_init__, but that runs
+            # AFTER execute_insert — a bad hash would commit to `calls` and only then
+            # raise. Checking here keeps the audit trail pristine (Tier 1): a bad
+            # hash leaves zero rows (elspeth-a94e626a36).
+            validate_approved_prompt_artifact_hash(call_type, approved_prompt_artifact_hash)
+            if type(token_usage) is not TokenUsage:
+                raise TypeError("token_usage must be TokenUsage")
+
+            explicit_call_id = call_id is not None
+            if explicit_call_id and (type(call_id) is not str or not call_id or len(call_id) > 64):
+                raise ValueError("Explicit call_id must be a non-empty string of at most 64 characters")
+            if explicit_call_id and (call_type is not CallType.LLM or source_call_id is not None):
+                raise ValueError("Explicit call_id is reserved for physical LLM outcomes")
+            call_id = generate_id() if call_id is None else call_id
+            returned_model = response_data.model if isinstance(response_data, LLMCallResponse) else None
+            if created_at is not None and (type(created_at) is not datetime or created_at.tzinfo is None):
+                raise ValueError("Explicit call created_at must be an aware datetime")
+            timestamp = now() if created_at is None else created_at
+            prepared = self._prepare_call_payloads(
+                request_data,
+                response_data,
+                error,
+                request_ref,
+                response_ref,
+            )
+            # Built before the fence: a value the refused record cannot hold fails
+            # here, where no refusal exists yet to be replaced.
+            refused_call = _refused_call_record(
+                call_id=call_id,
+                state_id=state_id,
+                operation_id=None,
+                call_index=call_index,
+                call_type=call_type,
+                status=status,
+                prepared=prepared,
+                token_usage=token_usage,
+                latency_ms=latency_ms,
+            )
+            refused_work_item = RefusedCallWorkItem(work_item_id=work_item.work_item_id, attempt=work_item.attempt)
+
+            values: dict[str, object] = {
+                "call_id": call_id,
+                "state_id": state_id,
+                "operation_id": None,  # State call, not operation call
+                "call_index": call_index,
+                "call_type": call_type,
+                "status": status,
+                "request_hash": prepared.request_hash,
+                "request_ref": prepared.request_ref,
+                "response_hash": prepared.response_hash,
+                "response_ref": prepared.response_ref,
+                "returned_model": returned_model,
+                "source_call_id": source_call_id,
+                "approved_prompt_artifact_hash": approved_prompt_artifact_hash,
+                "prompt_tokens": token_usage.prompt_tokens,
+                "completion_tokens": token_usage.completion_tokens,
+                "cached_prompt_tokens": token_usage.cached_prompt_tokens,
+                "reasoning_tokens": token_usage.reasoning_tokens,
+                "error_json": prepared.error_json,
+                "latency_ms": latency_ms,
+                "created_at": timestamp,
+            }
+
+            allocation_is_owned = self._allocation_context(
+                parent_id=reservation_parent,
+                call_index=reservation_index,
+                operation=False,
+            )
+            try:
+                with fenced_item_transaction(
+                    self._db.engine,
+                    member_token=member_token,
+                    work_item=work_item,
+                    verb="record_call",
+                ) as conn:
+                    self._verify_state_parent(conn, state_id=state_id, run_id=member_token.run_id, token_id=work_item.token_id)
+                    self._verify_source_call(conn, source_call_id=source_call_id, current_run_id=member_token.run_id, call_type=call_type)
+                    values = self._insert_allocated_call(
+                        conn,
+                        values,
+                        parent_column="state_id",
+                        parent_id=reservation_parent,
+                        allocation_is_owned=allocation_is_owned,
+                        preserve_call_id=explicit_call_id,
+                    )
+                call_id = str(values["call_id"])
+                recorded_value = values["call_index"]
+                if type(recorded_value) is not int:
+                    raise FrameworkBugError("inserted state call returned a non-integer call_index")
+                recorded_index = recorded_value
+                call_index = recorded_index
+            except SchedulerLeaseLostError:
+                # The call already happened; with its row refused, the refusal
+                # event is its only durable record.
+                self._record_refused_state_call(member_token, refused_work_item, refused_call, fence="item")
+                raise
+            except RunMembershipLostError:
+                self._record_refused_state_call(member_token, refused_work_item, refused_call, fence="membership")
+                raise
         finally:
             self._finish_allocation(
-                parent_id=state_id,
-                proposed_index=proposed_call_index,
+                parent_id=reservation_parent,
+                proposed_index=reservation_index,
                 recorded_index=recorded_index,
                 operation=False,
             )
@@ -674,6 +790,25 @@ class CallAuditRepository:
             completion_tokens=token_usage.completion_tokens,
             cached_prompt_tokens=token_usage.cached_prompt_tokens,
             reasoning_tokens=token_usage.reasoning_tokens,
+        )
+
+    def _record_refused_state_call(
+        self,
+        member_token: WorkerMembershipToken,
+        work_item: RefusedCallWorkItem,
+        refused_call: RefusedCallRecord,
+        *,
+        fence: Literal["membership", "item"],
+    ) -> None:
+        record_refused_call(
+            self._db.engine,
+            run_id=member_token.run_id,
+            worker_id=member_token.worker_id,
+            leader_epoch=None,
+            verb="record_call",
+            fence=fence,
+            refused_call=refused_call,
+            work_item=work_item,
         )
 
     def record_operation_call(
@@ -718,94 +853,148 @@ class CallAuditRepository:
         Returns:
             The recorded Call model
         """
-        # Validate the cross-DB prompt-hash anchor BEFORE inserting (see the
-        # state-parented record_call for rationale): a bad hash must leave zero
-        # `calls` rows rather than commit and then raise from Call.__post_init__
-        # (elspeth-a94e626a36).
-        validate_approved_prompt_artifact_hash(call_type, approved_prompt_artifact_hash)
-        if not isinstance(token_usage, TokenUsage):
-            raise TypeError("token_usage must be TokenUsage")
-
-        if call_index is None:
-            call_index = self.allocate_operation_call_index(operation_id, coordination_token=coordination_token)
-        explicit_call_id = call_id is not None
-        if explicit_call_id and (type(call_id) is not str or not call_id or len(call_id) > 64):
-            raise ValueError("Explicit call_id must be a non-empty string of at most 64 characters")
-        if explicit_call_id and (call_type is not CallType.LLM or source_call_id is not None):
-            raise ValueError("Explicit call_id is reserved for physical LLM outcomes")
-        call_id = f"call_{operation_id}_{call_index}" if call_id is None else call_id
-        returned_model = response_data.model if isinstance(response_data, LLMCallResponse) else None
-        if created_at is not None and (type(created_at) is not datetime or created_at.tzinfo is None):
-            raise ValueError("Explicit call created_at must be an aware datetime")
-        timestamp = now() if created_at is None else created_at
-        prepared = self._prepare_call_payloads(
-            request_data,
-            response_data,
-            error,
-            request_ref,
-            response_ref,
-        )
-
-        values: dict[str, object] = {
-            "call_id": call_id,
-            "state_id": None,  # NOT a node_state call
-            "operation_id": operation_id,  # Operation call
-            "call_index": call_index,
-            "call_type": call_type,
-            "status": status,
-            "request_hash": prepared.request_hash,
-            "request_ref": prepared.request_ref,
-            "response_hash": prepared.response_hash,
-            "response_ref": prepared.response_ref,
-            "returned_model": returned_model,
-            "source_call_id": source_call_id,
-            "approved_prompt_artifact_hash": approved_prompt_artifact_hash,
-            "prompt_tokens": token_usage.prompt_tokens,
-            "completion_tokens": token_usage.completion_tokens,
-            "cached_prompt_tokens": token_usage.cached_prompt_tokens,
-            "reasoning_tokens": token_usage.reasoning_tokens,
-            "error_json": prepared.error_json,
-            "latency_ms": latency_ms,
-            "created_at": timestamp,
-        }
-
-        proposed_call_index = call_index
-        allocation_is_owned = self._allocation_context(
-            parent_id=operation_id,
-            call_index=proposed_call_index,
-            operation=True,
-        )
-        recorded_index = None
+        # A caller's reservation from allocate_operation_call_index, or the one this call takes,
+        # is released when the call ends, whether it is recorded, refused by a fence or
+        # refused at entry, by the exact key the allocator stored.
+        reservation_parent = _exact_parent_key(operation_id)
+        reservation_index = None if call_index is None else _exact_index_key(call_index)
+        recorded_index: int | None = None
         try:
-            with fenced_leader_transaction(
-                self._db.engine,
-                token=coordination_token,
-                window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
-                verb="record_operation_call",
-            ) as conn:
-                self._verify_operation_parent(conn, operation_id=operation_id, run_id=coordination_token.run_id)
-                self._verify_source_call(conn, source_call_id=source_call_id, current_run_id=coordination_token.run_id, call_type=call_type)
-                values = self._insert_allocated_call(
-                    conn,
-                    values,
-                    parent_column="operation_id",
-                    parent_id=operation_id,
-                    allocation_is_owned=allocation_is_owned,
-                    preserve_call_id=explicit_call_id,
-                )
-            call_id = str(values["call_id"])
-            recorded_value = values["call_index"]
-            if type(recorded_value) is not int:
-                raise FrameworkBugError("inserted operation call returned a non-integer call_index")
-            recorded_index = recorded_value
-            call_index = recorded_index
-        finally:
-            self._finish_allocation(
-                parent_id=operation_id,
-                proposed_index=proposed_call_index,
-                recorded_index=recorded_index,
+            # Validate the cross-DB prompt-hash anchor BEFORE inserting (see the
+            # state-parented record_call for rationale): a bad hash must leave zero
+            # `calls` rows rather than commit and then raise from Call.__post_init__
+            # (elspeth-a94e626a36).
+            validate_approved_prompt_artifact_hash(call_type, approved_prompt_artifact_hash)
+            if type(token_usage) is not TokenUsage:
+                raise TypeError("token_usage must be TokenUsage")
+
+            explicit_call_id = call_id is not None
+            if explicit_call_id and (type(call_id) is not str or not call_id or len(call_id) > 64):
+                raise ValueError("Explicit call_id must be a non-empty string of at most 64 characters")
+            if explicit_call_id and (call_type is not CallType.LLM or source_call_id is not None):
+                raise ValueError("Explicit call_id is reserved for physical LLM outcomes")
+            if created_at is not None and (type(created_at) is not datetime or created_at.tzinfo is None):
+                raise ValueError("Explicit call created_at must be an aware datetime")
+            prepared = self._prepare_call_payloads(
+                request_data,
+                response_data,
+                error,
+                request_ref,
+                response_ref,
+            )
+            # Built before the index allocation and the fence: a value the refused
+            # record cannot hold fails here, where no refusal exists yet to be
+            # replaced. Until an index is allocated the record carries the index
+            # (and any generated id) as absent, never a placeholder.
+            refused_call = _refused_call_record(
+                call_id=call_id,
+                state_id=None,
+                operation_id=operation_id,
+                call_index=call_index,
+                call_type=call_type,
+                status=status,
+                prepared=prepared,
+                token_usage=token_usage,
+                latency_ms=latency_ms,
+            )
+            if call_index is None:
+                try:
+                    call_index = self.allocate_operation_call_index(reservation_parent, coordination_token=coordination_token)
+                except RunLeadershipLostError:
+                    # The call already happened and no index was ever assigned to it.
+                    record_refused_call(
+                        self._db.engine,
+                        run_id=coordination_token.run_id,
+                        worker_id=coordination_token.worker_id,
+                        leader_epoch=coordination_token.leader_epoch,
+                        verb="allocate_operation_call_index",
+                        fence="leader",
+                        refused_call=refused_call,
+                        work_item=None,
+                    )
+                    raise
+                reservation_index = call_index
+            index_key = _exact_index_key(call_index)
+            call_id = f"call_{reservation_parent}_{index_key}" if call_id is None else call_id
+            refused_call = replace(refused_call, call_id=call_id, call_index=index_key)
+            returned_model = response_data.model if isinstance(response_data, LLMCallResponse) else None
+            timestamp = now() if created_at is None else created_at
+
+            values: dict[str, object] = {
+                "call_id": call_id,
+                "state_id": None,  # NOT a node_state call
+                "operation_id": operation_id,  # Operation call
+                "call_index": call_index,
+                "call_type": call_type,
+                "status": status,
+                "request_hash": prepared.request_hash,
+                "request_ref": prepared.request_ref,
+                "response_hash": prepared.response_hash,
+                "response_ref": prepared.response_ref,
+                "returned_model": returned_model,
+                "source_call_id": source_call_id,
+                "approved_prompt_artifact_hash": approved_prompt_artifact_hash,
+                "prompt_tokens": token_usage.prompt_tokens,
+                "completion_tokens": token_usage.completion_tokens,
+                "cached_prompt_tokens": token_usage.cached_prompt_tokens,
+                "reasoning_tokens": token_usage.reasoning_tokens,
+                "error_json": prepared.error_json,
+                "latency_ms": latency_ms,
+                "created_at": timestamp,
+            }
+
+            allocation_is_owned = self._allocation_context(
+                parent_id=reservation_parent,
+                call_index=index_key,
                 operation=True,
             )
+            try:
+                with fenced_leader_transaction(
+                    self._db.engine,
+                    token=coordination_token,
+                    window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+                    verb="record_operation_call",
+                ) as conn:
+                    self._verify_operation_parent(conn, operation_id=operation_id, run_id=coordination_token.run_id)
+                    self._verify_source_call(
+                        conn, source_call_id=source_call_id, current_run_id=coordination_token.run_id, call_type=call_type
+                    )
+                    values = self._insert_allocated_call(
+                        conn,
+                        values,
+                        parent_column="operation_id",
+                        parent_id=reservation_parent,
+                        allocation_is_owned=allocation_is_owned,
+                        preserve_call_id=explicit_call_id,
+                    )
+                call_id = str(values["call_id"])
+                recorded_value = values["call_index"]
+                if type(recorded_value) is not int:
+                    raise FrameworkBugError("inserted operation call returned a non-integer call_index")
+                recorded_index = recorded_value
+                call_index = recorded_index
+            except RunLeadershipLostError:
+                # The call already happened; with its row refused, the refusal
+                # event is its only durable record.
+                record_refused_call(
+                    self._db.engine,
+                    run_id=coordination_token.run_id,
+                    worker_id=coordination_token.worker_id,
+                    leader_epoch=coordination_token.leader_epoch,
+                    verb="record_operation_call",
+                    fence="leader",
+                    refused_call=refused_call,
+                    work_item=None,
+                )
+                raise
+        finally:
+            if reservation_index is not None:
+                self._finish_allocation(
+                    parent_id=reservation_parent,
+                    proposed_index=reservation_index,
+                    recorded_index=recorded_index,
+                    operation=True,
+                )
         request_ref, response_ref = self._materialize_call_refs_after_insert(call_id, prepared)
 
         if prepared.request_bytes is not None or prepared.response_bytes is not None:

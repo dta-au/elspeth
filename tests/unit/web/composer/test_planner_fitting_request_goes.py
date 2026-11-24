@@ -19,6 +19,7 @@ import json
 import math
 from collections.abc import Callable
 from pathlib import Path
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -29,13 +30,14 @@ from openai import BadRequestError as OpenAIBadRequestError
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.composer_planner_audit import ComposerPlannerCode
+from elspeth.contracts.composer_progress import CONTEXT_BUDGET_PROVIDER_REFUSAL_DETAIL, CONTEXT_BUDGET_REQUEST_TOO_LARGE_DETAIL
 from elspeth.core.canonical import canonical_json
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.context_budget import ContextBudgetPolicy
 from elspeth.web.composer.pipeline_planner import PipelinePlannerError, PlannerDeclined
 from elspeth.web.composer.provider_errors import request_size_rejection
 from elspeth.web.composer.tools import ToolContext
-from elspeth.web.sessions.routes._helpers import _FREEFORM_PLANNER_FAILURE_HTTP, _freeform_planner_failure_code
+from elspeth.web.sessions.routes._helpers import _FREEFORM_PLANNER_FAILURE_HTTP, _freeform_planner_failure_code, _handle_planner_failure
 from tests.unit.web.composer.test_pipeline_planner import _context_policy, _plan, _ScriptedCompletion, _text_response
 from tests.unit.web.composer.test_planner_context_budget import _context, _decline, _payload, _sent_bytes, _sent_matches_record
 
@@ -351,3 +353,90 @@ async def test_a_request_sent_over_the_estimate_and_rejected_for_another_reason_
     assert record.over_estimate is True
     assert record.max_prompt_tokens == policy.max_prompt_tokens
     assert _CANARY not in canonical_json(call.to_dict())
+
+
+@pytest.mark.asyncio
+async def test_a_size_shaped_failure_after_the_response_is_recorded_as_an_api_error_without_a_size_reason(
+    tmp_path: Path, tool_context: ToolContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A failure while recording a received response is recorded as API_ERROR. Even
+    # a size-shaped exception there is not a rejected request, so its call record
+    # carries no size reason or source (the record admits a source only on a
+    # BAD_REQUEST_ERROR call) and the planner's own failure stands.
+    from elspeth.web.composer import pipeline_planner
+
+    size_shaped = ContextWindowExceededError(message=f"prompt is too long {_CANARY}", model="test-model", llm_provider="anthropic")
+    original = pipeline_planner.build_llm_call_record
+
+    def build(**kwargs: object) -> object:
+        if kwargs["status"] is ComposerLLMCallStatus.SUCCESS:
+            raise size_shaped
+        return original(**kwargs)
+
+    monkeypatch.setattr(pipeline_planner, "build_llm_call_record", build)
+    completion = _ScriptedCompletion(_text_response("Which output format do you want?"))
+    recorder = BufferingRecorder()
+
+    with pytest.raises(ContextWindowExceededError) as caught:
+        await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, recorder=recorder)
+
+    assert caught.value is size_shaped
+    (call,) = recorder.llm_calls
+    assert call.status is ComposerLLMCallStatus.API_ERROR
+    assert call.error_message == "ContextWindowExceededError"
+    assert call.rejection_reason_source is None
+
+
+class _AuditSink:
+    """The session store ``_handle_planner_failure`` writes its disposition row to; nothing else is used."""
+
+    def __init__(self) -> None:
+        self.rows: list[object] = []
+
+    async def add_message(self, *args: object, **kwargs: object) -> None:
+        self.rows.append((args, kwargs))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("rejection", "reason", "detail"),
+    [
+        pytest.param(lambda: _mapped_413("openai"), "request_too_large", CONTEXT_BUDGET_REQUEST_TOO_LARGE_DETAIL, id="413"),
+        pytest.param(lambda: _mapped_413("bedrock"), "request_too_large", CONTEXT_BUDGET_REQUEST_TOO_LARGE_DETAIL, id="bedrock-413"),
+        pytest.param(
+            lambda: ContextWindowExceededError(message="prompt is too long", model="test-model", llm_provider="anthropic"),
+            "context_length_exceeded",
+            CONTEXT_BUDGET_PROVIDER_REFUSAL_DETAIL,
+            id="context-limit",
+        ),
+    ],
+)
+async def test_the_planner_refusal_text_is_chosen_by_the_typed_size_reason(
+    tmp_path: Path, tool_context: ToolContext, rejection: Callable[[], BaseException], reason: str, detail: str
+) -> None:
+    # The refusal carries the provider's typed reason; the route chooses the user's text by it, never by text.
+    completion = _ScriptedCompletion(rejection(), rejection())
+    refusal = await _plan_once(tmp_path, tool_context, completion, BufferingRecorder())
+
+    assert refusal.detail_codes[0] == "context_ceiling_provider"
+    assert refusal.provider_size_reason == reason
+    status, body = await _handle_planner_failure(refusal, _AuditSink(), uuid4(), None, session_operation_context=object())
+    assert (status, body["failure_code"], body["detail"]) == (422, "context_budget_exceeded", detail)
+
+
+def test_a_provider_ceiling_refusal_and_only_one_carries_the_size_reason() -> None:
+    from elspeth.contracts.errors import AuditIntegrityError
+    from elspeth.web.composer.pipeline_planner import _planner_context_budget_exhausted
+
+    components = {"system": 1}
+    assert _planner_context_budget_exhausted("bytes", components).provider_size_reason is None
+    with pytest.raises(AuditIntegrityError):
+        _planner_context_budget_exhausted("provider", components)
+    with pytest.raises(AuditIntegrityError):
+        _planner_context_budget_exhausted("tokens", components, provider_size_reason="request_too_large")
+
+
+def _mapped_413(route: str) -> BaseException:
+    from tests.unit.web.composer.test_request_too_large import mapped_provider_error
+
+    return mapped_provider_error(route, 413)

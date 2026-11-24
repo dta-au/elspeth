@@ -57,6 +57,7 @@ from elspeth.web.coordination.contracts import (
     ArchiveDeleteReconciliation,
     ArchiveManifestRelation,
     CancellationSource,
+    CloseReleaseOutcome,
     CompatibilityKey,
     InstanceState,
     RecoveryRequiredReason,
@@ -2569,6 +2570,10 @@ class SessionOperationAuthority(Protocol):
     ) -> T: ...
 
     def release(self, context: SessionOperationContext) -> None: ...
+
+    def release_at_close(self, context: SessionOperationContext) -> CloseReleaseOutcome:
+        """Release this exact, unreleased fence at lease close, even after its deadline."""
+        ...
 
     def archive_delete(self, context: SessionOperationContext) -> None: ...
 

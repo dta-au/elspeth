@@ -344,7 +344,7 @@ def test_rm07_occupied_leader_seat_truth_table(monkeypatch: pytest.MonkeyPatch) 
     factory, _repository, _ids = _seed_scheduler_image()
     coordination = RunCoordinationRepository(factory._db.engine)
 
-    occupied = coordination.live_leader(run_id=RUN_ID)
+    occupied = coordination.seat_holder(run_id=RUN_ID)
     assert occupied is not None
     assert occupied.leader_worker_id == LEADER
     assert occupied.leader_epoch == 1
@@ -358,11 +358,11 @@ def test_rm07_occupied_leader_seat_truth_table(monkeypatch: pytest.MonkeyPatch) 
         )
     monkeypatch.setattr(coordination_module, "read_landscape_decision_time", lambda _conn: database_now)
     before_read = capture_state_engine_image(factory, run_id=RUN_ID)
-    equality = coordination.live_leader(run_id=RUN_ID)
+    equality = coordination.seat_holder(run_id=RUN_ID)
     assert equality is not None
     assert equality.seat_live is True
     assert capture_state_engine_image(factory, run_id=RUN_ID) == before_read
-    assert coordination.live_leader(run_id="missing-run") is None
+    assert coordination.seat_holder(run_id="missing-run") is None
 
     with factory._db.engine.begin() as conn:
         conn.execute(
@@ -370,7 +370,7 @@ def test_rm07_occupied_leader_seat_truth_table(monkeypatch: pytest.MonkeyPatch) 
             .where(run_coordination_table.c.run_id == RUN_ID)
             .values(leader_worker_id=None, leader_heartbeat_expires_at=None, updated_at=NOW)
         )
-    assert coordination.live_leader(run_id=RUN_ID) is None
+    assert coordination.seat_holder(run_id=RUN_ID) is None
 
 
 def test_rm08_dead_non_leader_worker_truth_table_and_ordering(monkeypatch: pytest.MonkeyPatch) -> None:

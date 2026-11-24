@@ -2194,7 +2194,7 @@ def _insert_scheduler_owner_records(
 
 
 def _scheduler_leader(engine: Tier1Engine, run_id: str = "run-1") -> CoordinationToken:
-    leader = RunCoordinationRepository(engine).live_leader(run_id=run_id)
+    leader = RunCoordinationRepository(engine).seat_holder(run_id=run_id)
     assert leader is not None
     return CoordinationToken(run_id=run_id, worker_id=leader.leader_worker_id, leader_epoch=leader.leader_epoch)
 

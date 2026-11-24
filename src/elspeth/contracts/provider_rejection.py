@@ -13,8 +13,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 RequestRejectionReason = Literal["invalid_request", "context_length_exceeded", "unsupported_parameter", "request_too_large"]
 ReasonDisposition = Literal["retained", "absent", "unrecognized", "unavailable"]
-# ``sdk_class`` and ``message_pattern`` admit only ``context_length_exceeded``: the SDK's own
-# context-window exception class, or a fixed wording of that rejection on an HTTP 400.
+# ``sdk_class`` and ``message_pattern`` admit only ``context_length_exceeded``: litellm's
+# context-window exception class, or ELSPETH's fixed wording of that rejection on an HTTP 400.
+# ``sdk_class`` is not typed evidence: on some routes litellm itself assigns that class by
+# matching the provider's wording.
 # ``http_status`` is exactly ``request_too_large``: an HTTP 413 from the provider or a proxy in front of it.
 ReasonSource = Literal["sdk_body", "http_response", "sdk_class", "message_pattern", "http_status", "unavailable"]
 
@@ -65,7 +67,9 @@ class SafeRequestRejection(BaseModel):
         if self.reason_code == "context_length_exceeded":
             return "The request exceeded the model's context limit. Reduce the review context before trying again."
         if self.reason_code == "request_too_large":
-            return "The request was larger than the provider, or a proxy in front of it, accepts. Reduce the review context before trying again."
+            return (
+                "The provider, or a proxy in front of it, refused the request as too large. Reduce the review context before trying again."
+            )
         if self.reason_code == "unsupported_parameter":
             return "The request included an unsupported parameter. Check the provider request configuration before trying again."
         if self.reason_code == "invalid_request":

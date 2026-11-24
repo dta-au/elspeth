@@ -7,7 +7,8 @@ import re
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, ClassVar, Final, Literal
+from types import MappingProxyType
+from typing import Any, ClassVar, Final, Literal, assert_never
 
 from opentelemetry import metrics
 
@@ -124,11 +125,42 @@ _REVIEW_REPLY_CONTEXT_BUDGET_NOTICE: Final = (
     "is too large for the composer. Start a new session, or shorten your request."
 )
 _REVIEW_REPLY_CONTEXT_BUDGET_SUFFIX = _bare_trusted_suffix(_REVIEW_REPLY_CONTEXT_BUDGET_NOTICE)
-_ADVISOR_REVIEW_BUDGET_NOTICE: Final = (
-    "The reply was withheld because the completion review could not run within the existing request limits. "
-    "Saved draft progress remains available; continue in a new message."
+# The final review could not run. Each cause has one fixed detail sentence;
+# only the recourse depends on whether the draft has content, so the claim
+# "Saved draft progress remains available" is made only when it is true. The
+# blocker card (advisor_policy) uses the same detail and suggestion strings,
+# so the two surfaces cannot drift.
+_ADVISOR_REVIEW_BUDGET_DETAIL: Final = (
+    "The reply was withheld because the completion review could not run within the existing request limits."
 )
+_ADVISOR_REVIEW_COST_UNKNOWN_DETAIL: Final = (
+    "The reply was withheld because the completion review could not run: "
+    "the cost of an earlier model call in this request could not be confirmed."
+)
+_ADVISOR_REVIEW_DRAFT_SUGGESTION: Final = "Saved draft progress remains available; continue in a new message."
+_ADVISOR_REVIEW_NO_DRAFT_SUGGESTION: Final = "Continue in a new message."
+_ADVISOR_REVIEW_BUDGET_NOTICE: Final = f"{_ADVISOR_REVIEW_BUDGET_DETAIL} {_ADVISOR_REVIEW_DRAFT_SUGGESTION}"
 _ADVISOR_REVIEW_BUDGET_SUFFIX = _bare_trusted_suffix(_ADVISOR_REVIEW_BUDGET_NOTICE)
+_ADVISOR_REVIEW_BUDGET_NO_DRAFT_NOTICE: Final = f"{_ADVISOR_REVIEW_BUDGET_DETAIL} {_ADVISOR_REVIEW_NO_DRAFT_SUGGESTION}"
+_ADVISOR_REVIEW_BUDGET_NO_DRAFT_SUFFIX = _bare_trusted_suffix(_ADVISOR_REVIEW_BUDGET_NO_DRAFT_NOTICE)
+_ADVISOR_REVIEW_COST_UNKNOWN_NOTICE: Final = f"{_ADVISOR_REVIEW_COST_UNKNOWN_DETAIL} {_ADVISOR_REVIEW_DRAFT_SUGGESTION}"
+_ADVISOR_REVIEW_COST_UNKNOWN_SUFFIX = _bare_trusted_suffix(_ADVISOR_REVIEW_COST_UNKNOWN_NOTICE)
+_ADVISOR_REVIEW_COST_UNKNOWN_NO_DRAFT_NOTICE: Final = f"{_ADVISOR_REVIEW_COST_UNKNOWN_DETAIL} {_ADVISOR_REVIEW_NO_DRAFT_SUGGESTION}"
+_ADVISOR_REVIEW_COST_UNKNOWN_NO_DRAFT_SUFFIX = _bare_trusted_suffix(_ADVISOR_REVIEW_COST_UNKNOWN_NO_DRAFT_NOTICE)
+# Every review-could-not-run notice, by (reason, draft has content). The
+# recognizer accepts exactly these; the producers below look them up and
+# raise on any other reason.
+_ADVISOR_REVIEW_NOT_RUN_NOTICES: Final[Mapping[tuple[str, bool], tuple[str, str]]] = MappingProxyType(
+    {
+        ("budget_exhausted", True): (_ADVISOR_REVIEW_BUDGET_SUFFIX, _ADVISOR_REVIEW_BUDGET_NOTICE),
+        ("budget_exhausted", False): (_ADVISOR_REVIEW_BUDGET_NO_DRAFT_SUFFIX, _ADVISOR_REVIEW_BUDGET_NO_DRAFT_NOTICE),
+        ("prior_call_cost_unknown", True): (_ADVISOR_REVIEW_COST_UNKNOWN_SUFFIX, _ADVISOR_REVIEW_COST_UNKNOWN_NOTICE),
+        ("prior_call_cost_unknown", False): (
+            _ADVISOR_REVIEW_COST_UNKNOWN_NO_DRAFT_SUFFIX,
+            _ADVISOR_REVIEW_COST_UNKNOWN_NO_DRAFT_NOTICE,
+        ),
+    }
+)
 
 
 def compose_review_reply_unavailable_message(content: str) -> str:
@@ -136,14 +168,29 @@ def compose_review_reply_unavailable_message(content: str) -> str:
     return content + _REVIEW_REPLY_UNAVAILABLE_SUFFIX
 
 
+# Every END block reason, explicitly: a review that could not finish, or one
+# that ran and did not admit the reply. A reason missing here raises rather
+# than claiming the review ran.
+_REVIEW_REPLY_SUFFIX_BY_REASON: Final[Mapping[str, str]] = MappingProxyType(
+    {
+        "unavailable": _REVIEW_REPLY_UNREVIEWED_SUFFIX,
+        "malformed": _REVIEW_REPLY_UNREVIEWED_SUFFIX,
+        "request_rejected": _REVIEW_REPLY_UNREVIEWED_SUFFIX,
+        "budget_exhausted": _REVIEW_REPLY_UNREVIEWED_SUFFIX,
+        "prior_call_cost_unknown": _REVIEW_REPLY_UNREVIEWED_SUFFIX,
+        "publication_withheld": _REVIEW_REPLY_WITHHELD_SUFFIX,
+        "flagged_final_pass": _REVIEW_REPLY_WITHHELD_SUFFIX,
+        "flagged_no_repair": _REVIEW_REPLY_WITHHELD_SUFFIX,
+        "flagged_unrepairable": _REVIEW_REPLY_WITHHELD_SUFFIX,
+    }
+)
+
+
 def compose_review_reply_withheld_message(content: str, *, reason: AdvisorTerminalBlockReason = "publication_withheld") -> str:
     """Disclose withheld prose after the existing graph-status notice."""
-    suffix = (
-        _REVIEW_REPLY_UNREVIEWED_SUFFIX
-        if reason in {"unavailable", "malformed", "request_rejected", "budget_exhausted"}
-        else _REVIEW_REPLY_WITHHELD_SUFFIX
-    )
-    return content + suffix
+    if reason not in _REVIEW_REPLY_SUFFIX_BY_REASON:
+        raise AuditIntegrityError(f"Withheld reply has no notice for END block reason {reason!r}")
+    return content + _REVIEW_REPLY_SUFFIX_BY_REASON[reason]
 
 
 def compose_review_reply_context_budget_message(content: str) -> str:
@@ -707,8 +754,9 @@ def _canonical_base_suffix_segments(suffix: str, *, allow_request_rejection: boo
                         return (*preceding_segments, TrustedSystemNoticeSegment(rejection_notice))
     if suffix == _GRAPH_RECOVERY_REFUSAL_SUFFIX:
         return (TrustedSystemNoticeSegment(_GRAPH_RECOVERY_REFUSAL_NOTICE),)
-    if suffix == _ADVISOR_REVIEW_BUDGET_SUFFIX:
-        return (TrustedSystemNoticeSegment(_ADVISOR_REVIEW_BUDGET_NOTICE),)
+    for not_run_suffix, not_run_notice in _ADVISOR_REVIEW_NOT_RUN_NOTICES.values():
+        if suffix == not_run_suffix:
+            return (TrustedSystemNoticeSegment(not_run_notice),)
     if suffix.endswith(_INTERPRETATION_REVIEW_HANDOFF_FINALIZE_SUFFIX):
         preceding = suffix[: -len(_INTERPRETATION_REVIEW_HANDOFF_FINALIZE_SUFFIX)]
         if preceding:
@@ -1051,7 +1099,10 @@ def compose_advisor_signoff_unverified_message(content: str) -> str:
 
 
 def compose_advisor_signoff_unrendered_pending_message(
-    content: str, *, failure_class: Literal["unavailable", "request_rejected", "malformed", "budget_exhausted"]
+    content: str,
+    *,
+    failure_class: Literal["unavailable", "request_rejected", "malformed", "budget_exhausted", "prior_call_cost_unknown"],
+    draft_has_content: bool,
 ) -> str:
     """GREEN preflight + an UNRENDERED advisory verdict (unavailable/malformed).
 
@@ -1060,19 +1111,25 @@ def compose_advisor_signoff_unrendered_pending_message(
     the verdict class and its remedy (retry, or check the advisor model
     configuration). Fixed prose; nothing from the advisor is interpolated.
     """
-    if failure_class == "budget_exhausted":
-        return _append_advisor_suffix(content, _ADVISOR_REVIEW_BUDGET_SUFFIX)
+    if failure_class == "budget_exhausted" or failure_class == "prior_call_cost_unknown":
+        not_run_suffix, _notice = _ADVISOR_REVIEW_NOT_RUN_NOTICES[(failure_class, draft_has_content)]
+        return _append_advisor_suffix(content, not_run_suffix)
     if failure_class == "request_rejected":
         return content
     if failure_class == "unavailable":
         suffix = _ADVISOR_SIGNOFF_UNAVAILABLE_PENDING_PUBLISHED_FINALIZE_SUFFIX
-    else:
+    elif failure_class == "malformed":
         suffix = _ADVISOR_SIGNOFF_MALFORMED_PENDING_PUBLISHED_FINALIZE_SUFFIX
+    else:
+        assert_never(failure_class)
     return _append_advisor_suffix(content, suffix)
 
 
 def compose_advisor_signoff_unrendered_unverified_message(
-    content: str, *, failure_class: Literal["unavailable", "request_rejected", "malformed", "budget_exhausted"]
+    content: str,
+    *,
+    failure_class: Literal["unavailable", "request_rejected", "malformed", "budget_exhausted", "prior_call_cost_unknown"],
+    draft_has_content: bool,
 ) -> str:
     """ABSENT preflight + an UNRENDERED advisory verdict (unavailable/malformed).
 
@@ -1080,14 +1137,17 @@ def compose_advisor_signoff_unrendered_unverified_message(
     facet B readiness disclosure (no preflight ran, so no pipeline claim), with
     the could-not-be-obtained framing and remedy for the verdict class.
     """
-    if failure_class == "budget_exhausted":
-        return _append_advisor_suffix(content, _ADVISOR_REVIEW_BUDGET_SUFFIX)
+    if failure_class == "budget_exhausted" or failure_class == "prior_call_cost_unknown":
+        not_run_suffix, _notice = _ADVISOR_REVIEW_NOT_RUN_NOTICES[(failure_class, draft_has_content)]
+        return _append_advisor_suffix(content, not_run_suffix)
     if failure_class == "request_rejected":
         return content
     if failure_class == "unavailable":
         suffix = _ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX
-    else:
+    elif failure_class == "malformed":
         suffix = _ADVISOR_SIGNOFF_MALFORMED_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX
+    else:
+        assert_never(failure_class)
     return _append_advisor_suffix(content, suffix)
 
 

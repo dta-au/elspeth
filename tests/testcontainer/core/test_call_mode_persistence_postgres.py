@@ -122,3 +122,45 @@ def test_postgres_call_mode_lineage_and_verdict_are_durable_and_run_bound() -> N
             source_call.call_id,
             source_second_call.call_id,
         }
+
+
+@pytest.mark.timeout(120)
+def test_postgres_replayed_call_latency_is_an_exact_float_the_call_record_accepts() -> None:
+    """A latency read back from PostgreSQL (the replay path's source) is an exact float, and recording it succeeds.
+
+    The call record admits a latency only as a value whose type is a built-in
+    number; the replay loader hands the driver's value through unchanged, so
+    the driver's type is what replay forwards.
+    """
+    with postgres_test_target(driver="psycopg") as postgres_url:
+        db = LandscapeDB.from_url(postgres_url)
+        factory = RecorderFactory(db, payload_store=MockPayloadStore())
+        factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="source")
+        register_test_node(factory.data_flow, "source", "source-node", node_type=NodeType.SOURCE, plugin_name="source")
+        token = leader_coordination_token(factory, "source")
+        operation = factory.execution.begin_operation("source-node", "source_load", coordination_token=token)
+        factory.execution.record_operation_call(
+            operation.operation_id,
+            CallType.HTTP,
+            CallStatus.SUCCESS,
+            RawCallPayload({"url": "https://example.test/a"}),
+            RawCallPayload({"status": 200}),
+            latency_ms=12.5,
+            coordination_token=token,
+        )
+
+        (loaded,) = factory.execution.get_operation_calls(operation.operation_id)
+        assert type(loaded.latency_ms) is float
+        assert type(loaded.call_type) is CallType
+        assert type(loaded.status) is CallStatus
+        replayed = factory.execution.record_operation_call(
+            operation.operation_id,
+            loaded.call_type,
+            loaded.status,
+            RawCallPayload({"url": "https://example.test/a"}),
+            RawCallPayload({"status": 200}),
+            latency_ms=loaded.latency_ms,
+            coordination_token=token,
+        )
+        assert replayed.latency_ms == 12.5
+        db.close()

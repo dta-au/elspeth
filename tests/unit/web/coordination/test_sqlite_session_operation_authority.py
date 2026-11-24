@@ -26,6 +26,7 @@ from elspeth.web.coordination.contracts import (
     SessionOperationFenceLost,
     SessionOperationKind,
 )
+from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.coordination.repository import PostgresSessionOperationRepository, SessionOperationConflictError
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.sessions.models import (
@@ -420,7 +421,9 @@ def _seed_parent_messages(engine, *, session_id: str, messages: tuple[tuple[UUID
         )
 
 
-def _seed_fork_operation(engine, *, session_id: str, operation_id: str, result_session_id: str | None = None) -> None:
+def _seed_fork_operation(
+    engine, *, session_id: str, operation_id: str, result_session_id: str | None = None, kind: str = "session_fork"
+) -> None:
     # SQLite's repository clock is second-precision. Keep fixture creation
     # strictly before that DB-owned mutation time so the real ordering CHECK
     # remains active when a test exercises the receipt binding UPDATE.
@@ -430,7 +433,7 @@ def _seed_fork_operation(engine, *, session_id: str, operation_id: str, result_s
             insert(session_operation_receipts_table).values(
                 session_id=session_id,
                 operation_id=operation_id,
-                kind="session_fork",
+                kind=kind,
                 status="in_progress",
                 request_hash="a" * 64,
                 lease_token="receipt-lease",
@@ -593,6 +596,171 @@ def test_sqlite_archive_capability_rejects_active_receipt_blockers(engine, block
     with engine.connect() as conn:
         archived_at = conn.execute(select(sessions_table.c.archived_at).where(sessions_table.c.id == str(target.id))).scalar_one()
     assert archived_at is None
+
+
+def _expire_receipt(engine, *, operation_id: str) -> None:
+    with engine.begin() as conn:
+        conn.execute(
+            update(session_operation_receipts_table)
+            .where(session_operation_receipts_table.c.operation_id == operation_id)
+            .values(lease_expires_at=database_now(conn) - timedelta(hours=1))
+        )
+
+
+def _stage_child(engine, *, session_id: str) -> datetime:
+    """Archive a session the way fork construction stages its child; returns archived_at."""
+    archived_at = datetime.now(UTC) - timedelta(minutes=1)
+    with engine.begin() as conn:
+        conn.execute(update(sessions_table).where(sessions_table.c.id == session_id).values(archived_at=archived_at))
+    return archived_at
+
+
+def test_sqlite_archive_soft_archives_past_own_expired_receipt_and_refuses_its_retry(engine) -> None:
+    """An abandoned receipt whose lease expired no longer blocks deletion.
+
+    The parent is archived rather than removed, the receipt stays as history
+    naming its staged child, the archived parent refuses the fence a client
+    retry would need, and the staged child (archived from construction, as
+    fork construction leaves it) refuses any operation fence and stays archived.
+    """
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    target = _created(authority)
+    child = _created(authority)
+    _stage_child(engine, session_id=str(child.id))
+    operation_id = str(uuid4())
+    _seed_fork_operation(engine, session_id=str(target.id), operation_id=operation_id, result_session_id=str(child.id))
+    _expire_receipt(engine, operation_id=operation_id)
+    context = authority.acquire(
+        session_id=target.id,
+        operation_kind=SessionOperationKind.ARCHIVE,
+        owner_instance_id="sqlite-owner",
+        lease_seconds=30,
+    )
+
+    disposition = authority.mutate(
+        context,
+        lambda transaction: transaction.session.decide_and_soft_archive(archived_at=datetime.now(UTC)),
+    )
+    authority.release(context)
+
+    assert disposition is SessionArchiveDisposition.SOFT_ARCHIVED
+    with engine.connect() as conn:
+        archived_at = conn.execute(select(sessions_table.c.archived_at).where(sessions_table.c.id == str(target.id))).scalar_one()
+        receipt_status = conn.execute(
+            select(session_operation_receipts_table.c.status).where(
+                session_operation_receipts_table.c.session_id == str(target.id),
+                session_operation_receipts_table.c.operation_id == operation_id,
+            )
+        ).scalar_one()
+    assert archived_at is not None
+    assert receipt_status == "in_progress"
+    with pytest.raises(SessionOperationFenceLost):
+        authority.acquire(
+            session_id=target.id,
+            operation_kind=SessionOperationKind.SESSION_FORK,
+            owner_instance_id="sqlite-retry",
+            lease_seconds=30,
+        )
+    with engine.connect() as conn:
+        child_archived_at = conn.execute(select(sessions_table.c.archived_at).where(sessions_table.c.id == str(child.id))).scalar_one()
+    with pytest.raises(SessionOperationFenceLost):
+        authority.acquire(
+            session_id=child.id,
+            operation_kind=SessionOperationKind.ARCHIVE,
+            owner_instance_id="sqlite-owner",
+            lease_seconds=30,
+        )
+    with engine.connect() as conn:
+        assert (
+            conn.execute(select(sessions_table.c.archived_at).where(sessions_table.c.id == str(child.id))).scalar_one() == child_archived_at
+        )
+
+
+@pytest.mark.parametrize("kind", ("session_fork", "state_revert"))
+@pytest.mark.parametrize("lease", ("expired", "live", "expires_at_the_decision_instant"))
+def test_sqlite_archive_judges_an_own_receipt_by_the_takeover_boundary(
+    engine, monkeypatch: pytest.MonkeyPatch, kind: str, lease: str
+) -> None:
+    """An own in-progress receipt of either kind blocks deletion only while its lease is live.
+
+    The boundary is the takeover's: a lease expiring AT the decision instant is
+    abandoned (takeover treats ``lease_expires_at <= now`` as takeable). The
+    equality case freezes the repository clock at that instant, so a reader
+    comparing ``>=`` would refuse here.
+    """
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    target = _created(authority)
+    operation_id = str(uuid4())
+    _seed_fork_operation(engine, session_id=str(target.id), operation_id=operation_id, kind=kind)
+    with engine.begin() as conn:
+        now = database_now(conn)
+        instant = now + timedelta(minutes=10)
+        lease_expires_at = {
+            "expired": now - timedelta(hours=1),
+            "live": now + timedelta(hours=1),
+            "expires_at_the_decision_instant": instant,
+        }[lease]
+        conn.execute(
+            update(session_operation_receipts_table)
+            .where(session_operation_receipts_table.c.operation_id == operation_id)
+            .values(lease_expires_at=lease_expires_at)
+        )
+    if lease == "expires_at_the_decision_instant":
+        monkeypatch.setattr(
+            coordination_repository._SessionOperationAuthorityRepository, "_database_now", staticmethod(lambda _conn: instant)
+        )
+    context = authority.acquire(
+        session_id=target.id,
+        operation_kind=SessionOperationKind.ARCHIVE,
+        owner_instance_id="sqlite-owner",
+        lease_seconds=30,
+    )
+
+    def archive():
+        return authority.mutate(
+            context,
+            lambda transaction: transaction.session.decide_and_soft_archive(archived_at=datetime.now(UTC)),
+        )
+
+    if lease == "live":
+        with pytest.raises(SessionReceiptInProgressError):
+            archive()
+    else:
+        assert archive() is SessionArchiveDisposition.SOFT_ARCHIVED
+    with engine.connect() as conn:
+        archived_at = conn.execute(select(sessions_table.c.archived_at).where(sessions_table.c.id == str(target.id))).scalar_one()
+        receipt_status = conn.execute(
+            select(session_operation_receipts_table.c.status).where(session_operation_receipts_table.c.operation_id == operation_id)
+        ).scalar_one()
+    assert (archived_at is None) is (lease == "live")
+    assert receipt_status == "in_progress"
+
+
+def test_sqlite_archive_still_refuses_an_expired_incoming_fork(engine) -> None:
+    """Reader only: an expired incoming fork still refuses the receipt check.
+
+    The child here is active, which fork construction never produces (a staged
+    child is archived until settlement and so refuses any operation fence);
+    this pins the incoming reader itself, not a reachable user flow.
+    """
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    target = _created(authority)
+    parent = _created(authority)
+    operation_id = str(uuid4())
+    _seed_fork_operation(engine, session_id=str(parent.id), operation_id=operation_id, result_session_id=str(target.id))
+    _expire_receipt(engine, operation_id=operation_id)
+    context = authority.acquire(
+        session_id=target.id,
+        operation_kind=SessionOperationKind.ARCHIVE,
+        owner_instance_id="sqlite-owner",
+        lease_seconds=30,
+    )
+
+    with pytest.raises(SessionReceiptInProgressError):
+        authority.mutate(
+            context,
+            lambda transaction: transaction.session.decide_and_soft_archive(archived_at=datetime.now(UTC)),
+        )
 
 
 @pytest.mark.parametrize(

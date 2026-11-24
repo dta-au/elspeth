@@ -195,6 +195,11 @@ class TestConvergenceProgressEvent:
         assert event.reason == "context_budget_exceeded"
         assert event.headline == "This conversation is too large for the composer to continue."
         assert event.likely_next == "Start a new session, or shorten your request."
+        # The same event reaches a refusal by the composer's own budget, the
+        # provider's context limit and a proxy's request size limit, so the
+        # evidence names none of them.
+        assert event.evidence == ("The request is too large to send, even with earlier conversation left out.",)
+        assert "context budget" not in " ".join(event.evidence)
         assert CONTEXT_BUDGET_REFUSAL_DETAIL == (
             "This conversation is too large for the composer to continue. Start a new session, or shorten your request."
         )

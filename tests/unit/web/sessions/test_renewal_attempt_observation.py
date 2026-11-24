@@ -11,6 +11,7 @@ from sqlalchemy.exc import OperationalError
 
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.web.coordination import lifecycle
+from elspeth.web.coordination.contracts import CloseReleaseOutcome
 from elspeth.web.required_work import RequiredAuthorityKind, RequiredWorkAuthority, RequiredWorkCoordinator, RequiredWorkSource
 from elspeth.web.sessions.service import ComposerTerminalSQLCompletionUnknown
 
@@ -31,6 +32,10 @@ class _HeldRenewalAuthority:
 
     def release(self, context: SessionOperationContext) -> None:
         self.released.append(context)
+
+    def release_at_close(self, context: SessionOperationContext) -> CloseReleaseOutcome:
+        self.release(context)
+        return CloseReleaseOutcome.RELEASED_LIVE
 
 
 @pytest.mark.asyncio

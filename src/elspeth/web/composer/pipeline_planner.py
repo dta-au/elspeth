@@ -46,7 +46,7 @@ from elspeth.contracts.composer_planner_audit import (
     ComposerPlannerCode,
     ComposerPlannerInformationClass,
 )
-from elspeth.contracts.composer_progress import ComposerProgressSink
+from elspeth.contracts.composer_progress import ComposerProgressSink, ProviderSizeReason
 from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.hashing import canonical_json as _primitive_canonical_json
@@ -164,7 +164,7 @@ from elspeth.web.composer.provider_context import capture_provider_context
 from elspeth.web.composer.provider_discovery_response import (
     argument_error_response,
 )
-from elspeth.web.composer.provider_errors import classify_provider_failure, request_size_rejection
+from elspeth.web.composer.provider_errors import classify_provider_failure, provider_size_reason, request_size_rejection
 from elspeth.web.composer.provider_gateway import _litellm_acompletion
 from elspeth.web.composer.provider_quota import (
     ProviderCallCustody,
@@ -175,6 +175,7 @@ from elspeth.web.composer.provider_quota import (
     quota_provider_calls,
     required_provider_audit_scope,
 )
+from elspeth.web.composer.provider_retry import retry_delay_seconds
 from elspeth.web.composer.reasoning import ReasoningEffort, apply_reasoning_kwargs
 from elspeth.web.composer.recovery_controls import parse_recovery_tool_call, recovery_context_message, recovery_tool_definitions
 from elspeth.web.composer.redaction import GetBlobContentArgumentsModel, ReadAttachmentArgumentsModel, SetPipelineArgumentsModel
@@ -788,6 +789,10 @@ class PipelinePlannerError(RuntimeError):
     the durable failure disposition so it never requires a temp diagnostic.
     Empty for non-rejection failures (timeout, provider error, ...).
 
+    ``provider_size_reason`` is set exactly on the refusal of a sent request
+    the provider rejected as too large (detail code ``context_ceiling_provider``):
+    over the model's context limit, or as a request (HTTP 413). The user's text
+    is chosen by it.
     """
 
     def __init__(
@@ -796,10 +801,12 @@ class PipelinePlannerError(RuntimeError):
         *,
         code: str,
         detail_codes: tuple[str, ...] = (),
+        provider_size_reason: ProviderSizeReason | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.detail_codes = detail_codes
+        self.provider_size_reason = provider_size_reason
 
 
 class PlannerDeclined(PipelinePlannerError):
@@ -3455,12 +3462,18 @@ def _planner_context_budget_components(
 
 
 def _planner_context_budget_exhausted(
-    ceiling: Literal["tokens", "bytes", "provider"], components: Mapping[str, int]
+    ceiling: Literal["tokens", "bytes", "provider"],
+    components: Mapping[str, int],
+    *,
+    provider_size_reason: ProviderSizeReason | None = None,
 ) -> PipelinePlannerError:
+    if (ceiling == "provider") != (provider_size_reason is not None):
+        raise AuditIntegrityError("A provider-ceiling refusal, and only one, carries the provider's size reason")
     return PipelinePlannerError(
         "planner context budget exhausted",
         code="CONTEXT_BUDGET_EXHAUSTED",
         detail_codes=(f"context_ceiling_{ceiling}", f"largest_component_{largest_component(components)}"),
+        provider_size_reason=provider_size_reason,
     )
 
 
@@ -4175,7 +4188,8 @@ async def _plan_pipeline_inner(
             # Preserve the historical validated-success accumulator. Unknown
             # earlier transport cost cannot become free END allowance.
             continuation_cost_known = False
-            size_rejection = request_size_rejection(exc)
+            # A size rejection is a rejected request: named only on a call recorded as one.
+            size_rejection = request_size_rejection(exc) if status is ComposerLLMCallStatus.BAD_REQUEST_ERROR else None
             failed_call = build_llm_call_record(
                 model_requested=effective_model,
                 pricing_model=effective_pricing_model,
@@ -4412,7 +4426,8 @@ async def _plan_pipeline_inner(
                     # An admitted dispatch still needs terminal evidence, but
                     # a first-party fault must retain its original type.
                     raise
-                if request_size_rejection(exc) is not None:
+                size_reason = provider_size_reason(exc)
+                if size_reason is not None:
                     unshed_history = request_conversation_context is not None and (
                         any(
                             request.history_index not in context_budget.shed_history_indices
@@ -4455,14 +4470,38 @@ async def _plan_pipeline_inner(
                             history_sheddable=0,
                             hatch_sheddable=0,
                         ),
+                        provider_size_reason=size_reason,
                     ) from None
                 if provider_failure.kind == "timeout":
                     raise PipelinePlannerError("planner provider call timed out", code="TIMEOUT") from None
                 if provider_failure.retryable and attempt < model_config.max_api_attempts:
-                    retry_delay = model_config.api_retry_base_seconds * (2 ** (attempt - 1))
-                    if retry_delay > 0:
-                        await asyncio.sleep(min(retry_delay, max(0.0, deadline - _planner_deadline_time())))
-                    continue
+                    retry_delay = retry_delay_seconds(
+                        attempt=attempt,
+                        retry_after=provider_failure.retry_after,
+                        deadline=deadline,
+                        now=_planner_deadline_time(),
+                        base_delay_seconds=model_config.api_retry_base_seconds,
+                    )
+                    # With the call budget spent, the loop head's refusal is
+                    # certain: go straight to it, without a wait, so it is raised
+                    # there and carries no provider exception.
+                    call_budget_spent = total_calls >= budget_policy.max_total_provider_calls
+                    if retry_delay is not None:
+                        if retry_delay > 0 and not call_budget_spent:
+                            await asyncio.sleep(retry_delay)
+                        continue
+                    if not provider_failure.rate_limited:
+                        # A non-429 retry whose delay plus call margin does not fit
+                        # starts no call. It waits out the operation budget and the
+                        # loop head ends the run there, so callers see a spent
+                        # deadline. Under the Composer retry policy (1 s, then 2 s)
+                        # the delay ceiling never applies here, so only the
+                        # deadline declines it.
+                        if not call_budget_spent:
+                            remaining = deadline - _planner_deadline_time()
+                            if remaining > 0:
+                                await asyncio.sleep(remaining)
+                        continue
                 raise PipelinePlannerError(
                     f"planner provider call failed ({type(exc).__name__})",
                     code="PROVIDER_ERROR",

@@ -19,7 +19,8 @@ from typing import TYPE_CHECKING, Any, Literal, Never, cast, final
 from uuid import UUID
 
 import structlog
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import DBAPIError, OperationalError, SQLAlchemyError
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from elspeth.contracts import errors as contract_errors
 from elspeth.contracts.errors import ComposerOwnedSettlementFailure
@@ -36,6 +37,7 @@ from elspeth.web.async_workers import (
 )
 from elspeth.web.coordination.contracts import (
     ArchiveDeleteReconciliation,
+    CloseReleaseOutcome,
     FenceLossReason,
     SessionOperationContext,
     SessionOperationFence,
@@ -124,6 +126,16 @@ _SLOW_RENEWAL_LOG_SECONDS = 2.0
 # end). Logging only; touched only on the event loop; bounded oldest-first.
 _RENEWAL_FINISHED_AT: dict[tuple[str, str, int], float] = {}
 _RENEWAL_FINISHED_RETAINED = 1_024
+# A plain-branch renewal that raises ``OperationalError`` (transient database
+# contention) is retried only while a retry taking as long as the failed
+# attempt would finish before the lease expires, and only this many times in a
+# row: the same bound as the membership heartbeat and the orphan sweeper. Every
+# other renewal error loses the lease at once.
+_RENEWAL_MAX_CONSECUTIVE_TRANSIENT_FAILURES = 5
+# SQLite stamps lease expiry with CURRENT_TIMESTAMP, which has whole-second
+# resolution, so its expiry can fall up to a second before the monotonic
+# reading plus the lease length. The retry window reserves that second.
+_RENEWAL_RETRY_CLOCK_SLACK_SECONDS = 1.0
 
 slog = structlog.get_logger()
 type ArchiveLifecycleCallback = Callable[[], Awaitable[None]]
@@ -328,6 +340,45 @@ def _safe_cleanup_context(context: object) -> SessionOperationContext | None:
     )
 
 
+@final
+@dataclass(frozen=True, slots=True)
+class CloseReleaseAfterRenewalFailure:
+    """Renewal outcomes after which a closing lease still releases its own fence.
+
+    ``error_types`` are failures whose outcome is known and which leave the
+    fence row with this lease's exact identity: the database or its driver
+    refused the statement, the connection pool timed out, or the transport
+    (including the upkeep executor's admission wait) failed.
+    ``fence_loss_reasons`` are the fence losses that still leave this lease's
+    row in place. Every other failure, including an unknown physical outcome,
+    an integrity failure, a group retaining cancellations or a fence replaced
+    by another operation, leaves the fence untouched: nothing further is
+    written. ``excluded_operation_kinds`` keep the plain release and never
+    release after a failed renewal; an EXECUTE lease with its obligation
+    releases through that obligation and never reaches this check.
+    """
+
+    error_types: tuple[type[BaseException], ...]
+    fence_loss_reasons: frozenset[FenceLossReason]
+    excluded_operation_kinds: frozenset[SessionOperationKind]
+
+    def admits(self, renewal_error: BaseException | None, *, operation_kind: SessionOperationKind) -> bool:
+        if renewal_error is None:
+            return True
+        if operation_kind in self.excluded_operation_kinds:
+            return False
+        if type(renewal_error) is SessionOperationFenceLost:
+            return renewal_error.reason in self.fence_loss_reasons
+        return isinstance(renewal_error, self.error_types)
+
+
+CLOSE_RELEASE_AFTER_RENEWAL_FAILURE = CloseReleaseAfterRenewalFailure(
+    error_types=(DBAPIError, PoolTimeoutError, OSError),
+    fence_loss_reasons=frozenset({FenceLossReason.LEASE_EXPIRED}),
+    excluded_operation_kinds=frozenset({SessionOperationKind.EXECUTE}),
+)
+
+
 async def _release_acquired_context(
     authority: SessionOperationAuthority,
     context: object,
@@ -480,6 +531,7 @@ class SessionOperationLease:
         "_execution_obligation",
         "_finish_mode",
         "_fork_authority",
+        "_lease_extended_at",
         "_lease_seconds",
         "_lost_event",
         "_owned_tasks",
@@ -503,7 +555,13 @@ class SessionOperationLease:
         fork_authority: SessionForkAuthority | None = None,
         required_work: RequiredWorkCoordinator | None = None,
         execution_obligation: ExecutionAcquisitionObligation | None = None,
+        lease_extended_at: float | None = None,
     ) -> None:
+        # ``lease_extended_at`` is the monotonic time read before the SQL that
+        # last set this lease's expiry, or ``None`` when that time is unknown
+        # (an adopted lease); renewal tolerates no transient failure until it
+        # knows when the lease expires. No statement may precede the guards:
+        # the required-work reserve contract pins them first.
         if required_work is not None:
             if type(required_work) is not RequiredWorkCoordinator:
                 raise contract_errors.AuditIntegrityError("Lease requires an owned required-work coordinator")
@@ -521,6 +579,7 @@ class SessionOperationLease:
         self._upkeep_authority = lease_upkeep_authority(authority)
         self._context = context
         self._lease_seconds = lease_seconds
+        self._lease_extended_at = lease_extended_at
         self._renew_interval_seconds = renew_interval_seconds
         self._fork_authority = fork_authority
         self._stop_renewal = asyncio.Event()
@@ -571,6 +630,10 @@ class SessionOperationLease:
                 authority, session_id=session_id, owner_instance_id=owner_instance_id, lease_seconds=lease_seconds
             )
             return await cls._acquire_execution(authority, execution_obligation, interval)
+        # Read before the acquire SQL: the database stamps the expiry later,
+        # so the lease lasts lease_seconds from about this reading (up to the
+        # database clock's resolution earlier on SQLite).
+        lease_extended_at = time.monotonic()
         # Held in a list so the finished task (whose repr carries its result or
         # exception) can be dropped from this frame on every path before a
         # failure escapes; a plain local cannot be deleted on one branch only.
@@ -646,6 +709,7 @@ class SessionOperationLease:
             context,
             lease_seconds=lease_seconds,
             renew_interval_seconds=interval,
+            lease_extended_at=lease_extended_at,
         )
 
     @classmethod
@@ -654,6 +718,8 @@ class SessionOperationLease:
     ) -> SessionOperationLease:
         if cls is not SessionOperationLease:
             raise contract_errors.AuditIntegrityError("EXECUTE lease constructor must retain its owned concrete type")
+        # Read before the acquire SQL is submitted; see ``acquire``.
+        lease_extended_at = time.monotonic()
         outcome = await run_execution_lease_sql_finish_once(obligation.acquire_submission)
         cancellations = list(outcome.deferred_cancellations)
         if isinstance(outcome, RequiredSQLRaised):
@@ -681,6 +747,7 @@ class SessionOperationLease:
                 lease_seconds=obligation.lease_seconds,
                 renew_interval_seconds=interval,
                 execution_obligation=obligation,
+                lease_extended_at=lease_extended_at,
             )
         except BaseException as original:
             obligation.record_construction_failure(original)
@@ -985,6 +1052,8 @@ class SessionOperationLease:
                 raise contract_errors.AuditIntegrityError("EXECUTE renewal lacks actual Task ownership")
             obligation.bind_actual_renewal_task(self, actual_task)
             self._renewal_task = actual_task
+        renewed_at = self._lease_extended_at
+        transient_failures = 0
         while not self._stop_renewal.is_set():
             with suppress(TimeoutError):
                 await asyncio.wait_for(
@@ -993,6 +1062,7 @@ class SessionOperationLease:
                 )
             if self._stop_renewal.is_set():
                 return
+            attempt_started_at = time.monotonic()
             try:
                 if self._fork_authority is None:
                     if self._required_work is None:
@@ -1040,8 +1110,72 @@ class SessionOperationLease:
                 self._record_renewal_error(renewal_error)
                 return
             except Exception as renewal_error:
-                self._record_renewal_error(renewal_error)
-                return
+                transient_failures += 1
+                failed_at = time.monotonic()
+                # An adopted lease has no reading of when its expiry was last
+                # set, so it retries nothing until its first renewal succeeds.
+                if renewed_at is None or not self._retries_transient_renewal_failure(
+                    renewal_error,
+                    renewed_at=renewed_at,
+                    attempt_started_at=attempt_started_at,
+                    failed_at=failed_at,
+                    consecutive_failures=transient_failures,
+                ):
+                    self._record_renewal_error(renewal_error)
+                    return
+                try:
+                    self._log_renewal_retry(
+                        renewal_error, consecutive_failures=transient_failures, seconds_since_renewal=failed_at - renewed_at
+                    )
+                except Exception:
+                    # The loss is recorded before a logging fault ends renewal.
+                    self._record_renewal_error(renewal_error)
+                    raise
+            else:
+                renewed_at = attempt_started_at
+                transient_failures = 0
+
+    def _retries_transient_renewal_failure(
+        self,
+        error: Exception,
+        *,
+        renewed_at: float,
+        attempt_started_at: float,
+        failed_at: float,
+        consecutive_failures: int,
+    ) -> bool:
+        """True when a plain-branch renewal may try again after ``error``.
+
+        Only ``OperationalError`` models transient contention. The retry
+        starts one interval after ``failed_at`` and is allowed only when a
+        retry taking as long as the failed attempt would finish, with one
+        second of slack for the database clock's resolution, before the lease
+        expires, measured from the reading taken before the SQL that last
+        extended it. The retry's own duration is not bounded here, and the
+        database refuses a late renewal and every fenced write. A
+        required-work renewal is never retried: its failed ticket stays with
+        the coordinator.
+        """
+        if not isinstance(error, OperationalError) or self._required_work is not None:
+            return False
+        if consecutive_failures >= _RENEWAL_MAX_CONSECUTIVE_TRANSIENT_FAILURES:
+            return False
+        retry_finishes_at = failed_at + self._renew_interval_seconds + (failed_at - attempt_started_at)
+        return retry_finishes_at - renewed_at + _RENEWAL_RETRY_CLOCK_SLACK_SECONDS < self._lease_seconds
+
+    def _log_renewal_retry(self, error: Exception, *, consecutive_failures: int, seconds_since_renewal: float) -> None:
+        # exc_info is deliberately omitted: SQLAlchemy cause chains carry the
+        # database URL.
+        slog.warning(
+            "session_operation.renewal_retrying",
+            session_id=self._context.fence.session_id,
+            operation_id=self._context.fence.operation_id,
+            operation_epoch=self._context.fence.operation_epoch,
+            operation_kind=self._context.operation_kind.value,
+            exc_class=type(error).__name__,
+            consecutive_failures=consecutive_failures,
+            seconds_since_renewal=round(seconds_since_renewal, 3),
+        )
 
     async def _run_required_renewal_attempt(
         self, attempt: _RenewalAttemptObservation, ticket: RequiredWorkTicket
@@ -1148,11 +1282,25 @@ class SessionOperationLease:
                 _raise_lifecycle_originals(
                     list(outcome.deferred_cancellations), [outcome.error] if type(outcome) is RequiredSQLRaised else []
                 )
-            elif self._required_work is None:
-                await run_lease_upkeep_in_worker(self._upkeep_authority.release, self._context)
+            elif self._context.operation_kind in CLOSE_RELEASE_AFTER_RENEWAL_FAILURE.excluded_operation_kinds:
+                # An excluded kind keeps the plain release of a live fence.
+                if self._required_work is None:
+                    await run_lease_upkeep_in_worker(self._upkeep_authority.release, self._context)
+                else:
+                    ticket = self._required_work.prepare_lease_release()
+                    await run_required_sql_in_worker(ticket, self._authority.release, self._context)
             else:
-                ticket = self._required_work.prepare_lease_release()
-                await run_required_sql_in_worker(ticket, self._authority.release, self._context)
+                if self._required_work is None:
+                    released = await run_lease_upkeep_in_worker(self._upkeep_authority.release_at_close, self._context)
+                else:
+                    ticket = self._required_work.prepare_lease_release()
+                    released = await run_required_sql_in_worker(ticket, self._authority.release_at_close, self._context)
+                if type(released) is not CloseReleaseOutcome:
+                    raise contract_errors.AuditIntegrityError("Close release returned no owned outcome")
+                if released is CloseReleaseOutcome.RELEASED_AFTER_EXPIRY:
+                    # Released, but the deadline had passed: the operation's
+                    # authority was already lost, and the lease reports it so.
+                    raise SessionOperationFenceLost(FenceLossReason.LEASE_EXPIRED)
         except SessionOperationFenceLost:
             self._disposition = SessionOperationLeaseDisposition.LOST
             raise
@@ -1188,12 +1336,17 @@ class SessionOperationLease:
             except BaseException as error:
                 custody_error = error
                 self._disposition = SessionOperationLeaseDisposition.UNKNOWN
-            if custody_error is None and self._renewal_error is None:
+            if custody_error is None and CLOSE_RELEASE_AFTER_RENEWAL_FAILURE.admits(
+                self._renewal_error, operation_kind=self._context.operation_kind
+            ):
+                # Work and renewal have stopped and required work is complete,
+                # so the lease gives up its own fence even after a failed
+                # renewal; the renewal failure stays the primary error.
                 try:
                     await self._release_current()
                 except BaseException as error:
                     release_error = error
-            elif self._renewal_error is not None:
+            if self._renewal_error is not None:
                 self._disposition = SessionOperationLeaseDisposition.LOST
         finally:
             self._closed = True
@@ -1593,7 +1746,12 @@ class SessionOperationLease:
             raise
 
     async def close(self) -> None:
-        """Join children, stop renewal, and release only known-current authority."""
+        """Join children, stop renewal, and release this lease's own fence.
+
+        The release is a compare-and-swap on the fence's exact identity, so it
+        never touches a successor. After a failed renewal it runs only for the
+        outcomes in ``CLOSE_RELEASE_AFTER_RENEWAL_FAILURE``.
+        """
         obligation = self._execution_obligation
         cancellations: list[asyncio.CancelledError] = []
         allocation_failures: list[BaseException] = []

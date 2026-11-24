@@ -382,7 +382,7 @@ class TestUpdateGradeAfterPurge:
             )
             with pytest.raises(RunLeadershipLostError):
                 update_grade_after_purge(db, coordination_token=authority)
-            current_leader = factory.run_coordination.live_leader(run_id="run-1")
+            current_leader = factory.run_coordination.seat_holder(run_id="run-1")
             assert current_leader is not None
             assert current_leader.leader_worker_id == successor.worker_id
         else:

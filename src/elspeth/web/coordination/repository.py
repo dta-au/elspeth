@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol, cast, final, get_args
 from uuid import UUID, uuid4
 
 from pydantic import JsonValue
-from sqlalchemy import ColumnElement, Connection, Engine, Row, and_, delete, func, insert, select, update
+from sqlalchemy import ColumnElement, Connection, Engine, Row, and_, case, delete, func, insert, select, update
 from sqlalchemy.engine import RowMapping
 from sqlalchemy.exc import IntegrityError
 
@@ -79,6 +79,7 @@ from elspeth.web.coordination.composer_operation_authority import (
 from elspeth.web.coordination.contracts import (
     ArchiveDeleteReconciliation,
     ArchiveManifestRelation,
+    CloseReleaseOutcome,
     FenceLossReason,
     RecoveryRequiredReason,
     RunSagaState,
@@ -763,11 +764,18 @@ class _RepositorySessionMutations:
             raise TypeError("archived_at must be an exact datetime")
         archived_at = _ensure_utc(archived_at)
         session_id = state._session_id
+        # The session's own receipt blocks archival only while its lease is
+        # live, judged by the database clock as a receipt takeover judges it.
+        # An expired one is an abandoned operation: it must not block deletion
+        # forever, and it makes the archive soft below. An incoming fork stays
+        # refused whatever its lease: its child is still staged, and settling a
+        # retried fork would reactivate a child archived here.
         active_receipt_kind = connection.execute(
             select(session_operation_receipts_table.c.kind)
             .where(
                 session_operation_receipts_table.c.session_id == session_id,
                 session_operation_receipts_table.c.status == "in_progress",
+                session_operation_receipts_table.c.lease_expires_at > state._database_now,
             )
             .order_by(session_operation_receipts_table.c.operation_id)
             .limit(1)
@@ -810,6 +818,17 @@ class _RepositorySessionMutations:
                     session_operation_receipts_table.c.kind == "session_fork",
                     session_operation_receipts_table.c.status == "completed",
                     session_operation_receipts_table.c.result_session_id == session_id,
+                )
+                .limit(1)
+            ).first()
+            # The session's own expired in-progress receipt (live ones are
+            # refused above) is an abandoned operation's record, and a fork's
+            # names its staged child under a RESTRICT key: archive softly.
+            or connection.execute(
+                select(session_operation_receipts_table.c.operation_id)
+                .where(
+                    session_operation_receipts_table.c.session_id == session_id,
+                    session_operation_receipts_table.c.status == "in_progress",
                 )
                 .limit(1)
             ).first()
@@ -3331,6 +3350,7 @@ class _RepositoryBlobMutations:
                 session_operation_receipts_table.c.session_id == state._session_id,
                 session_operation_receipts_table.c.kind == SessionOperationKind.SESSION_FORK.value,
                 session_operation_receipts_table.c.status == "in_progress",
+                session_operation_receipts_table.c.lease_expires_at > state._database_now,
             )
             .order_by(session_operation_receipts_table.c.operation_id)
             .limit(1)
@@ -5440,10 +5460,8 @@ class _SessionOperationAuthorityRepository:
             raise SessionOperationFenceLost(FenceLossReason.LEASE_EXPIRED)
 
     @staticmethod
-    def _exact_active_predicates(
-        context: SessionOperationContext,
-        database_now: datetime,
-    ) -> tuple[ColumnElement[bool], ...]:
+    def _exact_unreleased_predicates(context: SessionOperationContext) -> tuple[ColumnElement[bool], ...]:
+        """This exact fence (identity, epoch and kind), not yet released; no deadline term."""
         fence = context.fence
         return (
             session_operation_fences_table.c.session_id == fence.session_id,
@@ -5452,6 +5470,15 @@ class _SessionOperationAuthorityRepository:
             session_operation_fences_table.c.operation_epoch == fence.operation_epoch,
             session_operation_fences_table.c.operation_kind == context.operation_kind.value,
             session_operation_fences_table.c.released_at.is_(None),
+        )
+
+    @staticmethod
+    def _exact_active_predicates(
+        context: SessionOperationContext,
+        database_now: datetime,
+    ) -> tuple[ColumnElement[bool], ...]:
+        return (
+            *_SessionOperationAuthorityRepository._exact_unreleased_predicates(context),
             session_operation_fences_table.c.lease_expires_at > database_now,
         )
 
@@ -6144,6 +6171,47 @@ class _SessionOperationAuthorityRepository:
                     database_now=database_now,
                     execution_release=context.operation_kind is SessionOperationKind.EXECUTE,
                 )
+
+    def release_at_close(self, context: SessionOperationContext) -> CloseReleaseOutcome:
+        """Release this lease's own exact fence at close, whether or not its deadline has passed.
+
+        The lease calls this only after its work and renewal have stopped. The
+        compare-and-swap names the exact operation, token, epoch and kind and
+        requires the row to be unreleased, so a fence that another operation
+        has since taken over is never released here; that case raises the same
+        loss as ``release``. The deadline is never moved later. A read
+        admission (``BLOB_READ``) holds no fence row and keeps the ordinary
+        release.
+        """
+        _validate_context(context)
+        if context.operation_kind is SessionOperationKind.BLOB_READ:
+            self.release(context)
+            return CloseReleaseOutcome.RELEASED_LIVE
+        fence = context.fence
+        with self._locked_transaction(fence.session_id) as conn:
+            database_now = self._lock_fence_for_release_and_read_database_time(conn, context)
+            row = self._select_fence(conn, session_id=fence.session_id)
+            expiry = session_operation_fences_table.c.lease_expires_at
+            result = conn.execute(
+                update(session_operation_fences_table)
+                .where(and_(*self._exact_unreleased_predicates(context)))
+                .values(
+                    lease_expires_at=case((expiry > database_now, database_now), else_=expiry),
+                    released_at=database_now,
+                )
+            )
+            if result.rowcount != 1:
+                self._raise_fence_lost(
+                    conn,
+                    context,
+                    database_now=database_now,
+                    execution_release=context.operation_kind is SessionOperationKind.EXECUTE,
+                )
+            if row is None:
+                raise AuditIntegrityError("close release updated a fence its own transaction did not read")
+            if _ensure_utc(row.lease_expires_at) <= database_now:
+                return CloseReleaseOutcome.RELEASED_AFTER_EXPIRY
+            return CloseReleaseOutcome.RELEASED_LIVE
 
     def archive_delete(self, context: SessionOperationContext) -> None:
         """Delete a parent only while its exact current archive fence is live."""
