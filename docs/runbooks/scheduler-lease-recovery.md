@@ -716,7 +716,11 @@ leader" refusal. If the leader heartbeats before admission, the
 post-admission check still tests graph readiness and departs the follower on
 refusal. Once the graph is ready, the recorded edge set must equal the
 follower graph's edges by endpoints, label, and mode; any difference, or
-different plugin implementation evidence, is refused.
+different plugin implementation evidence, is refused. A stored source
+lifecycle state outside the known set, or (once the graph is ready) source
+rows that do not match the run's recorded source nodes, is an audit integrity
+failure, not a refusal: the join stops with the fatal integrity error and the
+run's Landscape records need investigation.
 
 The atomic `BEGIN IMMEDIATE` admission transaction (ADR-030 D3, §B.1) checks
 the authoritative preconditions and registers the follower only when all hold:
@@ -735,7 +739,9 @@ graph readiness, and plugin implementation after registration.
 A refusal at that point records follower registration followed by departure if
 the departure write succeeds. If the departure write fails, the refusal says
 so; the follower row lapses at heartbeat expiry and is departed at finalize or
-evicted by the liveness sweep.
+evicted by the liveness sweep. For any other post-admission error, the
+`Join failed:` line names the error class and message, followed by any
+departure failure on its own line.
 
 A **filesystem-writability preflight runs first** (before the registry is
 touched): the follower verifies write access to the DB file, its directory,

@@ -239,6 +239,29 @@ class TestJoinSourceLifecycleEvidence:
         assert [row for row in _worker_rows(db) if row["role"] == "follower"] == []
         db.close()
 
+    def test_ready_subset_mid_seeding_is_not_ready_not_integrity_failure(self) -> None:
+        """While every row is READY the leader may still be seeding: coverage is not checked yet."""
+        db = make_landscape_db()
+        _begin_run_with_leader(db)
+        with (
+            _PATCH_RESOLVE,
+            _PATCH_HASH_SENTINEL,
+            patch.object(
+                RunLifecycleReadRepository,
+                "get_run_source_lifecycle_records",
+                return_value={"source": dataclasses.replace(_LOADING_SOURCE, lifecycle_state="ready")},
+            ),
+            patch.object(
+                DataFlowReadRepository,
+                "get_nodes",
+                return_value=[_SOURCE_NODE, types.SimpleNamespace(node_id="second", node_type=NodeType.SOURCE), _SINK_NODE],
+            ),
+            pytest.raises(JoinNotReadyError, match="not finished registering its graph"),
+        ):
+            _orchestrator(db).join_run(run_id=RUN_ID, settings=types.SimpleNamespace(), **_JOIN_INPUTS)
+        assert [row for row in _worker_rows(db) if row["role"] == "follower"] == []
+        db.close()
+
 
 # ---------------------------------------------------------------------------
 # §H test #2(b): happy path — test_join_attaches_follower_to_running_run
