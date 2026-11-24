@@ -51,7 +51,7 @@ from unittest.mock import patch
 import pytest
 from sqlalchemy import select, update
 
-from elspeth.contracts import NodeType, RoutingMode, RunStatus
+from elspeth.contracts import NodeType, RunStatus
 from elspeth.contracts.config import RuntimeRetryConfig
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.errors import AuditIntegrityError, FollowerSeatDeadError, JoinNotReadyError, JoinRefusedError, RunMembershipLostError
@@ -258,7 +258,8 @@ class TestJoinRunAdmissionRefusals:
         _assert_no_follower_mutation(setup, run_id=setup.run_id, seat_before=seat_before)
         setup.db.close()
 
-    def test_same_follower_joins_after_graph_registration(self) -> None:
+    @pytest.mark.parametrize("different_edge", [False, True])
+    def test_same_follower_joins_after_graph_registration(self, different_edge: bool) -> None:
         config, graph, _sink, _source = _build_pipeline(_SOURCE_ROWS)
         db = make_landscape_db()
         factory = RecorderFactory(db)
@@ -314,9 +315,21 @@ class TestJoinRunAdmissionRefusals:
                     coordination_token=leader_token,
                     from_node_id=edge.from_node,
                     to_node_id=edge.to_node,
-                    label=edge.label,
+                    label="different-label" if different_edge and edge is edges[-1] else edge.label,
                     mode=edge.mode,
                 )
+            if different_edge:
+                with pytest.raises(JoinRefusedError, match="recorded graph edges do not match follower graph"):
+                    Orchestrator(db).join_run(run_id=run_id, settings=settings, config=config, graph=graph)
+                with db.engine.connect() as conn:
+                    followers = conn.execute(
+                        select(run_workers_table.c.worker_id).where(
+                            run_workers_table.c.run_id == run_id, run_workers_table.c.role == "follower"
+                        )
+                    ).all()
+                assert followers == []
+                db.close()
+                return
             member = Orchestrator(db).join_run(run_id=run_id, settings=settings, config=config, graph=graph)
             factory.data_flow.register_edge(
                 coordination_token=leader_token,
@@ -327,7 +340,7 @@ class TestJoinRunAdmissionRefusals:
             )
             with pytest.raises(
                 JoinRefusedError,
-                match=rf"recorded graph edge count {len(edges) + 1} does not match follower graph edge count {len(edges)}",
+                match="recorded graph edges do not match follower graph",
             ):
                 Orchestrator(db).join_run(run_id=run_id, settings=settings, config=config, graph=graph)
         with db.engine.connect() as conn:
@@ -511,12 +524,14 @@ class TestJoinRunAdmissionRefusals:
             leader_worker_id="worker:run-join-seat-readiness:leader",
         )
         if edge_count:
-            sink_id = register_test_node(setup.factory.data_flow, setup.run_id, "partial-sink", node_type=NodeType.SINK)
+            edge = _join_inputs()["graph"].get_edges()[0]
+            register_test_node(setup.factory.data_flow, setup.run_id, edge.from_node)
+            register_test_node(setup.factory.data_flow, setup.run_id, edge.to_node)
             setup.factory.data_flow.register_edge(
-                from_node_id=setup.source_node_id,
-                to_node_id=sink_id,
-                label="default",
-                mode=RoutingMode.MOVE,
+                from_node_id=edge.from_node,
+                to_node_id=edge.to_node,
+                label=edge.label,
+                mode=edge.mode,
                 coordination_token=setup.coordination_token,
             )
         if not seat_live:

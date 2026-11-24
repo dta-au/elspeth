@@ -60,19 +60,18 @@ class JoinAdmissionService:
                 run_id,
                 f"canonical version changed from {run.canonical_version!r} to {hashing.CANONICAL_VERSION!r}",
             )
-        recorded_edges = read_factory.data_flow.get_edges(run_id)
-        expected_edge_count = len(graph.get_edges())
-        if len(recorded_edges) < expected_edge_count:
+        recorded_edges = {
+            (edge.from_node_id, edge.to_node_id, edge.label, edge.default_mode) for edge in read_factory.data_flow.get_edges(run_id)
+        }
+        expected_edges = {(edge.from_node, edge.to_node, edge.label, edge.mode) for edge in graph.get_edges()}
+        if recorded_edges < expected_edges:
             if defer_to_admission_on_dead_leader:
                 leader = RunCoordinationRepository(self._db.engine).live_leader(run_id=run_id)
                 if leader is None or not leader.seat_live:
                     return
             raise JoinNotReadyError(run_id, "the run's leader has not finished registering its graph; retry the join")
-        if len(recorded_edges) > expected_edge_count:
-            raise JoinRefusedError(
-                run_id,
-                f"recorded graph edge count {len(recorded_edges)} does not match follower graph edge count {expected_edge_count}",
-            )
+        if recorded_edges != expected_edges:
+            raise JoinRefusedError(run_id, "recorded graph edges do not match follower graph")
         implementation_check = check_implementation_compatibility(read_factory, run_id, config, graph)
         if not implementation_check.can_resume:
             assert implementation_check.reason is not None
@@ -199,7 +198,7 @@ class JoinAdmissionService:
 
         Raises:
             JoinRefusedError: Filesystem preflight failed, version, graph edge
-                count or plugin implementation differs, run is not RUNNING,
+                identity or plugin implementation differs, run is not RUNNING,
                 config hash mismatches, or no live leader seat.
             JoinNotReadyError: The leader is live but graph registration is incomplete.
         """
