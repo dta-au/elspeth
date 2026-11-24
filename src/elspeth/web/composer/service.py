@@ -109,6 +109,7 @@ from elspeth.web.composer.context_budget import (
 from elspeth.web.composer.context_budget_apply import (
     CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES,
     first_history_shed_of_turn,
+    held_after_provider_rejection,
     largest_component,
     latest_round_trip_start,
     message_wire_split,
@@ -654,21 +655,6 @@ def _sheddable_message_positions(frame: _ContextBudgetFrame) -> set[int]:
     return {
         _CONTEXT_BUDGET_HISTORY_START + position for position, (_chat_index, kind) in enumerate(frame.history_entries) if kind is not None
     }
-
-
-def _history_held_after_provider_rejection(calls: Sequence[ComposerLLMCall]) -> frozenset[str]:
-    """History keys a retry after a provider's context-limit rejection left out earlier in this turn.
-
-    The provider has judged the request with them too large, so they stay out
-    for the rest of the turn whatever the estimate says. ``calls`` are this
-    turn's calls only; a later turn follows the ordinary release rule.
-    """
-    return frozenset(
-        f"history:{chat_index}"
-        for call in calls
-        if call.context_budget is not None and call.context_budget.retry_after_provider_rejection is True
-        for chat_index in call.context_budget.shed_history_indices
-    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1832,7 +1818,7 @@ class ComposerServiceImpl:
                 previously_shed=previously_shed_keys(frame.history, recorder.llm_calls),
                 held=(frame.history.shed_history_after(recorder.llm_calls) if reply_stage else frozenset())
                 | (frozenset(segment_positions) if shed_all_history else frozenset())
-                | _history_held_after_provider_rejection(recorder.llm_calls),
+                | held_after_provider_rejection(recorder.llm_calls),
                 # A message under the byte maximum always goes: the estimate
                 # decides what is left out, the provider judges its own limit.
                 on_over_estimate="send",

@@ -187,6 +187,22 @@ def held_tool_keys(calls: Iterable[ComposerLLMCall]) -> frozenset[str]:
     )
 
 
+def held_after_provider_rejection(calls: Iterable[ComposerLLMCall]) -> frozenset[str]:
+    """Earlier turns a retry after a provider's context-limit rejection left out earlier in this turn.
+
+    The provider has judged the request with them too large, so they stay out
+    for the rest of the turn whatever the estimate says. ``calls`` are this
+    turn's calls only; a later turn follows the ordinary release rule. Keys
+    of a kind the caller's request does not carry are inert.
+    """
+    held: set[str] = set()
+    for call in calls:
+        if call.context_budget is not None and call.context_budget.retry_after_provider_rejection is True:
+            held.update(f"history:{index}" for index in call.context_budget.shed_history_indices)
+            held.update(f"hatch:{index}" for index in call.context_budget.shed_hatch_event_indices)
+    return frozenset(held)
+
+
 def first_history_shed_of_turn(record: ComposerContextBudgetRecord, earlier_calls: Iterable[ComposerLLMCall]) -> bool:
     """Whether this call's decision sheds conversation history and no earlier call of the turn did.
 

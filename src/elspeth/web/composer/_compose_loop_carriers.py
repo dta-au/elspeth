@@ -272,8 +272,8 @@ class _CallModelOutcome:
     object leaves the Tier-3 boundary. P2 reads its owned message, P3 consumes
     its already-admitted tool batch and provider metadata, and P5's B-4D-3
     last-chance path consumes the same carrier directly. ``delivery`` is set
-    only for that last-chance call, which confirms the delivery itself, and
-    only when its reply carries no tool calls.
+    only for that last-chance call; its caller confirms the delivery itself,
+    and only when the reply carries no tool calls.
     """
 
     completion: _AdmittedLLMCompletion

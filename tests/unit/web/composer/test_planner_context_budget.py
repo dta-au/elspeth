@@ -1432,6 +1432,23 @@ def test_provider_rejection_refit_leaves_out_every_earlier_hatch_event() -> None
     )
 
 
+@pytest.mark.parametrize("after_rejection", [True, False], ids=["held-after-provider-rejection", "control-released"])
+def test_events_left_out_after_a_provider_rejection_stay_out_for_the_turn_even_when_the_request_fits(after_rejection: bool) -> None:
+    # The provider judged the request with them too large. A later planner call
+    # of the same turn keeps them out, as the compose loop does, even below the
+    # low mark. Control: the same keys shed by an ordinary decision are released.
+    transcript, _ = _hatch_message(_AWKWARD_EVENTS, ["authenticated_persisted_history_not_supplied"])
+    earlier = _earlier_call(("hatch:0", "hatch:1"))
+    assert earlier.context_budget is not None
+    if after_rejection:
+        earlier = replace(earlier, context_budget=replace(earlier.context_budget, retry_after_provider_rejection=True))
+    roomy = _context_policy(max_prompt_tokens=10_000_000, max_request_bytes=1_000_000)
+
+    _, record, _ = _fit_hatch_request(transcript, earlier_calls=(earlier,), policy=roomy)
+
+    assert record.shed_hatch_event_indices == ((0, 1) if after_rejection else ())
+
+
 def test_an_escape_heavy_hatch_event_that_fits_once_shed_is_shed_not_refused() -> None:
     """An event's saving is what it occupies on the wire, not its bytes in the transcript.
 

@@ -907,7 +907,8 @@ async def test_advisor_size_resend_is_available_after_the_last_ordinary_attempt(
 
 
 def _scripted_advisor(monkeypatch: pytest.MonkeyPatch, script: list[str]) -> list[dict[str, Any]]:
-    """Each call takes the next step: ``size`` (rejected as over the context limit), ``timeout``, ``junk`` (text that is no verdict) or ``ok``."""
+    """Each call takes the next step: ``size`` (rejected as over the context limit), ``timeout``,
+    ``junk`` (text that is no verdict), ``empty`` (whitespace text, a malformed reply) or ``ok``."""
     from litellm.exceptions import BadRequestError
 
     _transport(monkeypatch)
@@ -929,9 +930,9 @@ def _scripted_advisor(monkeypatch: pytest.MonkeyPatch, script: list[str]) -> lis
         if step == "timeout":
             raise TimeoutError("advisor provider timed out")
         return ModelResponse(
-            id="advisor-junk",
+            id=f"advisor-{step}",
             model=kwargs["model"],
-            choices=[{"message": {"role": "assistant", "content": "no verdict here", "tool_calls": None}}],
+            choices=[{"message": {"role": "assistant", "content": "   " if step == "empty" else "no verdict here", "tool_calls": None}}],
             usage=Usage(prompt_tokens=100, completion_tokens=5, total_tokens=105),
         )
 
@@ -1056,6 +1057,39 @@ async def test_a_size_resend_that_then_times_out_is_recorded_as_unavailable(tmp_
     assert (verdict.ok, verdict.failure_class) == (False, "unavailable")
     (record,) = records
     assert record.verdict == "unavailable"
+    assert record.provider_attempts == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "script",
+    [["size", "empty", "empty"], ["size", "junk", "empty"]],
+    ids=["resend-then-two-malformed-replies", "resend-then-no-verdict-then-malformed"],
+)
+async def test_a_size_resend_that_then_gets_malformed_replies_is_recorded_as_malformed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, script: list[str]
+) -> None:
+    # The model answered the later attempts, badly. The first request's size
+    # rejection does not describe them, and a malformed pass carries no
+    # request-rejection evidence (the pass record refuses that combination).
+    from elspeth.web.composer import advisor_checkpoint
+    from tests.unit.web.composer._helpers import _empty_state
+
+    records: list[Any] = []
+
+    async def capture(**kwargs: Any) -> None:
+        records.append(kwargs["record"])
+
+    monkeypatch.setattr(advisor_checkpoint, "persist_advisor_checkpoint_pass", capture)
+    sent = _scripted_advisor(monkeypatch, script)
+    verdict = await _owner(tmp_path)._run_advisor_checkpoint(
+        phase="end", state=_empty_state(), session_id=None, recorder=BufferingRecorder(), publication_review=_review(_probe(8))
+    )
+
+    assert len(sent) == 3
+    assert (verdict.ok, verdict.failure_class, verdict.provider_failure) == (False, "malformed", None)
+    (record,) = records
+    assert record.verdict == "malformed"
     assert record.provider_attempts == 3
 
 

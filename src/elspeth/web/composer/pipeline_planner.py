@@ -103,6 +103,7 @@ from elspeth.web.composer.context_budget_apply import (
     CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES,
     CONTEXT_BUDGET_TRANSCRIPT_GAP_ALLOWANCE_BYTES,
     first_history_shed_of_turn,
+    held_after_provider_rejection,
     largest_component,
     latest_round_trip_start,
     message_wire_split,
@@ -3616,8 +3617,10 @@ def _fit_planner_context_budget(
             # event of this turn, recorded before those stopped being segments) are inert.
             previously_shed=previously_shed_keys(history, earlier_calls),
             # After the provider rejected the request as too large, every
-            # earlier turn is left out; nothing of the turn in progress is a segment.
-            held=frozenset(segment.key for segment in segments) if shed_all_history else frozenset(),
+            # earlier turn is left out; nothing of the turn in progress is a
+            # segment. What such a retry left out stays out for the turn.
+            held=(frozenset(segment.key for segment in segments) if shed_all_history else frozenset())
+            | held_after_provider_rejection(earlier_calls),
             # A request under the byte maximum always goes, as on the compose
             # loop: the estimate decides what is left out, the provider judges
             # its own limit.
