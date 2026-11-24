@@ -25,6 +25,10 @@ from tests.unit.web.composer.test_compose_loop_llm_audit import (
 
 _GENEROUS_SETTING = 10_000_000
 _SMALL_SETTING = 20_000
+# These tests are about the token estimate, not the byte maximum. Without an
+# explicit byte maximum it is derived from the token cap (8 bytes per token),
+# which at the small setting refuses the request before it is sent.
+_REQUEST_BYTE_CEILING = 960 * 1024
 
 
 @pytest.fixture(autouse=True)
@@ -60,7 +64,10 @@ def _other_rejection(message: str = "GatewayError - unsupported value for field 
 
 def _service(max_prompt_tokens: int) -> tuple[ComposerServiceImpl, str]:
     return _composer_service_with_session(
-        catalog=_mock_catalog(), settings=_make_settings(composer_context_max_prompt_tokens=max_prompt_tokens)
+        catalog=_mock_catalog(),
+        settings=_make_settings(
+            composer_context_max_prompt_tokens=max_prompt_tokens, composer_planner_max_request_bytes=_REQUEST_BYTE_CEILING
+        ),
     )
 
 
