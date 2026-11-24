@@ -2646,6 +2646,35 @@ def _create_app(
             },
         )
 
+    # ``AsyncWorkerAdmissionTimeoutError`` is a ``TimeoutError`` and so an
+    # ``OSError``. Without this exact-class key, Starlette's MRO lookup hands
+    # it to ``handle_storage_unavailable``, which re-raises it (its errno is
+    # None) and the request ends as a 500. A full shared worker pool is a
+    # supported, retryable refusal: answer it with the same 503
+    # ``database_unavailable`` body ``project_composer_operation_error`` gives
+    # it on the composer paths. WebSocket scopes keep the previous outcome:
+    # the exception propagates unchanged.
+    @app.exception_handler(AsyncWorkerAdmissionTimeoutError)
+    async def handle_worker_admission_timeout(request: Request, exc: AsyncWorkerAdmissionTimeoutError) -> JSONResponse:
+        if request.scope["type"] != "http":
+            raise exc
+        request_id = _request_id(request)
+        _handler_slog.error(
+            "http_worker_admission_timeout",
+            path=request.url.path,
+            method=request.method,
+            request_id=request_id,
+            exc_class=type(exc).__name__,
+        )
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": "Database is currently unavailable. Please retry in a moment.",
+                "error_type": "database_unavailable",
+                "request_id": request_id,
+            },
+        )
+
     @app.exception_handler(OperationalError)
     async def handle_database_unavailable(
         request: Request,
