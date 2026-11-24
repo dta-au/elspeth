@@ -908,7 +908,9 @@ async def test_advisor_size_resend_is_available_after_the_last_ordinary_attempt(
 
 def _scripted_advisor(monkeypatch: pytest.MonkeyPatch, script: list[str]) -> list[dict[str, Any]]:
     """Each call takes the next step: ``size`` (rejected as over the context limit), ``timeout``,
-    ``413`` (refused as too large by the provider or a proxy in front of it), ``junk`` (text that is
+    ``predispatch_timeout`` (times out in quota admission, before the provider dispatch, as
+    ``asyncio.wait_for`` does when the deadline runs out in the guard or admission), ``413``
+    (refused as too large by the provider or a proxy in front of it), ``junk`` (text that is
     no verdict), ``empty`` (whitespace text, a malformed reply) or ``ok``."""
     from litellm.exceptions import BadRequestError
 
@@ -921,6 +923,8 @@ def _scripted_advisor(monkeypatch: pytest.MonkeyPatch, script: list[str]) -> lis
         step = script[len(sent) - 1]
         if step == "ok":
             return await complete(**kwargs)
+        if step == "predispatch_timeout":
+            raise TimeoutError("the deadline ran out before dispatch")
         await admit_provider_attempt(model=kwargs["model"])
         if kwargs.get("on_provider_dispatch") is not None:
             kwargs["on_provider_dispatch"]()
@@ -1098,6 +1102,41 @@ async def test_a_size_resend_the_deadline_stops_before_dispatch_keeps_the_reject
     assert verdict.provider_failure is not None
     assert verdict.provider_failure.details.reason_code == "context_length_exceeded"
     (record,) = records
+    assert record.provider_attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_a_size_resend_that_times_out_before_dispatch_keeps_the_rejection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The resend started, then the deadline ran out in quota admission, before
+    # it reached the provider; the next attempt finds the deadline passed. Only
+    # the first request went, and it was rejected for size: the pass describes
+    # that rejection, not the advisor unavailable, and not worth repeating unchanged.
+    from elspeth.web.composer import advisor_checkpoint
+    from tests.unit.web.composer._helpers import _empty_state
+
+    records: list[Any] = []
+
+    async def capture(**kwargs: Any) -> None:
+        records.append(kwargs["record"])
+
+    monkeypatch.setattr(advisor_checkpoint, "persist_advisor_checkpoint_pass", capture)
+    sent = _scripted_advisor(monkeypatch, ["size", "predispatch_timeout", "ok"])
+    monkeypatch.setattr(advisor_checkpoint, "_compose_deadline_time", lambda: 0.0 if len(sent) < 2 else 1_000.0)
+    verdict = await _owner(tmp_path)._run_advisor_checkpoint(
+        phase="end",
+        state=_empty_state(),
+        session_id=None,
+        recorder=BufferingRecorder(),
+        publication_review=_review(_probe(8)),
+        deadline=100.0,
+    )
+
+    assert len(sent) == 2
+    assert (verdict.ok, verdict.failure_class, verdict.retryable) == (False, "request_rejected", False)
+    assert verdict.provider_failure is not None
+    assert verdict.provider_failure.details.reason_code == "context_length_exceeded"
+    (record,) = records
+    assert record.verdict == "request_rejected"
     assert record.provider_attempts == 1
 
 

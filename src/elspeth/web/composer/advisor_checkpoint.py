@@ -1581,14 +1581,25 @@ class AdvisorCheckpointOwner:
                 and continuation_budget.policy.max_completion_tokens < self._settings.composer_advisor_max_completion_tokens,
             )
 
+        # Whether the current attempt reached the provider (set at dispatch).
+        attempt_dispatched = False
+
         def provider_dispatched() -> None:
-            nonlocal provider_attempts, format_reprompt_sent
+            nonlocal provider_attempts, format_reprompt_sent, last_request_failure, last_failure_retryable, attempt_dispatched
             if continuation_budget is not None:
                 continuation_budget.check_dispatch(now=_compose_deadline_time())
             # Quota admission is awaited before the physical provider call.
             # A timeout there must not fabricate a call or a sent re-prompt.
             provider_attempts += 1
             format_reprompt_sent = format_reprompt_sent or format_reprompt_pending
+            attempt_dispatched = True
+            # The final verdict describes the last attempt that went. A rejection
+            # of an earlier, different request (a size resend sheds history) must
+            # not be reported for this attempt once it goes; until it goes (the
+            # guard, quota admission or the continuation budget can stop it), the
+            # last call's outcome stands, rejection and retryability alike.
+            last_request_failure = None
+            last_failure_retryable = True
 
         normal_attempts_used = 0
         size_resend_pending = False
@@ -1627,12 +1638,7 @@ class AdvisorCheckpointOwner:
                     if last_exc is None and not last_response_unparseable:
                         raise _AdvisorCheckpointComposeDeadlineExpired
                     break
-            # The final verdict describes the last attempt that went. A rejection
-            # of an earlier, different request (a size resend sheds history) must
-            # not be reported for a later attempt that timed out or answered
-            # badly; until this attempt goes, the last call's outcome stands.
-            last_request_failure = None
-            last_failure_retryable = True
+            attempt_dispatched = False
             attempt_call_offset = len(recorder.llm_calls) if recorder is not None else 0
             # A size resend repeats this request, format instruction included, with the earlier turns left out.
             sent_arguments, sent_format_reprompt = call_arguments, format_reprompt_pending
@@ -1671,7 +1677,8 @@ class AdvisorCheckpointOwner:
                     state=state, initial_version=state.version, llm_calls=recorder.llm_calls if recorder is not None else ()
                 ) from exc
             except PlannerContinuationUnavailable:
-                return continuation_withheld()
+                # Withheld at dispatch: this attempt did not go, so the last call that did go keeps its rejection.
+                return continuation_withheld(provider_failure=last_request_failure)
             except _MalformedLLMResponseError as exc:
                 if continuation_budget is not None and not continuation_budget.has_cost_headroom():
                     return continuation_withheld()
@@ -1714,7 +1721,10 @@ class AdvisorCheckpointOwner:
                     )
                 if continuation_budget is not None and not continuation_budget.has_cost_headroom():
                     return continuation_withheld(provider_failure=last_request_failure)
-                last_failure_retryable = failure is None or failure.retryable
+                if attempt_dispatched:
+                    # An attempt stopped before dispatch (a timeout in the guard or
+                    # quota admission) leaves the last call's retryability standing.
+                    last_failure_retryable = failure is None or failure.retryable
                 if request_size_rejection(exc) is not None and sent_earlier_turn and not leave_out_all_earlier:
                     leave_out_all_earlier = True
                     size_resend_pending = True
