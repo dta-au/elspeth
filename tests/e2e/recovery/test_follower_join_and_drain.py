@@ -392,33 +392,43 @@ class TestJoinRunAdmissionRefusals:
         )
         crashed.db.close()
 
-    @pytest.mark.parametrize("integrity_failure", [False, True])
-    def test_join_departure_failure_preserves_refusal(self, tmp_path: Path, integrity_failure: bool) -> None:
+    @pytest.mark.parametrize("post_kind", ["tier1", "refusal", "ordinary"])
+    @pytest.mark.parametrize("departure_kind", ["tier1", "database", "ordinary"])
+    def test_join_departure_failure_preserves_post_check_error(self, tmp_path: Path, post_kind: str, departure_kind: str) -> None:
         crashed = _run_to_interrupted_checkpoint(tmp_path, MockClock(start=_T0))
         _seat_run_with_live_leader(crashed, leader_id=f"worker:{crashed.run_id}:leader-departure")
         with crashed.db.engine.begin() as conn:
             conn.execute(update(runs_table).where(runs_table.c.run_id == crashed.run_id).values(status=RunStatus.FAILED.value))
-            conn.execute(update(runs_table).where(runs_table.c.run_id == crashed.run_id).values(canonical_version="previous-version"))
 
         original_get_run = RunLifecycleReadRepository.get_run
         reads = 0
+        root_cause = KeyError("post-check root cause")
+        post_error: Exception = {
+            "tier1": AuditIntegrityError("post-check integrity failure"),
+            "refusal": JoinRefusedError(crashed.run_id, "post-check refusal"),
+            "ordinary": ValueError("post-check ordinary failure"),
+        }[post_kind]
 
         def resume_between_reads(repo: RunLifecycleReadRepository, run_id: str) -> Any:
             nonlocal reads
-            run = original_get_run(repo, run_id)
             reads += 1
             if reads == 1:
+                run = original_get_run(repo, run_id)
                 with crashed.db.engine.begin() as conn:
                     conn.execute(update(runs_table).where(runs_table.c.run_id == run_id).values(status=RunStatus.RUNNING.value))
-            return run
+                return run
+            raise post_error from root_cause
 
-        departure_error = (
-            AuditIntegrityError("departure integrity failure") if integrity_failure else SQLAlchemyError("departure unavailable")
-        )
+        departure_error: Exception = {
+            "tier1": AuditIntegrityError("departure integrity failure"),
+            "database": SQLAlchemyError("departure unavailable"),
+            "ordinary": ValueError("departure unavailable"),
+        }[departure_kind]
+        expected_error = departure_error if departure_kind == "tier1" and post_kind != "tier1" else post_error
         with (
             patch.object(RunLifecycleReadRepository, "get_run", resume_between_reads),
             patch.object(RunCoordinationRepository, "depart_worker", side_effect=departure_error),
-            pytest.raises(AuditIntegrityError if integrity_failure else JoinRefusedError) as exc_info,
+            pytest.raises(type(expected_error)) as exc_info,
         ):
             _join_follower(crashed, leader_token_for(crashed.db, crashed.run_id))
         with crashed.db.engine.connect() as conn:
@@ -430,14 +440,17 @@ class TestJoinRunAdmissionRefusals:
         assert reads >= 2
         assert len(rows) == 1
         assert rows[0].status == "active"
-        if integrity_failure:
-            assert exc_info.value is departure_error
-            assert isinstance(exc_info.value.__cause__, JoinRefusedError)
-            assert "canonical version" in str(exc_info.value.__cause__)
+        assert exc_info.value is expected_error
+        if expected_error is departure_error:
+            assert departure_error.__cause__ is post_error
         else:
-            assert "canonical version" in str(exc_info.value)
-            assert exc_info.value.departure_failure == "SQLAlchemyError: departure unavailable"
-            assert exc_info.value.__cause__ is departure_error
+            assert post_error.__cause__ is root_cause
+            if post_kind == "refusal" and departure_kind == "database":
+                assert isinstance(post_error, JoinRefusedError)
+                assert post_error.departure_failure == "SQLAlchemyError: departure unavailable"
+            else:
+                notes = post_error.__notes__
+                assert any(rows[0].worker_id in note and type(departure_error).__name__ in note for note in notes)
         crashed.db.close()
 
     def test_join_rechecks_graph_after_run_appears(self) -> None:

@@ -238,14 +238,30 @@ class JoinAdmissionService:
             if current_run is None:
                 raise AuditIntegrityError(f"Admitted follower's run {run_id!r} is missing from the Landscape")
             self._check_join_compatibility(current_factory, current_run, run_id, config, graph, defer_to_admission_on_dead_leader=False)
-        except Exception as refusal:
+        except contract_errors.TIER_1_ERRORS as error:
+            try:
+                factory.run_coordination.depart_worker(member_token=token)
+            except Exception as departure_error:
+                error.add_note(f"follower {token.worker_id} departure failed: {type(departure_error).__name__}")
+            raise
+        except JoinRefusedError as refusal:
             try:
                 factory.run_coordination.depart_worker(member_token=token)
             except contract_errors.TIER_1_ERRORS as departure_error:
                 raise departure_error from refusal
             except SQLAlchemyError as departure_error:
-                if isinstance(refusal, JoinRefusedError):
-                    refusal.departure_failure = f"{type(departure_error).__name__}: {departure_error}"
-                raise refusal from departure_error
+                refusal.departure_failure = f"{type(departure_error).__name__}: {departure_error}"
+            except Exception as departure_error:
+                refusal.add_note(f"follower {token.worker_id} departure failed: {type(departure_error).__name__}")
+            raise
+        except Exception as error:
+            try:
+                factory.run_coordination.depart_worker(member_token=token)
+            except contract_errors.TIER_1_ERRORS as departure_error:
+                raise departure_error from error
+            except SQLAlchemyError as departure_error:
+                error.add_note(f"follower {token.worker_id} departure failed: {type(departure_error).__name__}: {departure_error}")
+            except Exception as departure_error:
+                error.add_note(f"follower {token.worker_id} departure failed: {type(departure_error).__name__}")
             raise
         return token

@@ -4660,7 +4660,7 @@ def join(
         except contract_errors.TIER_1_ERRORS:
             raise
         except Exception as e:
-            typer.echo(f"Sink effect preflight failed: {e}", err=True)
+            typer.echo(f"Join failed: {e}", err=True)
             raise typer.Exit(1) from None
 
         # The registered identity IS the membership token's worker_id (§A.1);

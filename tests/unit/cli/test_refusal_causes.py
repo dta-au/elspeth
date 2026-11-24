@@ -69,6 +69,16 @@ def test_join_refusal_reports_departure_failure(tmp_path: Path, output_format: s
             assert departure_failure in result.stderr
 
 
+def test_join_post_admission_error_has_join_label(tmp_path: Path) -> None:
+    settings = _make_jsonl_settings(tmp_path)
+    initial = CliRunner().invoke(app, ["run", "-s", str(settings), "--execute"])
+    assert initial.exit_code == 0, initial.output
+    with patch.object(Orchestrator, "join_run", side_effect=ValueError("post-check unavailable")):
+        result = CliRunner().invoke(app, ["join", "run-join", "-s", str(settings)])
+    assert result.exit_code == 1, result.output
+    assert "Join failed: post-check unavailable" in result.stderr
+
+
 def test_join_graph_build_failure_writes_no_follower_row(tmp_path: Path) -> None:
     settings = _make_jsonl_settings(tmp_path)
     initial = CliRunner().invoke(app, ["run", "-s", str(settings), "--execute"])
