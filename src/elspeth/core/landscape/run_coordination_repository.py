@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import os
 import socket
 from collections.abc import Iterator, Mapping, Sequence
@@ -665,18 +666,27 @@ def record_refused_call(
     refused_call: RefusedCallRecord,
     work_item_id: str | None,
     attempt: int | None,
-) -> BestEffortEventOutcome:
+) -> None:
     """Record a call whose ``calls`` row a fence refused; fresh connection, never raises.
 
-    Called after the refused transaction has rolled back. Unlike the fences'
-    own refusal events, this one explains durable state outside the database:
-    the call already happened, and this event is its only record. The leader
-    and membership fences have already written their own ``fence_refusal``
-    naming only the verb (and fence); the row carrying ``refused_call`` is the
-    call's, and the item-lease fence writes no row of its own. If a DB
-    fault loses the event too, the audit store cannot hold the call, so the
-    last-resort log carries the call's identity and usage at ERROR.
+    Called after the refused transaction has rolled back, from inside the
+    caller's ``except <refusal>: ... raise``: raising here would replace the
+    fence's refusal. Unlike the fences' own refusal events, this one explains
+    durable state outside the database: the call already happened, and this
+    event is its only record. The leader and membership fences have already
+    written their own ``fence_refusal`` naming only the verb (and fence); the
+    row carrying ``refused_call`` is the call's. The item-lease fence writes no
+    row of its own.
+
+    When the audit store cannot hold the event (a DB fault, or a non-finite
+    latency that canonical JSON rejects), the last-resort ERROR log carries the
+    call's identity and usage, formatted without canonical JSON.
     """
+    if refused_call.latency_ms is not None and not math.isfinite(refused_call.latency_ms):
+        _log_unrecorded_refused_call(
+            run_id=run_id, worker_id=worker_id, verb=verb, fence=fence, refused_call=refused_call, cause="non-finite latency_ms"
+        )
+        return
     outcome = _record_best_effort_event(
         engine,
         run_id=run_id,
@@ -693,15 +703,23 @@ def record_refused_call(
         },
     )
     if outcome is BestEffortEventOutcome.LOST_TO_DB_FAULT:
-        logger.error(
-            "refused call record for run %r (worker %r, verb %r, fence %r) was not recorded: %s",
-            run_id,
-            worker_id,
-            verb,
-            fence,
-            canonical_json(refused_call.event_context()),
+        _log_unrecorded_refused_call(
+            run_id=run_id, worker_id=worker_id, verb=verb, fence=fence, refused_call=refused_call, cause="database fault"
         )
-    return outcome
+
+
+def _log_unrecorded_refused_call(
+    *, run_id: str, worker_id: str, verb: str, fence: str, refused_call: RefusedCallRecord, cause: str
+) -> None:
+    logger.error(
+        "refused call record for run %r (worker %r, verb %r, fence %r) was not recorded (%s): %s",
+        run_id,
+        worker_id,
+        verb,
+        fence,
+        cause,
+        ", ".join(f"{key}={value!r}" for key, value in refused_call.event_context().items()),
+    )
 
 
 class RunCoordinationRepository:

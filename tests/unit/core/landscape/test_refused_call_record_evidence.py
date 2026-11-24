@@ -71,7 +71,7 @@ def _setup() -> _Setup:
     return _Setup(recorder, member, item, state_id)
 
 
-def _record_state_call(setup: _Setup) -> None:
+def _record_state_call(setup: _Setup, *, latency_ms: float = 12.5) -> None:
     setup.recorder.execution.record_call(
         setup.state_id,
         0,
@@ -79,7 +79,7 @@ def _record_state_call(setup: _Setup) -> None:
         CallStatus.SUCCESS,
         RawCallPayload(_REQUEST),
         RawCallPayload(_RESPONSE),
-        latency_ms=12.5,
+        latency_ms=latency_ms,
         token_usage=_USAGE,
         call_id="attempt-late-1",
         member_token=setup.member,
@@ -255,6 +255,34 @@ def test_refused_call_record_lost_to_a_db_fault_is_logged_with_its_identity(
     assert len(lost) == 1
     assert lost[0].levelname == "ERROR"
     message = lost[0].getMessage()
-    assert '"call_id":"attempt-late-1"' in message
-    assert '"prompt_tokens":120' in message
-    assert '"completion_tokens":45' in message
+    assert "(database fault)" in message
+    assert "call_id='attempt-late-1'" in message
+    assert "prompt_tokens=120" in message
+    assert "completion_tokens=45" in message
+
+
+def test_refused_call_with_non_finite_latency_keeps_the_refusal_and_logs_the_call(caplog: pytest.LogCaptureFixture) -> None:
+    """A value the audit store cannot hold must not replace the fence's refusal."""
+    from elspeth.core.landscape import run_coordination_repository
+
+    setup = _setup()
+    with setup.recorder.db.write_connection() as conn:
+        conn.execute(
+            token_work_items_table.update()
+            .where(token_work_items_table.c.work_item_id == setup.item.work_item_id)
+            .values(status="terminal", lease_owner=None)
+        )
+
+    with caplog.at_level("ERROR", logger=run_coordination_repository.__name__), pytest.raises(SchedulerLeaseLostError):
+        _record_state_call(setup, latency_ms=float("nan"))
+
+    assert _call_count(setup) == 0
+    assert _fence_refusals(setup) == []
+    lost = [record for record in caplog.records if record.getMessage().startswith("refused call record for run")]
+    assert len(lost) == 1
+    assert lost[0].levelname == "ERROR"
+    message = lost[0].getMessage()
+    assert "(non-finite latency_ms)" in message
+    assert "call_id='attempt-late-1'" in message
+    assert "prompt_tokens=120" in message
+    assert "latency_ms=nan" in message
