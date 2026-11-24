@@ -60,6 +60,7 @@ class ResumeRefusalCause(StrEnum):
     CHECKPOINT_FORMAT_MISSING = "checkpoint_format_missing"
     CHECKPOINT_FORMAT_INCOMPATIBLE = "checkpoint_format_incompatible"
     CHECKPOINT_TOPOLOGY_CHANGED = "checkpoint_topology_changed"
+    CANONICAL_VERSION_CHANGED = "canonical_version_changed"
     PLUGIN_IMPLEMENTATION_CHANGED = "plugin_implementation_changed"
     FIRST_EFFECT_BOUNDARY_CROSSED = "first_effect_boundary_crossed"
     TERMINAL_STATUS_CHANGED = "terminal_status_changed"

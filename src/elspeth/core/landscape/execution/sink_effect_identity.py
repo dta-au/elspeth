@@ -32,7 +32,6 @@ from elspeth.contracts.sink_effects import (
     SinkEffectRole,
     SinkEffectRoutingContext,
 )
-from elspeth.core.canonical import stable_hash as type_faithful_stable_hash
 
 MAX_LINEAGE_DEPTH: Final = 256
 MAX_LINEAGE_NODES_PER_MEMBER: Final = 4_096
@@ -268,7 +267,7 @@ def resolve_sink_effect_members(
         if len(lineage_json.encode("utf-8")) > MAX_LINEAGE_EVIDENCE_BYTES:
             raise _audit_error(f"lineage evidence exceeds {MAX_LINEAGE_EVIDENCE_BYTES} bytes")
         try:
-            payload_hash = type_faithful_stable_hash(candidate.row)
+            payload_hash = stable_hash(candidate.row)
             pending_identity_hash = stable_hash(candidate.pending_identity)
         except (TypeError, ValueError) as exc:
             raise _audit_error(f"member {root.token_id!r} has non-canonical sink-boundary input") from exc

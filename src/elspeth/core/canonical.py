@@ -39,11 +39,6 @@ if TYPE_CHECKING:
     from elspeth.core.dag import ExecutionGraph
 
 
-_CANONICAL_TYPE_KEY = "__elspeth_canonical_type__"
-_CANONICAL_BYTES_TAG = "bytes"
-_CANONICAL_MAPPING_TAG = "mapping"
-
-
 def _normalize_value(obj: Any) -> Any:
     """Convert a single value to JSON-safe primitive.
 
@@ -143,10 +138,7 @@ def _normalize_value(obj: Any) -> Any:
         return str(obj)
 
     if isinstance(obj, bytes):
-        return {
-            _CANONICAL_TYPE_KEY: _CANONICAL_BYTES_TAG,
-            "base64": base64.b64encode(obj).decode("ascii"),
-        }
+        return base64.b64encode(obj).decode("ascii")
 
     if isinstance(obj, Decimal):
         if not obj.is_finite():  # Rejects NaN, sNaN, Infinity, -Infinity
@@ -156,7 +148,7 @@ def _normalize_value(obj: Any) -> Any:
     return obj
 
 
-def _normalize_for_canonical(data: Any) -> Any:
+def normalize_for_canonical(data: Any) -> Any:
     """Recursively normalize a data structure for canonical JSON.
 
     Converts pandas/numpy types to JSON-safe primitives.
@@ -176,21 +168,9 @@ def _normalize_for_canonical(data: Any) -> Any:
         data = data.to_dict()
 
     if isinstance(data, Mapping):
-        if _CANONICAL_TYPE_KEY in data:
-            entries = [
-                {
-                    "key": _normalize_for_canonical(key),
-                    "value": _normalize_for_canonical(value),
-                }
-                for key, value in data.items()
-            ]
-            return {
-                _CANONICAL_TYPE_KEY: _CANONICAL_MAPPING_TAG,
-                "entries": sorted(entries, key=lambda entry: _primitive_canonical_json(entry["key"])),
-            }
-        return {k: _normalize_for_canonical(v) for k, v in data.items()}
+        return {k: normalize_for_canonical(v) for k, v in data.items()}
     if isinstance(data, list | tuple):
-        return [_normalize_for_canonical(v) for v in data]
+        return [normalize_for_canonical(v) for v in data]
     return _normalize_value(data)
 
 
@@ -211,7 +191,7 @@ def canonical_json(obj: Any) -> str:
         ValueError: If data contains NaN, Infinity, or other non-finite values
         TypeError: If data contains types that cannot be serialized
     """
-    normalized = _normalize_for_canonical(obj)
+    normalized = normalize_for_canonical(obj)
     return _primitive_canonical_json(normalized)
 
 
@@ -224,7 +204,7 @@ def stable_hash(obj: Any) -> str:
     Returns:
         SHA-256 hex digest of canonical JSON
     """
-    normalized = _normalize_for_canonical(obj)
+    normalized = normalize_for_canonical(obj)
     return _primitive_stable_hash(normalized)
 
 

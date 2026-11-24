@@ -36,6 +36,7 @@ from sqlalchemy import insert, select
 from elspeth.contracts import Determinism, NodeType, RunStatus, TokenInfo
 from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
 from elspeth.contracts.enums import FrameKind, TerminalOutcome, TerminalPath
+from elspeth.contracts.hashing import CANONICAL_VERSION
 from elspeth.contracts.scheduler import TokenWorkStatus
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import FieldContract, SchemaContract
@@ -132,7 +133,7 @@ def _new_barrier_factory(db: LandscapeDB, payload_path: str) -> RecorderFactory:
     factory = RecorderFactory(db, payload_store=FilesystemPayloadStore(Path(payload_path)))
     factory.run_lifecycle.begin_run(
         config={"test": "barrier-process-death"},
-        canonical_version="v1",
+        canonical_version=CANONICAL_VERSION,
         run_id=RUN_ID,
         openrouter_catalog_sha256="0" * 64,
         openrouter_catalog_source="bundled",

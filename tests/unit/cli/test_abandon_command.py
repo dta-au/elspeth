@@ -25,6 +25,7 @@ from elspeth.contracts import NodeType, RunStatus
 from elspeth.contracts.checkpoint import CheckpointDraft, ResumeCheck, ResumeRefusalCause
 from elspeth.contracts.enums import TerminalPath
 from elspeth.contracts.errors import IncompleteSourceResumeError
+from elspeth.contracts.hashing import CANONICAL_VERSION
 from elspeth.core.checkpoint import CheckpointManager
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
@@ -75,7 +76,7 @@ def _seed_leaderless_run(
     factory = RecorderFactory(db)
     factory.run_lifecycle.begin_run(
         config={},
-        canonical_version="v1",
+        canonical_version=CANONICAL_VERSION,
         run_id=RUN_ID,
         leader_worker_id=LEADER_WORKER_ID,
         openrouter_catalog_sha256="0" * 64,
