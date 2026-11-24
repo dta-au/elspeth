@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -222,6 +222,98 @@ def _still_held(engine: Engine, context: SessionOperationContext) -> bool:
             )
         ).one_or_none()
         return row is not None and row.released_at is None
+
+
+def _expire_own_authority_row(engine: Engine, context: SessionOperationContext) -> None:
+    """Move this lease's own authority row (fence row, or read admission) past its deadline."""
+    with engine.begin() as conn:
+        if context.operation_kind is SessionOperationKind.BLOB_READ:
+            conn.execute(
+                update(session_read_admissions_table)
+                .where(
+                    session_read_admissions_table.c.session_id == context.fence.session_id,
+                    session_read_admissions_table.c.operation_id == context.fence.operation_id,
+                )
+                # The row's CHECK keeps expiry after admission, so both move back.
+                .values(admitted_at=_PAST, expires_at=_PAST + timedelta(seconds=1))
+            )
+            return
+        conn.execute(
+            update(session_operation_fences_table)
+            .where(
+                session_operation_fences_table.c.session_id == context.fence.session_id,
+                session_operation_fences_table.c.operation_id == context.fence.operation_id,
+            )
+            .values(lease_expires_at=_PAST)
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30, method="thread")
+@pytest.mark.parametrize("kind", _CLOSE_RELEASED_KINDS, ids=lambda kind: kind.value)
+async def test_every_lease_kind_past_its_deadline_after_a_renewal_error_leaves_the_session_acquirable(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, kind: SessionOperationKind
+) -> None:
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    session_id = _session(authority)
+    lease = await SessionOperationLease.acquire(
+        authority,
+        session_id=session_id,
+        operation_kind=kind,
+        owner_instance_id="owner-a",
+        lease_seconds=30,
+        renew_interval_seconds=0.05,
+    )
+    monkeypatch.setattr(lease, "_upkeep_authority", _FailingRenewal(authority))
+    try:
+        await _until(lambda: lease.renewal_error is not None)
+        _expire_own_authority_row(engine, lease.context)
+        with pytest.raises(OperationalError):
+            await asyncio.wait_for(lease.close(), timeout=10)
+
+        assert lease.disposition is SessionOperationLeaseDisposition.LOST
+        # The same replica starts the next operation of this kind, and a
+        # writing operation, at once.
+        following = authority.acquire(session_id=session_id, operation_kind=kind, owner_instance_id="owner-a", lease_seconds=30)
+        authority.release(following)
+        writer = authority.acquire(
+            session_id=session_id, operation_kind=SessionOperationKind.COMPOSE, owner_instance_id="owner-a", lease_seconds=30
+        )
+        assert writer.operation_kind is SessionOperationKind.COMPOSE
+    finally:
+        await asyncio.wait_for(async_workers.shutdown_async_workers(), timeout=10)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30, method="thread")
+async def test_close_after_a_failed_renewal_never_releases_a_successor_that_took_over(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    session_id = _session(authority)
+    lease = await _lease_with_failing_renewal(authority, session_id, monkeypatch, required=False)
+    try:
+        await _until(lambda: lease.renewal_error is not None)
+        _expire(engine, session_id)
+        successor = _acquire(authority, session_id, "owner-b")
+
+        with pytest.raises(OperationalError):
+            await asyncio.wait_for(lease.close(), timeout=10)
+
+        assert lease.disposition is SessionOperationLeaseDisposition.LOST
+        row = _row(engine, session_id)
+        assert (row.operation_id, row.lease_token, row.operation_epoch, row.released_at) == (
+            successor.fence.operation_id,
+            successor.fence.lease_token,
+            successor.fence.operation_epoch,
+            None,
+        )
+        # The successor still renews and releases as the owner.
+        authority.renew(successor, lease_seconds=30)
+        authority.release(successor)
+        assert _row(engine, session_id).released_at is not None
+    finally:
+        await asyncio.wait_for(async_workers.shutdown_async_workers(), timeout=10)
 
 
 @pytest.mark.asyncio
