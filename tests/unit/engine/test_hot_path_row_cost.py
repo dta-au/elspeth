@@ -670,6 +670,26 @@ def test_sqlite_row_cost_pins(shape: str, tmp_path: Path) -> None:
     _assert_measurement(shape, "sqlite", measured)
 
 
+# Statement counts differ by dialect (session pragmas on SQLite, SET on PostgreSQL); the
+# hash and commit counters count engine work that does not depend on the database.
+_DIALECT_INDEPENDENT_COUNTERS = tuple(name for name in _COUNTERS if name != "statements")
+
+
+@pytest.mark.parametrize("shape", ("linear", "fork"))
+def test_dialect_independent_counter_pins_agree_across_dialects(shape: str) -> None:
+    """A re-pin of a hash or commit counter must move the SQLite and PostgreSQL tables together.
+
+    The PostgreSQL pins run only under the testcontainer selection, so this check is what
+    keeps a SQLite-only re-pin from landing green.
+    """
+    projected: dict[str, dict[str, object]] = {}
+    for dialect in ("sqlite", "postgres"):
+        counters = _PINS[dialect][shape]["counters"]
+        assert isinstance(counters, dict), (dialect, shape)
+        projected[dialect] = {name: counters[name] for name in _DIALECT_INDEPENDENT_COUNTERS}
+    assert projected["sqlite"] == projected["postgres"], f"{shape}: move both dialect tables by the measured amount"
+
+
 @pytest.fixture(scope="module")
 def postgres_url() -> Iterator[str]:
     from tests.helpers.postgres_target import postgres_test_target
