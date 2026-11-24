@@ -3358,7 +3358,7 @@ def _reviewed_call_created_at_transfers(sources: dict[str, str]) -> set[ClockVio
         (
             "src/elspeth/core/landscape/execution/calls.py",
             "CallAuditRepository.record_operation_call",
-        ): "eff8ba0ca23d35b25af7792e775f94841a989ad41d1a03dad864442cdef930af",
+        ): "2a7cfd0fb4f0db56b085d6a74e1884d5549f811e628d622cabbc28ce2d81f010",
         (
             "src/elspeth/core/landscape/execution_repository.py",
             "ExecutionRepository.record_operation_call",
