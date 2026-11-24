@@ -44,6 +44,7 @@ CredentialScanSurface = Literal[
     "composer_tool_wire",
     "composer_visible_tool_persistence",
     "composer_yaml_import",
+    "prompt_file_text",
     "session_title",
     "web_fork_message_ingress",
     "web_message_ingress",
