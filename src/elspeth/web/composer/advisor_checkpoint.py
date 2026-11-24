@@ -26,7 +26,7 @@ from elspeth.contracts.prompt_guard import (
     PromptGuardTrust,
     detach_prompt_guard_evidence,
 )
-from elspeth.contracts.provider_rejection import SafeRequestRejection
+from elspeth.contracts.provider_rejection import ReasonSource, SafeRequestRejection
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.composer import advisor_context as _advisor_context
@@ -116,7 +116,6 @@ from elspeth.web.composer.provider_errors import (
     ProviderRequestFailure,
     classify_provider_failure,
     request_size_rejection,
-    size_rejection_code,
 )
 from elspeth.web.composer.provider_gateway import (
     _capture_composer_llm_completion_fields,
@@ -623,6 +622,7 @@ class AdvisorCheckpointOwner:
         response_metadata: _AdmittedLLMProviderMetadata | None = None
         error_class: str | None = None
         error_message: str | None = None
+        rejection_reason_source: ReasonSource | None = None
         kwargs: dict[str, Any] = build_advisor_request_options(
             model=advisor_model,
             temperature=self._settings.composer_temperature,
@@ -731,8 +731,10 @@ class AdvisorCheckpointOwner:
             failure = classify_provider_failure(exc)
             status = failure.audit_status if failure is not None else ComposerLLMCallStatus.API_ERROR
             error_class = type(exc).__name__
-            # As the provider gateway records it: a context-length rejection is named.
-            error_message = size_rejection_code(exc) or error_class
+            # As the provider gateway records it: a size rejection is named, with what recognised it.
+            size_rejection = request_size_rejection(exc)
+            error_message = error_class if size_rejection is None else size_rejection.reason_code
+            rejection_reason_source = None if size_rejection is None else size_rejection.reason_source
             raise
         except _MalformedLLMResponseError as exc:
             status = ComposerLLMCallStatus.MALFORMED_RESPONSE
@@ -780,6 +782,7 @@ class AdvisorCheckpointOwner:
                             response_metadata=response_metadata,
                             error_class=error_class,
                             error_message=error_message,
+                            rejection_reason_source=rejection_reason_source,
                             max_completion_tokens_requested=max_completion,
                             credential_surface="composer_advisor_response",
                             provider_custody=provider_custody,

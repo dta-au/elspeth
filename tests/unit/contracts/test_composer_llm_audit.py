@@ -400,3 +400,52 @@ def test_recorder_protocol_runtime_check() -> None:
     rec: ComposerLLMCallRecorder = _StubRecorder()
     rec.record_llm_call(_make_call())
     rec.resolve_session("abc")
+
+
+def _size_rejected(**overrides: object) -> ComposerLLMCall:
+    values: dict[str, object] = {
+        "status": ComposerLLMCallStatus.BAD_REQUEST_ERROR,
+        "error_class": "BadRequestError",
+        "error_message": "context_length_exceeded",
+        "rejection_reason_source": "message_pattern",
+    }
+    values.update(overrides)
+    return _make_call(**values)
+
+
+@pytest.mark.parametrize(
+    ("error_message", "source"),
+    [
+        ("context_length_exceeded", "sdk_body"),
+        ("context_length_exceeded", "http_response"),
+        ("context_length_exceeded", "sdk_class"),
+        ("context_length_exceeded", "message_pattern"),
+        ("request_too_large", "http_status"),
+    ],
+)
+def test_a_size_rejection_records_what_recognised_it(error_message: str, source: str) -> None:
+    call = _size_rejected(error_message=error_message, rejection_reason_source=source)
+    assert call.to_dict()["rejection_reason_source"] == source
+
+
+def test_a_call_that_was_not_a_size_rejection_records_no_reason_source() -> None:
+    assert _make_call().to_dict()["rejection_reason_source"] is None
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"rejection_reason_source": "provider_prose"}, "rejection_reason_source must be one of"),
+        ({"rejection_reason_source": "unavailable"}, "rejection_reason_source must be one of"),
+        (
+            {"status": ComposerLLMCallStatus.API_ERROR},
+            "rejection_reason_source is recorded only on a rejected request",
+        ),
+        ({"error_message": "BadRequestError"}, "rejection_reason_source is recorded only on a size rejection"),
+        ({"error_message": "request_too_large"}, "a request-too-large rejection is recognised only from its HTTP status"),
+        ({"rejection_reason_source": "http_status"}, "a request-too-large rejection is recognised only from its HTTP status"),
+    ],
+)
+def test_a_reason_source_that_does_not_describe_the_recorded_rejection_is_refused(overrides: dict[str, object], message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        _size_rejected(**overrides)

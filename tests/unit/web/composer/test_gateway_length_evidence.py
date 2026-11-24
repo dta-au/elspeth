@@ -189,3 +189,5 @@ async def test_gateway_length_code_reaches_compose_size_branch(monkeypatch: pyte
     assert caught.value.evidence["ceiling"] == "provider"
     (call,) = caught.value.llm_calls
     assert call.error_message == "context_length_exceeded"
+    # litellm maps this Bedrock wording to its context-window class itself, and the record says so.
+    assert call.rejection_reason_source == "sdk_class"

@@ -164,7 +164,7 @@ from elspeth.web.composer.provider_context import capture_provider_context
 from elspeth.web.composer.provider_discovery_response import (
     argument_error_response,
 )
-from elspeth.web.composer.provider_errors import classify_provider_failure, request_size_rejection, size_rejection_code
+from elspeth.web.composer.provider_errors import classify_provider_failure, request_size_rejection
 from elspeth.web.composer.provider_gateway import _litellm_acompletion
 from elspeth.web.composer.provider_quota import (
     ProviderCallCustody,
@@ -4168,6 +4168,7 @@ async def _plan_pipeline_inner(
             # Preserve the historical validated-success accumulator. Unknown
             # earlier transport cost cannot become free END allowance.
             continuation_cost_known = False
+            size_rejection = request_size_rejection(exc)
             failed_call = build_llm_call_record(
                 model_requested=effective_model,
                 pricing_model=effective_pricing_model,
@@ -4179,8 +4180,10 @@ async def _plan_pipeline_inner(
                 temperature=model_config.temperature,
                 seed=model_config.seed,
                 error_class=type(exc).__name__,
-                # A recognised context-limit rejection is recorded by its closed reason, never by provider text.
-                error_message=size_rejection_code(exc) or type(exc).__name__,
+                # A recognised size rejection is recorded by its closed reason, never by
+                # provider text, with what recognised it.
+                error_message=type(exc).__name__ if size_rejection is None else size_rejection.reason_code,
+                rejection_reason_source=None if size_rejection is None else size_rejection.reason_source,
                 failure=exc,
                 private_request=private_request,
                 max_completion_tokens_requested=budget_policy.max_completion_tokens,

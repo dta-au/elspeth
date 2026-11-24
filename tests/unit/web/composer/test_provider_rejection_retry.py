@@ -81,7 +81,10 @@ async def test_a_rejection_with_history_present_is_retried_once_with_every_earli
     rejected, retried = result.llm_calls
     assert rejected.status is ComposerLLMCallStatus.BAD_REQUEST_ERROR
     assert rejected.error_message == "context_length_exceeded"
+    # Recognised from the SDK's own class, and recorded as such.
+    assert rejected.rejection_reason_source == "sdk_class"
     assert retried.status is ComposerLLMCallStatus.SUCCESS
+    assert retried.rejection_reason_source is None
     assert _budget(rejected).shed_history_indices == ()
     assert _budget(rejected).retry_after_provider_rejection is None
     retry_budget = _budget(retried)

@@ -33,6 +33,7 @@ from elspeth.core.canonical import canonical_json
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.context_budget import ContextBudgetPolicy
 from elspeth.web.composer.pipeline_planner import PipelinePlannerError, PlannerDeclined
+from elspeth.web.composer.provider_errors import request_size_rejection
 from elspeth.web.composer.tools import ToolContext
 from elspeth.web.sessions.routes._helpers import _FREEFORM_PLANNER_FAILURE_HTTP, _freeform_planner_failure_code
 from tests.unit.web.composer.test_pipeline_planner import _context_policy, _plan, _ScriptedCompletion, _text_response
@@ -230,6 +231,10 @@ async def test_a_gateway_length_rejection_on_the_planner_path_is_the_size_refusa
     assert all(row.status is ComposerLLMCallStatus.BAD_REQUEST_ERROR for row in recorder.llm_calls)
     # Recorded by its closed reason, never by provider text.
     assert call.error_message == "context_length_exceeded"
+    # The record names what recognised the rejection, as the classifier read it.
+    expected = request_size_rejection(rejection())
+    assert expected is not None
+    assert call.rejection_reason_source == expected.reason_source
     assert call.context_budget is not None and call.context_budget.over_estimate is False
     assert _CANARY not in str(refusal)
     assert _CANARY not in canonical_json(call.to_dict())
@@ -254,6 +259,7 @@ async def test_a_413_on_the_planner_path_is_the_size_refusal_naming_the_provider
     assert len(completion.requests) == 2
     assert all(row.status is ComposerLLMCallStatus.BAD_REQUEST_ERROR for row in recorder.llm_calls)
     assert recorder.llm_calls[-1].error_message == "request_too_large"
+    assert recorder.llm_calls[-1].rejection_reason_source == "http_status"
     assert _freeform_planner_failure_code(refusal) == "context_budget_exceeded"
 
 

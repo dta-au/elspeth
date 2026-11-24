@@ -24,6 +24,7 @@ from elspeth.contracts.composer_audit import PrivateFailureFacts, PrivateReceive
 from elspeth.contracts.composer_provider_context import PrivateProviderContext
 from elspeth.contracts.credential_material import CredentialCategory
 from elspeth.contracts.freeze import deep_thaw, freeze_fields, require_int
+from elspeth.contracts.provider_rejection import ReasonSource
 
 ContextBudgetAnchorStatus = Literal[
     "no_previous_call",
@@ -494,6 +495,12 @@ class ComposerLLMCall:
     ``context_budget`` is the :class:`ComposerContextBudgetRecord` of the
     pre-call context-budget decision (estimates, policy hash, what was shed),
     or ``None`` when the call was not budgeted.
+
+    ``rejection_reason_source`` says what recognised a size rejection (an
+    ``error_message`` of ``context_length_exceeded`` or ``request_too_large``):
+    a structured SDK or HTTP field, the SDK's exception class, the HTTP status,
+    or a fixed-wording match on the provider's message. ``None`` on every other
+    call, and on records written before it was kept.
     """
 
     model_requested: str
@@ -535,6 +542,7 @@ class ComposerLLMCall:
     strict_tool_count: int | None = None
     request_byte_split: ComposerLLMRequestByteSplit | None = None
     context_budget: ComposerContextBudgetRecord | None = None
+    rejection_reason_source: ReasonSource | None = None
     private_failure: PrivateFailureFacts | None = field(default=None, repr=False)
     private_diagnostics: tuple[PrivateReceivedDiagnostic, ...] = field(default=(), repr=False)
     private_request: PrivateProviderContext | None = field(default=None, repr=False)
@@ -635,6 +643,8 @@ class ComposerLLMCall:
             raise ValueError("SUCCESS calls must not include error_class or error_message")
         if self.status is not ComposerLLMCallStatus.SUCCESS and (self.error_class is None or self.error_message is None):
             raise ValueError("non-success calls must include error_class and error_message")
+        if self.rejection_reason_source is not None:
+            _require_size_rejection_source(self.rejection_reason_source, self.status, self.error_message)
         if self.reasoning_content is not None and type(self.reasoning_content) is not str:
             raise TypeError(f"reasoning_content must be str or None, got {type(self.reasoning_content).__name__}")
         freeze_fields(self, "declared_tool_names", "reasoning_details", "thinking_blocks", "reasoning_withholds")
@@ -671,6 +681,21 @@ class ComposerLLMCall:
         raw["started_at"] = self.started_at.isoformat()
         raw["finished_at"] = self.finished_at.isoformat()
         return raw
+
+
+_SIZE_REJECTION_SOURCES: Final[frozenset[str]] = frozenset({"sdk_body", "http_response", "sdk_class", "message_pattern", "http_status"})
+
+
+def _require_size_rejection_source(source: object, status: ComposerLLMCallStatus, error_message: str | None) -> None:
+    """A recorded reason source must describe the size rejection the call records."""
+    if type(source) is not str or source not in _SIZE_REJECTION_SOURCES:
+        raise ValueError(f"rejection_reason_source must be one of {sorted(_SIZE_REJECTION_SOURCES)}, got {source!r}")
+    if status is not ComposerLLMCallStatus.BAD_REQUEST_ERROR:
+        raise ValueError("rejection_reason_source is recorded only on a rejected request")
+    if error_message not in ("context_length_exceeded", "request_too_large"):
+        raise ValueError("rejection_reason_source is recorded only on a size rejection")
+    if (source == "http_status") != (error_message == "request_too_large"):
+        raise ValueError("a request-too-large rejection is recognised only from its HTTP status")
 
 
 class ComposerLLMCallRecorder(Protocol):

@@ -1113,6 +1113,8 @@ async def test_a_413_gets_the_size_resend_with_every_earlier_turn_left_out(tmp_p
     assert _labels(_sent_transcript(sent[0]["messages"][1]["content"])) != _NOW
     assert _labels(_sent_transcript(sent[1]["messages"][1]["content"])) == _NOW
     assert recorder.llm_calls[0].error_message == "request_too_large"
+    assert recorder.llm_calls[0].rejection_reason_source == "http_status"
+    assert recorder.llm_calls[1].rejection_reason_source is None
 
 
 @pytest.mark.asyncio
@@ -1236,10 +1238,11 @@ def test_a_context_length_rejection_suggests_the_context_budget_recourse(reason_
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("code", "expected"), [("context_length_exceeded", "context_length_exceeded"), ("invalid_request", "BadRequestError")]
+    ("code", "expected", "source"),
+    [("context_length_exceeded", "context_length_exceeded", "sdk_body"), ("invalid_request", "BadRequestError", None)],
 )
 async def test_the_advisor_call_row_names_a_context_length_rejection(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: str, expected: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: str, expected: str, source: str | None
 ) -> None:
     from litellm.exceptions import BadRequestError
 
@@ -1256,3 +1259,4 @@ async def test_the_advisor_call_row_names_a_context_length_rejection(
     assert len(recorder.llm_calls) == 1
     assert recorder.llm_calls[0].error_class == "BadRequestError"
     assert recorder.llm_calls[0].error_message == expected
+    assert recorder.llm_calls[0].rejection_reason_source == source

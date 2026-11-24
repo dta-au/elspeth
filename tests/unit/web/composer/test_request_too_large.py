@@ -115,6 +115,7 @@ async def test_a_413_with_history_present_is_resent_once_with_every_earlier_turn
     assert rejected.status is ComposerLLMCallStatus.BAD_REQUEST_ERROR
     # Recorded by its closed reason, never by provider text.
     assert rejected.error_message == "request_too_large"
+    assert rejected.rejection_reason_source == "http_status"
     assert retried.status is ComposerLLMCallStatus.SUCCESS
     assert _budget(retried).retry_after_provider_rejection is True
 
@@ -132,4 +133,5 @@ async def test_a_413_with_nothing_left_to_leave_out_is_the_size_refusal_naming_t
     assert exc_info.value.evidence["ceiling"] == "provider"
     (call,) = exc_info.value.llm_calls
     assert call.error_message == "request_too_large"
+    assert call.to_dict()["rejection_reason_source"] == "http_status"
     assert _PROXY_BODY not in str(call.to_dict())
