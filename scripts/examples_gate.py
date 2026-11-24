@@ -10,6 +10,8 @@ Subcommands
   validate   --cases F --tree T            data file covers every example, config and launcher
   inventory  --cases F --tree T [--out F]  render the inventory (classification + deciding line)
   list       --cases F [--only IDS]        one line per case for the driver (\x1f-separated)
+  count      --cases F [--only IDS]        selected case count for list integrity
+  digest     --tree T --manifest F         frozen-tree digest, including metadata
   excluded   --cases F                     one SKIP line per config the gate does not run
   preflight  --cases F --tree T --case ID  offline guard + prerequisites for one case
   check      --cases F --root R --case ID --exit N --log L --evidence E
@@ -21,20 +23,23 @@ Exit codes: 0 = ok/PASS, 1 = FAIL/refused, 2 = usage or data-file error.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
 import re
 import sqlite3
+import stat
 import sys
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, cast
+from urllib.parse import urlsplit
 
 import yaml
 
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
-URL_RE = re.compile(r"https?://(\[[0-9a-fA-F:]+\]|[^/:\s'\"<>]+)")
+URL_RE = re.compile(r"[a-z][a-z0-9+.-]*://[^/\s'\"<>?#]+", re.IGNORECASE)
 # Plugins that talk to a remote service by construction, whatever their URL.
 REMOTE_PLUGINS = frozenset(
     {
@@ -44,6 +49,13 @@ REMOTE_PLUGINS = frozenset(
         "azure_ai_search",
         "power_automate",
         "aws_textract_inline_analysis",
+        "aws_s3",
+        "aws_bedrock_content_safety",
+        "aws_bedrock_prompt_shield",
+        "aws_textract_document_analysis",
+        "azure_document_intelligence",
+        "azure_content_understanding",
+        "dataverse",
     }
 )
 URL_OPTION_KEYS = frozenset({"url", "base_url", "endpoint", "account_url", "vault_url", "trigger_url"})
@@ -108,6 +120,33 @@ def discover(tree: Path) -> dict[str, dict[str, list[str]]]:
     return found
 
 
+def digest_tree(tree: Path, manifest: Path) -> str:
+    """Hash every entry's name, type, mode, link target, and regular-file bytes."""
+    digest = hashlib.sha256()
+    with manifest.open("wb") as output:
+        for base, dirs, files in os.walk(tree, followlinks=False):
+            dirs.sort()
+            for name in sorted([*dirs, *files]):
+                path = Path(base) / name
+                info = path.lstat()
+                entry_type = stat.S_IFMT(info.st_mode)
+                record = f"{path.relative_to(tree)}\0{entry_type:o}\0{stat.S_IMODE(info.st_mode):o}\0".encode()
+                if stat.S_ISLNK(info.st_mode):
+                    record += os.fsencode(os.readlink(path))
+                elif stat.S_ISREG(info.st_mode):
+                    with path.open("rb") as source:
+                        record += hashlib.file_digest(source, "sha256").hexdigest().encode()
+                record += b"\0"
+                output.write(record)
+                digest.update(record)
+    return digest.hexdigest()
+
+
+def cmd_digest(args: argparse.Namespace) -> int:
+    print(digest_tree(Path(args.tree), Path(args.manifest)))
+    return 0
+
+
 # ----------------------------------------------------------------- offline guard
 
 
@@ -126,6 +165,13 @@ def _line_of(text: str, needle: str) -> tuple[int, str]:
         if needle in line:
             return number, line.strip()
     return 0, ""
+
+
+def _url_host(value: str) -> str | None:
+    try:
+        return urlsplit(value).hostname
+    except ValueError:
+        return None
 
 
 def _source_paths(doc: dict[str, Any]) -> list[str]:
@@ -154,7 +200,7 @@ def network_findings(tree: Path, config: Path) -> list[str]:
         findings.append(f"{rel}:{number}: {line} -- {reason}")
 
     for match in URL_RE.finditer(text):
-        host = match.group(1).lower()
+        host = _url_host(match.group(0))
         if host not in LOOPBACK_HOSTS:
             add(match.group(0), f"non-loopback URL host {host}")
     for _path, key, value in _walk(doc):
@@ -174,7 +220,7 @@ def network_findings(tree: Path, config: Path) -> list[str]:
                 add(f"provider: {provider}", f"LLM provider {provider} with no base_url (public API)")
             else:
                 base_match = URL_RE.match(base_url)
-                if base_match is None or base_match.group(1).lower() not in LOOPBACK_HOSTS:
+                if base_match is None or _url_host(base_match.group(0)) not in LOOPBACK_HOSTS:
                     add(base_url, "LLM base_url is not loopback")
     for _path, key, _value in _walk(doc):
         if key == "vault_url":
@@ -183,14 +229,23 @@ def network_findings(tree: Path, config: Path) -> list[str]:
         if "${" in raw:
             raw = re.sub(r"\$\{[^}:]*:-([^}]*)\}", r"\1", raw)
         candidate = tree / raw
-        if candidate.is_file() and candidate.stat().st_size < 50_000_000:
+        if not candidate.is_file():
+            add(raw, f"input fixture {raw} missing or unreadable")
+            continue
+        try:
+            if candidate.stat().st_size >= 50_000_000:
+                add(raw, f"input fixture {raw} exceeds size bound")
+                continue
             data = candidate.read_text(encoding="utf-8", errors="replace")
-            for match in URL_RE.finditer(data):
-                host = match.group(1).lower()
-                if host not in LOOPBACK_HOSTS:
-                    number, line = _line_of(data, match.group(0))
-                    findings.append(f"{candidate.relative_to(tree)}:{number}: {line[:120]} -- source row URL host {host}")
-                    break
+        except OSError:
+            add(raw, f"input fixture {raw} unreadable")
+            continue
+        for match in URL_RE.finditer(data):
+            host = _url_host(match.group(0))
+            if host not in LOOPBACK_HOSTS:
+                number, line = _line_of(data, match.group(0))
+                findings.append(f"{candidate.relative_to(tree)}:{number}: {line[:120]} -- source row URL host {host}")
+                break
     # De-duplicate while keeping order.
     return list(dict.fromkeys(findings))
 
@@ -236,6 +291,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
     for name in sorted(set(declared) - set(found)):
         problems.append(f"data file classifies {name!r}, which is not an example directory")
     case_ids = {case["id"] for case in data["cases"]}
+    cases_by_id = {case["id"]: case for case in data["cases"]}
     for name, entry in declared.items():
         if name not in found:
             continue
@@ -256,12 +312,35 @@ def cmd_validate(args: argparse.Namespace) -> int:
             for ref in [item.get("case"), item.get("covered_by")]:
                 if ref and ref not in case_ids:
                     problems.append(f"{name}: references unknown case {ref!r}")
+        for cfg, item in configs.items():
+            if item["class"] != "NON-NETWORK":
+                continue
+            ref = item.get("case") or item.get("covered_by")
+            if ref in cases_by_id:
+                case = cases_by_id[ref]
+                if f"examples/{name}/{cfg}" not in case["configs"]:
+                    problems.append(f"{name}/{cfg}: NON-NETWORK config absent from case {ref}")
+                if case.get("skip"):
+                    problems.append(f"{name}/{cfg}: NON-NETWORK config belongs to skipped case {ref}")
     for case in data["cases"]:
         if case["example"] not in declared:
             problems.append(f"case {case['id']}: unknown example {case['example']!r}")
+        if not case.get("skip") and not case["configs"]:
+            problems.append(f"case {case['id']}: non-skip case has no configs")
+        for command in [case["command"], (case.get("server") or {}).get("command", "")]:
+            if not isinstance(command, str) or any(char in command for char in ("\n", "\r", "\x00")):
+                problems.append(f"case {case['id']}: command contains control characters")
         for cfg in case["configs"]:
             if not (tree / cfg).is_file():
                 problems.append(f"case {case['id']}: config {cfg} missing from tree")
+                continue
+            parts = Path(cfg).parts
+            if len(parts) != 3 or parts[0] != "examples":
+                problems.append(f"case {case['id']}: config {cfg} is outside an example")
+                continue
+            item = (declared.get(parts[1], {}).get("configs") or {}).get(parts[2])
+            if not item or item.get("class") != "NON-NETWORK" or (item.get("case") or item.get("covered_by")) != case["id"]:
+                problems.append(f"case {case['id']}: config {cfg} has no matching NON-NETWORK classification")
     for line in problems:
         print(f"DATA: {line}")
     print(
@@ -329,12 +408,20 @@ def cmd_inventory(args: argparse.Namespace) -> int:
 # ------------------------------------------------------------------------- list
 
 
+def _selected_cases(data: dict[str, Any], only_arg: str | None) -> list[dict[str, Any]]:
+    """The cases --only selects, in case-file order; an id that names no case is refused, never dropped."""
+    if not only_arg:
+        return list(data["cases"])
+    only = set(only_arg.split(","))
+    unknown = sorted(only - {case["id"] for case in data["cases"]})
+    if unknown:
+        raise DataError(f"--only names no case: {', '.join(unknown)}")
+    return [case for case in data["cases"] if case["id"] in only]
+
+
 def cmd_list(args: argparse.Namespace) -> int:
     data = load_cases(Path(args.cases))
-    only = set(args.only.split(",")) if args.only else None
-    for case in data["cases"]:
-        if only is not None and case["id"] not in only:
-            continue
+    for case in _selected_cases(data, args.only):
         server = case.get("server") or {}
         env = " ".join(f"{k}={v}" for k, v in (case.get("env") or {}).items())
         fields = [
@@ -352,6 +439,12 @@ def cmd_list(args: argparse.Namespace) -> int:
         if any("\x1f" in f or "\n" in f for f in fields):
             raise DataError(f"case {case['id']}: separator or newline in a driver field")
         print("\x1f".join(fields))
+    return 0
+
+
+def cmd_count(args: argparse.Namespace) -> int:
+    data = load_cases(Path(args.cases))
+    print(len(_selected_cases(data, args.only)))
     return 0
 
 
@@ -541,6 +634,12 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("list")
     p.add_argument("--cases", required=True)
     p.add_argument("--only")
+    p = sub.add_parser("count")
+    p.add_argument("--cases", required=True)
+    p.add_argument("--only")
+    p = sub.add_parser("digest")
+    p.add_argument("--tree", required=True)
+    p.add_argument("--manifest", required=True)
     p = sub.add_parser("excluded")
     p.add_argument("--cases", required=True)
     p = sub.add_parser("preflight")
@@ -559,6 +658,8 @@ def main(argv: list[str] | None = None) -> int:
         "validate": cmd_validate,
         "inventory": cmd_inventory,
         "list": cmd_list,
+        "count": cmd_count,
+        "digest": cmd_digest,
         "excluded": cmd_excluded,
         "preflight": cmd_preflight,
         "check": cmd_check,

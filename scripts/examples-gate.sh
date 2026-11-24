@@ -26,28 +26,24 @@
 #        - an offline guard over every config the case runs and its input
 #          fixtures: any non-loopback URL, remote-service plugin, cloud LLM
 #          provider or provider without a loopback base_url refuses the case;
-#        - refuses when a port the case binds is already in use;
 #        - starts the fixture server the documentation tells you to start
 #          (only chaosllm/chaosweb on loopback), runs the documented command
 #          under `env -i` with an allowlisted environment, records its exit
-#          code from `wait`, and kills only the process groups it created;
+#          code, and tears down the private PID namespace;
 #        - checks the result: accepted exit codes, run status, source row count,
 #          per-sink completed outcomes, launcher self-verification markers,
 #          conservation for stochastic fault-injection cases (examples_gate.py check).
 #   4. Hashes the exported tree before and after; a tree that moved is not evidence.
 #
-# Network: the gate does not create a network namespace. Offline execution rests
-# on the data-file classification, the per-case
-# offline guard, an environment built from an allowlist (no provider or cloud
-# credential can reach a case; no .env may exist above the case root, because
-# the CLI searches upward for one), and HTTP(S)_PROXY pointed at a closed
-# loopback port with loopback exempted, so a client that honours proxy settings
-# fails instead of leaving the box.
+# --execute requires bwrap (bubblewrap): each case's server and command share
+# one private network with loopback, and the kernel blocks outbound traffic.
+# The text guard remains an early, explanatory refusal. The case environment
+# has no inherited credentials, and each case gets an empty HOME.
 #
 # Verdicts (summary.txt, one line per case, then one SKIP line per excluded config)
 #   PASS     ran and matched every documented expectation
 #   FAIL     ran and did not match (evidence on the line; full log in logs/)
-#   NOTRUN   could not be run here (stop file, busy port, missing prerequisite,
+#   NOTRUN   could not be run here (stop file, missing prerequisite,
 #            provenance or offline-guard refusal) -- counts against the gate
 #   SKIP     classified as not runnable offline in the data file (network,
 #            container-only, not a pipeline); never counts against the gate
@@ -142,10 +138,15 @@ if [ "$EXECUTE" -eq 1 ]; then
     TMP_ROOT="$(cd "$TMP_ROOT" && pwd)"
 fi
 [ -n "$STOP_FILE" ] || STOP_FILE="$TMP_ROOT/STOP"
+STOP_FILE="$(realpath -m "$STOP_FILE")"
 # Second resolution alone let two gates started in the same second share (and
 # overwrite) a log dir and case roots; the PID makes the stamp unique per run.
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 [ -n "$LOG_DIR" ] || LOG_DIR="$TMP_ROOT/runs/$STAMP"
+LOG_DIR="$(realpath -m "$LOG_DIR")"
+for output_path in "$LOG_DIR" "$STOP_FILE"; do
+    case "$output_path/" in "$(realpath "$ROOT")"/*) die "$output_path must not be inside the checkout" ;; esac
+done
 PY="$VENV/bin/python"
 [ -x "$PY" ] || die "no interpreter at $PY"
 HELPER=("$PY" -I "$SCRIPT_DIR/examples_gate.py")
@@ -154,6 +155,11 @@ SEP=$'\x1f'
 # ------------------------------------------------------------------ the tree
 if [ -n "$TREE" ]; then
     TREE="$(cd "$TREE" && pwd)"
+    case "$TMP_ROOT/" in "$TREE"/*) die "--tmp-root must not be inside --tree ($TREE)" ;; esac
+    while IFS= read -r -d '' link; do
+        target="$(realpath -m "$link")"
+        case "$target/" in "$TREE"/*) ;; *) die "tree symlink $link resolves outside --tree" ;; esac
+    done < <(find "$TREE" -type l -print0)
     SOURCE_DESC="tree $TREE (pre-exported; --root/--ref not used)"
     SHA="n/a"
 else
@@ -201,6 +207,13 @@ echo "overall=running" > "$LOG_DIR/overall.exit"
 
 refuse() { echo "REFUSED: $*" | tee -a "$PREFLIGHT" >&2; echo 2 > "$LOG_DIR/overall.exit"; exit 2; }
 
+cp -- "$CASES" "$LOG_DIR/cases.yaml" || refuse "could not snapshot case data"
+cp -- "$SCRIPT_DIR/examples_gate.py" "$LOG_DIR/examples_gate.py" || refuse "could not snapshot helper"
+CASES="$LOG_DIR/cases.yaml"
+HELPER=("$PY" -I "$LOG_DIR/examples_gate.py")
+echo "cases_sha256=$(sha256sum "$CASES" | cut -d' ' -f1)" >> "$PREFLIGHT"
+echo "helper_sha256=$(sha256sum "$LOG_DIR/examples_gate.py" | cut -d' ' -f1)" >> "$PREFLIGHT"
+
 mem_kb="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)"
 echo "MemAvailable_kB=$mem_kb (floor ${MIN_MEM_GB} GB)" >> "$PREFLIGHT"
 [ "$mem_kb" -ge $((MIN_MEM_GB * 1024 * 1024)) ] || refuse "MemAvailable ${mem_kb} kB is below ${MIN_MEM_GB} GB"
@@ -208,13 +221,6 @@ echo "MemAvailable_kB=$mem_kb (floor ${MIN_MEM_GB} GB)" >> "$PREFLIGHT"
 for tool in sqlite3 tar cp; do command -v "$tool" >/dev/null || refuse "$tool not on PATH"; done
 [ -z "$CPUS" ] || command -v taskset >/dev/null || refuse "taskset not on PATH (--cpus given)"
 for bin in elspeth chaosllm chaosweb; do [ -x "$VENV/bin/$bin" ] || refuse "$VENV/bin/$bin missing (install the package and errorworks)"; done
-
-dir="$TMP_ROOT"
-while :; do
-    [ -e "$dir/.env" ] && refuse "$dir/.env exists; the elspeth CLI loads the nearest .env above its cwd"
-    [ "$dir" = "/" ] && break
-    dir="$(dirname "$dir")"
-done
 
 CASE_BASE="$TMP_ROOT/cases/$STAMP"
 [ -e "$CASE_BASE" ] && refuse "case directory $CASE_BASE already exists"
@@ -227,44 +233,65 @@ if [ -z "$TREE" ]; then
 fi
 echo "source_sha=$SHA" >> "$PREFLIGHT"
 
+while IFS= read -r -d '' link; do
+    target="$(realpath -m "$link")"
+    case "$target/" in "$TREE"/*) ;; *) refuse "tree symlink $link resolves outside --tree" ;; esac
+done < <(find "$TREE" -type l -print0)
+
+[ -z "$(find "$TREE" -name .env -print -quit)" ] || refuse "exported tree contains .env"
+
 set +e
 "${HELPER[@]}" validate --cases "$CASES" --tree "$TREE" >> "$PREFLIGHT" 2>&1
 rc=$?
 set -e
 [ "$rc" -eq 0 ] || refuse "case data file does not cover the tree (see $PREFLIGHT)"
 
+set +e
+"${HELPER[@]}" list --cases "$CASES" ${ONLY:+--only "$ONLY"} > "$LOG_DIR/cases.list" 2>> "$PREFLIGHT"
+list_rc=$?
+count="$("${HELPER[@]}" count --cases "$CASES" ${ONLY:+--only "$ONLY"} 2>> "$PREFLIGHT")"
+count_rc=$?
+set -e
+[ "$list_rc" -eq 0 ] || refuse "case list failed (exit $list_rc; see $PREFLIGHT)"
+[ "$count_rc" -eq 0 ] && [[ "$count" =~ ^[0-9]+$ ]] || refuse "case list count failed"
+mapfile -t CASE_LINES < "$LOG_DIR/cases.list"
+[ "${#CASE_LINES[@]}" -eq "$count" ] || refuse "case list has ${#CASE_LINES[@]} rows, selection reports $count"
+[ "$count" -gt 0 ] || refuse "no cases selected"
+
+BWRAP="$(command -v bwrap || true)"
+[ -n "$BWRAP" ] || refuse "bwrap (bubblewrap) is required for kernel-enforced offline execution"
+BWRAP="$(realpath "$BWRAP")"
+pin() { if [ -n "$CPUS" ]; then echo taskset -c "$CPUS"; fi; }
+if ! env -i HOME="$LOG_DIR" PATH="/usr/local/bin:/usr/bin:/bin" TMPDIR="$LOG_DIR" LANG=C.UTF-8 \
+    $(pin) "$BWRAP" --dev-bind / / --unshare-net --unshare-pid --proc /proc --die-with-parent -- "$PY" -c '
+import socket
+interfaces = {line.split(":", 1)[0].strip() for line in open("/proc/net/dev").read().splitlines() if ":" in line}
+assert interfaces == {"lo"}, interfaces
+with socket.socket() as outside:
+    try:
+        outside.connect(("1.1.1.1", 53))
+    except OSError:
+        pass
+    else:
+        raise AssertionError("outbound connect succeeded")
+with socket.socket() as server:
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    with socket.socket() as client:
+        client.connect(server.getsockname())
+        peer, _ = server.accept()
+        peer.close()
+' >> "$PREFLIGHT" 2>&1; then
+    refuse "bwrap private-network self-test failed (see $PREFLIGHT)"
+fi
+
 tree_digest() {
-    (cd "$1" && find . -path ./.venv -prune -o -name __pycache__ -prune -o -type f -print0 \
-        | LC_ALL=C sort -z | xargs -0 sha256sum) > "$2"
-    sha256sum < "$2" | cut -d' ' -f1
+    "${HELPER[@]}" digest --tree "$1" --manifest "$2"
 }
 DIGEST_BEFORE="$(tree_digest "$TREE" "$LOG_DIR/tree-before.sha256")"
 echo "tree_digest_before=$DIGEST_BEFORE" >> "$PREFLIGHT"
 
 FINGERPRINT_KEY="$("$PY" -c 'import secrets; print(secrets.token_hex(32))')"
-
-port_busy() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
-pin() { if [ -n "$CPUS" ]; then echo taskset -c "$CPUS"; fi; }
-
-# Kill every process in session $1 (the sessions this script created; never a pattern match).
-kill_session() {
-    local sid="$1" pids="" p stat rest
-    local -a fields
-    for p in /proc/[0-9]*; do
-        stat="$(cat "$p/stat" 2>/dev/null)" || continue
-        # comm (field 2) may contain spaces and ')': parse after the LAST ') '.
-        rest="${stat##*) }"
-        read -r -a fields <<< "$rest"
-        # rest = state ppid pgrp session ...
-        if [ "${fields[3]:-}" = "$sid" ]; then pids="$pids ${p#/proc/}"; fi
-    done
-    if [ -n "$pids" ]; then
-        kill -TERM $pids 2>/dev/null || true
-        sleep 2
-        kill -KILL $pids 2>/dev/null || true
-    fi
-    echo "$pids"
-}
 
 make_case_root() {
     local root="$1" entry
@@ -282,8 +309,6 @@ make_case_root() {
 # ---------------------------------------------------------------- the cases
 PASS=0; FAIL=0; NOTRUN=0; SKIP=0
 GATE_START=$(date +%s)
-mapfile -t CASE_LINES < <("${HELPER[@]}" list --cases "$CASES" ${ONLY:+--only "$ONLY"})
-[ "${#CASE_LINES[@]}" -gt 0 ] || refuse "no cases selected"
 STOPPED=0
 
 record() { echo "$1" >> "$SUMMARY"; echo "$1"; }
@@ -296,10 +321,16 @@ for line in "${CASE_LINES[@]}"; do
     fi
     case_dir="$CASE_BASE/$id"; root="$case_dir/root"; log="$LOG_DIR/logs/$id.log"
     make_case_root "$root"
-    mkdir -p "$case_dir/tmp"
+    mkdir -p "$case_dir/tmp" "$case_dir/home"
+    dir="$root"
+    while :; do
+        { [ -e "$dir/.env" ] || [ -L "$dir/.env" ]; } && refuse "$dir/.env exists; the elspeth CLI loads the nearest .env above its cwd"
+        [ "$dir" = "/" ] && break
+        dir="$(dirname "$dir")"
+    done
     printf '%s started %s\n' "$id" "$(date -u +%FT%TZ)" > "$LOG_DIR/current-case.txt"
 
-    ENVV=(HOME="$HOME" USER="${USER:-$(id -un)}" LOGNAME="${LOGNAME:-$(id -un)}" LANG=C.UTF-8
+    ENVV=(HOME="$case_dir/home" USER="${USER:-$(id -un)}" LOGNAME="${LOGNAME:-$(id -un)}" LANG=C.UTF-8
           PATH="$root/.venv/bin:/usr/local/bin:/usr/bin:/bin" TMPDIR="$case_dir/tmp"
           PYTHONPATH="$root/src:$root/elspeth-lints/src"
           ANONYMIZED_TELEMETRY=False HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 LITELLM_LOCAL_MODEL_COST_MAP=True
@@ -335,40 +366,46 @@ for line in "${CASE_LINES[@]}"; do
     if [ "$rc" -ne 0 ]; then
         record "NOTRUN $id -- $(echo "$pre" | tr '\n' ' ')"; NOTRUN=$((NOTRUN + 1)); continue
     fi
-    busy=""
-    for p in ${ports//,/ } $sport; do port_busy "$p" && busy="$busy $p"; done
-    if [ -n "$busy" ]; then
-        record "NOTRUN $id -- loopback port(s)$busy already in use (not ours; refusing)"; NOTRUN=$((NOTRUN + 1)); continue
+    cat > "$case_dir/inner.sh" <<'INNER'
+#!/usr/bin/env bash
+set -u
+root="$1"; cmd="$2"; scmd="$3"; sport="$4"; log="$5"; server_log="$6"; rc_file="$7"; server_marker="$8"
+cd "$root" || exit 2
+port_busy() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+if [ -n "$scmd" ]; then
+    bash -c "$scmd" > "$server_log" 2>&1 &
+    for _ in $(seq 1 60); do port_busy "$sport" && break; sleep 0.5; done
+    if ! port_busy "$sport"; then
+        : > "$server_marker"
+        exit 1
     fi
-
-    server_sid=""
-    if [ -n "$scmd" ]; then
-        (cd "$root" && exec setsid env -i "${ENVV[@]}" $(pin) bash -c "$scmd" > "$LOG_DIR/logs/$id.server.log" 2>&1) &
-        server_sid=$!
-        for _ in $(seq 1 60); do port_busy "$sport" && break; sleep 0.5; done
-        if ! port_busy "$sport"; then
-            kill_session "$server_sid" > /dev/null
-            record "FAIL $id -- fixture server ($scmd) did not listen on $sport; see logs/$id.server.log"
-            FAIL=$((FAIL + 1)); continue
-        fi
-    fi
-
+fi
+bash -c "$cmd" > "$log" 2>&1
+rc=$?
+printf '%s\n' "$rc" > "$rc_file"
+exit "$rc"
+INNER
     t0=$(date +%s)
-    (cd "$root" && exec setsid env -i "${ENVV[@]}" $(pin) bash -c "$cmd" > "$log" 2>&1) &
-    run_sid=$!
     set +e
-    wait "$run_sid"
-    rc=$?
+    env -i "${ENVV[@]}" $(pin) "$BWRAP" --dev-bind / / --unshare-net --unshare-pid --proc /proc --die-with-parent -- \
+        bash "$case_dir/inner.sh" "$root" "$cmd" "$scmd" "$sport" "$log" "$LOG_DIR/logs/$id.server.log" \
+        "$case_dir/command.exit" "$case_dir/server.failed" > "$LOG_DIR/logs/$id.sandbox.log" 2>&1
+    sandbox_rc=$?
     set -e
     secs=$(( $(date +%s) - t0 ))
-    leftover="$(kill_session "$run_sid")"
-    [ -n "$server_sid" ] && kill_session "$server_sid" > /dev/null
-    [ -n "$server_sid" ] && { wait "$server_sid" 2>/dev/null || true; }
-    still=""
-    for p in ${ports//,/ } $sport; do
-        for _ in $(seq 1 20); do port_busy "$p" || break; sleep 0.5; done
-        port_busy "$p" && still="$still $p"
-    done
+    if [ -e "$case_dir/server.failed" ]; then
+        record "FAIL $id -- fixture server ($scmd) did not listen on $sport; see logs/$id.server.log"
+        FAIL=$((FAIL + 1)); continue
+    fi
+    if [ ! -f "$case_dir/command.exit" ]; then
+        record "FAIL $id -- sandbox error: command exit file missing (bwrap exit $sandbox_rc; see logs/$id.sandbox.log)"
+        FAIL=$((FAIL + 1)); continue
+    fi
+    rc="$(cat "$case_dir/command.exit")"
+    if ! [[ "$rc" =~ ^(0|[1-9][0-9]{0,2})$ ]] || [ "$rc" -gt 255 ] || [ "$rc" -ne "$sandbox_rc" ]; then
+        record "FAIL $id -- sandbox error: invalid command exit file or bwrap exit mismatch ($sandbox_rc; see logs/$id.sandbox.log)"
+        FAIL=$((FAIL + 1)); continue
+    fi
 
     set +e
     verdict="$("${HELPER[@]}" check --cases "$CASES" --root "$root" --case "$id" --exit "$rc" \
@@ -376,8 +413,6 @@ for line in "${CASE_LINES[@]}"; do
     crc=$?
     set -e
     extra=" [${secs}s]"
-    [ -n "$leftover" ] && extra="$extra [WARN: command left processes running:$leftover -- killed]"
-    [ -n "$still" ] && extra="$extra [WARN: port(s)$still still bound after the case]"
     if [ "$crc" -eq 0 ]; then
         PASS=$((PASS + 1)); record "$verdict$extra"
         # Remove successful case copies unless explicitly requested for inspection.
