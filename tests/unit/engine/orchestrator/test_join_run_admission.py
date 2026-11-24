@@ -32,10 +32,13 @@ from unittest.mock import patch
 import pytest
 from sqlalchemy import insert, select, update
 
-from elspeth.contracts import ResumeCheck
+from elspeth.contracts import ResumeCheck, RoutingMode
+from elspeth.contracts.audit import Edge
 from elspeth.contracts.coordination import WorkerMembershipToken, mint_worker_id
 from elspeth.contracts.errors import JoinNotReadyError, JoinRefusedError
 from elspeth.contracts.hashing import CANONICAL_VERSION
+from elspeth.contracts.routing import EdgeInfo
+from elspeth.contracts.types import NodeID
 from elspeth.core.landscape import run_coordination_repository as coordination_module
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.database_clock import read_landscape_decision_time, read_landscape_transaction_time
@@ -67,13 +70,23 @@ _SENTINEL_HASH = fake_sha256("sentinel-config-hash-abc123")
 _PATCH_RESOLVE = patch("elspeth.engine.orchestrator.join_admission.resolve_config", return_value={})
 _PATCH_HASH_SENTINEL = patch("elspeth.engine.orchestrator.join_admission.stable_hash", return_value=_SENTINEL_HASH)
 
-_JOIN_INPUTS = {"config": types.SimpleNamespace(), "graph": types.SimpleNamespace(get_edges=lambda: [object()])}
+_GRAPH_EDGE = EdgeInfo(from_node=NodeID("source"), to_node=NodeID("sink"), label="default", mode=RoutingMode.MOVE)
+_RECORDED_EDGE = Edge(
+    edge_id="edge-1",
+    run_id=RUN_ID,
+    from_node_id="source",
+    to_node_id="sink",
+    label="default",
+    default_mode=RoutingMode.MOVE,
+    created_at=NOW,
+)
+_JOIN_INPUTS = {"config": types.SimpleNamespace(), "graph": types.SimpleNamespace(get_edges=lambda: [_GRAPH_EDGE])}
 
 
 @pytest.fixture
 def _registered_graph_baseline() -> object:
     with (
-        patch.object(DataFlowReadRepository, "get_edges", return_value=[object()]),
+        patch.object(DataFlowReadRepository, "get_edges", return_value=[_RECORDED_EDGE]),
         patch("elspeth.engine.orchestrator.join_admission.check_implementation_compatibility", return_value=ResumeCheck(can_resume=True)),
     ):
         yield
