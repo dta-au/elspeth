@@ -13,6 +13,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
+# peer-flood-stalled: the owner's first accept resumes this long before its startup deadline.
+STALL_EDGE_NS = 250_000_000
 
 
 def event(directory: Path, name: str) -> None:
@@ -34,10 +36,14 @@ def supervise(directory: Path, mode: str, speed: int, ignored_chld: bool) -> int
     started = time.monotonic()
     namespace = runpy.run_path(str(ROOT / "src/elspeth/composer_mcp/portable_supervisor.py"))
     phase_started = None
+    first_reading = None
 
     def clock():
-        nonlocal phase_started
+        nonlocal phase_started, first_reading
         now = time.monotonic_ns()
+        if first_reading is None:
+            # The owner's first reading sets its startup deadline (STARTUP_NS after it).
+            first_reading = now
         if owner.armed_at is not None and (not mode.startswith("early-stop") or (directory / "connected").exists()):
             return owner.armed_at + (now - owner.armed_at) * speed
         if owner.completed:
@@ -71,6 +77,25 @@ def supervise(directory: Path, mode: str, speed: int, ignored_chld: bool) -> int
         # Only transport fragmentation is injected. The real selector owner,
         # sockets, Popen target, deadlines and recovery callbacks all run.
         socket.socket = FragmentingSocket
+    if mode == "peer-flood-stalled":
+
+        class StalledSocket(original_socket):
+            stalled = False
+
+            def accept(self):
+                # The first accept blocks until STALL_EDGE_NS before the startup deadline, so the
+                # whole flood waits in the listen queue and the owner refuses the peer over its
+                # limit in the time left. The owner checks its startup deadline before it selects,
+                # so an accept due at the deadline never runs.
+                if not StalledSocket.stalled:
+                    StalledSocket.stalled = True
+                    assert first_reading is not None
+                    resume_at = first_reading + namespace["STARTUP_NS"] - STALL_EDGE_NS
+                    time.sleep(max(0, resume_at - time.monotonic_ns()) / 1e9)
+                return super().accept()
+
+        # Only scheduling is injected: the real listener, selector loop and deadline all run.
+        socket.socket = StalledSocket
     if ignored_chld:
         signal.signal(signal.SIGCHLD, signal.SIG_IGN)
 
@@ -121,12 +146,39 @@ def raw_child(directory: Path, mode: str) -> int:
 
     port = int(os.environ.pop("_ELSPETH_COMPOSER_CONTROL_PORT"))
     nonce = os.environ.pop("_ELSPETH_COMPOSER_CONTROL_NONCE")
-    if mode == "peer-flood":
+    if mode in ("peer-flood", "peer-flood-stalled"):
+        import runpy
+
+        owner = runpy.run_path(str(ROOT / "src/elspeth/composer_mcp/portable_supervisor.py"))
+        limit = owner["PEER_LIMIT"]
+        startup_seconds = owner["STARTUP_NS"] / 1e9
+        # The owner listens with a backlog of PEER_LIMIT and Linux queues backlog + 1 completed
+        # connections, so all PEER_LIMIT + 1 connects complete whether or not the owner is
+        # scheduled during the flood.
         held = []
-        for _ in range(12):
-            peer = socket.create_connection(("127.0.0.1", port), timeout=1)
+        for _ in range(limit):
+            peer = socket.create_connection(("127.0.0.1", port), timeout=startup_seconds)
+            # One byte of a frame header: an incomplete frame, so the peer is held, not refused.
             peer.sendall(b"\x00")
             held.append(peer)
+        over_limit = socket.create_connection(("127.0.0.1", port), timeout=startup_seconds)
+        # The accept queue is first in, first out, so this is accept attempt PEER_LIMIT + 1, which
+        # the owner closes. It sent nothing, so the close arrives as end of stream. The wait runs
+        # to the startup deadline: the close comes whenever the owner next runs, and the deadline
+        # kills this child first if it does not.
+        over_limit.settimeout(startup_seconds)
+        assert over_limit.recv(1) == b"", "the owner did not close the peer over its limit"
+        # Checked at the moment the close is seen: the owner is one thread accepting in queue
+        # order, so it accepted every held peer before this close. A non-blocking peek on each
+        # finds neither data nor end of stream.
+        for peer in held:
+            peer.setblocking(False)
+            try:
+                peer.recv(1, socket.MSG_PEEK)
+            except BlockingIOError:
+                continue
+            raise AssertionError("the owner closed a peer within its limit")
+        event(directory, "peer-limit-refused")
         while True:
             time.sleep(1)
     if mode == "no-handshake":
@@ -218,6 +270,7 @@ def child(directory: Path, mode: str) -> int:
     if mode in {
         "no-handshake",
         "peer-flood",
+        "peer-flood-stalled",
         "wrong-nonce",
         "wrong-pid",
         "partial-hello",
