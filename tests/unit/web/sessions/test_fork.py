@@ -2618,6 +2618,103 @@ class TestForkEndpoint:
         assert len(sessions) == 1
 
 
+async def _lapse_and_delete_parent(service: SessionServiceImpl, parent_id: uuid.UUID) -> None:
+    """A stalled fork's leases lapse by the database clock, then the user deletes the parent."""
+    from elspeth.web.coordination.database_clock import database_now
+
+    with service._engine.begin() as conn:
+        lapsed = database_now(conn) - timedelta(hours=1)
+        conn.execute(
+            update(session_operation_receipts_table)
+            .where(
+                session_operation_receipts_table.c.session_id == str(parent_id),
+                session_operation_receipts_table.c.status == "in_progress",
+            )
+            .values(lease_expires_at=lapsed)
+        )
+        conn.execute(
+            update(session_operation_fences_table)
+            .where(session_operation_fences_table.c.session_id == str(parent_id))
+            .values(lease_expires_at=lapsed)
+        )
+    await service.archive_session(parent_id)
+
+
+class TestForkParentArchivedUnderRejoin:
+    """A fork whose parent was deleted while its fence had lapsed answers 404, never the exhausted-rejoin 500.
+
+    Every fence-loss site in the fork route rejoins through the reservation,
+    which meets the archived parent as ``FenceLossReason.OWNER_INACTIVE``.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("site", ["control_archived_before_request", "settlement", "failure_before_staging", "failure_after_staging"])
+    async def test_fork_whose_parent_was_deleted_under_a_lapsed_fence_returns_404(self, tmp_path, site: str) -> None:
+        from elspeth.web.coordination.contracts import FenceLossReason, SessionOperationFenceLost
+
+        app, service, blob_service = _make_fork_app(tmp_path)
+        session = await service.create_session("alice", "Original", "local")
+        message = await service.add_message(session.id, "user", "Go", writer_principal="route_user_message")
+        operation_id = str(uuid.uuid4())
+        body = {"operation_id": operation_id, "from_message_id": str(message.id), "new_message_content": "Go edited"}
+
+        async def lapse_delete_and_lose_fence(*_args: object, **_kwargs: object) -> None:
+            await _lapse_and_delete_parent(service, session.id)
+            raise SessionOperationFenceLost(FenceLossReason.LEASE_EXPIRED)
+
+        async def fail_step(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("fork step failed")
+
+        patches: list[Any] = []
+        if site == "control_archived_before_request":
+            # Control: a parent soft-archived before the request is refused by
+            # the ownership check (404) before the fork loop runs, so this case
+            # holds with or without the OWNER_INACTIVE mapping. The other three
+            # meet the archived parent only on rejoin.
+            with service._engine.begin() as conn:
+                conn.execute(
+                    update(sessions_table).where(sessions_table.c.id == str(session.id)).values(archived_at=func.current_timestamp())
+                )
+        elif site == "settlement":
+            patches = [patch.object(service, "settle_fork_operation_receipt", new=lapse_delete_and_lose_fence)]
+        elif site == "failure_before_staging":
+            patches = [
+                patch.object(service, "fork_session", new=fail_step),
+                patch.object(service, "fail_operation_receipt", new=lapse_delete_and_lose_fence),
+            ]
+        else:
+            patches = [
+                patch.object(blob_service, "copy_blobs_for_fork", new=fail_step),
+                patch.object(service, "fail_fork_operation_receipt", new=lapse_delete_and_lose_fence),
+            ]
+        for active in patches:
+            active.start()
+        try:
+            response = TestClient(app, raise_server_exceptions=False).post(f"/api/sessions/{session.id}/fork", json=body)
+        finally:
+            for active in reversed(patches):
+                active.stop()
+
+        assert response.status_code == 404, response.text
+        assert response.content == b'{"detail":"Session not found"}'
+        with service._engine.connect() as conn:
+            parent = conn.execute(select(sessions_table).where(sessions_table.c.id == str(session.id))).one()
+            visible = conn.execute(
+                select(func.count()).select_from(sessions_table).where(sessions_table.c.archived_at.is_(None))
+            ).scalar_one()
+            completed = conn.execute(
+                select(func.count())
+                .select_from(session_operation_receipts_table)
+                .where(
+                    session_operation_receipts_table.c.operation_id == operation_id,
+                    session_operation_receipts_table.c.status == "completed",
+                )
+            ).scalar_one()
+        assert parent.archived_at is not None
+        assert visible == 0
+        assert completed == 0
+
+
 class TestForkRebasesSessionOwnedSinkOptions:
     """Same-user fork moves a sink target from the parent's session folders to the child's."""
 
