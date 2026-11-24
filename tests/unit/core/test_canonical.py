@@ -12,6 +12,36 @@ import pandas as pd
 import pytest
 
 
+@pytest.mark.parametrize(
+    ("value", "expected_hash"),
+    [
+        (None, "74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b"),
+        (True, "b5bea41b6c623f7c09f1bf24dcae58ebab3c0cdd90ad966bc43a45b44867e12b"),
+        ("café 雪", "1587a1b7b8713c8642c0cdc2fb2178e1096e4c14e0737b473209eb8489e10dde"),
+        (2**53 - 1, "f40b423c2dd95ff2b2f027e22208f438cf7242862e5e746860e697308c9add26"),
+        (-(2**53 - 1), "4c933a456bb8f2e9894b2d0b26480439cd72d52fb8a27cbf8fd7f323f22c7815"),
+        (0.125, "52c003e77e74cbacd60930b997433027175ca60b20b7fbb4ec6073b2c4932bb9"),
+        ({"z": [1, None, False], "a": {"deep": "value"}}, "d300d2a8068d712c258e6b95656f003c3bbdf04f7ee210c6600b7a3b364f71d6"),
+        (("first", 2, {"third": True}), "5d0c829369b4caa892db2d524c9524d6c84a513a023bb3b4b587bd49c3376f8e"),
+        (np.int64(42), "73475cb40a568e8da8a045ced110137e159f890ac4da883b6b17dc651b3a8049"),
+        (np.float64(1.25), "004a9e0878ff83e6b91f50d50dad439d2065c6cbb0d20f1f328b2fd75e085d6a"),
+        (pd.Timestamp("2026-01-02T03:04:05Z"), "79e0efd148417f4f2095bd06dec6863187689d3a98129063a152017845738199"),
+        (datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC), "79e0efd148417f4f2095bd06dec6863187689d3a98129063a152017845738199"),
+        (date(2026, 1, 2), "5dfe28dc540201810deee4b2457f71fcdc1c15dc9c9b5542824f16c675e203ba"),
+        (time(3, 4, 5), "1af6896174d385a417ed67d438cca361f8670c2e1724e486bd1bf76a512b5b8b"),
+        (Decimal("123.4500"), "42fdbdb048d0f6e0b6a193aa25515b0996a2d2cd89f4a7fc31cb3b7793f3e37b"),
+        (UUID("12345678-1234-5678-1234-567812345678"), "be6bf1ea57078ff17fa690d9c62d24fb803c8aac2368bb9088431187034a2cfe"),
+        ([{"stamp": date(2026, 1, 2)}, (Decimal("1.25"), "λ")], "24b218ece7daa37c9ac189abf90595ab2bafb718dba3d893ffe95d4c28faf102"),
+        (b"\x00\xffabc", "9424da9fc7fd67382c0e13a5bf61776f98afad62abf067b8c45647a4710c2976"),
+        ({"__elspeth_canonical_type__": {"literal": True}}, "5530f965a45087df67e62bf18589bca5b4fd045e219e534dc4db0d27b4eec4b4"),
+    ],
+)
+def test_canonical_hash_corpus_golden(value: object, expected_hash: str) -> None:
+    from elspeth.core.canonical import stable_hash
+
+    assert stable_hash(value) == expected_hash
+
+
 class TestNanInfinityRejection:
     """NaN and Infinity must be rejected, not silently converted.
 
@@ -204,17 +234,14 @@ class TestSpecialTypeConversion:
         result = _normalize_value(dt)
         assert result == "2026-01-12T10:30:00+00:00"
 
-    def test_bytes_to_base64_wrapper(self) -> None:
+    def test_bytes_to_base64_text(self) -> None:
         from elspeth.core.canonical import _normalize_value
 
         data = b"hello world"
         result = _normalize_value(data)
-        assert result == {
-            "__elspeth_canonical_type__": "bytes",
-            "base64": base64.b64encode(data).decode("ascii"),
-        }
+        assert result == base64.b64encode(data).decode("ascii")
 
-    def test_bytes_wrapper_does_not_collide_with_caller_mapping(self) -> None:
+    def test_bytes_text_and_caller_mapping_have_distinct_hashes(self) -> None:
         from elspeth.core.canonical import canonical_json, stable_hash
 
         data = b"hello world"
@@ -223,7 +250,7 @@ class TestSpecialTypeConversion:
         assert canonical_json(data) != canonical_json(user_mapping)
         assert stable_hash(data) != stable_hash(user_mapping)
 
-    def test_reserved_bytes_envelope_mapping_is_escaped(self) -> None:
+    def test_reserved_key_mapping_is_canonicalized_verbatim(self) -> None:
         from elspeth.core.canonical import canonical_json, stable_hash
 
         data = b"hello world"
@@ -235,12 +262,7 @@ class TestSpecialTypeConversion:
 
         assert canonical_json(data) != canonical_json(user_mapping)
         assert stable_hash(data) != stable_hash(user_mapping)
-        assert canonical_json(user_mapping) == (
-            '{"__elspeth_canonical_type__":"mapping","entries":['
-            '{"key":"__elspeth_canonical_type__","value":"bytes"},'
-            f'{{"key":"base64","value":"{encoded}"}}'
-            "]}"
-        )
+        assert canonical_json(user_mapping) == f'{{"__elspeth_canonical_type__":"bytes","base64":"{encoded}"}}'
 
     def test_decimal_to_string(self) -> None:
         from elspeth.core.canonical import _normalize_value
@@ -404,25 +426,25 @@ class TestRecursiveNormalization:
     """Nested structures must be normalized recursively."""
 
     def test_dict_with_numpy_values(self) -> None:
-        from elspeth.core.canonical import _normalize_for_canonical
+        from elspeth.core.canonical import normalize_for_canonical
 
         data = {"count": np.int64(42), "rate": np.float64(3.14)}
-        result = _normalize_for_canonical(data)
+        result = normalize_for_canonical(data)
         assert result == {"count": 42, "rate": 3.14}
         assert type(result["count"]) is int
         assert type(result["rate"]) is float
 
     def test_list_with_mixed_types(self) -> None:
-        from elspeth.core.canonical import _normalize_for_canonical
+        from elspeth.core.canonical import normalize_for_canonical
 
         data = [np.int64(1), pd.Timestamp("2026-01-12"), None]
-        result = _normalize_for_canonical(data)
+        result = normalize_for_canonical(data)
         assert result[0] == 1
         assert "2026-01-12" in result[1]
         assert result[2] is None
 
     def test_nested_dict(self) -> None:
-        from elspeth.core.canonical import _normalize_for_canonical
+        from elspeth.core.canonical import normalize_for_canonical
 
         data = {
             "outer": {
@@ -430,24 +452,24 @@ class TestRecursiveNormalization:
                 "list": [np.float64(1.0), np.float64(2.0)],
             }
         }
-        result = _normalize_for_canonical(data)
+        result = normalize_for_canonical(data)
         assert result["outer"]["inner"] == 42
         assert result["outer"]["list"] == [1.0, 2.0]
 
     def test_tuple_converts_to_list(self) -> None:
-        from elspeth.core.canonical import _normalize_for_canonical
+        from elspeth.core.canonical import normalize_for_canonical
 
         data = (1, 2, 3)
-        result = _normalize_for_canonical(data)
+        result = normalize_for_canonical(data)
         assert result == [1, 2, 3]
         assert type(result) is list
 
     def test_nan_in_nested_raises(self) -> None:
-        from elspeth.core.canonical import _normalize_for_canonical
+        from elspeth.core.canonical import normalize_for_canonical
 
         data = {"values": [1.0, float("nan"), 3.0]}
         with pytest.raises(ValueError, match="non-finite"):
-            _normalize_for_canonical(data)
+            normalize_for_canonical(data)
 
 
 class TestCanonicalJsonSerialization:
@@ -601,7 +623,7 @@ class TestCrossProcessStability:
         """CANONICAL_VERSION must be available for audit records."""
         from elspeth.core.canonical import CANONICAL_VERSION
 
-        assert CANONICAL_VERSION == "sha256-rfc8785-v1"
+        assert CANONICAL_VERSION == "sha256-rfc8785-v2"
 
 
 class TestPublicAPI:
@@ -899,14 +921,14 @@ class TestNumpyDatetime64Normalization:
 
     def test_np_datetime64_in_dict_with_other_types(self) -> None:
         """np.datetime64 works alongside other numpy/pandas types."""
-        from elspeth.core.canonical import _normalize_for_canonical
+        from elspeth.core.canonical import normalize_for_canonical
 
         data = {
             "timestamp": np.datetime64("2024-01-01"),
             "count": np.int64(42),
             "rate": np.float64(3.14),
         }
-        result = _normalize_for_canonical(data)
+        result = normalize_for_canonical(data)
         assert isinstance(result["timestamp"], str)
         assert result["count"] == 42
         assert result["rate"] == 3.14

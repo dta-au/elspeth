@@ -352,7 +352,7 @@ Record deployment-specific residual-risk acceptance in
 ### 2.1 Canonical JSON and hashes
 
 Hashes are SHA-256 over RFC 8785 canonical JSON, versioned as
-`sha256-rfc8785-v1` (`src/elspeth/contracts/hashing.py`,
+`sha256-rfc8785-v2` (`src/elspeth/contracts/hashing.py`,
 `src/elspeth/core/canonical.py`;
 [guarantees § 1.3](../release/guarantees.md#13-hash-integrity)):
 

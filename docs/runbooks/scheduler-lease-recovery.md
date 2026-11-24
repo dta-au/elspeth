@@ -706,8 +706,24 @@ The `--settings` file is **required**: the joiner must reproduce the same
 different pipeline would disagree about the graph and barrier keys, so a
 mismatch is refused.
 
-Admission is one atomic `BEGIN IMMEDIATE` transaction (ADR-030 D3, §B.1) that
-checks **all three** preconditions or refuses:
+After the filesystem preflight, join admission checks the run's canonical
+version, graph readiness, and plugin implementation. The graph is ready once
+some source of the run has left the `ready` lifecycle state: the leader seeds
+every source as `ready`, registers every edge, and only then starts loading.
+Before that point the join returns retryable `join_not_ready`; if the leader
+seat remains expired through admission, the transaction returns its "no live
+leader" refusal. If the leader heartbeats before admission, the
+post-admission check still tests graph readiness and departs the follower on
+refusal. Once the graph is ready, the recorded edge set must equal the
+follower graph's edges by endpoints, label, and mode; any difference, or
+different plugin implementation evidence, is refused. A stored source
+lifecycle state outside the known set, or (once the graph is ready) source
+rows that do not match the run's recorded source nodes, is an audit integrity
+failure, not a refusal: the join stops with the fatal integrity error and the
+run's Landscape records need investigation.
+
+The atomic `BEGIN IMMEDIATE` admission transaction (ADR-030 D3, §B.1) checks
+the authoritative preconditions and registers the follower only when all hold:
 
 1. `runs.status = 'RUNNING'` (else `JoinRefusedError` — terminal runs use
    `elspeth resume`);
@@ -717,6 +733,15 @@ checks **all three** preconditions or refuses:
    `elspeth resume`, or finalize the run with `elspeth abandon`"). A follower
    must never be the first process on an abandoned run — barrier and ingest
    state need a leader. **Join and takeover are disjoint verbs.**
+
+After every successful admission, the service re-checks the canonical version,
+graph readiness, and plugin implementation after registration.
+A refusal at that point records follower registration followed by departure if
+the departure write succeeds. If the departure write fails, the refusal says
+so; the follower row lapses at heartbeat expiry and is departed at finalize or
+evicted by the liveness sweep. For any other post-admission error, the
+`Join failed:` line names the error class and message, followed by any
+departure failure on its own line.
 
 A **filesystem-writability preflight runs first** (before the registry is
 touched): the follower verifies write access to the DB file, its directory,

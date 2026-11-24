@@ -14,6 +14,7 @@ from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.web.composer.audit import begin_dispatch, finish_success, rebind_dispatch_arguments
 from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
 from elspeth.web.composer.authority_hashing import (
+    canonical_json_and_hash,
     composer_authority_hash,
     project_composer_authority_payload,
     restore_composer_authority_payload,
@@ -24,7 +25,7 @@ from elspeth.web.composer.pipeline_proposal import (
     PipelineProposal,
     composition_content_hash,
 )
-from elspeth.web.composer.redaction import redact_tool_call_arguments
+from elspeth.web.composer.redaction import redact_tool_call_arguments, semantic_redacted_pipeline_arguments_hash
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata
 from elspeth.web.sessions.proposal_authority import (
@@ -33,6 +34,50 @@ from elspeth.web.sessions.proposal_authority import (
     _pipeline_private_arguments_hash,
 )
 from elspeth.web.sessions.protocol import CompositionStateData
+
+_PRE_UPGRADE_GENERIC_HASH = "14f0c4aa54cd8886ed195d28306a44beca435cbbae95f831be6a459dabbfc9b6"
+_PRE_UPGRADE_AUTHORITY_HASH = "edc01541b29f82a1a14e842d2c7c5b5bdcd2c3431f48083d1ac10fb708630e1d"
+
+
+def _reserved_arguments() -> dict[str, object]:
+    return {
+        "sources": {},
+        "nodes": [{"id": "n1", "options": {}, "node_type": "gate", "input": "rows", "routes": {"__elspeth_canonical_type__": "out"}}],
+        "edges": [],
+        "outputs": [],
+    }
+
+
+def test_canonical_json_and_hash_recomputes_reserved_arguments() -> None:
+    canonical, digest = canonical_json_and_hash(_reserved_arguments())
+    assert '"routes":{"__elspeth_canonical_type__":"out"}' in canonical
+    assert digest != _PRE_UPGRADE_GENERIC_HASH
+
+
+def test_composer_authority_hash_recomputes_reserved_arguments() -> None:
+    assert composer_authority_hash(_reserved_arguments()) != _PRE_UPGRADE_AUTHORITY_HASH
+
+
+def test_semantic_redacted_hash_recomputes_reserved_arguments() -> None:
+    assert semantic_redacted_pipeline_arguments_hash(_reserved_arguments()) != _PRE_UPGRADE_AUTHORITY_HASH
+
+
+def test_dispatch_audit_records_current_hash_for_reserved_arguments() -> None:
+    dispatch = begin_dispatch("reserved-call", "set_pipeline", _reserved_arguments(), version_before=1, actor="test")
+    assert dispatch.arguments_hash != _PRE_UPGRADE_GENERIC_HASH
+    assert dispatch.authority_arguments_hash != _PRE_UPGRADE_AUTHORITY_HASH
+
+
+def test_reserved_route_arguments_round_trip_through_dispatch_audit() -> None:
+    arguments = _reserved_arguments()
+    dispatch = begin_dispatch("reserved-route-call", "set_pipeline", arguments, version_before=1, actor="test")
+    invocation = finish_success(dispatch, result_payload=_dispatch_result(), version_after=2)
+    _content, envelope = redacted_tool_invocation_content_and_envelope(invocation)
+
+    binding = PipelineDispatchAuditBinding.from_persisted_envelope(envelope)
+
+    redacted = redact_tool_call_arguments("set_pipeline", arguments, telemetry=NoopRedactionTelemetry())
+    assert binding.arguments_hash == semantic_redacted_pipeline_arguments_hash(redacted)
 
 
 def _branches(order: Sequence[str]) -> dict[str, str]:

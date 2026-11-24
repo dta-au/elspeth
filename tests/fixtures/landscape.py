@@ -29,6 +29,7 @@ from sqlalchemy.pool import Pool
 
 from elspeth.contracts import NodeType
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.hashing import CANONICAL_VERSION
 from elspeth.contracts.payload_store import PayloadStore
 from elspeth.contracts.results import RowResult
 from elspeth.contracts.scheduler import TokenWorkItem, TokenWorkStatus
@@ -695,7 +696,7 @@ def make_recorder_with_run(
     run_id: str | None = None,
     source_node_id: str | None = None,
     source_plugin_name: str = "source",
-    canonical_version: str = "v1",
+    canonical_version: str = CANONICAL_VERSION,
     payload_store: PayloadStore | None = None,
     leader_worker_id: str | None = None,
     db: LandscapeDB | None = None,
@@ -713,8 +714,7 @@ def make_recorder_with_run(
         run_id: Explicit run ID for deterministic tests. Auto-generated if None.
         source_node_id: Explicit source node ID. Auto-generated if None.
         source_plugin_name: Plugin name for the source node (default "source").
-        canonical_version: Version string for begin_run (default "v1").
-            Some tests (e.g., test_processor.py) use "sha256-rfc8785-v1".
+        canonical_version: Version string for begin_run (defaults to the current canonical version).
         payload_store: Payload store to inject (defaults to MockPayloadStore).
             Pass a specific MockPayloadStore instance to inspect stored payloads.
             Tests that explicitly test "no payload store" behavior must pass

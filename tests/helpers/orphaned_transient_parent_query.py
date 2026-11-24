@@ -9,6 +9,7 @@ from sqlalchemy import Select, and_, select
 from sqlalchemy.engine import Connection
 
 from elspeth.contracts import NodeType
+from elspeth.contracts.hashing import CANONICAL_VERSION
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
@@ -62,7 +63,7 @@ def begin_test_run(factory: RecorderFactory, run_id: str) -> str:
     """Begin a run with one source row; return that row's id for token FKs."""
     factory.run_lifecycle.begin_run(
         config={},
-        canonical_version="v1",
+        canonical_version=CANONICAL_VERSION,
         run_id=run_id,
         openrouter_catalog_sha256="0" * 64,
         openrouter_catalog_source="bundled",

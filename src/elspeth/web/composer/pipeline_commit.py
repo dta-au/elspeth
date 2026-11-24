@@ -45,7 +45,7 @@ from elspeth.web.composer.pipeline_proposal import (
     restore_owned_composition_state_authority,
 )
 from elspeth.web.composer.protocol import ToolArgumentError
-from elspeth.web.composer.redaction import normalize_set_pipeline_redacted_arguments, semantic_redacted_pipeline_arguments_hash
+from elspeth.web.composer.redaction import semantic_redacted_pipeline_arguments_hash
 from elspeth.web.composer.reviewed_source_authority import (
     resolve_owned_composition_source_authority,
 )
@@ -214,7 +214,7 @@ class PipelineDispatchAuditBinding:
         if type(raw_status) is not str or type(tool_call_id) is not str or type(tool_name) is not str:
             raise AuditIntegrityError("persisted pipeline dispatch scalar fields are malformed")
         try:
-            stored_authority_hash, restored_arguments = _validate_pipeline_authority_binding(
+            _stored_authority_hash, restored_arguments = _validate_pipeline_authority_binding(
                 arguments_canonical=arguments_canonical,
                 arguments_hash=arguments_hash,
                 authority_arguments_canonical=authority_arguments_canonical,
@@ -229,14 +229,7 @@ class PipelineDispatchAuditBinding:
             raise AuditIntegrityError("persisted pipeline dispatch canonical hashes are malformed")
         if type(restored_arguments) is not dict:
             raise AuditIntegrityError("persisted pipeline dispatch arguments are malformed")
-        # Restored arguments already occupy the canonical domain. Rehashing an
-        # unchanged reserved mapping would escape its canonical wrapper again.
-        normalized_arguments = normalize_set_pipeline_redacted_arguments(restored_arguments)
-        semantic_arguments_hash = (
-            stored_authority_hash
-            if normalized_arguments is restored_arguments
-            else semantic_redacted_pipeline_arguments_hash(restored_arguments)
-        )
+        semantic_arguments_hash = semantic_redacted_pipeline_arguments_hash(restored_arguments)
         return cls(
             tool_call_id=tool_call_id,
             tool_name=tool_name,

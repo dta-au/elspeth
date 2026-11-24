@@ -1675,7 +1675,7 @@ class TestGetCallResponseData:
         result = factory.execution.get_call_response_data(call.call_id)
 
         assert result.state == CallDataState.AVAILABLE
-        assert result.data == {"blob": {"__elspeth_canonical_type__": "bytes", "base64": "YWJj"}}
+        assert result.data == {"blob": "YWJj"}
 
     def test_returns_dict_response_payload_successfully(self, tmp_path):
         """Bug gxan: valid dict payload should return correctly."""

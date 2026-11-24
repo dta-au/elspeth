@@ -19,6 +19,7 @@ import pytest
 
 from elspeth.contracts import Checkpoint, PluginSchema, ResumePoint, RunStatus
 from elspeth.contracts.errors import AuditIntegrityError, EmptyResumeStateError, OrchestrationInvariantError
+from elspeth.contracts.hashing import CANONICAL_VERSION
 from elspeth.contracts.schema_contract import FieldContract, SchemaContract
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
@@ -131,7 +132,7 @@ def _create_failed_run(
 
     run = factory.run_lifecycle.begin_run(
         config={"test": "resume-guardrails"},
-        canonical_version="v1",
+        canonical_version=CANONICAL_VERSION,
         status=RunStatus.FAILED,
         source_schema_json=json.dumps(_ResumeSourceSchema.model_json_schema()),
     )
