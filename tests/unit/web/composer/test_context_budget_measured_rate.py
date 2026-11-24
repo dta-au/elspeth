@@ -10,14 +10,12 @@ density, and what is shed would flip at every turn boundary.
 from __future__ import annotations
 
 import math
-from dataclasses import replace
 from typing import Any
 
 import pytest
 
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.context_budget import (
     CONTEXT_BUDGET_MEASURED_MARGIN,
     ContextBudgetDecision,
@@ -27,9 +25,7 @@ from elspeth.web.composer.context_budget import (
     decide_context_budget,
 )
 from elspeth.web.composer.context_budget_history import ContextBudgetHistory, MeasuredDensity
-from tests.unit.web.composer.test_compose_loop_context_budget import _GENEROUS_TOKENS, _service, _two_round_turn
 from tests.unit.web.composer.test_context_budget_history import _COMPOSER, _audit_row, _call
-from tests.unit.web.composer.test_context_budget_turn_in_progress import _fit_two_round_turn
 
 # A recorded 0.8.17 session (one model, sizes and audit budget fields only). Its first shed:
 # a 518,623 B request whose live anchor was 108,710 tokens for 481,960 B (4.43 B/token), with
@@ -174,25 +170,5 @@ def test_a_stored_dialect_outside_the_vocabulary_is_corruption() -> None:
         ContextBudgetHistory.from_records([_audit_row(1, _dialect_call("not-a-dialect"))])
 
 
-@pytest.mark.asyncio
-async def test_the_first_call_of_a_turn_is_priced_at_the_sessions_stored_density() -> None:
-    # The real compose path: a stored session density reaches the decision when this exchange
-    # has made no call yet, so there is no live anchor.
-    service, _ = _service(_GENEROUS_TOKENS)
-    dialect = service._planner_dialect
-    stored = _dialect_call(dialect.value if dialect is not None else None, total_bytes=44_000, prompt_tokens=10_000, model=service._model)
-    history = ContextBudgetHistory.from_records([_audit_row(1, stored)])
-    llm_messages = _two_round_turn(service, "f" * 2_000, "s" * 2_000)
-
-    _selected, record = await _fit_two_round_turn(service, llm_messages, recorder=BufferingRecorder(), history=history, reply_stage=False)
-
-    assert record.anchor_status == "no_previous_call"
-    assert record.bytes_per_token == repr(4.4 * CONTEXT_BUDGET_MEASURED_MARGIN)
-    assert record.pricing_mode == "authored_prefix"
-    # Control: the same request with no stored density is priced at the policy's fallback rate
-    # (this fixture's worst-case 1.0 B/token).
-    _selected, fallback = await _fit_two_round_turn(
-        service, llm_messages, recorder=BufferingRecorder(), history=replace(history, measured=()), reply_stage=False
-    )
-    assert fallback.bytes_per_token == repr(service._context_budget_policy.fallback_bytes_per_token)
-    assert fallback.bytes_per_token != record.bytes_per_token
+# The compose path from stored history to the turn's first call is pinned in
+# test_context_budget_turn_in_progress.py, with base symbols only.
