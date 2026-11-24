@@ -100,7 +100,7 @@ class JoinAdmissionService:
                 raise AuditIntegrityError(f"run {run_id!r} run_sources rows do not cover its recorded source nodes")
         else:
             if defer_to_admission_on_dead_leader:
-                leader = RunCoordinationRepository(self._db.engine).live_leader(run_id=run_id)
+                leader = RunCoordinationRepository(self._db.engine).seat_holder(run_id=run_id)
                 if leader is None or not leader.seat_live:
                     return
             raise JoinNotReadyError(run_id, "the run's leader has not finished registering its graph; retry the join")

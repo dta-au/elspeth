@@ -197,7 +197,17 @@ async def test_actual_lease_release_fault_outranks_persisted_stop(tmp_path, monk
     committed_before_release = []
     real_started_under_lease = worker._run_started_under_lease
 
-    def failed_release(*args, **kwargs):
+    original_close_release = service.session_operation_authority.release_at_close
+
+    def first_release_fails(fallback):
+        # The lease close releases through release_at_close; plain release is
+        # kept failing the same way so either verb meets the injected fault.
+        def failed_release(*args, **kwargs):
+            return _first_release_outcome(fallback, *args, **kwargs)
+
+        return failed_release
+
+    def _first_release_outcome(fallback, *args, **kwargs):
         nonlocal release_failed
         if not release_failed:
             release_failed = True
@@ -216,7 +226,7 @@ async def test_actual_lease_release_fault_outranks_persisted_stop(tmp_path, monk
             original = RuntimeError("private owned lease close failure")
             original_close_errors.append(original)
             raise original
-        return original_release(*args, **kwargs)
+        return fallback(*args, **kwargs)
 
     async def stop_before_close(services, running, lease, settlement, setup_ticket):
         assert setup_ticket is not None
@@ -232,7 +242,8 @@ async def test_actual_lease_release_fault_outranks_persisted_stop(tmp_path, monk
             raise RuntimeError("ordinary provider weather")
         return await real_started_under_lease(services, running, lease, settlement, setup_ticket)
 
-    monkeypatch.setattr(service.session_operation_authority, "release", failed_release)
+    monkeypatch.setattr(service.session_operation_authority, "release", first_release_fails(original_release))
+    monkeypatch.setattr(service.session_operation_authority, "release_at_close", first_release_fails(original_close_release))
     monkeypatch.setattr(worker, "_run_started_under_lease", stop_before_close)
     try:
         record = await _admit(app, service, authority, operation_id=str(uuid4()))

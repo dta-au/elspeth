@@ -252,12 +252,13 @@ async def test_actual_renewal_snapshot_retains_three_original_cancels_and_physic
                 with pytest.raises(OperationalError) as closed:
                     await lease.close()
                 assert closed.value is original
+                # The driver refused the renewal with a known outcome, so the
+                # close still gives up this lease's own fence.
+                assert _read_actual_fence(engine, context).released_at is not None
             else:
                 await lease.close()
         finally:
             await async_workers.shutdown_async_workers()
-            if sql_fails:
-                authority.release(context)  # Explicit test-owner cleanup of the deliberately lost renewal fence.
             engine.dispose()
 
 

@@ -25,6 +25,7 @@ from elspeth.web.config import WebSettings
 from elspeth.web.coordination import lifecycle as lifecycle_module
 from elspeth.web.coordination import membership_lifecycle as membership_lifecycle_module
 from elspeth.web.coordination import upkeep_engine as upkeep_module
+from elspeth.web.coordination.contracts import CloseReleaseOutcome
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.coordination.membership_authority import (
     RepositoryWebInstanceMembershipAuthority,
@@ -247,12 +248,14 @@ class _SiteRecorder:
     def __init__(self, monkeypatch: pytest.MonkeyPatch, main: object, sibling: object) -> None:
         self.calls: list[tuple[str, str, bool]] = []
         for label, authority in (("main", main), ("sibling", sibling)):
-            for verb in ("renew", "renew_fork_child_lease", "release"):
+            for verb in ("renew", "renew_fork_child_lease", "release", "release_at_close"):
                 monkeypatch.setattr(authority, verb, self._recorder(label, verb))
 
     def _recorder(self, label: str, verb: str) -> Callable[..., Any]:
-        def record(*args: Any, **kwargs: Any) -> SessionOperationContext | None:
+        def record(*args: Any, **kwargs: Any) -> SessionOperationContext | CloseReleaseOutcome | None:
             self.calls.append((label, verb, async_workers.on_lease_upkeep_worker()))
+            if verb == "release_at_close":
+                return CloseReleaseOutcome.RELEASED_LIVE
             return None if verb == "release" else _context()
 
         return record
@@ -317,12 +320,12 @@ def _assert_upkeep_wiring(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> None
     observed = asyncio.run(scenario())
     on_sibling_worker = {site: set(calls) for site, calls in observed.items()}
     assert on_sibling_worker == {
-        "lease renew + release": {("sibling", "renew", True), ("sibling", "release", True)},
-        "fork renew + release": {("sibling", "renew_fork_child_lease", True), ("sibling", "release", True)},
+        "lease renew + release": {("sibling", "renew", True), ("sibling", "release_at_close", True)},
+        "fork renew + release": {("sibling", "renew_fork_child_lease", True), ("sibling", "release_at_close", True)},
         "_release_acquired_context": {("sibling", "release", True)},
         "_capture_adopt_release_error": {("sibling", "release", True)},
     }
-    releases = {site: sum(1 for call in calls if call[1] == "release") for site, calls in observed.items()}
+    releases = {site: sum(1 for call in calls if call[1] in ("release", "release_at_close")) for site, calls in observed.items()}
     assert releases == dict.fromkeys(observed, 1)
 
 
