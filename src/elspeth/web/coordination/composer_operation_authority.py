@@ -829,6 +829,14 @@ class ComposerAsyncOperationAuthority:
                     and restore_utc(fence.lease_expires_at) <= now
                     and row.claim_owner_instance_id == self._owner_instance_id
                 )
+                # The job's exact fence must be this instance's COMPOSE fence. A
+                # mismatch is corrupt stored state, never a lost race.
+                if (
+                    valid
+                    and fence is not None
+                    and (fence.operation_kind != SessionOperationKind.COMPOSE.value or fence.owner_instance_id != self._owner_instance_id)
+                ):
+                    raise AuditIntegrityError("own lapsed settlement found its exact fence bound to another kind or owner")
             elif recovery_context is not None and fence is not None:
                 f = recovery_context.fence
                 valid = (
@@ -864,7 +872,8 @@ class ComposerAsyncOperationAuthority:
                         fences.c.operation_id == fence.operation_id,
                         fences.c.lease_token == fence.lease_token,
                         fences.c.operation_epoch == fence.operation_epoch,
-                        fences.c.operation_kind == fence.operation_kind,
+                        fences.c.operation_kind == SessionOperationKind.COMPOSE.value,
+                        fences.c.owner_instance_id == self._owner_instance_id,
                         fences.c.released_at.is_(None),
                     )
                     .values(lease_expires_at=case((expiry > now, now), else_=expiry), released_at=now)

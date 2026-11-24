@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from datetime import datetime, timedelta
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 import structlog
@@ -64,12 +65,14 @@ def _expiry(engine: Engine, context: SessionOperationContext) -> datetime:
     return expiry
 
 
-def _with_fence(context: SessionOperationContext, *, lease_token: str | None = None, epoch: int | None = None) -> SessionOperationContext:
+def _with_fence(
+    context: SessionOperationContext, *, operation_id: str | None = None, lease_token: str | None = None, epoch: int | None = None
+) -> SessionOperationContext:
     fence = context.fence
     return SessionOperationContext(
         fence=SessionOperationFence(
             session_id=fence.session_id,
-            operation_id=fence.operation_id,
+            operation_id=fence.operation_id if operation_id is None else operation_id,
             lease_token=fence.lease_token if lease_token is None else lease_token,
             operation_epoch=fence.operation_epoch if epoch is None else epoch,
         ),
@@ -127,10 +130,12 @@ async def test_every_other_miss_stays_token_mismatch_live_or_past_the_deadline(e
     expiry = _expiry(engine, context)
     foreign_token = _with_fence(context, lease_token="not-this-lease")
     stale_epoch = _with_fence(context, epoch=context.fence.operation_epoch + 1)
+    foreign_operation = _with_fence(context, operation_id=str(uuid4()))
 
     for now in (expiry - timedelta(seconds=1), expiry + timedelta(seconds=1)):
         assert _reason(service, engine, foreign_token, now=now) is FenceLossReason.TOKEN_MISMATCH
         assert _reason(service, engine, stale_epoch, now=now) is FenceLossReason.TOKEN_MISMATCH
+        assert _reason(service, engine, foreign_operation, now=now) is FenceLossReason.TOKEN_MISMATCH
         # The exact fence asked for under another kind is a mismatch, expired or not.
         assert _reason(service, engine, context, now=now, expected_kind=SessionOperationKind.PROPOSAL) is FenceLossReason.TOKEN_MISMATCH
 
