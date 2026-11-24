@@ -30,6 +30,14 @@ changes land and is not a release.
   sent once more with earlier turns left out, then refused as too large,
   instead of being retried unchanged. On the direct Anthropic route a 413 is
   reported as an ordinary rejected request.
+- **Added:** each Composer call's audit record now says what recognised a
+  size rejection (a structured code, the exception class, the HTTP status or
+  a fixed provider wording), and its context-budget record names the call it
+  was made for (compose loop, reply, planner or escape hatch) and where the
+  density it was priced from came from. Advisor review calls have no
+  context-budget record, so they carry no surface or density. Records written
+  before this release carry none of these fields; their absence means
+  unknown.
 
 ### Fixed
 
