@@ -45,6 +45,7 @@ _MODEL_OUTPUT_SURFACES: Final[frozenset[str]] = frozenset(
         "composer_planner_response",
         "composer_advisor_response",
         "composer_provider_thinking",
+        "composer_tool_arguments",
         "composer_tool_batch",
         "composer_tool_wire",
         "composer_recovery_reply",
@@ -54,6 +55,16 @@ _MODEL_OUTPUT_CREDENTIAL_REFUSAL_DETAIL: Final[str] = (
     "The model's output appears to contain a credential, so it was blocked. "
     "If you gave the Composer a credential, store it through the secret service and use a secret reference instead. "
     "Otherwise, retry your request."
+)
+
+
+# What a failed turn's progress view shows for a credential refusal, by who
+# wrote the refused content (``CredentialMaterialRefused.from_model_output``).
+CREDENTIAL_REFUSAL_HEADLINE: Final[str] = "Something in this session appears to be a credential, so the composer stopped."
+CREDENTIAL_REFUSAL_NEXT_STEP: Final[str] = "Remove the credential and retry. If you can't find or remove it, start a new session."
+MODEL_OUTPUT_CREDENTIAL_REFUSAL_HEADLINE: Final[str] = "The composer blocked the model's output."
+MODEL_OUTPUT_CREDENTIAL_REFUSAL_NEXT_STEP: Final[str] = (
+    "Retry the request without any credential you gave. If it is blocked again, rephrase it or start a new session."
 )
 
 
@@ -75,8 +86,19 @@ class CredentialMaterialRefused(ComposerAdmissionRefused):
     def __init__(self, *, surface: str, finding: CredentialMaterialFinding) -> None:
         self.surface = surface
         self.finding = finding
-        self.detail = _MODEL_OUTPUT_CREDENTIAL_REFUSAL_DETAIL if surface in _MODEL_OUTPUT_SURFACES else CREDENTIAL_REFUSAL_DETAIL
+        # Who wrote the refused content: the model, or the user and their
+        # pipeline. The detail and every per-cause message follow this one flag.
+        self.from_model_output = surface in _MODEL_OUTPUT_SURFACES
+        self.detail = _MODEL_OUTPUT_CREDENTIAL_REFUSAL_DETAIL if self.from_model_output else CREDENTIAL_REFUSAL_DETAIL
         super().__init__(self.detail)
+
+    @property
+    def progress_headline(self) -> str:
+        return MODEL_OUTPUT_CREDENTIAL_REFUSAL_HEADLINE if self.from_model_output else CREDENTIAL_REFUSAL_HEADLINE
+
+    @property
+    def progress_next_step(self) -> str:
+        return MODEL_OUTPUT_CREDENTIAL_REFUSAL_NEXT_STEP if self.from_model_output else CREDENTIAL_REFUSAL_NEXT_STEP
 
     def to_payload(self) -> CredentialMaterialRefusalPayload:
         return {

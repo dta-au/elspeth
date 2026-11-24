@@ -17,7 +17,18 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
+import pytest
+
+from elspeth.contracts.composer_progress import ComposerProgressEvent
+from elspeth.contracts.credential_material import find_credential_material
 from elspeth.web.composer.protocol import ComposerAdmissionRefused, ComposerService, ComposerServiceError
+from elspeth.web.credential_guard import (
+    CREDENTIAL_REFUSAL_HEADLINE,
+    CREDENTIAL_REFUSAL_NEXT_STEP,
+    MODEL_OUTPUT_CREDENTIAL_REFUSAL_HEADLINE,
+    MODEL_OUTPUT_CREDENTIAL_REFUSAL_NEXT_STEP,
+    CredentialMaterialRefused,
+)
 from tests.helpers.composer_operations import settle_sync, strip_request_id
 from tests.unit.web.sessions.test_routes import TestClient, _make_app
 
@@ -111,3 +122,42 @@ def test_recompose_generic_composer_service_error_still_502_without_failure_code
     assert detail == {"error_type": "composer_error", "detail": "prompt preparation failed"}
     assert progress["phase"] == "failed"
     assert progress["reason"] == "service_setup_failed"
+
+
+def _credential_refusal(surface: str) -> CredentialMaterialRefused:
+    finding = find_credential_material({"value": "sk-" + "c" * 24}, purpose="admission")
+    assert finding is not None
+    return CredentialMaterialRefused(surface=surface, finding=finding)
+
+
+@pytest.mark.parametrize(
+    ("surface", "headline", "next_step"),
+    [
+        ("composer_provider_request", CREDENTIAL_REFUSAL_HEADLINE, CREDENTIAL_REFUSAL_NEXT_STEP),
+        ("composer_provider_response", MODEL_OUTPUT_CREDENTIAL_REFUSAL_HEADLINE, MODEL_OUTPUT_CREDENTIAL_REFUSAL_NEXT_STEP),
+        ("composer_tool_arguments", MODEL_OUTPUT_CREDENTIAL_REFUSAL_HEADLINE, MODEL_OUTPUT_CREDENTIAL_REFUSAL_NEXT_STEP),
+    ],
+    ids=["user-or-pipeline-content", "model-response", "model-tool-arguments"],
+)
+def test_a_credential_refusal_shows_the_headline_and_next_step_for_its_cause(
+    tmp_path: Path, surface: str, headline: str, next_step: str
+) -> None:
+    refusal = _credential_refusal(surface)
+    status_code, detail, progress = _post_after_compose_failure(tmp_path, refusal, route="messages")
+
+    assert status_code == 422
+    assert detail["failure_code"] == "credential_material_rejected"
+    assert progress["phase"] == "failed"
+    assert progress["reason"] == "admission_refused"
+    assert progress["headline"] == headline
+    # The evidence line is the refusal's detail, bounded as every progress text is.
+    bounded = ComposerProgressEvent(phase="failed", headline=headline, evidence=(refusal.detail,), reason="admission_refused").evidence
+    assert progress["evidence"] == list(bounded)
+    assert progress["likely_next"] == next_step
+
+
+def test_a_non_credential_admission_refusal_keeps_the_access_and_quota_step(tmp_path: Path) -> None:
+    _, _, progress = _post_after_compose_failure(tmp_path, ComposerAdmissionRefused(_REFUSAL_TEXT), route="messages")
+
+    assert progress["headline"] == "This request was refused by the admission policy."
+    assert progress["likely_next"] == "Ask an administrator to review your access and quota configuration."

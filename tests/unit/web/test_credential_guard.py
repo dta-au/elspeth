@@ -365,6 +365,7 @@ def test_structured_refusal_contains_only_closed_evidence() -> None:
         "composer_planner_response",
         "composer_advisor_response",
         "composer_provider_thinking",
+        "composer_tool_arguments",
         "composer_tool_batch",
         "composer_tool_wire",
         "composer_recovery_reply",
@@ -382,6 +383,7 @@ def test_model_output_refusal_identifies_model_and_keeps_evidence_closed(surface
         "Otherwise, retry your request."
     )
     assert str(caught.value) == detail
+    assert caught.value.from_model_output
     assert caught.value.to_payload() == {
         "error_type": "credential_material_rejected",
         "failure_code": "credential_material_rejected",
@@ -403,7 +405,6 @@ def test_model_output_refusal_identifies_model_and_keeps_evidence_closed(surface
         "web_fork_message_ingress",
         "session_title",
         "blob_filename",
-        "composer_tool_arguments",
         "composer_advisor_complete_content",
         "composer_mcp_tool_arguments",
         "composer_prompt_guard_request",
@@ -416,6 +417,7 @@ def test_non_model_output_surfaces_keep_original_refusal_copy(surface: str) -> N
 
     detail = "This control content appears to contain a credential. Store the value through the secret service and use a secret reference."
     assert str(caught.value) == detail
+    assert not caught.value.from_model_output
     assert caught.value.to_payload()["detail"] == detail
 
 

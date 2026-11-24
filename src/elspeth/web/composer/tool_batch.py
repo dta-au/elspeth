@@ -181,6 +181,7 @@ from elspeth.web.composer.tools.generation import MalformedSourceProofClaim, _ad
 from elspeth.web.composer.tools.sessions import ADVISOR_TRIGGER_CANNOT_COMPLETE, RequestAdvisorHintArgumentsModel
 from elspeth.web.composer.tools.wire_projection import _WIRE_TOOL_DEFS, decode_wire_arguments, encode_semantic_arguments
 from elspeth.web.credential_guard import (
+    CredentialMaterialRefused,
     require_no_credential_material,
     require_no_credential_material_in_llm_metadata,
     require_no_credential_material_in_tool_wire,
@@ -3560,6 +3561,11 @@ async def run_tool_batch(
         except AuditIntegrityError:
             # Tier-1 audit invariant. Do not let the plugin-bug
             # catch-all below launder it into ComposerPluginCrashError.
+            raise
+        except CredentialMaterialRefused:
+            # The dispatch-time argument scan refused the model's tool
+            # arguments. That is a credential refusal, not a plugin bug, so it
+            # leaves the turn the way the wire scan's refusal does.
             raise
         except Exception as tool_exc:
             # Plugin-bug path: any exception class OTHER than
