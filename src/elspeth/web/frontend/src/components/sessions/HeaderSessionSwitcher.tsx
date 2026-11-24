@@ -519,7 +519,7 @@ export function HeaderSessionSwitcher(): JSX.Element {
       {archiveTarget && (
         <ConfirmDialog
           title="Archive session"
-          message={`Archive session "${archiveTarget.title}"? You can restore it later.`}
+          message={`Archive session "${archiveTarget.title}"? Archived sessions cannot be reopened or restored. If it has runs or other recorded history, that history is kept.`}
           confirmLabel="Archive"
           variant="danger"
           onConfirm={confirmArchive}

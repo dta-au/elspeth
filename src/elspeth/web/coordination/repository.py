@@ -764,11 +764,18 @@ class _RepositorySessionMutations:
             raise TypeError("archived_at must be an exact datetime")
         archived_at = _ensure_utc(archived_at)
         session_id = state._session_id
+        # The session's own receipt blocks archival only while its lease is
+        # live, judged by the database clock as a receipt takeover judges it.
+        # An expired one is an abandoned operation: it must not block deletion
+        # forever, and it makes the archive soft below. An incoming fork stays
+        # refused whatever its lease: its child is still staged, and settling a
+        # retried fork would reactivate a child archived here.
         active_receipt_kind = connection.execute(
             select(session_operation_receipts_table.c.kind)
             .where(
                 session_operation_receipts_table.c.session_id == session_id,
                 session_operation_receipts_table.c.status == "in_progress",
+                session_operation_receipts_table.c.lease_expires_at > state._database_now,
             )
             .order_by(session_operation_receipts_table.c.operation_id)
             .limit(1)
@@ -811,6 +818,17 @@ class _RepositorySessionMutations:
                     session_operation_receipts_table.c.kind == "session_fork",
                     session_operation_receipts_table.c.status == "completed",
                     session_operation_receipts_table.c.result_session_id == session_id,
+                )
+                .limit(1)
+            ).first()
+            # The session's own expired in-progress receipt (live ones are
+            # refused above) is an abandoned operation's record, and a fork's
+            # names its staged child under a RESTRICT key: archive softly.
+            or connection.execute(
+                select(session_operation_receipts_table.c.operation_id)
+                .where(
+                    session_operation_receipts_table.c.session_id == session_id,
+                    session_operation_receipts_table.c.status == "in_progress",
                 )
                 .limit(1)
             ).first()
@@ -3332,6 +3350,7 @@ class _RepositoryBlobMutations:
                 session_operation_receipts_table.c.session_id == state._session_id,
                 session_operation_receipts_table.c.kind == SessionOperationKind.SESSION_FORK.value,
                 session_operation_receipts_table.c.status == "in_progress",
+                session_operation_receipts_table.c.lease_expires_at > state._database_now,
             )
             .order_by(session_operation_receipts_table.c.operation_id)
             .limit(1)
