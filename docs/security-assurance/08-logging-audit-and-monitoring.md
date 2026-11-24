@@ -254,8 +254,9 @@ The eleven triggers are created on both SQLite and PostgreSQL (measured by
 creating a scratch SQLite sessions database and listing its triggers; the
 PostgreSQL forms are defined beside them in `src/elspeth/web/sessions/models.py`).
 When a user deletes a session that carries durable history — a run, a
-completion event, a fork, an approval, review or library record, or usage
-records — the session is soft-archived: it is hidden, and its transcript
+completion event, a fork, an approval, review or library record, usage
+records, or its own fork or revert operation left in progress past its
+lease — the session is soft-archived: it is hidden, and its transcript
 and records are kept (`decide_and_soft_archive` in
 `src/elspeth/web/coordination/repository.py`). A session with none of these
 is deleted [EV-307].
