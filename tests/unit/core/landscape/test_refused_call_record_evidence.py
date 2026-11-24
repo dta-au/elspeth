@@ -8,7 +8,8 @@ it must carry enough to identify the call and its usage.
 
 import json
 from dataclasses import dataclass, replace
-from typing import ClassVar
+from decimal import Decimal
+from typing import Any, ClassVar
 
 import pytest
 from sqlalchemy import func, select
@@ -694,4 +695,186 @@ def test_token_usage_subclass_is_refused_at_state_call_entry_before_any_fence() 
         _ArmedUsage.armed = False
 
     assert _ArmedUsage.reads == []
+    assert _coordination_state(setup) == before
+
+
+class _LyingMroMeta(type):
+    """A metaclass whose computed MRO omits the real base, so ``issubclass(type(v), float)`` is false."""
+
+    def mro(cls) -> list[type]:
+        return [cls, object]
+
+
+def _unrecognised(kind: str) -> Any:
+    """A value no type-only check recognises; deliberately outside every annotation it is passed to."""
+    if kind == "decimal":
+        return Decimal("12.5")
+
+    class _LyingFloat(float, metaclass=_LyingMroMeta):
+        pass
+
+    return _LyingFloat(12.5)
+
+
+_UNRECOGNISED = pytest.mark.parametrize("kind", ["decimal", "lying_float"])
+
+
+def _assert_raised_at_entry(excinfo: pytest.ExceptionInfo[BaseException]) -> None:
+    """The error was not raised while handling a refusal (it would then chain to it)."""
+    raised_inside_a_refusal = excinfo.value.__context__ is not None
+    assert not raised_inside_a_refusal
+
+
+@_UNRECOGNISED
+def test_unrecognised_latency_is_refused_at_state_call_entry_before_the_item_fence(kind: str) -> None:
+    """A latency no type check recognises fails at entry: the item-lease refusal never starts, so none is replaced."""
+    setup = _setup()
+    _terminate_item(setup)
+    before = _coordination_state(setup)
+
+    with pytest.raises(TypeError, match="refused-call field holds") as excinfo:
+        _record_state_call(setup, latency_ms=_unrecognised(kind))
+
+    _assert_raised_at_entry(excinfo)
+    assert _coordination_state(setup) == before
+
+
+@_UNRECOGNISED
+def test_unrecognised_latency_is_refused_at_state_call_entry_before_the_membership_fence(kind: str) -> None:
+    """The membership fence writes its own refusal event when it runs; here it never runs."""
+    setup = _setup()
+    setup.recorder.factory.run_coordination.depart_worker(member_token=setup.member)
+    before = _coordination_state(setup)
+
+    with pytest.raises(TypeError, match="refused-call field holds") as excinfo:
+        _record_state_call(setup, latency_ms=_unrecognised(kind))
+
+    _assert_raised_at_entry(excinfo)
+    assert _coordination_state(setup) == before
+
+
+def test_unrecognised_attempt_is_refused_at_state_call_entry_before_the_membership_fence() -> None:
+    """The work item's attempt is normalised at entry like the record's own fields."""
+    setup = _setup()
+    setup.recorder.factory.run_coordination.depart_worker(member_token=setup.member)
+    unrecognised = replace(setup.item, attempt=_unrecognised("decimal"))
+    before = _coordination_state(setup)
+
+    with pytest.raises(TypeError, match="refused-call field holds") as excinfo:
+        setup.recorder.execution.record_call(
+            setup.state_id,
+            0,
+            CallType.LLM,
+            CallStatus.SUCCESS,
+            RawCallPayload(_REQUEST),
+            RawCallPayload(_RESPONSE),
+            latency_ms=12.5,
+            token_usage=_USAGE,
+            call_id="attempt-late-1",
+            member_token=setup.member,
+            work_item=unrecognised,
+        )
+
+    _assert_raised_at_entry(excinfo)
+    assert _coordination_state(setup) == before
+
+
+def test_status_that_is_not_the_enum_is_refused_at_state_call_entry_before_the_membership_fence() -> None:
+    """``status.value`` would otherwise be read inside the unwind; a plain string fails at entry instead."""
+    setup = _setup()
+    setup.recorder.factory.run_coordination.depart_worker(member_token=setup.member)
+    before = _coordination_state(setup)
+    status: Any = "success"
+
+    with pytest.raises(TypeError, match="refused-call status must be CallStatus") as excinfo:
+        setup.recorder.execution.record_call(
+            setup.state_id,
+            0,
+            CallType.LLM,
+            status,
+            RawCallPayload(_REQUEST),
+            RawCallPayload(_RESPONSE),
+            latency_ms=12.5,
+            token_usage=_USAGE,
+            call_id="attempt-late-1",
+            member_token=setup.member,
+            work_item=setup.item,
+        )
+
+    _assert_raised_at_entry(excinfo)
+    assert _coordination_state(setup) == before
+
+
+def _begin_operation(setup: _Setup) -> str:
+    repo = setup.recorder.execution
+    return repo.begin_operation(
+        setup.recorder.source_node_id, "source_load", coordination_token=setup.recorder.coordination_token
+    ).operation_id
+
+
+@_UNRECOGNISED
+@pytest.mark.parametrize("call_index", [0, None], ids=["leader_fence", "index_allocation"])
+def test_unrecognised_latency_is_refused_at_operation_call_entry_before_any_leader_fence(kind: str, call_index: int | None) -> None:
+    """Both leader fences (the call's own, and the index allocation's) write their own refusal event when they run."""
+    setup = _setup()
+    operation_id = _begin_operation(setup)
+    token = setup.recorder.coordination_token
+    stale = replace(token, leader_epoch=token.leader_epoch + 1)
+    before = _coordination_state(setup)
+
+    with pytest.raises(TypeError, match="refused-call field holds") as excinfo:
+        setup.recorder.execution.record_operation_call(
+            operation_id,
+            CallType.HTTP,
+            CallStatus.SUCCESS,
+            RawCallPayload(_REQUEST),
+            RawCallPayload(_RESPONSE),
+            latency_ms=_unrecognised(kind),
+            call_index=call_index,
+            coordination_token=stale,
+        )
+
+    _assert_raised_at_entry(excinfo)
+    assert _coordination_state(setup) == before
+
+
+def test_unrecognised_latency_is_refused_before_an_operation_call_index_is_allocated() -> None:
+    """With a live leader, the refusal at entry comes before the allocation, so no index is consumed."""
+    setup = _setup()
+    repo = setup.recorder.execution
+    operation = repo.begin_operation(setup.recorder.source_node_id, "source_load", coordination_token=setup.recorder.coordination_token)
+
+    with pytest.raises(TypeError, match="refused-call field holds"):
+        repo.record_operation_call(
+            operation.operation_id,
+            CallType.HTTP,
+            CallStatus.SUCCESS,
+            RawCallPayload(_REQUEST),
+            RawCallPayload(_RESPONSE),
+            latency_ms=_unrecognised("decimal"),
+            coordination_token=setup.recorder.coordination_token,
+        )
+    recorded = repo.record_operation_call(
+        operation.operation_id,
+        CallType.HTTP,
+        CallStatus.SUCCESS,
+        RawCallPayload(_REQUEST),
+        RawCallPayload(_RESPONSE),
+        latency_ms=12.5,
+        coordination_token=setup.recorder.coordination_token,
+    )
+
+    assert recorded.call_index == 0
+    assert _fence_refusals(setup) == []
+
+
+@_UNRECOGNISED
+def test_unrecognised_latency_is_refused_when_no_fence_refuses_either(kind: str) -> None:
+    """The type a refused record cannot hold is refused on every path, not only under a refusal."""
+    setup = _setup()
+    before = _coordination_state(setup)
+
+    with pytest.raises(TypeError, match="refused-call field holds"):
+        _record_state_call(setup, latency_ms=_unrecognised(kind))
+
     assert _coordination_state(setup) == before

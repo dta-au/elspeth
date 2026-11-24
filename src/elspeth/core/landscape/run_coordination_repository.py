@@ -286,6 +286,12 @@ class RefusedCallRecord:
     allocation itself (event verb ``allocate_operation_call_index``): no index
     was ever assigned, so none is invented. ``call_id`` is then ``None`` too
     unless the caller supplied an explicit attempt id.
+
+    The record is built before the fence, and construction normalises every
+    field to an exact built-in (see :func:`_exact_builtin`) and requires
+    ``call_type`` and ``status`` to be the enums themselves. A value of any
+    other type therefore fails at entry, where no refusal exists yet to be
+    replaced, and the refusal's unwind handles only exact built-ins.
     """
 
     call_id: str | None
@@ -301,6 +307,23 @@ class RefusedCallRecord:
     cached_prompt_tokens: int | None
     reasoning_tokens: int | None
     latency_ms: float | None
+
+    def __post_init__(self) -> None:
+        if type(self.call_type) is not CallType:
+            raise TypeError("refused-call call_type must be CallType")
+        if type(self.status) is not CallStatus:
+            raise TypeError("refused-call status must be CallStatus")
+        object.__setattr__(self, "call_id", _exact_builtin(self.call_id))
+        object.__setattr__(self, "state_id", _exact_builtin(self.state_id))
+        object.__setattr__(self, "operation_id", _exact_builtin(self.operation_id))
+        object.__setattr__(self, "call_index", _exact_builtin(self.call_index))
+        object.__setattr__(self, "request_hash", _exact_builtin(self.request_hash))
+        object.__setattr__(self, "response_hash", _exact_builtin(self.response_hash))
+        object.__setattr__(self, "prompt_tokens", _exact_builtin(self.prompt_tokens))
+        object.__setattr__(self, "completion_tokens", _exact_builtin(self.completion_tokens))
+        object.__setattr__(self, "cached_prompt_tokens", _exact_builtin(self.cached_prompt_tokens))
+        object.__setattr__(self, "reasoning_tokens", _exact_builtin(self.reasoning_tokens))
+        object.__setattr__(self, "latency_ms", _exact_builtin(self.latency_ms))
 
     def event_context(self) -> dict[str, str | int | float | None]:
         """The record as exact built-in values (see :func:`_exact_builtin`)."""
@@ -321,12 +344,29 @@ class RefusedCallRecord:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class RefusedCallWorkItem:
+    """The work item and attempt a refused state call ran under.
+
+    Built before the fence, like :class:`RefusedCallRecord`, and normalised the
+    same way at construction, so the refusal's unwind reads only exact
+    built-ins.
+    """
+
+    work_item_id: str
+    attempt: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "work_item_id", _exact_builtin(self.work_item_id))
+        object.__setattr__(self, "attempt", _exact_builtin(self.attempt))
+
+
 def _exact_builtin(value: object) -> str | int | float | None:
     """One refused-call field as an exact built-in ``str``, ``int``, ``float``, ``bool`` or ``None``.
 
-    The record is built inside a fence refusal's unwind, so nothing downstream
-    of it (canonical JSON, its refusal message, the last-resort log) may reach
-    a method of a subclass the contracts admit (the ``TokenUsage`` constructor accepts an
+    Record construction runs this before the fence, so nothing downstream of
+    it inside a refusal's unwind (canonical JSON, its refusal message, the
+    last-resort log) may reach a method of a subclass the contracts admit (the ``TokenUsage`` constructor accepts an
     ``int`` subclass, and ``latency_ms`` is not type-checked). Each base-class
     conversion returns an exact-type copy for a subclass. ``bool`` is kept as
     itself: through ``int`` it would become ``1`` and change the event's
@@ -715,8 +755,7 @@ def record_refused_call(
     verb: str,
     fence: Literal["leader", "membership", "item"],
     refused_call: RefusedCallRecord,
-    work_item_id: str | None,
-    attempt: int | None,
+    work_item: RefusedCallWorkItem | None,
 ) -> None:
     """Record a call whose ``calls`` row a fence refused; fresh connection, never raises.
 
@@ -735,12 +774,15 @@ def record_refused_call(
     but canonical JSON refuses: a non-finite latency, or a token count beyond
     the canonical integer range. The context is encoded here with the writer's
     own encoder first, so no such value can raise inside the caller's unwind.
+    ``refused_call`` and ``work_item`` were normalised to exact built-ins when
+    they were built, before the fence; ``work_item`` is ``None`` for a call
+    made outside a work item (operation calls).
     """
     context: _RefusedCallEventContext = {
         "verb": verb,
         "fence": fence,
-        "work_item_id": _exact_builtin(work_item_id),
-        "attempt": _exact_builtin(attempt),
+        "work_item_id": None if work_item is None else work_item.work_item_id,
+        "attempt": None if work_item is None else work_item.attempt,
         "refused_call": refused_call.event_context(),
     }
     refusal = _canonical_json_refusal(context)

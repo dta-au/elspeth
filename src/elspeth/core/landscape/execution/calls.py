@@ -14,6 +14,7 @@ import json
 from collections import OrderedDict
 from collections.abc import Collection, Iterator
 from concurrent.futures import Future
+from dataclasses import replace
 from datetime import datetime
 from threading import Lock
 from typing import TYPE_CHECKING, Literal, NamedTuple
@@ -43,7 +44,12 @@ from elspeth.core.landscape.execution.sink_effect_identity import MAX_LINEAGE_DE
 from elspeth.core.landscape.item_fencing import fenced_item_transaction
 from elspeth.core.landscape.model_loaders import CallLoader
 from elspeth.core.landscape.row_data import CallDataResult, CallDataState
-from elspeth.core.landscape.run_coordination_repository import RefusedCallRecord, fenced_leader_transaction, record_refused_call
+from elspeth.core.landscape.run_coordination_repository import (
+    RefusedCallRecord,
+    RefusedCallWorkItem,
+    fenced_leader_transaction,
+    record_refused_call,
+)
 from elspeth.core.landscape.schema import (
     call_verifications_table,
     calls_table,
@@ -608,6 +614,20 @@ class CallAuditRepository:
             request_ref,
             response_ref,
         )
+        # Built before the fence: a value the refused record cannot hold fails
+        # here, where no refusal exists yet to be replaced.
+        refused_call = _refused_call_record(
+            call_id=call_id,
+            state_id=state_id,
+            operation_id=None,
+            call_index=call_index,
+            call_type=call_type,
+            status=status,
+            prepared=prepared,
+            token_usage=token_usage,
+            latency_ms=latency_ms,
+        )
+        refused_work_item = RefusedCallWorkItem(work_item_id=work_item.work_item_id, attempt=work_item.attempt)
 
         values: dict[str, object] = {
             "call_id": call_id,
@@ -639,17 +659,6 @@ class CallAuditRepository:
             operation=False,
         )
         recorded_index: int | None = None
-        refused_call = _refused_call_record(
-            call_id=call_id,
-            state_id=state_id,
-            operation_id=None,
-            call_index=call_index,
-            call_type=call_type,
-            status=status,
-            prepared=prepared,
-            token_usage=token_usage,
-            latency_ms=latency_ms,
-        )
         try:
             with fenced_item_transaction(
                 self._db.engine,
@@ -676,10 +685,10 @@ class CallAuditRepository:
         except SchedulerLeaseLostError:
             # The call already happened; with its row refused, the refusal
             # event is its only durable record.
-            self._record_refused_state_call(member_token, work_item, refused_call, fence="item")
+            self._record_refused_state_call(member_token, refused_work_item, refused_call, fence="item")
             raise
         except RunMembershipLostError:
-            self._record_refused_state_call(member_token, work_item, refused_call, fence="membership")
+            self._record_refused_state_call(member_token, refused_work_item, refused_call, fence="membership")
             raise
         finally:
             self._finish_allocation(
@@ -728,7 +737,7 @@ class CallAuditRepository:
     def _record_refused_state_call(
         self,
         member_token: WorkerMembershipToken,
-        work_item: TokenWorkItem,
+        work_item: RefusedCallWorkItem,
         refused_call: RefusedCallRecord,
         *,
         fence: Literal["membership", "item"],
@@ -741,8 +750,7 @@ class CallAuditRepository:
             verb="record_call",
             fence=fence,
             refused_call=refused_call,
-            work_item_id=work_item.work_item_id,
-            attempt=work_item.attempt,
+            work_item=work_item,
         )
 
     def record_operation_call(
@@ -809,13 +817,26 @@ class CallAuditRepository:
             request_ref,
             response_ref,
         )
+        # Built before the index allocation and the fence: a value the refused
+        # record cannot hold fails here, where no refusal exists yet to be
+        # replaced. Until an index is allocated the record carries the index
+        # (and any generated id) as absent, never a placeholder.
+        refused_call = _refused_call_record(
+            call_id=call_id,
+            state_id=None,
+            operation_id=operation_id,
+            call_index=call_index,
+            call_type=call_type,
+            status=status,
+            prepared=prepared,
+            token_usage=token_usage,
+            latency_ms=latency_ms,
+        )
         if call_index is None:
             try:
                 call_index = self.allocate_operation_call_index(operation_id, coordination_token=coordination_token)
             except RunLeadershipLostError:
-                # The call already happened and no index was ever assigned to
-                # it: the record carries its index (and any generated id) as
-                # absent, never a placeholder.
+                # The call already happened and no index was ever assigned to it.
                 record_refused_call(
                     self._db.engine,
                     run_id=coordination_token.run_id,
@@ -823,22 +844,12 @@ class CallAuditRepository:
                     leader_epoch=coordination_token.leader_epoch,
                     verb="allocate_operation_call_index",
                     fence="leader",
-                    refused_call=_refused_call_record(
-                        call_id=call_id,
-                        state_id=None,
-                        operation_id=operation_id,
-                        call_index=None,
-                        call_type=call_type,
-                        status=status,
-                        prepared=prepared,
-                        token_usage=token_usage,
-                        latency_ms=latency_ms,
-                    ),
-                    work_item_id=None,
-                    attempt=None,
+                    refused_call=refused_call,
+                    work_item=None,
                 )
                 raise
         call_id = f"call_{operation_id}_{call_index}" if call_id is None else call_id
+        refused_call = replace(refused_call, call_id=call_id, call_index=call_index)
         returned_model = response_data.model if isinstance(response_data, LLMCallResponse) else None
         timestamp = now() if created_at is None else created_at
 
@@ -872,17 +883,6 @@ class CallAuditRepository:
             operation=True,
         )
         recorded_index = None
-        refused_call = _refused_call_record(
-            call_id=call_id,
-            state_id=None,
-            operation_id=operation_id,
-            call_index=call_index,
-            call_type=call_type,
-            status=status,
-            prepared=prepared,
-            token_usage=token_usage,
-            latency_ms=latency_ms,
-        )
         try:
             with fenced_leader_transaction(
                 self._db.engine,
@@ -917,8 +917,7 @@ class CallAuditRepository:
                 verb="record_operation_call",
                 fence="leader",
                 refused_call=refused_call,
-                work_item_id=None,
-                attempt=None,
+                work_item=None,
             )
             raise
         finally:
