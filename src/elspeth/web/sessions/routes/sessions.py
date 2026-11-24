@@ -901,11 +901,17 @@ def register_session_routes(router: APIRouter) -> None:
         request: Request,
         user: Annotated[UserIdentity, Depends(require_pipeline_user)],
     ) -> None:
-        """Archive (delete) a session and all associated data.
+        """Archive a session, or delete it if it has no durable history.
 
-        Rejects deletion while a pipeline run is active — archive_session()
-        would delete run rows and blob directories out from under the
-        background worker, causing status update failures and data loss.
+        A session with durable history (a run, a completion event, a fork,
+        an approval, review or library record, usage records, or a fork or
+        revert operation left in progress past its lease) is archived: it
+        is hidden from the default session list, and its transcript and
+        records are kept. A session with none of these is deleted together
+        with its stored files. Archived sessions cannot be restored.
+
+        Returns 409 while a pipeline run is active (cancel the run first)
+        or while a fork or revert operation on the session is in progress.
         """
         session = await _verify_session_ownership(session_id, user, request)
         service = request.app.state.session_service
@@ -1006,7 +1012,10 @@ def register_session_routes(router: APIRouter) -> None:
                         replay=_replay,
                     )
                 except SessionOperationFenceLost as exc:
-                    if exc.reason is FenceLossReason.MISSING:
+                    # An archived parent (OWNER_INACTIVE) is absent to the user
+                    # exactly as a missing one is: every rejoin re-enters here,
+                    # so neither may loop into the exhausted-rejoin failure.
+                    if exc.reason in (FenceLossReason.MISSING, FenceLossReason.OWNER_INACTIVE):
                         record_session_operation_fence_loss(request, exc)
                         raise HTTPException(status_code=404, detail="Session not found") from exc
                     raise

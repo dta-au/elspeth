@@ -70,6 +70,18 @@ class SessionOperationLeaseDisposition(StrEnum):
     UNKNOWN = "unknown"
 
 
+class CloseReleaseOutcome(StrEnum):
+    """What a lease's close-time release found on its own exact fence.
+
+    ``RELEASED_AFTER_EXPIRY`` still releases the row: the lease's own close
+    gives up a fence whose deadline has passed, and the lifecycle reports the
+    expiry as the loss it is.
+    """
+
+    RELEASED_LIVE = "released_live"
+    RELEASED_AFTER_EXPIRY = "released_after_expiry"
+
+
 class StartPermitState(StrEnum):
     PENDING = "pending"
     START_PERMITTED = "start_permitted"

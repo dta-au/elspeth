@@ -91,10 +91,12 @@ def _graph_review_wording_bounds() -> tuple[int, int]:
             findings_backend_authored=backend,
             category=category,
             notice=notice,
+            draft_has_content=draft_has_content,
         )
         for reason in _TERMINAL_BLOCK_REASONS
         for category in ADVISOR_FINDING_CATEGORIES
         for backend in (False, True)
+        for draft_has_content in (False, True)
         for notice in (
             advisor_policy._ADVISOR_SIGNOFF_PENDING_PUBLISHED_NOTICE,
             advisor_policy._ADVISOR_SIGNOFF_UNVERIFIED_PUBLISHED_NOTICE,
@@ -306,6 +308,7 @@ AdvisorTerminalBlockReason = Literal[
     "request_rejected",
     "malformed",
     "budget_exhausted",
+    "prior_call_cost_unknown",
     "publication_withheld",
     "flagged_final_pass",
     "flagged_no_repair",
@@ -317,6 +320,7 @@ _TERMINAL_BLOCK_REASONS: Final[frozenset[str]] = frozenset(
         "request_rejected",
         "malformed",
         "budget_exhausted",
+        "prior_call_cost_unknown",
         "publication_withheld",
         "flagged_final_pass",
         "flagged_no_repair",

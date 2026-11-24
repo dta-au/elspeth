@@ -24,20 +24,61 @@ changes land and is not a release.
   set, the Composer's request byte maximum is now derived from
   `ELSPETH_WEB__COMPOSER_CONTEXT_MAX_PROMPT_TOKENS` (8 bytes per token:
   1,600,000 bytes for a 200,000-token limit) instead of the fixed 983,040.
-  If a proxy in front of your model gateway limits request bodies (nginx's
-  default is 1 MiB), set the byte maximum below that limit. A request a
-  provider or proxy refuses with HTTP 413 is now treated as too large: it is
-  sent once more with earlier turns left out, then refused as too large,
-  instead of being retried unchanged. On the direct Anthropic route a 413 is
-  reported as an ordinary rejected request.
+  An explicit value is used as set. If a proxy in front of your model gateway
+  limits request bodies (nginx's default is 1 MiB), set the byte maximum
+  below that limit.
+- **Changed:** a request that a provider or proxy refuses with HTTP 413 is
+  now a size rejection: it is sent once more with earlier turns left out and
+  is never resent unchanged. On the direct Anthropic route a 413 is not
+  recognised and stays an ordinary rejected request.
+- **Changed:** a request a provider or proxy refuses as too large is now
+  reported as too large, without a Retry button; an administrator can raise
+  that limit.
+- **Changed:** the Composer's context budget now prices a request at the
+  bytes per token measured on the newest successful call to the same model
+  and tool dialect (a call earlier in the same turn first, otherwise the
+  session's stored calls), less a 10% margin, and at 3.0 when there is no
+  such call. Before, it used 3.0. In both, the rate is lowered to the density
+  the provider counted on an earlier call in the same turn, when that is
+  lower. A recognised size
+  rejection (over the context limit, or HTTP 413) is now resent once with
+  earlier turns left out for planner, optional reply, advisor review and
+  last-composition requests too, not only the compose loop. If the resend is
+  rejected again, a compose-loop or planner turn is refused as too large,
+  the reply is reported unavailable as before, and the review is recorded as
+  a rejected request.
 - **Added:** each Composer call's audit record now says what recognised a
-  size rejection (a structured code, the exception class, the HTTP status or
-  a fixed provider wording), and its context-budget record names the call it
+  size rejection: a structured code, the HTTP status, the client library's
+  context-window exception (which it can assign from the provider's message)
+  or a fixed provider wording. Each context-budget record names the call it
   was made for (compose loop, reply, planner or escape hatch) and where the
-  density it was priced from came from. Advisor review calls have no
-  context-budget record, so they carry no surface or density. Records written
+  bytes-per-token density it was priced at came from. Advisor review calls
+  have no context-budget record, so they carry neither. Records written
   before this release carry none of these fields; their absence means
   unknown.
+- **Changed:** when a provider call fails, the composer's main loop and planner
+  decide whether a retry's wait plus 5 s still fits before the deadline (the
+  request's, or the planner's own time limit when that is earlier), and retry
+  only if it does. This also applies to the failures they already retried,
+  including a provider 503 and LiteLLM's general API error (see the 429 entry
+  under Fixed). Below, "a 503" means any of these. When the retry does not
+  fit, the main loop reports the provider failure at once. The planner, after a
+  503 whose retry does not fit, waits until the deadline and reports a time-out
+  instead of making one last call; after a 429 whose retry does not fit, it
+  reports the provider failure at once. When the failed call used the last call
+  the budget allows and another attempt remains, the planner reports a
+  call-budget refusal at once, after a 503 or after a 429 whose retry would
+  fit. On an escape-hatch turn, the planner reports the hatch's original
+  exhaustion in place of the provider failure or the call-budget refusal, as
+  it did before this release; the time-out still stands. The completion review
+  keeps its existing immediate retry and does not retry a 429.
+- **Do not enable a composer token quota yet.** With one configured, a failed
+  provider call's usage is recorded as unknown, and that refuses the user's
+  later model calls ("Token accounting is unavailable") until usage is
+  reconciled. A retry after a transient failure is refused the same way. Since
+  a 429 is now retried, a rate-limited turn with a quota configured waits for
+  the retry delay, up to 30 s, before that refusal; before this release the 429
+  was reported at once.
 
 ### Fixed
 
@@ -53,6 +94,27 @@ changes land and is not a release.
 - When a stored conversation row fails the composer's history integrity
   check, the error now names the row (id, sequence number, role), so the
   damaged row can be found.
+- The composer's main loop and planner now retry a provider 429 within the
+  request's deadline, after 1 s and then 2 s. Where LiteLLM keeps the
+  provider's Retry-After header, which was measured only on Bedrock, they wait
+  for the longer of that header and the 1 s or 2 s step, when the header is
+  30 s or less; a longer Retry-After is not retried. A quota or credit refusal
+  arrives as an ordinary 429, so it is retried within the same bound before it
+  is reported. On the OpenAI and Anthropic routes a provider 500 and connection
+  failures are still not retried, because LiteLLM reports a failure to read an
+  already billed response the same way. On the OpenRouter route LiteLLM
+  reports all of these as a general API error, which was already retried
+  before this release and still is. On the Anthropic and Bedrock routes a 403
+  in the composer's main loop now tells the user to check provider access; the
+  planner still reports it as the provider being unavailable. On the OpenAI and
+  OpenRouter routes LiteLLM reports a 403 as a general API error, so it is
+  still retried and reported as unavailable.
+- When a planner reply was withheld because the cost of an earlier model call
+  in the same request could not be confirmed, the notice blamed "the existing
+  request limits". It now names that cause. The withheld-reply notice also no
+  longer claims "Saved draft progress remains available" when the pipeline
+  draft is empty. Both corrections also apply to the existing withhold after a
+  provider 503.
 
 ---
 

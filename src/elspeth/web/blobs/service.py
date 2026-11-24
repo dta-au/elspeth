@@ -21,7 +21,7 @@ from typing import Any, Final, Never, TypedDict, TypeVar, cast
 from uuid import UUID, uuid4, uuid5
 
 from opentelemetry import metrics
-from sqlalchemy import Engine, func, select
+from sqlalchemy import Engine, select
 from sqlalchemy.engine import Connection, Row
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
@@ -65,6 +65,7 @@ from elspeth.web.blobs.protocol import (
     names_same_blob,
 )
 from elspeth.web.composer.yaml_generator import LoweredPipelineDocument
+from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.coordination.quota_authority import (
     QuotaExceeded,
     admit_storage_bytes_on_connection,
@@ -504,7 +505,7 @@ def _require_live_fork_write_fence(conn: Connection, fence: BlobForkWriteFence) 
             session_operation_receipts_table.c.result_session_id == str(fence.target_session_id),
             session_operation_receipts_table.c.lease_token == fence.lease_token,
             session_operation_receipts_table.c.attempt == fence.attempt,
-            session_operation_receipts_table.c.lease_expires_at > func.current_timestamp(),
+            session_operation_receipts_table.c.lease_expires_at > database_now(conn),
         )
     ).one_or_none()
     if row is None:
@@ -2310,13 +2311,18 @@ def _row_to_blob_record(row: Any) -> BlobRecord:
 
 
 def _in_progress_session_fork_operation_id(conn: Connection, session_id: str) -> str | None:
-    """Return the operation retaining every blob in a session, if any."""
+    """Return the live fork operation retaining every blob in a session, if any.
+
+    A fork whose receipt lease has expired, judged by the database clock as a
+    receipt takeover judges it, no longer retains the session's blobs.
+    """
     return conn.execute(
         select(session_operation_receipts_table.c.operation_id)
         .where(
             session_operation_receipts_table.c.session_id == session_id,
             session_operation_receipts_table.c.kind == "session_fork",
             session_operation_receipts_table.c.status == "in_progress",
+            session_operation_receipts_table.c.lease_expires_at > database_now(conn),
         )
         .limit(1)
     ).scalar_one_or_none()

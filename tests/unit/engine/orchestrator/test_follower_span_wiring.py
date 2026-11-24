@@ -40,7 +40,7 @@ class _RunCoordination:
     def __init__(self) -> None:
         self.departed: list[str] = []
 
-    def live_leader(self, *, run_id: str) -> LeaderInfo:
+    def seat_holder(self, *, run_id: str) -> LeaderInfo:
         return LeaderInfo(
             run_id=run_id,
             leader_worker_id=f"worker:{run_id}:leader",
