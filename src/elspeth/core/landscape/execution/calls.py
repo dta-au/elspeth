@@ -588,7 +588,7 @@ class CallAuditRepository:
         # raise. Checking here keeps the audit trail pristine (Tier 1): a bad
         # hash leaves zero rows (elspeth-a94e626a36).
         validate_approved_prompt_artifact_hash(call_type, approved_prompt_artifact_hash)
-        if not isinstance(token_usage, TokenUsage):
+        if type(token_usage) is not TokenUsage:
             raise TypeError("token_usage must be TokenUsage")
 
         explicit_call_id = call_id is not None
@@ -792,7 +792,7 @@ class CallAuditRepository:
         # `calls` rows rather than commit and then raise from Call.__post_init__
         # (elspeth-a94e626a36).
         validate_approved_prompt_artifact_hash(call_type, approved_prompt_artifact_hash)
-        if not isinstance(token_usage, TokenUsage):
+        if type(token_usage) is not TokenUsage:
             raise TypeError("token_usage must be TokenUsage")
 
         explicit_call_id = call_id is not None

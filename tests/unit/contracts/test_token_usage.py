@@ -219,6 +219,56 @@ class TestTokenUsageFromDict:
         assert usage.reported_total is None
 
 
+class _ProviderIntSubclass(int):
+    """An int subclass a duck-typed provider SDK object could hand over: its comparisons and attribute reads raise."""
+
+    def __ge__(self, other: object) -> bool:
+        raise RuntimeError("subclass __ge__ ran")
+
+    def __lt__(self, other: object) -> bool:
+        raise RuntimeError("subclass __lt__ ran")
+
+    def __getattribute__(self, name: str) -> object:
+        raise RuntimeError(f"subclass attribute read {name}")
+
+
+class TestTokenUsageFromDictExactIntegers:
+    """The Tier 3 boundary stores exact ints and never runs a provider subclass's own methods."""
+
+    def test_int_subclass_counts_are_stored_as_exact_ints(self) -> None:
+        usage = TokenUsage.from_dict(
+            {
+                "prompt_tokens": _ProviderIntSubclass(10),
+                "completion_tokens": _ProviderIntSubclass(20),
+                "total_tokens": _ProviderIntSubclass(30),
+                "cached_prompt_tokens": _ProviderIntSubclass(4),
+                "cache_creation_input_tokens": _ProviderIntSubclass(5),
+                "cache_read_input_tokens": _ProviderIntSubclass(6),
+                "reasoning_tokens": _ProviderIntSubclass(7),
+            }
+        )
+        stored = (
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            usage.reported_total,
+            usage.cached_prompt_tokens,
+            usage.cache_creation_input_tokens,
+            usage.cache_read_input_tokens,
+            usage.reasoning_tokens,
+        )
+        assert stored == (10, 20, 30, 4, 5, 6, 7)
+        assert [type(count) for count in stored] == [int] * 7
+
+    def test_negative_int_subclass_count_is_unknown(self) -> None:
+        usage = TokenUsage.from_dict({"prompt_tokens": _ProviderIntSubclass(-1), "completion_tokens": 3})
+        assert usage.prompt_tokens is None
+        assert usage.completion_tokens == 3
+
+    def test_bool_count_is_unknown(self) -> None:
+        usage = TokenUsage.from_dict({"prompt_tokens": True, "completion_tokens": False, "reasoning_tokens": True})
+        assert usage == TokenUsage.unknown()
+
+
 class TestTokenUsageImmutability:
     """Tests for frozen dataclass invariants."""
 

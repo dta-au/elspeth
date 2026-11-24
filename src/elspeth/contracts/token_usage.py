@@ -224,16 +224,12 @@ class TokenUsage:
         raw_completion = data.get("completion_tokens")
         raw_total = data.get("total_tokens")
 
-        # bool is a subclass of int in Python, so isinstance(True, int) is True.
-        # But True/False are not valid token counts — reject them as non-int.
-        # Negative values are coerced to None (not passed through to crash
-        # in __post_init__) — this is a Tier 3 boundary, so invalid external
-        # data is coerced, not propagated.
-        prompt = raw_prompt if isinstance(raw_prompt, int) and not isinstance(raw_prompt, bool) and raw_prompt >= 0 else None
-        completion = (
-            raw_completion if isinstance(raw_completion, int) and not isinstance(raw_completion, bool) and raw_completion >= 0 else None
-        )
-        total = raw_total if isinstance(raw_total, int) and not isinstance(raw_total, bool) and raw_total >= 0 else None
+        # True/False are not valid token counts, and negative values are coerced
+        # to None (not passed through to crash in __post_init__): this is a
+        # Tier 3 boundary, so invalid external data is coerced, not propagated.
+        prompt = _coerce_nonneg_int(raw_prompt)
+        completion = _coerce_nonneg_int(raw_completion)
+        total = _coerce_nonneg_int(raw_total)
 
         # Cache field extraction. Try the canonical top-level form first
         # (round-trip path), then fall back to the OpenAI nested shape for
@@ -274,25 +270,31 @@ UNKNOWN_TOKEN_USAGE = TokenUsage()
     tier=3,
     source=(
         "one token-count field lifted out of an LLM API provider response by TokenUsage.from_dict "
-        "(cached_prompt_tokens / prompt_tokens_details.cached_tokens / cache_creation_input_tokens / "
-        "cache_read_input_tokens / reasoning_tokens) — provider JSON ELSPETH does not own"
+        "(prompt_tokens / completion_tokens / total_tokens / cached_prompt_tokens / "
+        "prompt_tokens_details.cached_tokens / cache_creation_input_tokens / cache_read_input_tokens / "
+        "reasoning_tokens) — provider data ELSPETH does not own"
     ),
     source_param="value",
     suppresses=("R5",),
     invariant=(
-        "returns the value only when it is a non-negative, non-bool int; every other shape "
-        "(str, float, bool, None, absent key, negative int) returns None so an unreported cache "
-        "statistic stays unknown rather than being fabricated as zero; never raises on external data"
+        "returns an exact int only when the value is a non-negative, non-bool int; every other shape "
+        "(str, float, bool, None, absent key, negative int) returns None so an unreported count "
+        "stays unknown rather than being fabricated as zero; an int subclass is converted to an exact "
+        "int before it is compared, so none of its own methods run; never raises on external data"
     ),
 )
 def _coerce_nonneg_int(value: Any) -> int | None:
     """Tier-3 helper: coerce arbitrary input to a non-negative int or ``None``.
 
-    Mirrors the per-field coercion used for ``prompt_tokens`` /
-    ``completion_tokens`` / ``total_tokens`` so cache fields obey the same
-    "absence is evidence, not zero" semantics. ``bool`` is excluded because
-    ``isinstance(True, int)`` is ``True`` in Python.
+    Every token count obeys the same "absence is evidence, not zero"
+    semantics. ``bool`` is excluded first: it subclasses ``int`` but is not
+    a count. Dispatch reads only the value's type, never the value, and the
+    comparison runs on the exact ``int`` copy, so a subclass's own methods
+    (``__ge__``, ``__getattribute__``, ...) never run here and the stored
+    count is always an exact ``int``.
     """
-    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
-        return value
-    return None
+    value_type = type(value)
+    if issubclass(value_type, bool) or not issubclass(value_type, int):
+        return None
+    exact = int.__int__(value)
+    return exact if exact >= 0 else None

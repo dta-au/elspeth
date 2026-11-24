@@ -3362,11 +3362,13 @@ def _reviewed_call_created_at_transfers(sources: dict[str, str]) -> set[ClockVio
     Pin both facades and the complete final callee. Any new authority use,
     changed receiver, or altered forwarding body withdraws this admission.
     """
+    # record_operation_call re-derived by running this gate's digest on the tree after its
+    # token_usage entry check became an exact-type check; the created_at forward is unchanged.
     reviewed = {
         (
             "src/elspeth/core/landscape/execution/calls.py",
             "CallAuditRepository.record_operation_call",
-        ): "2a7cfd0fb4f0db56b085d6a74e1884d5549f811e628d622cabbc28ce2d81f010",
+        ): "de52d10682ea0aac7899afd7531c194f3d6d4f6365fc97041542b9eeb6112b9c",
         (
             "src/elspeth/core/landscape/execution_repository.py",
             "ExecutionRepository.record_operation_call",

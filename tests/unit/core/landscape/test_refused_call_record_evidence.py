@@ -8,6 +8,7 @@ it must carry enough to identify the call and its usage.
 
 import json
 from dataclasses import dataclass, replace
+from typing import ClassVar
 
 import pytest
 from sqlalchemy import func, select
@@ -486,3 +487,211 @@ def test_refused_call_field_of_another_type_is_refused() -> None:
 
     with pytest.raises(TypeError, match="refused-call field holds list"):
         _exact_builtin([12.5])
+
+
+class _AttributeTrapInt(int):
+    """An int subclass whose every attribute read raises, including ``__class__``."""
+
+    def __getattribute__(self, name: str) -> object:
+        raise RuntimeError(f"attribute read {name}")
+
+
+class _AttributeTrapFloat(float):
+    def __getattribute__(self, name: str) -> object:
+        raise RuntimeError(f"attribute read {name}")
+
+
+class _AttributeTrapStr(str):
+    def __getattribute__(self, name: str) -> object:
+        raise RuntimeError(f"attribute read {name}")
+
+
+class _HostileMeta(type):
+    """A metaclass that refuses every subclass/instance check and every MRO or name lookup."""
+
+    def __subclasscheck__(cls, subclass: type) -> bool:
+        raise RuntimeError("metaclass __subclasscheck__")
+
+    def __instancecheck__(cls, instance: object) -> bool:
+        raise RuntimeError("metaclass __instancecheck__")
+
+    def __getattribute__(cls, name: str) -> object:
+        if name in {"__mro__", "__bases__", "__class__", "__name__", "__qualname__", "mro"}:
+            raise RuntimeError(f"metaclass attribute read {name}")
+        return super().__getattribute__(name)
+
+
+class _MetaTrapFloat(float, metaclass=_HostileMeta):
+    pass
+
+
+@pytest.mark.parametrize(
+    ("value", "expected_type", "formatted"),
+    [
+        pytest.param(_AttributeTrapInt(7), int, "7", id="int_attribute_trap"),
+        pytest.param(_AttributeTrapInt(2**53), int, hex(2**53), id="int_attribute_trap_beyond_range"),
+        pytest.param(_AttributeTrapFloat(12.5), float, "12.5", id="float_attribute_trap"),
+        pytest.param(_AttributeTrapFloat("nan"), float, "nan", id="float_attribute_trap_nan"),
+        pytest.param(_AttributeTrapStr("attempt-late-1"), str, "'attempt-late-1'", id="str_attribute_trap"),
+    ],
+)
+def test_refused_call_field_dispatch_reads_only_the_type(value: str | int | float, expected_type: type, formatted: str) -> None:
+    """Neither the normaliser nor the last-resort formatter reads an attribute of the value or consults its metaclass."""
+    from elspeth.core.landscape.run_coordination_repository import _exact_builtin, _last_resort_log_value
+
+    assert type(_exact_builtin(value)) is expected_type
+    assert _last_resort_log_value(value) == formatted
+
+
+def test_refused_call_field_dispatch_never_consults_the_value_metaclass() -> None:
+    """A metaclass that refuses subclass checks, MRO and name lookups is never consulted.
+
+    The value is built here, not passed as a parameter, and the verdicts are
+    plain values: a failure report never has to repr an object whose type
+    refuses its own name.
+    """
+    from elspeth.core.landscape.run_coordination_repository import _exact_builtin, _last_resort_log_value
+
+    value = _MetaTrapFloat(2.5)
+    normalised_exactly = type(_exact_builtin(value)) is float
+    formatted = _last_resort_log_value(value)
+    assert normalised_exactly
+    assert formatted == "2.5"
+
+
+def _terminate_item(setup: _Setup) -> None:
+    with setup.recorder.db.write_connection() as conn:
+        conn.execute(
+            token_work_items_table.update()
+            .where(token_work_items_table.c.work_item_id == setup.item.work_item_id)
+            .values(status="terminal", lease_owner=None)
+        )
+
+
+def test_refused_call_with_an_attribute_trap_latency_keeps_the_refusal_and_records_the_call() -> None:
+    """A latency whose attribute reads raise is recorded as an exact float; the lease refusal still propagates."""
+    setup = _setup()
+    _terminate_item(setup)
+
+    with pytest.raises(SchedulerLeaseLostError):
+        _record_state_call(setup, latency_ms=_AttributeTrapFloat(12.5))
+
+    refusals = _fence_refusals(setup)
+    assert len(refusals) == 1
+    _assert_refused_call(refusals[0]["refused_call"], call_id="attempt-late-1", state_id=setup.state_id, operation_id=None)
+
+
+def test_refused_call_with_an_attribute_trap_attempt_keeps_the_refusal_and_records_the_attempt() -> None:
+    """The work item's attempt is normalised like every record field; the membership refusal still propagates.
+
+    The membership fence refuses before the item fence builds its predicate, so
+    the work item reaches the refused record untouched: this is the path where
+    the attempt meets canonical JSON inside the unwind.
+    """
+    setup = _setup()
+    setup.recorder.factory.run_coordination.depart_worker(member_token=setup.member)
+    trapped = replace(setup.item, attempt=_AttributeTrapInt(int.__int__(setup.item.attempt)))
+    before = len(_fence_refusals(setup))
+
+    with pytest.raises(RunMembershipLostError):
+        setup.recorder.execution.record_call(
+            setup.state_id,
+            0,
+            CallType.LLM,
+            CallStatus.SUCCESS,
+            RawCallPayload(_REQUEST),
+            RawCallPayload(_RESPONSE),
+            latency_ms=12.5,
+            token_usage=_USAGE,
+            call_id="attempt-late-1",
+            member_token=setup.member,
+            work_item=trapped,
+        )
+
+    refusals = _fence_refusals(setup)[before:]
+    assert len(refusals) == 2
+    context = refusals[1]
+    assert context["attempt"] == setup.item.attempt
+    _assert_refused_call(context["refused_call"], call_id="attempt-late-1", state_id=setup.state_id, operation_id=None)
+
+
+class _ArmedUsage(TokenUsage):
+    """A TokenUsage subclass whose token fields raise on read once armed."""
+
+    __slots__ = ()
+    armed: ClassVar[bool] = False
+    reads: ClassVar[list[str]] = []
+
+    def __getattribute__(self, name: str) -> object:
+        if name.endswith("_tokens") and type(self).armed:
+            type(self).reads.append(name)
+            raise RuntimeError(f"usage field {name}")
+        return super().__getattribute__(name)
+
+
+def _armed_usage() -> _ArmedUsage:
+    usage = _ArmedUsage(prompt_tokens=120, completion_tokens=45)
+    _ArmedUsage.reads = []
+    _ArmedUsage.armed = True
+    return usage
+
+
+def _coordination_state(setup: _Setup) -> tuple[int, int, tuple[object, ...]]:
+    """Every coordination event of the run, the calls count, and the work item's lease row."""
+    with setup.recorder.db.read_only_connection() as conn:
+        events = conn.execute(
+            select(func.count())
+            .select_from(run_coordination_events_table)
+            .where(run_coordination_events_table.c.run_id == setup.recorder.run_id)
+        ).scalar_one()
+        item_row = conn.execute(
+            select(token_work_items_table.c.status, token_work_items_table.c.lease_owner, token_work_items_table.c.attempt).where(
+                token_work_items_table.c.work_item_id == setup.item.work_item_id
+            )
+        ).one()
+    return events, _call_count(setup), tuple(item_row)
+
+
+def test_token_usage_subclass_is_refused_at_operation_call_entry_before_any_fence() -> None:
+    """At index allocation the refused record would read the usage inside the unwind; the subclass never gets that far."""
+    setup = _setup()
+    repo = setup.recorder.execution
+    operation = repo.begin_operation(setup.recorder.source_node_id, "source_load", coordination_token=setup.recorder.coordination_token)
+    stale = replace(setup.recorder.coordination_token, leader_epoch=setup.recorder.coordination_token.leader_epoch + 1)
+    before = _coordination_state(setup)
+    usage = _armed_usage()
+
+    try:
+        with pytest.raises(TypeError, match="token_usage must be TokenUsage"):
+            repo.record_operation_call(
+                operation.operation_id,
+                CallType.LLM,
+                CallStatus.SUCCESS,
+                RawCallPayload(_REQUEST),
+                RawCallPayload(_RESPONSE),
+                latency_ms=12.5,
+                token_usage=usage,
+                coordination_token=stale,
+            )
+    finally:
+        _ArmedUsage.armed = False
+
+    assert _ArmedUsage.reads == []
+    assert _coordination_state(setup) == before
+
+
+def test_token_usage_subclass_is_refused_at_state_call_entry_before_any_fence() -> None:
+    """The item-lease path refuses the subclass at entry too: no field read, no refusal event, no lease change."""
+    setup = _setup()
+    _terminate_item(setup)
+    before = _coordination_state(setup)
+    usage = _armed_usage()
+
+    try:
+        with pytest.raises(TypeError, match="token_usage must be TokenUsage"):
+            _record_state_call(setup, token_usage=usage)
+    finally:
+        _ArmedUsage.armed = False
+
+    assert _ArmedUsage.reads == []
+    assert _coordination_state(setup) == before

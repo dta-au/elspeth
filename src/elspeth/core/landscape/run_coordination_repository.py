@@ -62,7 +62,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import Enum
-from typing import Literal
+from typing import Literal, TypeIs
 
 from sqlalchemy import insert, select, update
 from sqlalchemy.engine import Connection
@@ -326,21 +326,43 @@ def _exact_builtin(value: object) -> str | int | float | None:
 
     The record is built inside a fence refusal's unwind, so nothing downstream
     of it (canonical JSON, its refusal message, the last-resort log) may reach
-    a method of a subclass the contracts admit (``TokenUsage`` accepts an
+    a method of a subclass the contracts admit (the ``TokenUsage`` constructor accepts an
     ``int`` subclass, and ``latency_ms`` is not type-checked). Each base-class
     conversion returns an exact-type copy for a subclass. ``bool`` is kept as
     itself: through ``int`` it would become ``1`` and change the event's
     meaning. Any other type is a programming error and is refused.
+
+    Dispatch reads only the value's type, never the value: ``isinstance``
+    falls back to the instance's ``__class__`` when its type check misses, and
+    a subclass can intercept that attribute read. ``issubclass`` against a
+    built-in consults the built-in's metaclass, not the subclass's.
     """
-    if value is None or type(value) is bool:
+    if value is None:
+        return None
+    if type(value) is bool:
         return value
-    if isinstance(value, int):
+    if _int_by_type(value):
         return int.__int__(value)
-    if isinstance(value, float):
+    if _float_by_type(value):
         return float.__float__(value)
-    if isinstance(value, str):
+    if _str_by_type(value):
         return str.__str__(value)
     raise TypeError(f"refused-call field holds {type(value).__qualname__}, not str, int, float, bool or None")
+
+
+def _int_by_type(value: object) -> TypeIs[int]:
+    """Whether the value's type is ``int`` or a subclass, judged from the type alone."""
+    return issubclass(type(value), int)
+
+
+def _float_by_type(value: object) -> TypeIs[float]:
+    """Whether the value's type is ``float`` or a subclass, judged from the type alone."""
+    return issubclass(type(value), float)
+
+
+def _str_by_type(value: object) -> TypeIs[str]:
+    """Whether the value's type is ``str`` or a subclass, judged from the type alone."""
+    return issubclass(type(value), str)
 
 
 def record_coordination_events(conn: Connection, *, run_id: str, events: Sequence[CoordinationEventRow]) -> None:
@@ -717,8 +739,8 @@ def record_refused_call(
     context: _RefusedCallEventContext = {
         "verb": verb,
         "fence": fence,
-        "work_item_id": work_item_id,
-        "attempt": attempt,
+        "work_item_id": _exact_builtin(work_item_id),
+        "attempt": _exact_builtin(attempt),
         "refused_call": refused_call.event_context(),
     }
     refusal = _canonical_json_refusal(context)
@@ -748,7 +770,7 @@ def record_refused_call(
         )
 
 
-_RefusedCallEventContext = dict[str, str | int | dict[str, str | int | float | None] | None]
+_RefusedCallEventContext = dict[str, str | int | float | dict[str, str | int | float | None] | None]
 """The ``fence_refusal`` context ``record_refused_call`` writes: the verb, fence,
 work item and attempt, and the ``refused_call`` record's own context."""
 
@@ -777,23 +799,24 @@ def _last_resort_log_value(value: str | int | float | None) -> str:
     """Format one refused-call field for the last-resort log; never raises.
 
     Formatting goes through the built-in base class's own methods, so a subclass
-    the contracts admit (``TokenUsage`` accepts an ``int`` subclass, and
+    the contracts admit (the ``TokenUsage`` constructor accepts an ``int`` subclass, and
     ``latency_ms`` is not type-checked) cannot reach its own ``__repr__``,
     ``__format__`` or comparisons. An integer beyond the canonical range, which
     is how it reached this log, is written in hex: Python refuses decimal
     conversion of an integer longer than its digit limit, and hex has no such
     limit. ``bool`` is formatted as itself, not as the integer it subclasses.
+    Dispatch reads only the value's type, as in :func:`_exact_builtin`.
     """
     if value is None:
         return "None"
-    if isinstance(value, bool):
+    if type(value) is bool:
         return bool.__repr__(value)
-    if isinstance(value, int):
+    if _int_by_type(value):
         exact = int.__int__(value)
         if -_CANONICAL_INTEGER_MAX <= exact <= _CANONICAL_INTEGER_MAX:
             return int.__repr__(exact)
         return int.__format__(exact, "#x")
-    if isinstance(value, float):
+    if _float_by_type(value):
         return float.__repr__(value)
     return str.__repr__(value)
 
