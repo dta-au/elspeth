@@ -23,6 +23,7 @@ no process re-exec.
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import types
 from datetime import UTC, datetime, timedelta
@@ -35,7 +36,8 @@ from sqlalchemy import insert, select, update
 from elspeth.contracts import ResumeCheck, RoutingMode
 from elspeth.contracts.audit import Edge
 from elspeth.contracts.coordination import WorkerMembershipToken, mint_worker_id
-from elspeth.contracts.errors import JoinNotReadyError, JoinRefusedError
+from elspeth.contracts.enums import NodeType
+from elspeth.contracts.errors import AuditIntegrityError, JoinNotReadyError, JoinRefusedError
 from elspeth.contracts.hashing import CANONICAL_VERSION
 from elspeth.contracts.routing import EdgeInfo
 from elspeth.contracts.types import NodeID
@@ -83,6 +85,8 @@ _RECORDED_EDGE = Edge(
 )
 # The leader has started loading its source, so graph registration is complete.
 _LOADING_SOURCE = RunSourceLifecycleRecord(source_node_id="source", source_name="primary", lifecycle_state="loading")
+_SOURCE_NODE = types.SimpleNamespace(node_id="source", node_type=NodeType.SOURCE)
+_SINK_NODE = types.SimpleNamespace(node_id="sink", node_type=NodeType.SINK)
 _JOIN_INPUTS = {"config": types.SimpleNamespace(), "graph": types.SimpleNamespace(get_edges=lambda: [_GRAPH_EDGE])}
 
 
@@ -90,6 +94,7 @@ _JOIN_INPUTS = {"config": types.SimpleNamespace(), "graph": types.SimpleNamespac
 def _registered_graph_baseline() -> object:
     with (
         patch.object(RunLifecycleReadRepository, "get_run_source_lifecycle_records", return_value={"source": _LOADING_SOURCE}),
+        patch.object(DataFlowReadRepository, "get_nodes", return_value=[_SOURCE_NODE, _SINK_NODE]),
         patch.object(DataFlowReadRepository, "get_edges", return_value=[_RECORDED_EDGE]),
         patch("elspeth.engine.orchestrator.join_admission.check_implementation_compatibility", return_value=ResumeCheck(can_resume=True)),
     ):
@@ -178,6 +183,61 @@ class TestJoinRealReadiness:
             _orchestrator(setup.db).join_run(run_id=RUN_ID, settings=types.SimpleNamespace(), **_JOIN_INPUTS)
         assert [row for row in _worker_rows(setup.db) if row["role"] == "follower"] == []
         setup.db.close()
+
+
+@pytest.mark.usefixtures("_registered_graph_baseline")
+class TestJoinSourceLifecycleEvidence:
+    """Stored lifecycle evidence is parsed in full and must cover the recorded source nodes."""
+
+    @pytest.mark.parametrize(
+        "records",
+        [
+            pytest.param({"source": dataclasses.replace(_LOADING_SOURCE, lifecycle_state="bogus")}, id="only-row-corrupt"),
+            pytest.param(
+                {
+                    "source": _LOADING_SOURCE,
+                    "second": dataclasses.replace(_LOADING_SOURCE, source_node_id="second", lifecycle_state="bogus"),
+                },
+                id="corrupt-after-non-ready",
+            ),
+        ],
+    )
+    def test_lifecycle_state_outside_enum_is_integrity_failure(self, records: dict[str, RunSourceLifecycleRecord]) -> None:
+        db = make_landscape_db()
+        _begin_run_with_leader(db)
+        with (
+            _PATCH_RESOLVE,
+            _PATCH_HASH_SENTINEL,
+            patch.object(RunLifecycleReadRepository, "get_run_source_lifecycle_records", return_value=records),
+            pytest.raises(AuditIntegrityError, match="outside RunSourceLifecycleState") as exc_info,
+        ):
+            _orchestrator(db).join_run(run_id=RUN_ID, settings=types.SimpleNamespace(), **_JOIN_INPUTS)
+        assert isinstance(exc_info.value.__cause__, ValueError)
+        assert [row for row in _worker_rows(db) if row["role"] == "follower"] == []
+        db.close()
+
+    @pytest.mark.parametrize(
+        "nodes",
+        [
+            pytest.param([_SINK_NODE], id="row-without-source-node"),
+            pytest.param(
+                [_SOURCE_NODE, types.SimpleNamespace(node_id="second", node_type=NodeType.SOURCE), _SINK_NODE],
+                id="source-node-without-row",
+            ),
+        ],
+    )
+    def test_registered_marker_requires_rows_for_exactly_the_source_nodes(self, nodes: list[types.SimpleNamespace]) -> None:
+        db = make_landscape_db()
+        _begin_run_with_leader(db)
+        with (
+            _PATCH_RESOLVE,
+            _PATCH_HASH_SENTINEL,
+            patch.object(DataFlowReadRepository, "get_nodes", return_value=nodes),
+            pytest.raises(AuditIntegrityError, match="do not cover its recorded source nodes"),
+        ):
+            _orchestrator(db).join_run(run_id=RUN_ID, settings=types.SimpleNamespace(), **_JOIN_INPUTS)
+        assert [row for row in _worker_rows(db) if row["role"] == "follower"] == []
+        db.close()
 
 
 # ---------------------------------------------------------------------------

@@ -72,10 +72,14 @@ def test_join_post_admission_error_has_join_label(tmp_path: Path) -> None:
     settings = _make_jsonl_settings(tmp_path)
     initial = CliRunner().invoke(app, ["run", "-s", str(settings), "--execute"])
     assert initial.exit_code == 0, initial.output
-    with patch.object(Orchestrator, "join_run", side_effect=ValueError("post-check unavailable")):
+    error = ValueError("post-check unavailable")
+    error.add_note("follower w1 departure failed: OperationalError: database is locked")
+    with patch.object(Orchestrator, "join_run", side_effect=error):
         result = CliRunner().invoke(app, ["join", "run-join", "-s", str(settings)])
     assert result.exit_code == 1, result.output
-    assert "Join failed: post-check unavailable" in result.stderr
+    assert "Join failed: ValueError: post-check unavailable" in result.stderr
+    # A departure failure recorded as a note on the original error reaches the operator.
+    assert "follower w1 departure failed: OperationalError: database is locked" in result.stderr
 
 
 def test_join_graph_build_failure_writes_no_follower_row(tmp_path: Path) -> None:

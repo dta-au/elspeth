@@ -26,6 +26,7 @@ from elspeth.contracts.coordination import (
     WorkerMembershipToken,
     mint_worker_id,
 )
+from elspeth.contracts.enums import NodeType
 from elspeth.contracts.errors import AuditIntegrityError, JoinNotReadyError, JoinRefusedError
 from elspeth.core.canonical import stable_hash
 from elspeth.core.config import resolve_config
@@ -82,11 +83,22 @@ class JoinAdmissionService:
         # commits. A source past READY therefore marks graph registration
         # complete. Read it before the edges so the edge read sees every edge
         # committed before the marker.
-        graph_registered = any(
-            RunSourceLifecycleState(record.lifecycle_state) is not RunSourceLifecycleState.READY
-            for record in read_factory.run_lifecycle.get_run_source_lifecycle_records(run_id).values()
-        )
-        if not graph_registered:
+        records = read_factory.run_lifecycle.get_run_source_lifecycle_records(run_id)
+        try:
+            states = {node_id: RunSourceLifecycleState(record.lifecycle_state) for node_id, record in records.items()}
+        except ValueError as exc:
+            # The column's CHECK admits only RunSourceLifecycleState values.
+            raise AuditIntegrityError(f"run {run_id!r} has a run_sources lifecycle state outside RunSourceLifecycleState") from exc
+        graph_registered = any(state is not RunSourceLifecycleState.READY for state in states.values())
+        if graph_registered:
+            # One registration wrote the source nodes and their run_sources rows
+            # from one graph, nodes first, so the two sets must agree once the
+            # marker is set. A follower-graph difference is skew, refused by the
+            # implementation check below.
+            source_node_ids = {node.node_id for node in read_factory.data_flow.get_nodes(run_id) if node.node_type is NodeType.SOURCE}
+            if set(states) != source_node_ids:
+                raise AuditIntegrityError(f"run {run_id!r} run_sources rows do not cover its recorded source nodes")
+        else:
             if defer_to_admission_on_dead_leader:
                 leader = RunCoordinationRepository(self._db.engine).live_leader(run_id=run_id)
                 if leader is None or not leader.seat_live:
@@ -276,7 +288,10 @@ class JoinAdmissionService:
             try:
                 factory.run_coordination.depart_worker(member_token=token)
             except contract_errors.TIER_1_ERRORS as departure_error:
-                raise departure_error from refusal
+                # Bare raise keeps any cause of its own; the refusal is its context,
+                # and the note keeps it visible when that cause suppresses context.
+                departure_error.add_note(f"follower {token.worker_id} departure followed join refusal: {refusal.reason}")
+                raise
             except Exception as departure_error:
                 refusal.departure_failure = _departure_summary(departure_error)
             raise
@@ -284,7 +299,8 @@ class JoinAdmissionService:
             try:
                 factory.run_coordination.depart_worker(member_token=token)
             except contract_errors.TIER_1_ERRORS as departure_error:
-                raise departure_error from error
+                departure_error.add_note(f"follower {token.worker_id} departure followed post-admission error: {_departure_summary(error)}")
+                raise
             except Exception as departure_error:
                 error.add_note(f"follower {token.worker_id} departure failed: {_departure_summary(departure_error)}")
             raise

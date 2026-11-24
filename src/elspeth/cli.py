@@ -4660,7 +4660,8 @@ def join(
         except contract_errors.TIER_1_ERRORS:
             raise
         except Exception as e:
-            typer.echo(f"Join failed: {e}", err=True)
+            # Message plus __notes__ (e.g. a failed follower departure), rendered by the standard library.
+            typer.echo("Join failed: " + "".join(traceback.format_exception_only(e)).rstrip(), err=True)
             raise typer.Exit(1) from None
 
         # The registered identity IS the membership token's worker_id (§A.1);

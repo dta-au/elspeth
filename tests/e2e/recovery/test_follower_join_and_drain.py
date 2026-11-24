@@ -483,7 +483,7 @@ class TestJoinRunAdmissionRefusals:
         crashed.db.close()
 
     @pytest.mark.parametrize("post_kind", ["tier1", "refusal", "ordinary"])
-    @pytest.mark.parametrize("departure_kind", ["tier1", "database", "sqlalchemy", "ordinary"])
+    @pytest.mark.parametrize("departure_kind", ["tier1", "tier1-chained", "database", "sqlalchemy", "ordinary"])
     def test_join_departure_failure_preserves_post_check_error(self, tmp_path: Path, post_kind: str, departure_kind: str) -> None:
         crashed = _run_to_interrupted_checkpoint(tmp_path, MockClock(start=_T0))
         _seat_run_with_live_leader(crashed, leader_id=f"worker:{crashed.run_id}:leader-departure")
@@ -511,6 +511,7 @@ class TestJoinRunAdmissionRefusals:
 
         departure_error: Exception = {
             "tier1": AuditIntegrityError("departure integrity failure"),
+            "tier1-chained": AuditIntegrityError("departure integrity failure"),
             "database": OperationalError(
                 "UPDATE run_workers SET status='departed' WHERE worker_id=?",
                 None,
@@ -520,7 +521,11 @@ class TestJoinRunAdmissionRefusals:
             "sqlalchemy": SQLAlchemyError("departure unavailable"),
             "ordinary": ValueError("departure unavailable"),
         }[departure_kind]
-        expected_error = departure_error if departure_kind == "tier1" and post_kind != "tier1" else post_error
+        departure_root = KeyError("departure root cause")
+        if departure_kind == "tier1-chained":
+            departure_error.__cause__ = departure_root
+        departure_is_tier1 = departure_kind in ("tier1", "tier1-chained")
+        expected_error = departure_error if departure_is_tier1 and post_kind != "tier1" else post_error
         with (
             patch.object(RunLifecycleReadRepository, "get_run", resume_between_reads),
             patch.object(RunCoordinationRepository, "depart_worker", side_effect=departure_error),
@@ -538,7 +543,12 @@ class TestJoinRunAdmissionRefusals:
         assert rows[0].status == "active"
         assert exc_info.value is expected_error
         if expected_error is departure_error:
-            assert departure_error.__cause__ is post_error
+            # The departure error is re-raised bare: its own cause survives, the
+            # post-check error is its context, and a note names the post-check error.
+            assert departure_error.__context__ is post_error
+            assert departure_error.__cause__ is (departure_root if departure_kind == "tier1-chained" else None)
+            expected_note_detail = "post-check refusal" if post_kind == "refusal" else "ValueError: post-check ordinary failure"
+            assert any(rows[0].worker_id in note and expected_note_detail in note for note in departure_error.__notes__)
         else:
             assert post_error.__cause__ is root_cause
             if post_kind == "refusal" and departure_kind == "database":
