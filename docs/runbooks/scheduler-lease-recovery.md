@@ -731,7 +731,10 @@ the authoritative preconditions and registers the follower only when all hold:
 
 After every successful admission, the service re-checks the canonical version,
 graph readiness, and plugin implementation after registration.
-A refusal at that point records follower registration followed by departure.
+A refusal at that point records follower registration followed by departure if
+the departure write succeeds. If the departure write fails, the refusal says
+so; the follower row lapses at heartbeat expiry and is departed at finalize or
+evicted by the liveness sweep.
 
 A **filesystem-writability preflight runs first** (before the registry is
 touched): the follower verifies write access to the DB file, its directory,
