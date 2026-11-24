@@ -202,6 +202,21 @@ def test_shared_retry_delay_respects_provider_minimum_and_call_headroom() -> Non
 
 
 @pytest.mark.parametrize(
+    ("retry_after", "deadline", "expected"),
+    [
+        # A Retry-After of up to 30 s is waited for; anything longer is not retried.
+        pytest.param(30.0, 100.0, 30.0, id="retry-after-at-ceiling"),
+        pytest.param(30.001, 100.0, None, id="retry-after-over-ceiling"),
+        # A retry starts only when its delay plus 5 s still fits before the deadline.
+        pytest.param(3.0, 8.0, 3.0, id="delay-plus-margin-exactly-fits"),
+        pytest.param(3.0, 7.999, None, id="inside-call-margin"),
+    ],
+)
+def test_shared_retry_delay_boundaries(retry_after: float, deadline: float, expected: float | None) -> None:
+    assert retry_delay_seconds(attempt=1, retry_after=RetryAfter(retry_after), deadline=deadline, now=0.0, base_delay_seconds=1) == expected
+
+
+@pytest.mark.parametrize(
     ("failure", "status", "kind", "retryable"),
     [
         pytest.param(

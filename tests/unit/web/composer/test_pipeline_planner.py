@@ -5273,23 +5273,31 @@ async def test_each_transient_api_retry_consumes_and_audits_a_wire_attempt(
         ({"retry-after-ms": "bad", "retry-after": "3"}, "success", 2, [3.0]),
         ({"retry-after": "bad"}, "success", 2, [1.0]),
         ({}, "exhausted", 2, [1.0]),
+        # The 30 s ceiling admits a Retry-After of exactly 30 s and refuses 31 s.
+        ({"retry-after": "30"}, "success", 2, [30.0]),
         ({"retry-after": "31"}, "too-long", 1, []),
         ({"retry-after": "6"}, "deadline", 1, []),
         ({}, "budget", 1, []),
     ],
-    ids=("seconds", "ms-wins", "malformed-ms", "malformed-seconds", "exhausted", "ceiling", "deadline", "budget"),
+    ids=("seconds", "ms-wins", "malformed-ms", "malformed-seconds", "exhausted", "at-ceiling", "over-ceiling", "deadline", "budget"),
 )
 async def test_planner_rate_limit_retries_after_header_and_records_both_physical_calls(
     tmp_path: Path, tool_context: ToolContext, headers: dict[str, str], scenario: str, calls: int, delays: list[float]
 ) -> None:
-    # A directly typed 429, as the SDK or a proxy raises it; LiteLLM's mapper strips this type (see the mapper-built quota test).
-    rate_limit = RateLimitError(
-        message="private rate limit",
-        llm_provider="test-provider",
-        model="anthropic/claude-planner",
-        response=httpx.Response(429, request=httpx.Request("POST", "https://example.invalid"), headers=headers),
-        rate_limit_type=RateLimitType.BUDGET if scenario == "budget" else None,
-    )
+    rate_limit: Exception
+    if scenario == "budget":
+        # LiteLLM's own in-process budget limiter raises this typed 429. A
+        # provider's 429 never carries the type: LiteLLM strips it on every route.
+        rate_limit = RateLimitError(
+            message="private rate limit",
+            llm_provider="bedrock",
+            model="bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0",
+            response=httpx.Response(429, request=httpx.Request("POST", "https://example.invalid")),
+            rate_limit_type=RateLimitType.BUDGET,
+        )
+    else:
+        # Bedrock is the route where LiteLLM keeps the provider's Retry-After headers.
+        rate_limit = await provider_failure("bedrock", "429_retry_after", retry_after_headers=headers)
     responses: list[Exception | _Response] = [rate_limit] * (2 if scenario == "exhausted" else 1)
     if scenario == "success":
         responses.append(_response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})))
@@ -5300,6 +5308,9 @@ async def test_planner_rate_limit_retries_after_header_and_records_both_physical
     model_overrides = {"max_api_attempts": 2, "api_retry_base_seconds": 1.0}
     if scenario == "deadline":
         model_overrides["timeout_seconds"] = 10.0
+    if headers.get("retry-after") in {"30", "31"}:
+        # Enough time that only the ceiling can decline the delay.
+        model_overrides["timeout_seconds"] = 60.0
     with patch.object(pipeline_planner, "asyncio", retry_asyncio):
         if scenario == "success":
             proposal = await _plan(
@@ -5392,6 +5403,68 @@ async def test_planner_does_not_wait_out_a_retry_delay_before_a_certain_call_bud
     assert caught.value.code == code
     assert len(completion.requests) == len(recorder.llm_calls) == 1
     retry_sleep.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("remaining_after_failure", "max_total_provider_calls", "code", "calls"),
+    [
+        # The 1 s delay exceeds the time left: the planner used to sleep to the
+        # deadline and its loop head refused there, on the call budget first.
+        pytest.param(0.5, 4, "TIMEOUT", 1, id="delay-past-deadline"),
+        pytest.param(0.5, 1, "PROVIDER_CALLS_EXHAUSTED", 1, id="delay-past-deadline-at-call-cap"),
+        # The delay fits but the call margin does not: the planner's own time-out.
+        pytest.param(5.99, 4, "TIMEOUT", 1, id="inside-call-margin"),
+        # Exactly the delay plus the 5 s call margin: the retry is made.
+        pytest.param(6.0, 4, None, 2, id="delay-plus-margin-fits"),
+    ],
+)
+async def test_planner_503_whose_retry_does_not_fit_ends_with_the_loop_head_outcome(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    remaining_after_failure: float,
+    max_total_provider_calls: int,
+    code: str | None,
+    calls: int,
+) -> None:
+    timeout_seconds = 60.0
+    clock = {"now": 1_000.0}
+
+    class _ClockedCompletion(_ScriptedCompletion):
+        async def __call__(self, **kwargs: Any) -> _Response | ModelResponse:
+            # The provider call uses up the time, leaving exactly this much.
+            clock["now"] = 1_000.0 + timeout_seconds - remaining_after_failure
+            return await super().__call__(**kwargs)
+
+    completion = _ClockedCompletion(
+        await provider_failure("openai", "503"),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+    recorder = BufferingRecorder()
+    retry_sleep = AsyncMock(spec=asyncio.sleep)
+    retry_asyncio = SimpleNamespace(**(vars(asyncio) | {"sleep": retry_sleep}))
+    with (
+        patch.object(pipeline_planner, "_planner_deadline_time", lambda: clock["now"]),
+        patch.object(pipeline_planner, "asyncio", retry_asyncio),
+    ):
+        planning = _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            recorder=recorder,
+            budget=_budget(max_total_provider_calls=max_total_provider_calls),
+            model_overrides={"max_api_attempts": 3, "api_retry_base_seconds": 1.0, "timeout_seconds": timeout_seconds},
+        )
+        if code is None:
+            proposal = await planning
+            assert deep_thaw(proposal.proposal.pipeline) == _pipeline(tmp_path)
+            assert [call.args[0] for call in retry_sleep.await_args_list] == [1.0]
+        else:
+            with pytest.raises(PipelinePlannerError) as caught:
+                await planning
+            assert caught.value.code == code
+            retry_sleep.assert_not_awaited()
+    assert len(completion.requests) == calls
 
 
 @pytest.mark.asyncio

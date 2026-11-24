@@ -6287,35 +6287,43 @@ class TestComposerAvailabilityAndBadRequest:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        ("headers", "outcome", "calls", "delays"),
+        ("headers", "budget_seconds", "outcome", "calls", "delays"),
         [
-            ({"retry-after": "3"}, "success", 2, [3.0]),
-            ({"retry-after-ms": "1500", "retry-after": "3"}, "success", 2, [1.5]),
-            ({"retry-after-ms": "bad", "retry-after": "3"}, "success", 2, [3.0]),
-            ({"retry-after": "bad"}, "success", 2, [1.0]),
-            ({}, "exhausted", 3, [1.0, 2.0]),
-            ({"retry-after": "31"}, "too-long", 1, []),
-            ({"retry-after": "6"}, "deadline", 1, []),
-            ({}, "budget", 1, []),
+            ({"retry-after": "3"}, None, "success", 2, [3.0]),
+            ({"retry-after-ms": "1500", "retry-after": "3"}, None, "success", 2, [1.5]),
+            ({"retry-after-ms": "bad", "retry-after": "3"}, None, "success", 2, [3.0]),
+            ({"retry-after": "bad"}, None, "success", 2, [1.0]),
+            ({}, None, "exhausted", 3, [1.0, 2.0]),
+            # The 30 s ceiling admits a Retry-After of exactly 30 s and refuses 31 s.
+            ({"retry-after": "30"}, 60.0, "success", 2, [30.0]),
+            ({"retry-after": "31"}, 60.0, "too-long", 1, []),
+            ({"retry-after": "6"}, 10.0, "deadline", 1, []),
+            ({}, None, "budget", 1, []),
         ],
-        ids=("seconds", "ms-wins", "malformed-ms", "malformed-seconds", "exhausted", "ceiling", "deadline", "budget"),
+        ids=("seconds", "ms-wins", "malformed-ms", "malformed-seconds", "exhausted", "at-ceiling", "over-ceiling", "deadline", "budget"),
     )
     async def test_real_rate_limit_uses_bounded_retry_and_audits_each_call(
-        self, headers: dict[str, str], outcome: str, calls: int, delays: list[float]
+        self, headers: dict[str, str], budget_seconds: float | None, outcome: str, calls: int, delays: list[float]
     ) -> None:
         from litellm.exceptions import RateLimitError, RateLimitType
 
         from elspeth.web.composer.provider_config import LLM_API_MAX_ATTEMPTS
 
         service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
-        # A directly typed 429, as the SDK or a proxy raises it; LiteLLM's mapper strips this type (see the mapper-built quota test).
-        failure = RateLimitError(
-            message="private rate limit",
-            model="openrouter/openai/gpt-5.5",
-            llm_provider="openrouter",
-            response=Response(429, request=Request("POST", "https://example.invalid"), headers=headers),
-            rate_limit_type=RateLimitType.BUDGET if outcome == "budget" else None,
-        )
+        failure: Exception
+        if outcome == "budget":
+            # LiteLLM's own in-process budget limiter raises this typed 429. A
+            # provider's 429 never carries the type: LiteLLM strips it on every route.
+            failure = RateLimitError(
+                message="private rate limit",
+                model="bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0",
+                llm_provider="bedrock",
+                response=Response(429, request=Request("POST", "https://example.invalid")),
+                rate_limit_type=RateLimitType.BUDGET,
+            )
+        else:
+            # Bedrock is the route where LiteLLM keeps the provider's Retry-After headers.
+            failure = await provider_failure("bedrock", "429_retry_after", retry_after_headers=headers)
         responses: list[object] = [failure] * (LLM_API_MAX_ATTEMPTS if outcome == "exhausted" else 1)
         if outcome == "success":
             responses.append(_make_raw_llm_response(content="Recovered."))
@@ -6323,7 +6331,7 @@ class TestComposerAvailabilityAndBadRequest:
             patch("litellm.acompletion", new_callable=AsyncMock, side_effect=responses) as mock_llm,
             _mock_composer_retry_sleep() as mock_sleep,
         ):
-            compose_kwargs = {"budget_seconds": 10.0} if outcome == "deadline" else {}
+            compose_kwargs = {} if budget_seconds is None else {"budget_seconds": budget_seconds}
             if outcome == "success":
                 result = await service.compose("Hello", [], _empty_state(), session_id=session_id, **compose_kwargs)
                 _assert_checkpoint_reply(result, "Recovered.", count=0)

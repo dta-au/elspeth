@@ -10,7 +10,7 @@ mapper, can carry fields this path never delivers.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Literal
 
 import httpx
@@ -19,12 +19,13 @@ from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
 from litellm.main import acompletion as _litellm_acompletion  # LiteLLM's own function, not a test's patched package attribute
 
 Route = Literal["openai", "anthropic", "openrouter", "bedrock"]
-Failure = Literal["429_retry_after", "429_quota", "500", "503", "connect", "read", "malformed_200"]
+Failure = Literal["429_retry_after", "429_quota", "403", "500", "503", "connect", "read", "malformed_200"]
 
 ROUTES: tuple[Route, ...] = ("openai", "anthropic", "openrouter", "bedrock")
-FAILURES: tuple[Failure, ...] = ("429_retry_after", "429_quota", "500", "503", "connect", "read", "malformed_200")
+FAILURES: tuple[Failure, ...] = ("429_retry_after", "429_quota", "403", "500", "503", "connect", "read", "malformed_200")
 
 _JSON = {"content-type": "application/json"}
+_DEFAULT_RETRY_AFTER: Mapping[str, str] = {"retry-after": "7"}
 _MODELS: dict[Route, str] = {
     "openai": "openai/gpt-4o",
     "anthropic": "anthropic/claude-3-5-sonnet-20241022",
@@ -33,15 +34,17 @@ _MODELS: dict[Route, str] = {
 }
 
 
-def _responder(failure: Failure) -> Callable[[httpx.Request], httpx.Response]:
+def _responder(failure: Failure, retry_after_headers: Mapping[str, str]) -> Callable[[httpx.Request], httpx.Response]:
     def respond(request: httpx.Request) -> httpx.Response:
         if failure == "429_retry_after":
             return httpx.Response(
-                429, headers={**_JSON, "retry-after": "7"}, json={"error": {"message": "slow down", "type": "rate_limit"}}
+                429, headers={**_JSON, **retry_after_headers}, json={"error": {"message": "slow down", "type": "rate_limit"}}
             )
         if failure == "429_quota":
             body = {"code": "insufficient_quota", "type": "insufficient_quota", "message": "quota"}
             return httpx.Response(429, headers=_JSON, json={"error": body})
+        if failure == "403":
+            return httpx.Response(403, headers=_JSON, json={"error": {"message": "no access", "type": "permission_error"}})
         if failure == "500":
             return httpx.Response(500, headers=_JSON, json={"error": {"message": "internal", "type": "server_error"}})
         if failure == "503":
@@ -55,9 +58,12 @@ def _responder(failure: Failure) -> Callable[[httpx.Request], httpx.Response]:
     return respond
 
 
-async def provider_failure(route: Route, failure: Failure) -> Exception:
-    """Return the exception ``litellm.acompletion`` raises for ``failure`` on ``route``."""
-    transport = httpx.MockTransport(_responder(failure))
+async def provider_failure(route: Route, failure: Failure, *, retry_after_headers: Mapping[str, str] = _DEFAULT_RETRY_AFTER) -> Exception:
+    """Return the exception ``litellm.acompletion`` raises for ``failure`` on ``route``.
+
+    ``retry_after_headers`` replaces the headers a ``429_retry_after`` response carries.
+    """
+    transport = httpx.MockTransport(_responder(failure, retry_after_headers))
     messages = [{"role": "user", "content": "hi"}]
     try:
         if route == "openai":

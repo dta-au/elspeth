@@ -20,8 +20,8 @@ changes land and is not a release.
   when the run started, now fails composer validation. No pipeline that could
   run before is refused. Only pipelines the runtime was already refusing at
   run start are now refused earlier, at validation.
-- **Changed:** the composer's main loop and planner no longer start a
-  provider retry within the last 5 s before the job deadline. This also applies
+- **Changed:** the composer's main loop and planner start a provider retry only
+  when its wait plus 5 s still fits before the job deadline. This also applies
   to their existing retries after a provider 503. The completion review keeps
   its existing immediate retry and does not retry a 429.
 - **Do not enable a composer token quota yet.** With one configured, a failed
@@ -44,15 +44,19 @@ changes land and is not a release.
   check, the error now names the row (id, sequence number, role), so the
   damaged row can be found.
 - The composer's main loop and planner now retry a provider 429 within the
-  request's deadline, after 1 s and then 2 s. They wait for the provider's
-  Retry-After instead (up to 30 s) only where LiteLLM keeps that header, which
-  was measured on Bedrock. A quota or credit refusal arrives as an ordinary
+  request's deadline, after 1 s and then 2 s. Where LiteLLM keeps the
+  provider's Retry-After header, which was measured only on Bedrock, they wait
+  for it instead when it is 30 s or less; a longer Retry-After is not retried.
+  A quota or credit refusal arrives as an ordinary
   429, so it is retried within the same bound before it is reported. On the
   OpenAI and Anthropic routes a provider 500 and connection failures are still
   not retried, because LiteLLM reports a failure to read an already billed
   response the same way. On the OpenRouter route LiteLLM reports all of these
   as a general API error, which was already retried before this release and
-  still is. A 403 now tells the user to check provider access.
+  still is. On the Anthropic and Bedrock routes a 403 now tells the user to
+  check provider access. On the OpenAI and OpenRouter routes LiteLLM reports a
+  403 as a general API error, so it is still retried and reported as
+  unavailable.
 - When a planner reply was withheld because the cost of an earlier model call
   in the same request could not be confirmed, the notice blamed "the existing
   request limits". It now names that cause. The withheld-reply notice also no
