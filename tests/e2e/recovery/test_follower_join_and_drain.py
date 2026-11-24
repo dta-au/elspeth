@@ -731,7 +731,7 @@ class TestJoinRunAdmissionRefusals:
             mode=edges[0].mode,
         )
         expire_leader_seat(db, run_id)
-        original_live_leader = RunCoordinationRepository.live_leader
+        original_live_leader = RunCoordinationRepository.seat_holder
         observed_dead = False
 
         def heartbeat_after_dead_read(repo: RunCoordinationRepository, *, run_id: str) -> Any:
@@ -762,7 +762,7 @@ class TestJoinRunAdmissionRefusals:
             return leader
 
         with (
-            patch.object(RunCoordinationRepository, "live_leader", heartbeat_after_dead_read),
+            patch.object(RunCoordinationRepository, "seat_holder", heartbeat_after_dead_read),
             patch("elspeth.engine.orchestrator.join_admission.resolve_config", return_value={}),
             pytest.raises(JoinRefusedError) as exc_info,
         ):
@@ -1326,7 +1326,7 @@ class TestFollowerLifecycle:
     def test_follower_idle_backoff_rechecks_status_and_snapshot(self, tmp_path: Path) -> None:
         """L1: no claimable work → idle loop re-reads run status + coordination snapshot.
 
-        The follower must call live_leader (coordination snapshot) and
+        The follower must call seat_holder (coordination snapshot) and
         _run_is_terminal (run status) on each loop iteration.  We drive two
         idle drain passes before a terminal exit.
         """
@@ -1337,7 +1337,7 @@ class TestFollowerLifecycle:
         leader_token = _seat_run_with_live_leader(crashed, leader_id=leader_id)
         follower_id = _join_follower(crashed, leader_token)
 
-        # Real coord repo + real factory so live_leader / depart_worker hit the DB.
+        # Real coord repo + real factory so seat_holder / depart_worker hit the DB.
         real_coord = crashed.factory.run_coordination
         real_factory = crashed.factory
 
@@ -1441,7 +1441,7 @@ class TestFollowerLifecycle:
         follower_id = _join_follower(crashed, leader_token)
 
         # Lapse the seat on the Landscape database clock (ADR-047) so
-        # live_leader returns seat_live=False; the process MockClock cannot.
+        # seat_holder returns seat_live=False; the process MockClock cannot.
         clock.advance(10.0)
         expire_leader_seat(crashed.db, crashed.run_id)
 

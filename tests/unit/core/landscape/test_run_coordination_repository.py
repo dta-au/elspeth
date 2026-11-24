@@ -953,22 +953,22 @@ class TestReleaseSeatAndLiveLeader:
 
     def test_live_leader_views(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
         _seed_run(engine)
-        assert repo.live_leader(run_id=RUN_ID) is None  # no seat row yet
+        assert repo.seat_holder(run_id=RUN_ID) is None  # no seat row yet
 
         token = register_run_leader(repo, run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), window_seconds=WINDOW)
-        live = repo.live_leader(run_id=RUN_ID)
+        live = repo.seat_holder(run_id=RUN_ID)
         assert live is not None
         assert live.leader_worker_id == token.worker_id
         assert live.leader_epoch == 1
         assert live.seat_live is True
 
         _expire_seat(engine)
-        lapsed = repo.live_leader(run_id=RUN_ID)
+        lapsed = repo.seat_holder(run_id=RUN_ID)
         assert lapsed is not None
         assert lapsed.seat_live is False  # dead seat: the slice-4 admissible-takeover signal
 
         repo.release_seat(token=token)
-        assert repo.live_leader(run_id=RUN_ID) is None  # vacant
+        assert repo.seat_holder(run_id=RUN_ID) is None  # vacant
 
 
 class TestRegistryVerbs:

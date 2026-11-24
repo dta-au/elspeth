@@ -58,7 +58,7 @@ _CLOCK_AUTHORITY_VERBS = frozenset(
         "fenced_leader_transaction",
         "fenced_write",
         "heartbeat_lease",
-        "live_leader",
+        "seat_holder",
         "peer_active_leases",
         "recover_expired_leases",
         "register_run_leader_on",
@@ -183,7 +183,9 @@ _AUTHORITY_SCOPE_PREFIXES = (
 # fence-extended on the caller's connection) arrive. Re-derived by RUNNING the gate.
 # QR H2 (resume coverage check): c864f58d… → the value below, +1 identity:
 # SchedulerLeaseRepository.verify_resume_coverage. Re-derived by RUNNING the gate.
-_CLOCK_BOUNDARY_DIGEST = "aecd851337f99f935215c8d914b386ab2e8cb782b9163571f0026984eb5c8e11"
+# RunCoordinationRepository.live_leader renamed seat_holder: aecd8513… → the value
+# below, same identity count, symbol text only. Re-derived by RUNNING the gate.
+_CLOCK_BOUNDARY_DIGEST = "0449862bc8c6e8e1cd5b23621f14650e3a66b72a9358aa7b58be86d63ae61fcb"
 
 
 def _name_has_clock_marker(name: str) -> bool:
@@ -316,7 +318,7 @@ _REVIEWED_CLOCK_BOUNDARY_IDENTITIES = frozenset(
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.admit_follower"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.dead_non_leader_workers"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.evict_worker"),
-        ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.live_leader"),
+        ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.seat_holder"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.register_run_leader_on"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.release_seat"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.worker_heartbeat"),
@@ -382,7 +384,7 @@ _REVIEWED_CLOCK_BOUNDARY_IDENTITIES = frozenset(
         ("src/elspeth/core/landscape/scheduler_repository.py", "TokenSchedulerRepository.recover_expired_leases"),
         ("src/elspeth/engine/orchestrator/resume.py", "ResumeCoordinator.resume"),
         # `elspeth abandon` (release/0.8.0): the operator verb reads the seat
-        # through live_leader, judges resumability through
+        # through seat_holder, judges resumability through
         # check_run_status_resumable, and takes/vacates the seat through
         # acquire_run_leadership / release_seat. Three identities added from
         # the live inventory on this tree, none removed; the digest below is
@@ -410,7 +412,7 @@ _REQUIRED_AUTHORITY_PUBLIC_SURFACE = frozenset(
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.acquire_export_leadership"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.acquire_run_leadership"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.admit_follower"),
-        ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.live_leader"),
+        ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.seat_holder"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.worker_heartbeat"),
         ("src/elspeth/core/landscape/scheduler/fencing.py", "fenced_write"),
         ("src/elspeth/core/landscape/scheduler_repository.py", "TokenSchedulerRepository.claim_pending_sink"),
@@ -5686,19 +5688,19 @@ def test_first_fence_rejects_strict_contract_bypasses(source: str, expected: str
 @pytest.mark.parametrize(
     "source",
     [
-        "from datetime import datetime\ndef live_leader(): return datetime.now()",
-        "import datetime as dt\ndef live_leader(): return dt.datetime.now()",
-        "from datetime import datetime\nclock = datetime.now\ndef live_leader(): return clock()",
-        "from datetime import datetime\nclock = getattr(datetime, 'now')\ndef live_leader(): return clock()",
-        "from datetime import datetime\ndef wall(): return datetime.now()\ndef live_leader(): return wall()",
-        "from datetime import datetime\nclock = lambda: datetime.now()\ndef live_leader(): return clock()",
+        "from datetime import datetime\ndef seat_holder(): return datetime.now()",
+        "import datetime as dt\ndef seat_holder(): return dt.datetime.now()",
+        "from datetime import datetime\nclock = datetime.now\ndef seat_holder(): return clock()",
+        "from datetime import datetime\nclock = getattr(datetime, 'now')\ndef seat_holder(): return clock()",
+        "from datetime import datetime\ndef wall(): return datetime.now()\ndef seat_holder(): return wall()",
+        "from datetime import datetime\nclock = lambda: datetime.now()\ndef seat_holder(): return clock()",
         "from elspeth.core.landscape._helpers import now as wall\ndef takeover_expired(): return wall()",
-        "from datetime import datetime\ndef wall():\n    local = datetime.now\n    value = local()\n    return value\ndef live_leader(): return wall()",
-        "import functools\nfrom datetime import datetime\nclock = functools.partial(datetime.now)\ndef live_leader(): return clock()",
-        "from datetime import datetime\nclock, other = datetime.today, object\ndef live_leader(): return clock()",
-        "from datetime import date as day\ndef live_leader(): return day.today()",
-        "from datetime import datetime\nclass Authority:\n    def __init__(self): self.wall = datetime.now\n    def live_leader(self): return self.wall()",
-        "from datetime import datetime\nclass Authority:\n    def wall(self): return datetime.now()\n    def live_leader(self): return self.wall()",
+        "from datetime import datetime\ndef wall():\n    local = datetime.now\n    value = local()\n    return value\ndef seat_holder(): return wall()",
+        "import functools\nfrom datetime import datetime\nclock = functools.partial(datetime.now)\ndef seat_holder(): return clock()",
+        "from datetime import datetime\nclock, other = datetime.today, object\ndef seat_holder(): return clock()",
+        "from datetime import date as day\ndef seat_holder(): return day.today()",
+        "from datetime import datetime\nclass Authority:\n    def __init__(self): self.wall = datetime.now\n    def seat_holder(self): return self.wall()",
+        "from datetime import datetime\nclass Authority:\n    def wall(self): return datetime.now()\n    def seat_holder(self): return self.wall()",
     ],
     ids=(
         "direct",
@@ -6048,12 +6050,12 @@ def test_required_authority_boundary_injection_cannot_mask_a_deleted_definition(
 @pytest.mark.parametrize(
     "source",
     [
-        "def call(repo, wall): repo.live_leader(run_id='r', now=wall)",
+        "def call(repo, wall): repo.seat_holder(run_id='r', now=wall)",
         "def call(repo, wall): fn = repo.worker_heartbeat; fn(worker_id='w', now=wall, window_seconds=1)",
         "def call(repo, wall): getattr(repo, 'acquire_run_leadership')(run_id='r', worker_id='w', now=wall, window_seconds=1)",
-        "def call(repo, wall): kwargs = {'run_id': 'r', 'now': wall}; repo.live_leader(**kwargs)",
-        "def call(repo, cutoff): alias = cutoff; repo.live_leader('r', alias)",
-        "def call(repo, moment: datetime): repo.live_leader('r', moment)",
+        "def call(repo, wall): kwargs = {'run_id': 'r', 'now': wall}; repo.seat_holder(**kwargs)",
+        "def call(repo, cutoff): alias = cutoff; repo.seat_holder('r', alias)",
+        "def call(repo, moment: datetime): repo.seat_holder('r', moment)",
     ],
     ids=("direct", "callable-alias", "getattr", "kwargs", "positional-alias", "typed-positional"),
 )
@@ -6062,11 +6064,11 @@ def test_scanner_rejects_caller_clock_forwarding_escapes(source: str) -> None:
 
 
 def test_scanner_rejects_authority_star_args_and_neutral_getattr() -> None:
-    star_args = "def call(repo, args): repo.live_leader(*args)"
+    star_args = "def call(repo, args): repo.seat_holder(*args)"
     assert "dynamic-authority-args" in {violation.kind for violation in _scan_source(star_args)}
 
     neutral_getattr = """
-def live_leader(target, method, observed):
+def seat_holder(target, method, observed):
     return getattr(target, method)(observed)
 """
     assert "dynamic-authority-getattr" in {violation.kind for violation in _scan_source(neutral_getattr)}
@@ -6188,7 +6190,7 @@ def test_scanner_resolves_explicit_temporal_aliases_forwarded_to_authority(absol
     source = f"""
 def forward(repo, {absolute_name}):
     value = {absolute_name}
-    repo.live_leader(value)
+    repo.seat_holder(value)
 """
     assert any(violation.kind.startswith("caller-clock") for violation in _scan_source(source))
 
@@ -6412,7 +6414,7 @@ def test_scanner_allows_duration_forwarding_and_forensic_mapping_positive_contro
 from datetime import datetime
 
 def call(repo, timeout_seconds):
-    repo.live_leader(window_seconds=timeout_seconds)
+    repo.seat_holder(window_seconds=timeout_seconds)
 
 def rotate(conn, timeout_seconds):
     conn.execute(
@@ -6440,7 +6442,7 @@ def record_event(conn):
 def test_scanner_allows_ordinary_authority_payload_parameters_positive_control() -> None:
     source = """
 def forward(repo, row_index, data, source_row_index, quarantined, plan, claim, verb, runtime_config):
-    repo.live_leader(row_index, data, source_row_index, quarantined, plan, claim, runtime_config, verb=verb)
+    repo.seat_holder(row_index, data, source_row_index, quarantined, plan, claim, runtime_config, verb=verb)
 """
     assert _scan_source(source) == ()
 
@@ -6514,11 +6516,11 @@ def test_scanner_fails_closed_on_dynamic_getattr_and_kwargs() -> None:
     source = """
 from datetime import datetime
 
-def live_leader(repo, method_name, options):
+def seat_holder(repo, method_name, options):
     clock = getattr(datetime, method_name)
     cutoff = clock()
     getattr(repo, method_name)(now=cutoff)
-    repo.live_leader(**options)
+    repo.seat_holder(**options)
 """
     kinds = {violation.kind for violation in _scan_source(source)}
     assert {"dynamic-authority-getattr", "dynamic-authority-kwargs"} <= kinds
@@ -6549,7 +6551,7 @@ def test_scanner_allows_database_clock_and_forensic_recording_positive_control()
     source = """
 from datetime import datetime
 
-def live_leader(conn, run_id):
+def seat_holder(conn, run_id):
     database_now = read_landscape_transaction_time(conn)
     return conn.execute(select(seat).where(seat.c.expires_at > database_now))
 

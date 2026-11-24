@@ -181,7 +181,7 @@ def check_run_status_resumable(db: LandscapeDB, run_id: str) -> tuple[RunStatus 
         # Lives in the SHARED implementation so the advisory can_resume() and
         # the enforcing resume() entry guard produce the SAME verdict
         # (the elspeth-2f23292372 parity contract).
-        leader = RunCoordinationRepository(db.engine).live_leader(run_id=run_id)
+        leader = RunCoordinationRepository(db.engine).seat_holder(run_id=run_id)
         if leader is not None and leader.seat_live:
             reason = (
                 f"Run is in progress under live leader {leader.leader_worker_id!r} "

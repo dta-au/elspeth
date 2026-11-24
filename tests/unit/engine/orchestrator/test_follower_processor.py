@@ -4,7 +4,7 @@ Tests each stop-condition arm of the follower drain loop plus the
 construction contract:
 
 1. ``run_terminal`` — run status leaves RUNNING; follower departs and returns.
-2. ``seat_dead`` — live_leader returns None or seat_live=False; follower
+2. ``seat_dead`` — seat_holder returns None or seat_live=False; follower
    departs and returns (no exception propagated).
 3. ``evicted`` — heartbeat latches coordination_lost; RunWorkerEvictedError
    propagates out of run() after a best-effort depart.
@@ -19,7 +19,7 @@ construction contract:
 Heartbeat is driven synchronously via ``_StubHeartbeat`` (no real threads).
 All sleeps are suppressed via injected ``wait_fn``.  The follower carries no
 clock (ADR-047: seat liveness is the Landscape database's verdict).
-``live_leader`` and ``_run_is_terminal`` are controlled via the stub
+``seat_holder`` and ``_run_is_terminal`` are controlled via the stub
 coordination repo and stub factory.
 
 Disposition arm note
@@ -234,7 +234,7 @@ class _StubHeartbeat:
 class _StubRunCoordRepo:
     """Stub of RunCoordinationRepository for FollowerProcessor tests.
 
-    Controls what live_leader() returns and records depart_worker() calls.
+    Controls what seat_holder() returns and records depart_worker() calls.
     """
 
     def __init__(
@@ -254,7 +254,7 @@ class _StubRunCoordRepo:
         # Override per-call via a list (pops first element each call)
         self.live_leader_results: list[LeaderInfo | None] = []
 
-    def live_leader(self, *, run_id: str) -> LeaderInfo | None:
+    def seat_holder(self, *, run_id: str) -> LeaderInfo | None:
         self.live_leader_calls.append({"run_id": run_id})
         if self.live_leader_results:
             return self.live_leader_results.pop(0)
@@ -474,9 +474,9 @@ class TestFollowerSeatDead:
     """
 
     def test_seat_absent_raises_follower_seat_dead(self) -> None:
-        """live_leader returns None -> FollowerSeatDeadError propagated after depart."""
+        """seat_holder returns None -> FollowerSeatDeadError propagated after depart."""
         processor = _CountingDrainProcessor()
-        coord_repo = _StubRunCoordRepo(seat_present=False)  # live_leader returns None
+        coord_repo = _StubRunCoordRepo(seat_present=False)  # seat_holder returns None
         factory = _StubFactory(running=True)
         heartbeat = _StubHeartbeat()
 
@@ -746,7 +746,7 @@ class TestFollowerEvicted:
         assert heartbeat.stop_called
 
     def test_eviction_before_any_drain_pass(self) -> None:
-        """check_and_raise fires before first live_leader poll; no drain calls."""
+        """check_and_raise fires before first seat_holder poll; no drain calls."""
         processor = _CountingDrainProcessor()
         coord_repo = _StubRunCoordRepo()
         factory = _StubFactory(running=True)

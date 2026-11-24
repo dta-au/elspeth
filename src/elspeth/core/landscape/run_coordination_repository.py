@@ -38,7 +38,7 @@ verb                        consumer
 register_run_leader_on      slice 2/3: ``begin_run`` (uniformity rule, epoch 1)
 acquire_run_leadership      slice 2/3: ``resume()``'s first durable act (§B.4)
 release_seat                slice 2/3: run/resume teardown + ceremony arms (LEADER-fenced)
-live_leader                 implemented now; WIRED in slice 4 (entry-guard precision)
+seat_holder                 implemented now; WIRED in slice 4 (entry-guard precision)
 record_fence_refusal        slice 2: every fenced verb's refusal path
 verify_and_extend_fence     slice 2: finalize/run-status/checkpoint/barrier/ingest
 worker_heartbeat            slice 4: the dedicated heartbeat thread (§A.3) (MEMBER-fenced)
@@ -1207,7 +1207,7 @@ class RunCoordinationRepository:
             return SeatReleaseOutcome.FENCE_REFUSED
         return SeatReleaseOutcome.RELEASED
 
-    def live_leader(self, *, run_id: str) -> LeaderInfo | None:
+    def seat_holder(self, *, run_id: str) -> LeaderInfo | None:
         """Read-only seat read (§B.3). Implemented now; WIRED into the entry guard in slice 4.
 
         Returns None when the run has no seat row or the seat is vacant;

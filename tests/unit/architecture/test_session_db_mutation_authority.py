@@ -6461,13 +6461,13 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
     # POSITION-DEPENDENT (it pins path:line per writer), unlike the fencing
     # gate's DML digest, which is position-independent. A re-pin here is a
     # POSITION movement and must never be ledgered as threading.
-    # SHARED-CONNECTION GUARD: live_leader and the 14 other plain coordination
+    # SHARED-CONNECTION GUARD: seat_holder and the 14 other plain coordination
     # and scheduler reads now open under _maybe_serialize_shared_connection, so
     # their FINGERPRINTS moved at unchanged lines; the database.py entries moved
     # by LINE ONLY (+7, the guard's docstring). Same symbols, tables, escapes.
     WriterIdentity(
         "src/elspeth/core/landscape/run_coordination_repository.py",
-        "RunCoordinationRepository.live_leader",
+        "RunCoordinationRepository.seat_holder",
         "<non-session-write-connection>",
         "write_connection",
         "29604692b4790788",

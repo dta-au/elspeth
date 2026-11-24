@@ -285,7 +285,7 @@ def test_postgresql_rm07_and_rm08_coordination_boundaries(postgres_db: Landscape
     _begin_run(factory, run_id, leader)
     coordination = RunCoordinationRepository(postgres_db.engine)
 
-    occupied = coordination.live_leader(run_id=run_id)
+    occupied = coordination.seat_holder(run_id=run_id)
     assert occupied is not None
     assert occupied.leader_worker_id == leader
     assert occupied.seat_live is True
@@ -303,11 +303,11 @@ def test_postgresql_rm07_and_rm08_coordination_boundaries(postgres_db: Landscape
         return sampled
 
     with patch("elspeth.core.landscape.run_coordination_repository.read_landscape_decision_time", side_effect=seat_equality_clock):
-        equality = coordination.live_leader(run_id=run_id)
+        equality = coordination.seat_holder(run_id=run_id)
     assert equality is not None
     assert seat_samples == [equality.leader_heartbeat_expires_at]
     assert equality.seat_live is True
-    assert coordination.live_leader(run_id="rm-postgresql-missing") is None
+    assert coordination.seat_holder(run_id="rm-postgresql-missing") is None
 
     # NOW is in the database clock's past: these deadlines are all beyond the
     # grace threshold; "equality" is re-stamped at the sweep's fresh sample.
@@ -361,7 +361,7 @@ def test_postgresql_rm07_and_rm08_coordination_boundaries(postgres_db: Landscape
             .where(run_coordination_table.c.run_id == run_id)
             .values(leader_worker_id=None, leader_heartbeat_expires_at=None, updated_at=NOW)
         )
-    assert coordination.live_leader(run_id=run_id) is None
+    assert coordination.seat_holder(run_id=run_id) is None
 
 
 def test_postgresql_rm14_accounting_census_and_abandoned_resume_refusal(

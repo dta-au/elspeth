@@ -14,7 +14,7 @@ Value objects threaded through the leader/follower coordination protocol
   every membership-fenced verb (ADR-030 D4's second fence: the holder is an
   ``active`` ``run_workers`` row). Established by ``admit_follower``; the
   leader derives its own through ``CoordinationToken.membership``.
-- :class:`LeaderInfo` — read-only seat snapshot (``live_leader``); the
+- :class:`LeaderInfo` — read-only seat snapshot (``seat_holder``); the
   slice-4 entry-guard precision upgrade consumes it.
 - :class:`CoordinationSnapshot` — returned by an admitted ``worker_heartbeat`` so
   followers learn of seat handover on their existing cadence (§A.3;
@@ -144,7 +144,7 @@ class WorkerMembershipLost:
 
 @dataclass(frozen=True, slots=True)
 class LeaderInfo:
-    """Read-only view of a run's leader seat (``live_leader``).
+    """Read-only view of a run's leader seat (``seat_holder``).
 
     ``seat_live`` is the §C.1 liveness predicate evaluated at the caller's
     ``now``: ``leader_heartbeat_expires_at >= now``. A dead seat
