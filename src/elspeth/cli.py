@@ -4653,7 +4653,7 @@ def join(
                 typer.echo(f"Cannot join run {run_id}: {e.reason}", err=True)
                 if e.departure_failure is not None:
                     typer.echo(
-                        f"Follower seat could not be released and will lapse at heartbeat expiry: {e.departure_failure}",
+                        f"Follower membership could not be released; it lapses at heartbeat expiry: {e.departure_failure}",
                         err=True,
                     )
             raise typer.Exit(1) from None

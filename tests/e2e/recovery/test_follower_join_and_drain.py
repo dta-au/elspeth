@@ -50,7 +50,7 @@ from unittest.mock import patch
 
 import pytest
 from sqlalchemy import select, update
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
 from elspeth.contracts import NodeType, RunStatus
 from elspeth.contracts.config import RuntimeRetryConfig
@@ -393,7 +393,7 @@ class TestJoinRunAdmissionRefusals:
         crashed.db.close()
 
     @pytest.mark.parametrize("post_kind", ["tier1", "refusal", "ordinary"])
-    @pytest.mark.parametrize("departure_kind", ["tier1", "database", "ordinary"])
+    @pytest.mark.parametrize("departure_kind", ["tier1", "database", "sqlalchemy", "ordinary"])
     def test_join_departure_failure_preserves_post_check_error(self, tmp_path: Path, post_kind: str, departure_kind: str) -> None:
         crashed = _run_to_interrupted_checkpoint(tmp_path, MockClock(start=_T0))
         _seat_run_with_live_leader(crashed, leader_id=f"worker:{crashed.run_id}:leader-departure")
@@ -421,7 +421,13 @@ class TestJoinRunAdmissionRefusals:
 
         departure_error: Exception = {
             "tier1": AuditIntegrityError("departure integrity failure"),
-            "database": SQLAlchemyError("departure unavailable"),
+            "database": OperationalError(
+                "UPDATE run_workers SET status='departed' WHERE worker_id=?",
+                None,
+                sqlite3.OperationalError("database is locked"),
+                hide_parameters=True,
+            ),
+            "sqlalchemy": SQLAlchemyError("departure unavailable"),
             "ordinary": ValueError("departure unavailable"),
         }[departure_kind]
         expected_error = departure_error if departure_kind == "tier1" and post_kind != "tier1" else post_error
@@ -447,10 +453,18 @@ class TestJoinRunAdmissionRefusals:
             assert post_error.__cause__ is root_cause
             if post_kind == "refusal" and departure_kind == "database":
                 assert isinstance(post_error, JoinRefusedError)
-                assert post_error.departure_failure == "SQLAlchemyError: departure unavailable"
+                assert post_error.departure_failure == "OperationalError: database is locked"
+            elif post_kind == "refusal" and departure_kind == "sqlalchemy":
+                assert isinstance(post_error, JoinRefusedError)
+                assert post_error.departure_failure == "SQLAlchemyError"
             else:
                 notes = post_error.__notes__
                 assert any(rows[0].worker_id in note and type(departure_error).__name__ in note for note in notes)
+                if departure_kind == "database" and post_kind == "ordinary":
+                    assert any("OperationalError: database is locked" in note for note in notes)
+                    assert all("[SQL:" not in note and "\n" not in note for note in notes)
+                if departure_kind == "sqlalchemy":
+                    assert all("departure unavailable" not in note for note in notes)
         crashed.db.close()
 
     def test_join_rechecks_graph_after_run_appears(self) -> None:

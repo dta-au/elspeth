@@ -39,7 +39,7 @@ def test_join_not_ready_has_distinct_json_event(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("output_format", ["json", "console"])
-@pytest.mark.parametrize("departure_failure", [None, "SQLAlchemyError: departure unavailable"])
+@pytest.mark.parametrize("departure_failure", [None, "OperationalError: database is locked"])
 def test_join_refusal_reports_departure_failure(tmp_path: Path, output_format: str, departure_failure: str | None) -> None:
     settings = _make_jsonl_settings(tmp_path)
     initial = CliRunner().invoke(app, ["run", "-s", str(settings), "--execute"])
@@ -62,10 +62,9 @@ def test_join_refusal_reports_departure_failure(tmp_path: Path, output_format: s
     else:
         assert "graph registration incomplete" in result.stderr
         if departure_failure is None:
-            assert "seat could not be released" not in result.stderr
+            assert "Follower membership could not be released" not in result.stderr
         else:
-            assert "seat could not be released" in result.stderr
-            assert "heartbeat expiry" in result.stderr
+            assert "Follower membership could not be released; it lapses at heartbeat expiry:" in result.stderr
             assert departure_failure in result.stderr
 
 
