@@ -629,6 +629,29 @@ def test_splice_forwards_the_error_it_adds_beside_a_standing_one(surface: Surfac
 
 
 @pytest.mark.parametrize("surface", ["handler", "dispatch"])
+def test_splice_forwards_an_added_error_that_differs_from_a_standing_one_only_by_consumer(surface: Surface) -> None:
+    # The successor already lacks ghost_field from before; the inserted node
+    # lacks the same field from the same producer. Only the consumer differs,
+    # so the new error must still be reported as added.
+    state = _successor_requiring("ghost_field")
+    context = _context()
+    standing = [entry.contract for entry in context.catalog.validate_composition_state(state).validation.errors if entry.contract]
+    # Control: the standing error is the same producer and field at the successor.
+    assert SchemaContractDetail(producer="before", consumer="after", missing_fields=("ghost_field",)) in standing
+    options = {"schema": {"mode": "observed"}, "required_input_fields": ["ghost_field"]}
+    result = _invoke(surface, "splice_transform", _splice_args(options), state, context)
+    assert not result.success and result.updated_state is state
+    forwarded = [entry for entry in result.validation.errors[1:] if entry.component == "rejected_mutation"]
+    assert [(entry.error_code, entry.rejected_component, entry.contract) for entry in forwarded] == [
+        (
+            "schema_contract_violation",
+            "node:inserted",
+            SchemaContractDetail(producer="before", consumer="inserted", missing_fields=("ghost_field",)),
+        )
+    ]
+
+
+@pytest.mark.parametrize("surface", ["handler", "dispatch"])
 def test_splice_after_a_named_source_keeps_its_standing_error_out_of_the_added_ones(surface: Surface) -> None:
     # A splice names a source by its key in state.sources; contract details
     # name it by its producer id. The standing error must match across both.
