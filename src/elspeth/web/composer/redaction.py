@@ -359,6 +359,13 @@ def _summarize_arg_error_text(value: str | None, *, label: str) -> str | None:
     return f"<redacted-arg-error-{label}>"
 
 
+def safe_arg_error_class(error_class: str | None) -> str | None:
+    """Return an ARG_ERROR exception class name, or a fixed marker for a class outside the closed set."""
+    if error_class is None or error_class in _SAFE_ARG_ERROR_CLASSES:
+        return error_class
+    return _REDACTED_ARG_ERROR_CLASS
+
+
 @trust_boundary(
     tier=3,
     source="Raw ARG_ERROR result payload from a failed tool-call argument parse (caller-controlled)",
@@ -385,15 +392,9 @@ def redact_arg_error_response(
     diagnostic shape; arbitrary messages, result values, and result keys
     never cross the persistence boundary.
     """
-    safe_error_class: str | None
-    if error_class is None or error_class in _SAFE_ARG_ERROR_CLASSES:
-        safe_error_class = error_class
-    else:
-        safe_error_class = _REDACTED_ARG_ERROR_CLASS
-
     projection: dict[str, object] = {
         "_redaction_status": _ARG_ERROR_REDACTION_STATUS,
-        "error_class": safe_error_class,
+        "error_class": safe_arg_error_class(error_class),
         "error_category": error_category.value if error_category is not None else None,
         "error_message": _summarize_arg_error_text(error_message, label="message"),
     }

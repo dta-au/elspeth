@@ -49,11 +49,12 @@ from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.composer import yaml_generator
-from elspeth.web.composer.audit import build_canonicalization_sentinel
+from elspeth.web.composer.audit import CREDENTIAL_REFUSAL_ERROR_MESSAGE, build_canonicalization_sentinel
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import redact_source_storage_path
 from elspeth.web.composer.state import CompositionState, EdgeContractDict, PipelineMetadata, ValidationEntryDict
+from elspeth.web.composer.tool_error_payloads import arg_error_arguments_projection
 from elspeth.web.composer.tools import (
     _DISCOVERY_TOOLS,
     _MUTATION_TOOLS,
@@ -68,7 +69,7 @@ from elspeth.web.composer.yaml_generator import (
     generate_public_composition_dict,
     generate_public_yaml,
 )
-from elspeth.web.credential_guard import require_no_credential_material_for_tool
+from elspeth.web.credential_guard import CredentialMaterialRefused, require_no_credential_material_for_tool
 from elspeth.web.execution.preflight import runtime_preflight_settings_hash
 from elspeth.web.execution.runtime_preflight import (
     RuntimePreflightCoordinator,
@@ -893,6 +894,15 @@ def create_server(
                     "requested_session_id": exc.requested_session_id,
                     "active_session_id": exc.active_session_id,
                 }
+            except CredentialMaterialRefused as exc:
+                status = ComposerToolStatus.ARG_ERROR
+                error_class = type(exc).__name__
+                error_category = ToolArgumentErrorCategory.CREDENTIAL_MATERIAL
+                error_message = CREDENTIAL_REFUSAL_ERROR_MESSAGE
+                projection = arg_error_arguments_projection(error_class=error_class, field_count=len(arguments))
+                arguments_canonical = canonical_json(projection)
+                arguments_hash = stable_hash(projection)
+                raise
             except Exception as exc:
                 _capture_plugin_crash(exc)
                 raise
