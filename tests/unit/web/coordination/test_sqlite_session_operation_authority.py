@@ -607,13 +607,15 @@ def _expire_receipt(engine, *, operation_id: str) -> None:
 def test_sqlite_archive_soft_archives_past_own_expired_receipt_and_refuses_its_retry(engine) -> None:
     """An abandoned receipt whose lease expired no longer blocks deletion.
 
-    The session is archived rather than removed, the receipt stays as history,
-    and the archived session refuses the fence a client retry would need.
+    The parent is archived rather than removed, the receipt stays as history
+    naming its staged child, the archived parent refuses the fence a client
+    retry would need, and the child's own delete is still refused.
     """
     authority = SQLiteLocalSessionOperationAuthority(engine)
     target = _created(authority)
+    child = _created(authority)
     operation_id = str(uuid4())
-    _seed_fork_operation(engine, session_id=str(target.id), operation_id=operation_id)
+    _seed_fork_operation(engine, session_id=str(target.id), operation_id=operation_id, result_session_id=str(child.id))
     _expire_receipt(engine, operation_id=operation_id)
     context = authority.acquire(
         session_id=target.id,
@@ -646,6 +648,21 @@ def test_sqlite_archive_soft_archives_past_own_expired_receipt_and_refuses_its_r
             owner_instance_id="sqlite-retry",
             lease_seconds=30,
         )
+    child_context = authority.acquire(
+        session_id=child.id,
+        operation_kind=SessionOperationKind.ARCHIVE,
+        owner_instance_id="sqlite-owner",
+        lease_seconds=30,
+    )
+    with pytest.raises(SessionReceiptInProgressError):
+        authority.mutate(
+            child_context,
+            lambda transaction: transaction.session.decide_and_soft_archive(archived_at=datetime.now(UTC)),
+        )
+    authority.release(child_context)
+    with engine.connect() as conn:
+        child_archived_at = conn.execute(select(sessions_table.c.archived_at).where(sessions_table.c.id == str(child.id))).scalar_one()
+    assert child_archived_at is None
 
 
 def test_sqlite_archive_still_refuses_an_expired_incoming_fork(engine) -> None:
