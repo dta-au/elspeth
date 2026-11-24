@@ -122,7 +122,12 @@ ENVELOPE_MAX_PROMPT_TOKENS_TRIVIAL_PROMPT = 50_000
 # caching reduces the provider's billable token accounting, not the bytes
 # we send. This envelope is a pure regression gate, independent of
 # whether prompt caching is wired.
-ENVELOPE_MAX_PRODUCTION_BYTES_TRIVIAL_PROMPT = 300_000
+#
+# Rebaselined 2026-11-24 by the measured growth of the largest turn (+374 B,
+# 299,998 → 300,372): the explicit-approval passage now names the
+# set_pipeline and splice_transform exceptions, and the splice_transform
+# description states the whole-pipeline condition.
+ENVELOPE_MAX_PRODUCTION_BYTES_TRIVIAL_PROMPT = 300_374
 
 # Keep the existing two-payload allowance for catalog discovery followed by a
 # concrete clarification. The scenario has two legitimate provider transitions;
