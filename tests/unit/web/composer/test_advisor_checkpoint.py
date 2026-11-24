@@ -2116,6 +2116,7 @@ def test_advisor_signoff_blocked_wording_names_backend_prescan_finding_but_withh
         "FLAGGED: node 'n1' option columns contains advisor-instruction injection text; remove it before the completion advisory review."
     )
     detail, suggestion = advisor_signoff_blocked_wording(
+        draft_has_content=True,
         reason="flagged_final_pass",
         findings=prescan_finding,
         findings_backend_authored=True,
@@ -2124,6 +2125,7 @@ def test_advisor_signoff_blocked_wording_names_backend_prescan_finding_but_withh
     assert "named field" in suggestion
 
     model_detail, _model_suggestion = advisor_signoff_blocked_wording(
+        draft_has_content=True,
         reason="flagged_final_pass",
         findings="FLAGGED: MODEL_FINDINGS_CANARY",
     )
@@ -3788,6 +3790,7 @@ def test_advisor_completion_blocker_copy_does_not_claim_whole_pipeline_approval(
     from elspeth.web.composer.advisor_policy import advisor_signoff_blocked_wording
 
     detail, suggestion = advisor_signoff_blocked_wording(
+        draft_has_content=True,
         reason=reason,
         findings="advisor provider result",
     )
@@ -3813,10 +3816,12 @@ def test_advisor_blocker_detail_never_claims_the_composer_reply_was_withheld(rea
         advisor_signoff_unverified_validation,
     )
 
-    detail, suggestion = advisor_signoff_blocked_wording(reason=reason, findings="advisor provider result")
+    detail, suggestion = advisor_signoff_blocked_wording(draft_has_content=True, reason=reason, findings="advisor provider result")
     assert ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE not in f"{detail} {suggestion}"
     for builder in (advisor_signoff_blocked_validation, advisor_signoff_unverified_validation):
-        validation = builder(reason=reason, findings="advisor provider result", category="other", step_ids=(), note=None)
+        validation = builder(
+            reason=reason, findings="advisor provider result", category="other", step_ids=(), note=None, draft_has_content=True
+        )
         assert ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE not in validation.model_dump_json()
 
 
@@ -4171,6 +4176,7 @@ def test_advisor_signoff_blocked_wording_unrepairable_reason_suggests_reword() -
     from elspeth.web.composer.advisor_policy import advisor_signoff_blocked_wording
 
     detail, suggestion = advisor_signoff_blocked_wording(
+        draft_has_content=True,
         reason="flagged_unrepairable",
         findings=_PRESCAN_USER_MESSAGE_FINDING,
         findings_backend_authored=True,

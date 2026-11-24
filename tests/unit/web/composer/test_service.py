@@ -3035,7 +3035,9 @@ class TestComposerMultiTurnToolCalls:
         _assert_checkpoint_reply(
             result,
             _no_tool_policy_module.compose_review_reply_withheld_message(
-                _no_tool_policy_module.compose_advisor_signoff_unrendered_unverified_message("", failure_class="unavailable"),
+                _no_tool_policy_module.compose_advisor_signoff_unrendered_unverified_message(
+                    "", failure_class="unavailable", draft_has_content=True
+                ),
                 reason="unavailable",
             ),
             raw="",

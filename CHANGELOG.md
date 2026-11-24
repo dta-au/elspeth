@@ -20,6 +20,14 @@ changes land and is not a release.
   when the run started, now fails composer validation. No pipeline that could
   run before is refused. Only pipelines the runtime was already refusing at
   run start are now refused earlier, at validation.
+- **Changed:** the composer no longer starts a provider retry within the last
+  5 s before the job deadline. This also applies to the existing retries after
+  a provider 503. A completion review whose quota admission times out that
+  close to the deadline now ends as unavailable instead of trying again.
+- **Do not enable a composer token quota yet.** With one configured, a failed
+  provider call's usage is recorded as unknown, and that refuses the user's
+  later model calls ("Token accounting is unavailable") until usage is
+  reconciled. A retry after a transient failure is refused the same way.
 
 ### Fixed
 
@@ -35,6 +43,16 @@ changes land and is not a release.
 - When a stored conversation row fails the composer's history integrity
   check, the error now names the row (id, sequence number, role), so the
   damaged row can be found.
+- The composer now retries a transient provider 429, 500 or connection failure
+  within the request's deadline, waiting for a provider's Retry-After of up to
+  30 s. A typed budget or quota 429 is not retried. A 403 now tells the user
+  to check provider access.
+- When a planner reply was withheld because the cost of an earlier model call
+  in the same request could not be confirmed, the notice blamed "the existing
+  request limits". It now names that cause. The withheld-reply notice also no
+  longer claims "Saved draft progress remains available" when the pipeline
+  draft is empty. Both corrections also apply to the existing withhold after a
+  provider 503.
 
 ---
 

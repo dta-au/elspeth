@@ -16,6 +16,7 @@ from elspeth.web.composer import service as service_module
 from elspeth.web.composer.advisor_checkpoint import _AdvisorCheckpointComposeDeadlineExpired
 from elspeth.web.composer.audit import BufferingRecorder, ComposerLLMCallStatus
 from elspeth.web.composer.prompt_guard import prompt_guard_user_scope
+from elspeth.web.composer.provider_config import LLM_API_RETRY_BASE_DELAY_SECONDS, LLM_API_RETRY_CALL_MARGIN_SECONDS
 from elspeth.web.composer.provider_quota import ProviderCallCustody
 from elspeth.web.sessions.models import chat_messages_table, quota_provider_attempts_table
 from tests.unit.web.composer import test_advisor_checkpoint as checkpoint_fixtures
@@ -89,7 +90,7 @@ async def test_nonretryable_provider_failure_does_not_invent_a_format_retry(make
     record = service._sessions_service.add_message.calls[0].kwargs["tool_calls"][0]["pass"]
     assert record["provider_attempts"] == 1
     assert record["format_reprompt_sent"] is False
-    detail, suggestion = advisor_signoff_blocked_wording(reason="unavailable", findings=verdict.findings_text)
+    detail, suggestion = advisor_signoff_blocked_wording(draft_has_content=True, reason="unavailable", findings=verdict.findings_text)
     assert "after a format retry" not in suggestion
     assert "private-malformed-marker" not in detail + suggestion
 
@@ -471,7 +472,10 @@ async def test_rejected_attempt_does_not_contribute_final_counts(make_service, s
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("scenario", ["clean", "blocked-first", "blocked-retry", "admission-timeout-then-clean"])
+@pytest.mark.parametrize(
+    "scenario",
+    ["clean", "blocked-first", "blocked-retry", "admission-timeout-then-clean", "admission-timeout-near-deadline"],
+)
 async def test_conformance_counts_only_physical_dispatch_after_quota_admission(
     make_service, simple_state, physical_advisor, monkeypatch, scenario
 ):
@@ -487,7 +491,7 @@ async def test_conformance_counts_only_physical_dispatch_after_quota_admission(
         nonlocal admissions
         assert model == service._settings.composer_advisor_model
         admissions += 1
-        if scenario == "admission-timeout-then-clean" and admissions == 1:
+        if scenario.startswith("admission-timeout") and admissions == 1:
             raise TimeoutError("quota admission timed out before dispatch")
         if scenario == "blocked-first" or (scenario == "blocked-retry" and admissions == 2):
             await asyncio.Event().wait()
@@ -508,25 +512,37 @@ async def test_conformance_counts_only_physical_dispatch_after_quota_admission(
     monkeypatch.setattr(litellm, "acompletion", complete)
     # Keep each attempt's admission timeout independent of earlier work.
     monkeypatch.setattr(advisor_checkpoint_module, "_compose_deadline_time", lambda: 0.0)
+    retry_delays: list[float] = []
+
+    async def record_retry_delay(delay: float) -> None:
+        retry_delays.append(delay)
+
+    monkeypatch.setattr(advisor_checkpoint_module, "asyncio", SimpleNamespace(**(vars(asyncio) | {"sleep": record_retry_delay})))
+    # A retry waits one base delay and still needs the call margin before the deadline.
+    # Near the deadline the retry is refused rather than dispatched without that room.
+    deadline = (
+        LLM_API_RETRY_BASE_DELAY_SECONDS + LLM_API_RETRY_CALL_MARGIN_SECONDS + 1.0 if scenario == "admission-timeout-then-clean" else 0.2
+    )
     with structlog.testing.capture_logs() as events, prompt_guard_user_scope(""):
         verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
             phase="early",
             state=simple_state,
             recorder=None,
-            deadline=0.2,
+            deadline=deadline,
             **fenced,
         )
-    expected_calls = 0 if scenario == "blocked-first" else 1
+    expected_calls = 0 if scenario in {"blocked-first", "admission-timeout-near-deadline"} else 1
     assert physical_calls == expected_calls
+    assert retry_delays == ([LLM_API_RETRY_BASE_DELAY_SECONDS] if scenario == "admission-timeout-then-clean" else [])
     record = service._sessions_service.add_message.await_args_list[0].kwargs["tool_calls"][0]["pass"]
     event = next(item for item in events if item["event"] == "composer.advisor_checkpoint_pass")
     for facts in (record, event):
         assert facts["provider_attempts"] == expected_calls
         assert facts["format_reprompt_sent"] is False
-        first_valid = None if scenario == "blocked-first" else scenario != "blocked-retry"
+        first_valid = None if expected_calls == 0 else scenario != "blocked-retry"
         assert facts["first_attempt_schema_valid"] is first_valid
         assert facts["first_attempt_accepted"] is first_valid
-    if scenario in {"blocked-first", "blocked-retry"}:
+    if scenario in {"blocked-first", "blocked-retry", "admission-timeout-near-deadline"}:
         assert verdict.failure_class == "unavailable"
         assert record["note_present"] is None
     else:

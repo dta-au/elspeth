@@ -7,7 +7,7 @@ import functools
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, assert_never, cast
 from uuid import UUID
 
 import structlog
@@ -956,6 +956,11 @@ class PlanningApplication:
                 candidate=candidate, request=request, current_state=state, scope="planner", plugin_snapshot=plugin_snapshot
             )
             budget = declined.continuation_budget
+            # Read before the review is attempted: if the only thing refusing
+            # the review is an earlier call's unknown cost, that is the cause
+            # reported. An absent budget, a disabled review, a passed deadline
+            # or a reached call count stays budget_exhausted.
+            cost_unknown_before_review = False
             verdict = AdvisorCheckpointVerdict(
                 ok=False,
                 blocking=False,
@@ -975,6 +980,12 @@ class PlanningApplication:
                 if budget.deadline > deadline:
                     raise AuditIntegrityError("Planner decline extended its original outer request deadline")
                 budget.bind_publication(review)
+                cost_unknown_before_review = (
+                    not budget.cost_known
+                    and self._settings.composer_advisor_checkpoint_max_passes > 0
+                    and asyncio.get_running_loop().time() < budget.deadline
+                    and budget.reserved_calls < budget.policy.max_total_provider_calls
+                )
                 if self._settings.composer_advisor_checkpoint_max_passes > 0:
                     try:
                         verdict = await self._advisor_checkpoint._run_advisor_checkpoint(
@@ -1016,20 +1027,28 @@ class PlanningApplication:
             await self._completion._persist_withheld_reply(
                 "advisor_publication_withheld", candidate, session_id=session_id, session_operation_context=session_operation_context
             )
-            reason: AdvisorTerminalBlockReason = (
-                "budget_exhausted"
-                if budget is None
+            reason: AdvisorTerminalBlockReason
+            if budget is not None and cost_unknown_before_review and asyncio.get_running_loop().time() < budget.deadline:
+                reason = "prior_call_cost_unknown"
+            elif (
+                budget is None
                 or not budget.within_cost_cap()
                 or asyncio.get_running_loop().time() >= budget.deadline
                 or verdict.failure_class == "budget_exhausted"
-                else "publication_withheld"
-                if verdict.ok
-                else "unavailable"
-                if verdict.failure_class == "unavailable"
-                else "request_rejected"
-                if verdict.failure_class == "request_rejected"
-                else "malformed"
-            )
+            ):
+                reason = "budget_exhausted"
+            elif verdict.ok:
+                reason = "publication_withheld"
+            elif verdict.failure_class == "unavailable":
+                reason = "unavailable"
+            elif verdict.failure_class == "request_rejected":
+                reason = "request_rejected"
+            elif verdict.failure_class == "malformed" or verdict.failure_class == "none":
+                # An unadmitted verdict with no recorded class is reported as
+                # malformed, as before.
+                reason = "malformed"
+            else:
+                assert_never(verdict.failure_class)
             blocked = self._advisor_checkpoint._advisor_blocked_result(
                 reason=reason,
                 verdict=verdict,

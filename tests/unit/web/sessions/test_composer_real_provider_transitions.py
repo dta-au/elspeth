@@ -507,13 +507,21 @@ async def test_each_real_composer_transition_has_its_own_settled_provider_eviden
                 )
             if transition == "initial" and failed_attempt_ids:
                 # The unreviewed decline is withheld, never published: the user
-                # sees a completed turn whose only reply is trusted system notices.
+                # sees a completed turn whose only reply is trusted system
+                # notices naming the real cause. The session has no draft, so
+                # no saved draft progress is claimed.
                 user_messages = await client.get(f"/api/sessions/{session_id}/messages")
                 assert user_messages.status_code == 200, user_messages.text
                 assert [item["role"] for item in user_messages.json()] == ["user", "assistant"]
                 withheld = user_messages.json()[1]
-                assert withheld["segments"]
-                assert all(segment["kind"] == "trusted_system_notice" for segment in withheld["segments"])
+                assert [(segment["kind"], segment["content"]) for segment in withheld["segments"]] == [
+                    (
+                        "trusted_system_notice",
+                        "The reply was withheld because the completion review could not run: the cost of an earlier "
+                        "model call in this request could not be confirmed. Continue in a new message.",
+                    ),
+                    ("trusted_system_notice", "The completion review could not finish, so the reply was withheld."),
+                ]
                 assert "Hello. I can explain pipelines." not in withheld["content"]
             if transition == "proposal":
                 # Measured: a retried planner call still delivers its proposal,
