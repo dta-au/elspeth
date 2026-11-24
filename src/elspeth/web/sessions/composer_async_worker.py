@@ -87,16 +87,27 @@ _OWNER_UNSETTLED_LOGGED_LEAVES = 8
 # Unsettled owners remembered for the reaper; the oldest is forgotten first.
 # One that is forgotten is settled as a lost worker, as before.
 _UNSETTLED_OWNERS_RETAINED = 1_024
-# A probe Task sleeps this long, repeatedly; waking this much later than asked
-# means some callback held the event loop, and is logged.
-# A poll whose reap or claim raises OperationalError (transient database
-# contention) is retried at the next scan, at most this many times in a row:
-# the same bound as session-lease renewal, the membership heartbeat and the
-# orphan sweeper. Past it, or on any other error, the loop ends and the
+# A poll whose custody-free reap or claim statement raises OperationalError
+# (transient database contention) is retried after a full scan interval, at
+# most this many times in a row: the same bound as session-lease renewal, the
+# membership heartbeat and the orphan sweeper. Past it, on any other error, or
+# on an OperationalError inside a reap's session lease, the loop ends and the
 # process is restarted.
 _POLL_MAX_CONSECUTIVE_TRANSIENT_FAILURES = 5
+# A probe Task sleeps this long, repeatedly; waking this much later than asked
+# means some callback held the event loop, and is logged.
 _EVENT_LOOP_PROBE_SECONDS = 0.5
 _EVENT_LOOP_LAG_LOG_SECONDS = 1.0
+
+
+class ComposerReapLeaseCustodyUnknown(RuntimeError):
+    """An OperationalError inside a reap's session lease (acquire, settle or release).
+
+    Any of those statements may have committed before the error, so the lease's
+    fence may still be held under this instance with no local owner. The poll
+    loop never retries it: it ends, and the process restart that follows frees
+    the fence as on any lost owner. The original error is the cause.
+    """
 
 
 @dataclass(slots=True)
@@ -361,12 +372,16 @@ class ComposerAsyncWorker:
                     await self.reap_once()
                     await self._claim_once()
                 except OperationalError as exc:
-                    # Each reap and claim statement is its own transaction and
-                    # leaves no local custody behind when it raises; a claim
-                    # whose commit outcome is unknown keeps its job queued, and
-                    # claim_next takes it again once its claim lease lapses.
-                    # exc_info is deliberately omitted: SQLAlchemy cause chains
-                    # carry the database URL.
+                    # Only custody-free statements reach here: each is its own
+                    # transaction and holds no lease or fence when it raises
+                    # (a reap's session lease raises
+                    # ComposerReapLeaseCustodyUnknown instead). claim_next
+                    # commits each candidate separately: a claim whose commit
+                    # is unknown, and any committed before the failing one, are
+                    # never run here, stay queued, and are taken again with a
+                    # new token once their claim lease lapses. exc_info is
+                    # deliberately omitted: SQLAlchemy cause chains carry the
+                    # database URL.
                     consecutive_failures += 1
                     if consecutive_failures >= _POLL_MAX_CONSECUTIVE_TRANSIENT_FAILURES:
                         slog.error(
@@ -382,8 +397,13 @@ class ComposerAsyncWorker:
                     )
                 else:
                     consecutive_failures = 0
-                with suppress(TimeoutError):
-                    await asyncio.wait_for(self._wake.wait(), timeout=self._scan_interval)
+                if consecutive_failures:
+                    # A failed scan waits its whole interval: new submissions
+                    # set the wake, which must not spend the bound in a burst.
+                    await asyncio.sleep(self._scan_interval)
+                else:
+                    with suppress(TimeoutError):
+                        await asyncio.wait_for(self._wake.wait(), timeout=self._scan_interval)
         finally:
             probe.cancel()
 
@@ -1570,6 +1590,10 @@ class ComposerAsyncWorker:
                         )
                     )
                 count += 1
+            except OperationalError as exc:
+                # Acquire, settle or release may have committed: the fence's
+                # custody is unknown, so this is never a transient poll error.
+                raise ComposerReapLeaseCustodyUnknown("Reap session lease outcome is unknown") from exc
             except SessionOperationConflictError:
                 if record.claim_owner_instance_id == self._owner_instance_id:
                     try:
