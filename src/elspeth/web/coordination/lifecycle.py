@@ -125,10 +125,10 @@ _SLOW_RENEWAL_LOG_SECONDS = 2.0
 _RENEWAL_FINISHED_AT: dict[tuple[str, str, int], float] = {}
 _RENEWAL_FINISHED_RETAINED = 1_024
 # A plain-branch renewal that raises ``OperationalError`` (transient database
-# contention) is retried only while an attempt as slow as the one that failed
-# would still finish inside the lease, and only this many times in a row: the
-# same bound as the membership heartbeat and the orphan sweeper. Every other
-# renewal error loses the lease at once.
+# contention) is retried only while a retry taking as long as the failed
+# attempt would finish before the lease expires, and only this many times in a
+# row: the same bound as the membership heartbeat and the orphan sweeper. Every
+# other renewal error loses the lease at once.
 _RENEWAL_MAX_CONSECUTIVE_TRANSIENT_FAILURES = 5
 # SQLite stamps lease expiry with CURRENT_TIMESTAMP, which has whole-second
 # resolution, so its expiry can fall up to a second before the monotonic
@@ -1082,9 +1082,14 @@ class SessionOperationLease:
                 ):
                     self._record_renewal_error(renewal_error)
                     return
-                self._log_renewal_retry(
-                    renewal_error, consecutive_failures=transient_failures, seconds_since_renewal=failed_at - renewed_at
-                )
+                try:
+                    self._log_renewal_retry(
+                        renewal_error, consecutive_failures=transient_failures, seconds_since_renewal=failed_at - renewed_at
+                    )
+                except Exception:
+                    # The loss is recorded before a logging fault ends renewal.
+                    self._record_renewal_error(renewal_error)
+                    raise
             else:
                 renewed_at = attempt_started_at
                 transient_failures = 0
@@ -1101,13 +1106,14 @@ class SessionOperationLease:
         """True when a plain-branch renewal may try again after ``error``.
 
         Only ``OperationalError`` models transient contention. The retry
-        starts one interval after ``failed_at`` and is allowed only when an
-        attempt as slow as the failed one would still finish inside the lease,
-        measured from the reading taken before the SQL that last extended it,
-        less the database clock's resolution. This bounds, but cannot remove,
-        an attempt running past expiry: the database still refuses a late
-        renewal and every fenced write. A required-work renewal is never
-        retried: its failed ticket stays with the coordinator.
+        starts one interval after ``failed_at`` and is allowed only when a
+        retry taking as long as the failed attempt would finish, with one
+        second of slack for the database clock's resolution, before the lease
+        expires, measured from the reading taken before the SQL that last
+        extended it. The retry's own duration is not bounded here, and the
+        database refuses a late renewal and every fenced write. A
+        required-work renewal is never retried: its failed ticket stays with
+        the coordinator.
         """
         if not isinstance(error, OperationalError) or self._required_work is not None:
             return False

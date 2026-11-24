@@ -1267,13 +1267,29 @@ def _renew_contract():
                                         ),
                                         [expr(call(s("_record_renewal_error"), n("renewal_error"))), ret()],
                                     ),
-                                    expr(
-                                        call(
-                                            s("_log_renewal_retry"),
-                                            n("renewal_error"),
-                                            consecutive_failures=n("transient_failures"),
-                                            seconds_since_renewal=ast.BinOp(left=n("failed_at"), op=ast.Sub(), right=n("renewed_at")),
-                                        )
+                                    try_(
+                                        [
+                                            expr(
+                                                call(
+                                                    s("_log_renewal_retry"),
+                                                    n("renewal_error"),
+                                                    consecutive_failures=n("transient_failures"),
+                                                    seconds_since_renewal=ast.BinOp(
+                                                        left=n("failed_at"), op=ast.Sub(), right=n("renewed_at")
+                                                    ),
+                                                )
+                                            ),
+                                        ],
+                                        [
+                                            handler(
+                                                n("Exception"),
+                                                None,
+                                                [
+                                                    expr(call(s("_record_renewal_error"), n("renewal_error"))),
+                                                    ast.Raise(exc=None, cause=None),
+                                                ],
+                                            ),
+                                        ],
                                     ),
                                 ],
                             ),

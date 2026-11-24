@@ -11,6 +11,7 @@ from uuid import uuid4
 
 import pytest
 from sqlalchemy.exc import OperationalError
+from structlog.testing import capture_logs
 
 from elspeth.contracts.composer_progress import ComposerProgressEvent
 from elspeth.web.auth.models import UserIdentity
@@ -664,12 +665,19 @@ def _transient_claim_error() -> OperationalError:
 
 
 async def _poll_loop_with_claim_failures(
-    tmp_path, monkeypatch, failures: list[BaseException | None], *, scan_interval_seconds: float = 0.01
+    tmp_path,
+    monkeypatch,
+    failures: list[BaseException | None],
+    *,
+    scan_interval_seconds: float = 0.01,
+    queued_reap_failures: list[BaseException] | None = None,
 ):
     """Start a worker whose first ``len(failures)`` claim scans raise, in order (``None`` scans normally).
 
-    Returns the admitted record, the worker, its watchdog, the authority and
-    the engine, plus the monotonic start time of each claim scan attempted.
+    ``queued_reap_failures`` likewise raise from the first expired-queued
+    reap reads. Returns the admitted record, the worker, its watchdog, the
+    authority and the engine, plus the monotonic start time of each claim
+    scan attempted.
     """
     app, service, engine, _composer = _file_app(tmp_path)
     authority = ComposerAsyncOperationAuthority(
@@ -689,6 +697,16 @@ async def _poll_loop_with_claim_failures(
         return actual_claim_next(limit=limit)
 
     monkeypatch.setattr(authority, "claim_next", claim_next)
+    if queued_reap_failures is not None:
+        actual_list_expired_queued = authority.list_expired_queued
+        pending_reap = queued_reap_failures
+
+        def list_expired_queued(*, limit: int):
+            if pending_reap:
+                raise pending_reap.pop(0)
+            return actual_list_expired_queued(limit=limit)
+
+        monkeypatch.setattr(authority, "list_expired_queued", list_expired_queued)
     worker.start()
     return record, worker, worker._process_recovery.watchdog, authority, engine, scans
 
@@ -832,16 +850,45 @@ async def _poll_loop_reaping_one_lease(tmp_path, monkeypatch, *, fault: str):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fault", ("acquire", "release"))
 async def test_poll_loop_escalates_on_a_transient_error_inside_a_reap_lease(tmp_path, monkeypatch: pytest.MonkeyPatch, fault: str) -> None:
-    # The lease's statements may have committed: the fence's custody is
-    # unknown, so the loop ends and the process restarts, as before.
-    worker, watchdog, engine, error = await _poll_loop_reaping_one_lease(tmp_path, monkeypatch, fault=fault)
+    # An error inside a reap's session lease leaves its custody unknown: the
+    # loop ends and the process restarts, as before.
+    with capture_logs() as logs:
+        worker, watchdog, engine, error = await _poll_loop_reaping_one_lease(tmp_path, monkeypatch, fault=fault)
+        try:
+            assert await _until(lambda: worker._loop_task.done()), "an error inside a reap lease must end the poll loop"
+            failure = worker._loop_task.exception()
+            assert type(failure) is worker_module.ComposerReapLeaseCustodyUnknown
+            assert failure.__cause__ is error
+            assert await _until(lambda: bool(watchdog.signals))
+            assert watchdog.reasons == [RecoveryReason.REQUIRED_WORKER_LOST]
+        finally:
+            await worker.stop()
+            engine.dispose()
+    lost = [entry for entry in logs if entry["event"] == "composer_operation.worker_loop_lost"]
+    assert [(entry["exc_class"], entry["cause_class"]) for entry in lost] == [("ComposerReapLeaseCustodyUnknown", "OperationalError")], (
+        "the loop-lost log names the original driver class"
+    )
+
+
+@pytest.mark.asyncio
+async def test_poll_loop_retries_a_transient_error_from_a_custody_free_reap_statement(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # list_expired_queued holds no lease or fence: its transient error is
+    # retried at the next scan like a claim error, and the job still runs.
+    reap_errors: list[BaseException] = [_transient_claim_error()]
+    record, worker, watchdog, authority, engine, scans = await _poll_loop_with_claim_failures(
+        tmp_path, monkeypatch, [], queued_reap_failures=reap_errors
+    )
     try:
-        assert await _until(lambda: worker._loop_task.done()), "an error inside a reap lease must end the poll loop"
-        failure = worker._loop_task.exception()
-        assert type(failure) is worker_module.ComposerReapLeaseCustodyUnknown
-        assert failure.__cause__ is error
-        assert await _until(lambda: bool(watchdog.signals))
-        assert watchdog.reasons == [RecoveryReason.REQUIRED_WORKER_LOST]
+
+        def completed() -> bool:
+            current = authority.get(session_id=record.session_id, operation_id=record.operation_id)
+            return current is not None and current.status == "completed"
+
+        assert await _until(lambda: completed() or worker._loop_task.done())
+        assert not worker._loop_task.done(), f"a custody-free reap error ended the poll loop; recovery reasons {watchdog.reasons}"
+        assert reap_errors == [] and completed(), "the failed reap must come first and the job must still run"
+        assert scans, "the job was claimed by a later scan"
+        assert watchdog.reasons == [] and watchdog.signals == []
     finally:
         await worker.stop()
         engine.dispose()

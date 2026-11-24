@@ -92,6 +92,39 @@ async def test_transient_renewal_retry_needs_a_plain_lease_that_knows_its_expiry
         engine.dispose()
 
 
+@pytest.mark.asyncio
+async def test_a_fault_logging_a_renewal_retry_records_the_loss_before_it_escapes(tmp_path, monkeypatch) -> None:
+    _service, engine, authority, context, _coordinator = await _actual_scope(tmp_path)
+    transient = OperationalError("transient renewal contention", {}, RuntimeError("owned driver fault"))
+    log_fault = RuntimeError("retry log fault")
+
+    def transient_renew(actual_context, *, lease_seconds):
+        raise transient
+
+    def failing_retry_log(self, error, *, consecutive_failures, seconds_since_renewal):
+        raise log_fault
+
+    monkeypatch.setattr(authority, "renew", transient_renew)
+    monkeypatch.setattr(lifecycle.SessionOperationLease, "_log_renewal_retry", failing_retry_log)
+    lease = lifecycle.SessionOperationLease(
+        authority, context, lease_seconds=30, renew_interval_seconds=0.01, lease_extended_at=time.monotonic()
+    )
+    try:
+        async with asyncio.timeout(10):
+            loss = await lease.wait_until_lost()
+            renewal = lease._renewal_task
+            assert renewal is not None
+            await asyncio.wait({renewal})
+        assert loss is transient and lease.renewal_error is transient, "the loss is recorded before the log fault escapes"
+        assert renewal.exception() is log_fault, "the log fault is not suppressed"
+    finally:
+        if not lease.closed:
+            with suppress(Exception):
+                await lease.close()
+        authority.release(context)
+        engine.dispose()
+
+
 def _read_actual_fence(engine, context):
     with engine.connect() as connection:
         return connection.execute(

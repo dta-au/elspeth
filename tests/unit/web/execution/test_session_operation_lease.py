@@ -1421,8 +1421,8 @@ async def _assert_renewal_error_escalates(
 @pytest.mark.asyncio
 async def test_execute_renewal_escalates_transient_errors_that_outlast_the_lease(execution_fixture: ExecutionTestCustody) -> None:
     # Each failed attempt takes 8 s of a 30 s lease. The third fails at 24 s;
-    # a retry as slow would finish at 32 s, past the lease less its 1 s clock
-    # slack, so it escalates two short of the cap. (Timing the retry's start
+    # a retry as slow would finish at 32 s, past the lease, so it escalates two
+    # short of the cap. (Timing the retry's start
     # alone would allow a fourth attempt; no window at all would reach the cap.)
     attempts = await _assert_renewal_error_escalates(
         execution_fixture,
@@ -1436,12 +1436,29 @@ async def test_execute_renewal_escalates_transient_errors_that_outlast_the_lease
 
 
 @pytest.mark.asyncio
+async def test_execute_renewal_reserves_one_second_of_clock_slack(execution_fixture: ExecutionTestCustody) -> None:
+    # Each failed attempt takes 9.7 s of a 30 s lease. After the second, a
+    # retry as slow would finish at 29.1 s: inside the lease, but not inside
+    # it less the 1 s slack for the database clock's resolution, so the second
+    # failure escalates (without the slack a third attempt would run).
+    attempts = await _assert_renewal_error_escalates(
+        execution_fixture,
+        error=_transient_renewal_error(),
+        one_shot=False,
+        lease_seconds=30,
+        renew_interval_seconds=0.01,
+        lease_seconds_per_attempt=9.7,
+    )
+    assert attempts == 2
+
+
+@pytest.mark.asyncio
 async def test_execute_renewal_escalates_a_slow_transient_error_it_could_not_retry_in_time(
     execution_fixture: ExecutionTestCustody,
 ) -> None:
     # One failed attempt takes 15 s of a 30 s lease. A retry would start
-    # inside the lease, but one as slow would finish at 30 s, past the lease
-    # less its 1 s clock slack, so the first failure escalates.
+    # inside the lease, but one as slow would finish at 30 s, at the lease's
+    # end, so the first failure escalates.
     attempts = await _assert_renewal_error_escalates(
         execution_fixture,
         error=_transient_renewal_error(),

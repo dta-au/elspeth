@@ -358,7 +358,12 @@ class ComposerAsyncWorker:
             return
         # Consume the exception without logging provider/request content.
         failure = None if task.cancelled() else task.exception()
-        slog.error("composer_operation.worker_loop_lost", exc_class=type(failure).__name__)
+        cause = None if failure is None else failure.__cause__
+        slog.error(
+            "composer_operation.worker_loop_lost",
+            exc_class=type(failure).__name__,
+            cause_class=None if cause is None else type(cause).__name__,
+        )
         self._process_recovery.request_shutdown()
 
     async def _loop(self) -> None:
