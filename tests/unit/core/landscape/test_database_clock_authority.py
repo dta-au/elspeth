@@ -7936,12 +7936,13 @@ def test_call_created_at_admission_withdraws_when_reviewed_audit_seam_changes(mu
     assert len(admitted) == 2
     assert not [violation for violation in _scan_sources(sources) if violation.kind == "caller-clock-forwarding"]
     if mutation == "authority_use":
-        marker = "        timestamp = now() if created_at is None else created_at"
+        marker = "            timestamp = now() if created_at is None else created_at"
         assert marker in sources[paths[0]]
         sources[paths[0]] = sources[paths[0]].replace(
             marker,
-            marker + "\n        conn.execute(update(run_workers_table).values(heartbeat_expires_at=created_at))",
+            marker + "\n            conn.execute(update(run_workers_table).values(heartbeat_expires_at=created_at))",
         )
+        ast.parse(sources[paths[0]])
     else:
         before = "created_at=created_at,"
         assert before in sources[paths[1]]
