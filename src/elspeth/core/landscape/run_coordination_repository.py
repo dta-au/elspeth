@@ -303,21 +303,44 @@ class RefusedCallRecord:
     latency_ms: float | None
 
     def event_context(self) -> dict[str, str | int | float | None]:
+        """The record as exact built-in values (see :func:`_exact_builtin`)."""
         return {
-            "call_id": self.call_id,
-            "state_id": self.state_id,
-            "operation_id": self.operation_id,
-            "call_index": self.call_index,
-            "call_type": self.call_type.value,
-            "status": self.status.value,
-            "request_hash": self.request_hash,
-            "response_hash": self.response_hash,
-            "prompt_tokens": self.prompt_tokens,
-            "completion_tokens": self.completion_tokens,
-            "cached_prompt_tokens": self.cached_prompt_tokens,
-            "reasoning_tokens": self.reasoning_tokens,
-            "latency_ms": self.latency_ms,
+            "call_id": _exact_builtin(self.call_id),
+            "state_id": _exact_builtin(self.state_id),
+            "operation_id": _exact_builtin(self.operation_id),
+            "call_index": _exact_builtin(self.call_index),
+            "call_type": _exact_builtin(self.call_type.value),
+            "status": _exact_builtin(self.status.value),
+            "request_hash": _exact_builtin(self.request_hash),
+            "response_hash": _exact_builtin(self.response_hash),
+            "prompt_tokens": _exact_builtin(self.prompt_tokens),
+            "completion_tokens": _exact_builtin(self.completion_tokens),
+            "cached_prompt_tokens": _exact_builtin(self.cached_prompt_tokens),
+            "reasoning_tokens": _exact_builtin(self.reasoning_tokens),
+            "latency_ms": _exact_builtin(self.latency_ms),
         }
+
+
+def _exact_builtin(value: object) -> str | int | float | None:
+    """One refused-call field as an exact built-in ``str``, ``int``, ``float``, ``bool`` or ``None``.
+
+    The record is built inside a fence refusal's unwind, so nothing downstream
+    of it (canonical JSON, its refusal message, the last-resort log) may reach
+    a method of a subclass the contracts admit (``TokenUsage`` accepts an
+    ``int`` subclass, and ``latency_ms`` is not type-checked). Each base-class
+    conversion returns an exact-type copy for a subclass. ``bool`` is kept as
+    itself: through ``int`` it would become ``1`` and change the event's
+    meaning. Any other type is a programming error and is refused.
+    """
+    if value is None or type(value) is bool:
+        return value
+    if isinstance(value, int):
+        return int.__int__(value)
+    if isinstance(value, float):
+        return float.__float__(value)
+    if isinstance(value, str):
+        return str.__str__(value)
+    raise TypeError(f"refused-call field holds {type(value).__qualname__}, not str, int, float, bool or None")
 
 
 def record_coordination_events(conn: Connection, *, run_id: str, events: Sequence[CoordinationEventRow]) -> None:
@@ -706,7 +729,8 @@ def record_refused_call(
             verb=verb,
             fence=fence,
             refused_call=refused_call,
-            cause=f"not canonical JSON: {refusal}",
+            cause=f"not canonical JSON: {type(refusal).__name__}",
+            exc_info=refusal,
         )
         return
     outcome = _record_best_effort_event(
@@ -729,17 +753,19 @@ _RefusedCallEventContext = dict[str, str | int | dict[str, str | int | float | N
 work item and attempt, and the ``refused_call`` record's own context."""
 
 
-def _canonical_json_refusal(context: _RefusedCallEventContext) -> str | None:
-    """Name the refusal ``canonical_json`` raises for ``context``, or ``None`` if it encodes.
+def _canonical_json_refusal(context: _RefusedCallEventContext) -> ValueError | TypeError | None:
+    """Return the refusal ``canonical_json`` raises for ``context``, or ``None`` if it encodes.
 
     The two documented refusals: ``ValueError`` for a non-finite float or an
     out-of-range integer (the rfc8785 domain errors subclass it), and
-    ``TypeError`` for a type it cannot encode.
+    ``TypeError`` for a type it cannot encode. The exception itself is returned
+    so the last-resort log keeps its message and traceback: an encoder defect
+    raising either class is then still diagnosable.
     """
     try:
         canonical_json(context)
     except (ValueError, TypeError) as exc:
-        return type(exc).__name__
+        return exc
     return None
 
 
@@ -750,17 +776,37 @@ _CANONICAL_INTEGER_MAX = 2**53 - 1
 def _last_resort_log_value(value: str | int | float | None) -> str:
     """Format one refused-call field for the last-resort log; never raises.
 
-    An integer beyond the canonical range, which is how it reached this log, is
-    written in hex: Python refuses decimal conversion of an integer longer than
-    its digit limit, and hex has no such limit. Every other value is its repr.
+    Formatting goes through the built-in base class's own methods, so a subclass
+    the contracts admit (``TokenUsage`` accepts an ``int`` subclass, and
+    ``latency_ms`` is not type-checked) cannot reach its own ``__repr__``,
+    ``__format__`` or comparisons. An integer beyond the canonical range, which
+    is how it reached this log, is written in hex: Python refuses decimal
+    conversion of an integer longer than its digit limit, and hex has no such
+    limit. ``bool`` is formatted as itself, not as the integer it subclasses.
     """
-    if type(value) is int and not -_CANONICAL_INTEGER_MAX <= value <= _CANONICAL_INTEGER_MAX:
-        return hex(value)
-    return repr(value)
+    if value is None:
+        return "None"
+    if isinstance(value, bool):
+        return bool.__repr__(value)
+    if isinstance(value, int):
+        exact = int.__int__(value)
+        if -_CANONICAL_INTEGER_MAX <= exact <= _CANONICAL_INTEGER_MAX:
+            return int.__repr__(exact)
+        return int.__format__(exact, "#x")
+    if isinstance(value, float):
+        return float.__repr__(value)
+    return str.__repr__(value)
 
 
 def _log_unrecorded_refused_call(
-    *, run_id: str, worker_id: str, verb: str, fence: str, refused_call: RefusedCallRecord, cause: str
+    *,
+    run_id: str,
+    worker_id: str,
+    verb: str,
+    fence: str,
+    refused_call: RefusedCallRecord,
+    cause: str,
+    exc_info: ValueError | TypeError | None = None,
 ) -> None:
     logger.error(
         "refused call record for run %r (worker %r, verb %r, fence %r) was not recorded (%s): %s",
@@ -770,6 +816,7 @@ def _log_unrecorded_refused_call(
         fence,
         cause,
         ", ".join(f"{key}={_last_resort_log_value(value)}" for key, value in refused_call.event_context().items()),
+        exc_info=exc_info,
     )
 
 

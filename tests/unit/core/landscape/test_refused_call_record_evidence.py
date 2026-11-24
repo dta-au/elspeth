@@ -146,6 +146,26 @@ def test_call_record_refused_by_item_lease_records_the_call() -> None:
     _assert_refused_call(context["refused_call"], call_id="attempt-late-1", state_id=setup.state_id, operation_id=None)
 
 
+def test_refused_call_bool_field_is_recorded_as_a_bool_not_an_integer() -> None:
+    """Normalising the record's fields to exact built-ins keeps a bool a bool (true, never 1)."""
+    setup = _setup()
+    with setup.recorder.db.write_connection() as conn:
+        conn.execute(
+            token_work_items_table.update()
+            .where(token_work_items_table.c.work_item_id == setup.item.work_item_id)
+            .values(status="terminal", lease_owner=None)
+        )
+
+    with pytest.raises(SchedulerLeaseLostError):
+        _record_state_call(setup, latency_ms=True)
+
+    refusals = _fence_refusals(setup)
+    assert len(refusals) == 1
+    refused_call = refusals[0]["refused_call"]
+    assert isinstance(refused_call, dict)
+    assert refused_call["latency_ms"] is True
+
+
 def test_call_record_refused_by_departed_membership_records_the_call() -> None:
     setup = _setup()
     setup.recorder.factory.run_coordination.depart_worker(member_token=setup.member)
@@ -309,6 +329,20 @@ def test_refused_call_record_lost_to_a_db_fault_is_logged_with_its_identity(
     assert "completion_tokens=45" in message
 
 
+class _RaisingReprInt(int):
+    """An ``int`` subclass ``TokenUsage`` admits, whose own ``repr`` raises."""
+
+    def __repr__(self) -> str:
+        raise RuntimeError("repr exploded")
+
+
+class _RaisingReprFloat(float):
+    """A ``float`` subclass an untyped ``latency_ms`` admits, whose own ``repr`` raises."""
+
+    def __repr__(self) -> str:
+        raise RuntimeError("repr exploded")
+
+
 @pytest.mark.parametrize(
     ("latency_ms", "token_usage", "logged"),
     [
@@ -324,6 +358,18 @@ def test_refused_call_record_lost_to_a_db_fault_is_logged_with_its_identity(
             TokenUsage(prompt_tokens=10**5000, completion_tokens=45),
             ("latency_ms=12.5", f"prompt_tokens={hex(10**5000)}"),
             id="token_count_beyond_the_decimal_conversion_limit",
+        ),
+        pytest.param(
+            12.5,
+            TokenUsage(prompt_tokens=_RaisingReprInt(2**53), completion_tokens=45),
+            ("latency_ms=12.5", f"prompt_tokens={hex(2**53)}"),
+            id="int_subclass_with_raising_repr_beyond_canonical_range",
+        ),
+        pytest.param(
+            _RaisingReprFloat("nan"),
+            _USAGE,
+            ("latency_ms=nan", "prompt_tokens=120"),
+            id="non_finite_float_subclass_with_raising_repr",
         ),
     ],
 )
@@ -350,7 +396,93 @@ def test_refused_call_with_a_value_canonical_json_refuses_keeps_the_refusal_and_
     assert len(lost) == 1
     assert lost[0].levelname == "ERROR"
     message = lost[0].getMessage()
-    assert "(not canonical JSON: " in message
+    # The encoder's own refusal is kept, not just its name: an encoder defect
+    # raising ValueError or TypeError stays diagnosable from this log alone.
+    assert lost[0].exc_info is not None
+    refusal_type = lost[0].exc_info[0]
+    assert refusal_type is not None
+    assert issubclass(refusal_type, (ValueError, TypeError))
+    assert f"(not canonical JSON: {refusal_type.__name__})" in message
     assert "call_id='attempt-late-1'" in message
     for fragment in logged:
         assert fragment in message
+
+
+class _HostileInt(int):
+    def __repr__(self) -> str:
+        raise RuntimeError("repr exploded")
+
+    def __str__(self) -> str:
+        raise RuntimeError("str exploded")
+
+    def __format__(self, spec: str) -> str:
+        raise RuntimeError("format exploded")
+
+
+class _HostileFloat(float):
+    def __repr__(self) -> str:
+        raise RuntimeError("repr exploded")
+
+    def __str__(self) -> str:
+        raise RuntimeError("str exploded")
+
+    def __format__(self, spec: str) -> str:
+        raise RuntimeError("format exploded")
+
+
+class _HostileStr(str):
+    def __repr__(self) -> str:
+        raise RuntimeError("repr exploded")
+
+    def __str__(self) -> str:
+        raise RuntimeError("str exploded")
+
+    def __format__(self, spec: str) -> str:
+        raise RuntimeError("format exploded")
+
+
+@pytest.mark.parametrize(
+    ("value", "formatted"),
+    [
+        pytest.param(None, "None", id="none"),
+        pytest.param(True, "True", id="bool_true"),
+        pytest.param(False, "False", id="bool_false"),
+        pytest.param(120, "120", id="int_in_range"),
+        pytest.param(-(2**53), hex(-(2**53)), id="negative_int_beyond_range"),
+        pytest.param(_HostileInt(7), "7", id="hostile_int_subclass_in_range"),
+        pytest.param(_HostileInt(2**53), hex(2**53), id="hostile_int_subclass_beyond_range"),
+        pytest.param(_HostileFloat("nan"), "nan", id="hostile_float_subclass_nan"),
+        pytest.param(_HostileFloat(12.5), "12.5", id="hostile_float_subclass"),
+        pytest.param(_HostileStr("attempt-late-1"), "'attempt-late-1'", id="hostile_str_subclass"),
+    ],
+)
+def test_last_resort_log_value_formats_through_the_builtin_base_class(value: str | int | float | None, formatted: str) -> None:
+    """The last-resort formatter never reaches a subclass's own repr, str or format, and formats bool as itself."""
+    from elspeth.core.landscape.run_coordination_repository import _last_resort_log_value
+
+    assert _last_resort_log_value(value) == formatted
+
+
+@pytest.mark.parametrize(
+    ("value", "expected_type"),
+    [
+        pytest.param(_HostileInt(2**53), int, id="int_subclass"),
+        pytest.param(_HostileFloat("nan"), float, id="float_subclass"),
+        pytest.param(_HostileStr("attempt-late-1"), str, id="str_subclass"),
+        pytest.param(True, bool, id="bool"),
+        pytest.param(None, type(None), id="none"),
+    ],
+)
+def test_refused_call_fields_are_exact_builtins(value: object, expected_type: type) -> None:
+    """Every refused-call field reaches canonical JSON and the log as an exact built-in, never a subclass."""
+    from elspeth.core.landscape.run_coordination_repository import _exact_builtin
+
+    assert type(_exact_builtin(value)) is expected_type
+
+
+def test_refused_call_field_of_another_type_is_refused() -> None:
+    """A container (or any other type) in a refused-call field is a programming error, refused by type."""
+    from elspeth.core.landscape.run_coordination_repository import _exact_builtin
+
+    with pytest.raises(TypeError, match="refused-call field holds list"):
+        _exact_builtin([12.5])
