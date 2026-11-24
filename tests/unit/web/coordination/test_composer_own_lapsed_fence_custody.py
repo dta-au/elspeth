@@ -5,7 +5,8 @@ epoch) is the session's current fence, unreleased and past its deadline, and
 with the reaper's flag releases that fence in the same transaction. The fence
 must be this instance's COMPOSE fence: an exact fence of another kind or owner
 is corrupt stored state and raises AuditIntegrityError before any write. A
-successor fence is never touched, and the release flag belongs to this arm only.
+successor fence is never touched, another instance never settles this instance's
+lapsed job, and the release flag belongs to this arm only.
 """
 
 from __future__ import annotations
@@ -185,5 +186,26 @@ def test_no_other_settlement_arm_may_release_a_fence(store, settled_by: str) -> 
         )
 
     record = authority.get(session_id=sid, operation_id=operation_id)
+    assert record is not None and record.status == "running"
+    assert _fence_row(engine, sid) == before
+
+
+@pytest.mark.parametrize("release", [True, False], ids=["reaper", "flagless"])
+def test_another_instance_never_settles_or_releases_this_instances_lapsed_job(store, release: bool) -> None:
+    engine, _repository, _authority, sid = store
+    operation_id, _context = _start_lapsed(store)
+    foreign = ComposerAsyncOperationAuthority(engine, owner_instance_id="foreign-owner", claim_lease_seconds=30)
+    before = _fence_row(engine, sid)
+
+    with pytest.raises(ComposerOperationFenceLost):
+        foreign.settle_own_lapsed(
+            session_id=sid,
+            operation_id=operation_id,
+            owner_instance_id="foreign-owner",
+            failure=worker_lost_error(request_id=None),
+            release_lapsed_fence=release,
+        )
+
+    record = foreign.get(session_id=sid, operation_id=operation_id)
     assert record is not None and record.status == "running"
     assert _fence_row(engine, sid) == before
