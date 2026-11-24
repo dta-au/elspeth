@@ -2643,13 +2643,21 @@ async def _lapse_and_delete_parent(service: SessionServiceImpl, parent_id: uuid.
 class TestForkParentArchivedUnderRejoin:
     """A fork whose parent was deleted while its fence had lapsed answers 404, never the exhausted-rejoin 500.
 
-    Every fence-loss site in the fork route rejoins through the reservation,
-    which meets the archived parent as ``FenceLossReason.OWNER_INACTIVE``.
+    Every fence-loss ``continue`` in the fork route's rejoin loop (settlement,
+    failure before staging, blob cleanup, failure after staging) re-enters the
+    reservation, which meets the archived parent as
+    ``FenceLossReason.OWNER_INACTIVE``.
     """
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("site", ["control_archived_before_request", "settlement", "failure_before_staging", "failure_after_staging"])
+    @pytest.mark.parametrize(
+        "site",
+        ["control_archived_before_request", "settlement", "failure_before_staging", "cleanup_after_staging", "failure_after_staging"],
+    )
     async def test_fork_whose_parent_was_deleted_under_a_lapsed_fence_returns_404(self, tmp_path, site: str) -> None:
+        from structlog.testing import capture_logs
+
+        from elspeth.contracts.blobs import BlobForkFenceLostError
         from elspeth.web.coordination.contracts import FenceLossReason, SessionOperationFenceLost
 
         app, service, blob_service = _make_fork_app(tmp_path)
@@ -2662,6 +2670,10 @@ class TestForkParentArchivedUnderRejoin:
             await _lapse_and_delete_parent(service, session.id)
             raise SessionOperationFenceLost(FenceLossReason.LEASE_EXPIRED)
 
+        async def lapse_delete_and_lose_blob_fence(*_args: object, **_kwargs: object) -> None:
+            await _lapse_and_delete_parent(service, session.id)
+            raise BlobForkFenceLostError(operation_id, attempt=1)
+
         async def fail_step(*_args: object, **_kwargs: object) -> None:
             raise RuntimeError("fork step failed")
 
@@ -2669,7 +2681,7 @@ class TestForkParentArchivedUnderRejoin:
         if site == "control_archived_before_request":
             # Control: a parent soft-archived before the request is refused by
             # the ownership check (404) before the fork loop runs, so this case
-            # holds with or without the OWNER_INACTIVE mapping. The other three
+            # holds with or without the OWNER_INACTIVE mapping. The other four
             # meet the archived parent only on rejoin.
             with service._engine.begin() as conn:
                 conn.execute(
@@ -2682,6 +2694,11 @@ class TestForkParentArchivedUnderRejoin:
                 patch.object(service, "fork_session", new=fail_step),
                 patch.object(service, "fail_operation_receipt", new=lapse_delete_and_lose_fence),
             ]
+        elif site == "cleanup_after_staging":
+            patches = [
+                patch.object(blob_service, "copy_blobs_for_fork", new=fail_step),
+                patch.object(blob_service, "cleanup_blobs_for_fork", new=lapse_delete_and_lose_blob_fence),
+            ]
         else:
             patches = [
                 patch.object(blob_service, "copy_blobs_for_fork", new=fail_step),
@@ -2690,13 +2707,19 @@ class TestForkParentArchivedUnderRejoin:
         for active in patches:
             active.start()
         try:
-            response = TestClient(app, raise_server_exceptions=False).post(f"/api/sessions/{session.id}/fork", json=body)
+            with capture_logs() as logs:
+                response = TestClient(app, raise_server_exceptions=False).post(f"/api/sessions/{session.id}/fork", json=body)
         finally:
             for active in reversed(patches):
                 active.stop()
 
         assert response.status_code == 404, response.text
         assert response.content == b'{"detail":"Session not found"}'
+        # The 404's cause: on rejoin the reservation met the archived parent as
+        # OWNER_INACTIVE. The control is refused by the ownership check before
+        # any reservation, so it records no fence loss.
+        fence_losses = [entry["reason"] for entry in logs if entry["event"] == "http_session_operation_fence_lost"]
+        assert fence_losses == ([] if site == "control_archived_before_request" else ["owner_inactive"])
         with service._engine.connect() as conn:
             parent = conn.execute(select(sessions_table).where(sessions_table.c.id == str(session.id))).one()
             visible = conn.execute(
