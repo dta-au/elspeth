@@ -757,12 +757,18 @@ def test_every_typed_identity_code_is_reviewed_complete() -> None:
     assert "field_name_header_spelling" not in transforms._SPLICE_COMPLETE_CONTRACT_DETAIL_CODES
 
 
+@pytest.mark.parametrize("field_kind", ["extra_fields", "missing_fields"])
 @pytest.mark.parametrize("code", sorted(_REVIEWED_COMPLETE_CONTRACT_DETAILS))
-def test_splice_identity_of_each_typed_code_matches_moved_and_keeps_changed_fields(code: str) -> None:
-    # Explicit boundary injection, per typed code: the same detail with the
-    # inserted node as producer is standing; other extra fields are added.
+def test_splice_identity_of_each_typed_code_matches_moved_and_keeps_changed_fields(code: str, field_kind: str) -> None:
+    # Explicit boundary injection, per typed code and per field list: the same
+    # detail with the inserted node as producer is standing; other fields are added.
     def extras(producer: str, fields: tuple[str, ...], message: str) -> ValidationEntry:
-        return _contract_entry(code, "node:after", message, SchemaContractDetail(producer, "after", extra_fields=fields))
+        detail = (
+            SchemaContractDetail(producer, "after", extra_fields=fields)
+            if field_kind == "extra_fields"
+            else SchemaContractDetail(producer, "after", missing_fields=fields)
+        )
+        return _contract_entry(code, "node:after", message, detail)
 
     result = transforms._splice_validation_rejection(
         splice_fixtures._state(),

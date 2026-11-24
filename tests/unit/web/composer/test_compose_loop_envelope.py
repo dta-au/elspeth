@@ -459,6 +459,8 @@ class TestEnvelopeHarnessSelfTests:
         small = _serialize_call([{"role": "user", "content": "x"}], [])
         assert small > 0
         assert _serialize_call([{"role": "user", "content": "x" * 1_001}], []) == small + 1_000
+        # It counts the tool block too: a tool definition adds at least its own bytes.
+        assert _serialize_call([{"role": "user", "content": "x"}], [{"description": "y" * 1_000}]) > small + 1_000
         # The gate passes at each cap and fails one byte over it.
         per_turn_cap = ENVELOPE_MAX_PRODUCTION_BYTES_TRIVIAL_PROMPT
         assert _within_production_byte_envelope((per_turn_cap,))

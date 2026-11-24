@@ -51,7 +51,7 @@ def test_splice_validation_failed_resolves_to_direct_guidance() -> None:
     assert "when no node configuration is invalid, add the step with upsert_node" in suggested_fix
     # The per-entry claim runs one way only: every added error is listed, not
     # every listed entry is added (a standing error the splice rewords can be
-    # listed when it is not a field contract).
+    # listed when its code is outside the complete-detail set).
     assert "Each rejected_mutation entry that follows this one names an error the insertion added" not in explanation
     # A splice refused only for errors the pipeline already had forwards no
     # entry of its own, so an unconditional "retry splice_transform" would
