@@ -29,6 +29,7 @@ from sqlalchemy.pool import Pool
 
 from elspeth.contracts import NodeType
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.hashing import CANONICAL_VERSION
 from elspeth.contracts.payload_store import PayloadStore
 from elspeth.contracts.results import RowResult
 from elspeth.contracts.scheduler import TokenWorkItem, TokenWorkStatus
@@ -502,7 +503,7 @@ def leader_token_for(db: LandscapeDB, run_id: str) -> CoordinationToken:
     passes its own leader's fence.
     """
 
-    leader = RunCoordinationRepository(db.engine).live_leader(run_id=run_id)
+    leader = RunCoordinationRepository(db.engine).seat_holder(run_id=run_id)
     if leader is None:
         raise AssertionError(f"run {run_id!r} has no run_coordination seat; begin_run mints one — was the run created via raw SQL?")
     return CoordinationToken(run_id=run_id, worker_id=leader.leader_worker_id, leader_epoch=leader.leader_epoch)
@@ -540,7 +541,7 @@ def leader_coordination_token(factory: RecorderFactory, run_id: str) -> Coordina
     token.
     """
 
-    leader = factory.run_coordination.live_leader(run_id=run_id)
+    leader = factory.run_coordination.seat_holder(run_id=run_id)
     if leader is None:
         raise AssertionError(f"run {run_id!r} has no run_coordination seat; begin_run mints one — was the run created via raw SQL?")
     return CoordinationToken(run_id=run_id, worker_id=leader.leader_worker_id, leader_epoch=leader.leader_epoch)
@@ -695,7 +696,7 @@ def make_recorder_with_run(
     run_id: str | None = None,
     source_node_id: str | None = None,
     source_plugin_name: str = "source",
-    canonical_version: str = "v1",
+    canonical_version: str = CANONICAL_VERSION,
     payload_store: PayloadStore | None = None,
     leader_worker_id: str | None = None,
     db: LandscapeDB | None = None,
@@ -713,8 +714,7 @@ def make_recorder_with_run(
         run_id: Explicit run ID for deterministic tests. Auto-generated if None.
         source_node_id: Explicit source node ID. Auto-generated if None.
         source_plugin_name: Plugin name for the source node (default "source").
-        canonical_version: Version string for begin_run (default "v1").
-            Some tests (e.g., test_processor.py) use "sha256-rfc8785-v1".
+        canonical_version: Version string for begin_run (defaults to the current canonical version).
         payload_store: Payload store to inject (defaults to MockPayloadStore).
             Pass a specific MockPayloadStore instance to inspect stored payloads.
             Tests that explicitly test "no payload store" behavior must pass

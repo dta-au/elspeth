@@ -1161,6 +1161,7 @@ class TestTwoResumesSameRunId:
         # Mock stable_hash(resolve_config(settings)) to return the ACTUAL hash
         # stored in the runs table (the real hash from the real run).
         fake_settings: Any = types.SimpleNamespace()
+        follower_config, follower_graph, _follower_sink, _follower_source = _build_pipeline(_SOURCE_ROWS)
         with (
             patch("elspeth.engine.orchestrator.join_admission.resolve_config", return_value={}),
             patch("elspeth.engine.orchestrator.join_admission.stable_hash", return_value=db_config_hash),
@@ -1169,6 +1170,8 @@ class TestTwoResumesSameRunId:
             follower_token = orch.join_run(
                 run_id=crashed.run_id,
                 settings=fake_settings,
+                config=follower_config,
+                graph=follower_graph,
                 window_seconds=_GUARD_LIVE_SEAT_WINDOW_SECONDS,
             )
             follower_id = follower_token.worker_id

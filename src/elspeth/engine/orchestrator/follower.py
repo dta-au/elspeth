@@ -368,7 +368,7 @@ class FollowerProcessor:
             ):
                 return
             last_leader_check_monotonic = monotonic_now
-            seat = self._run_coordination.live_leader(run_id=run_id)
+            seat = self._run_coordination.seat_holder(run_id=run_id)
             if seat is None or not seat.seat_live:
                 raise _SeatDeadError(worker_id, run_id)
 

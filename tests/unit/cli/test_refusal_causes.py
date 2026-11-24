@@ -10,15 +10,165 @@ from typer.testing import CliRunner
 
 from elspeth.cli import _emit_not_resumable_event, app
 from elspeth.contracts import Checkpoint
+from elspeth.contracts import errors as contract_errors
 from elspeth.contracts.checkpoint import ResumeRefusalCause
 from elspeth.core.checkpoint.recovery import NonResumableRunError, RecoveryManager
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 from elspeth.core.landscape.run_lifecycle_repository import RunLifecycleRepository
-from elspeth.core.landscape.schema import checkpoints_table, runs_table
+from elspeth.core.landscape.schema import checkpoints_table, run_workers_table, runs_table
+from elspeth.engine.orchestrator import Orchestrator
 from tests.fixtures.landscape import insert_crashed_leader_seat
 from tests.integration.cli.test_cli import _make_jsonl_settings
 from tests.unit.cli.test_export_resume_command import _make_landscape_db_with_run, _write_settings
+
+
+def test_join_not_ready_has_distinct_json_event(tmp_path: Path) -> None:
+    assert "JoinNotReadyError" in vars(contract_errors)
+    not_ready_error = vars(contract_errors)["JoinNotReadyError"]("run-join", "graph registration is pending")
+    assert isinstance(not_ready_error, contract_errors.JoinRefusedError)
+    settings = _make_jsonl_settings(tmp_path)
+    initial = CliRunner().invoke(app, ["run", "-s", str(settings), "--execute"])
+    assert initial.exit_code == 0, initial.output
+    with patch.object(Orchestrator, "join_run", side_effect=not_ready_error):
+        result = CliRunner().invoke(app, ["join", "run-join", "-s", str(settings), "--format", "json"])
+    assert result.exit_code == 1, result.output
+    payload = json.loads(result.stderr)
+    assert payload["event"] == "join_not_ready"
+    assert payload["run_id"] == "run-join"
+
+
+@pytest.mark.parametrize("output_format", ["json", "console"])
+@pytest.mark.parametrize("departure_failure", [None, "OperationalError: database is locked"])
+def test_join_refusal_reports_departure_failure(tmp_path: Path, output_format: str, departure_failure: str | None) -> None:
+    settings = _make_jsonl_settings(tmp_path)
+    initial = CliRunner().invoke(app, ["run", "-s", str(settings), "--execute"])
+    assert initial.exit_code == 0, initial.output
+    refusal = contract_errors.JoinRefusedError("run-join", "graph registration incomplete")
+    refusal.departure_failure = departure_failure
+    with patch.object(Orchestrator, "join_run", side_effect=refusal):
+        result = CliRunner().invoke(app, ["join", "run-join", "-s", str(settings), "--format", output_format])
+    assert result.exit_code == 1, result.output
+    if output_format == "json":
+        payload = json.loads(result.stderr)
+        assert payload["event"] == "join_refused"
+        assert payload["reason"] == "graph registration incomplete"
+        if departure_failure is None:
+            assert "departure_failed" not in payload
+            assert "departure_failure" not in payload
+        else:
+            assert payload["departure_failed"] is True
+            assert payload["departure_failure"] == departure_failure
+    else:
+        assert "graph registration incomplete" in result.stderr
+        if departure_failure is None:
+            assert "Follower membership could not be released" not in result.stderr
+        else:
+            assert "Follower membership could not be released; it lapses at heartbeat expiry:" in result.stderr
+            assert departure_failure in result.stderr
+
+
+def test_join_post_admission_error_has_join_label(tmp_path: Path) -> None:
+    settings = _make_jsonl_settings(tmp_path)
+    initial = CliRunner().invoke(app, ["run", "-s", str(settings), "--execute"])
+    assert initial.exit_code == 0, initial.output
+    error = ValueError("post-check unavailable")
+    error.add_note("follower w1 departure failed: OperationalError: database is locked")
+    with patch.object(Orchestrator, "join_run", side_effect=error):
+        result = CliRunner().invoke(app, ["join", "run-join", "-s", str(settings)])
+    assert result.exit_code == 1, result.output
+    assert "Join failed: ValueError: post-check unavailable" in result.stderr
+    # A departure failure recorded as a note on the original error reaches the operator.
+    assert "follower w1 departure failed: OperationalError: database is locked" in result.stderr
+
+
+def test_join_graph_build_failure_writes_no_follower_row(tmp_path: Path) -> None:
+    settings = _make_jsonl_settings(tmp_path)
+    initial = CliRunner().invoke(app, ["run", "-s", str(settings), "--execute"])
+    assert initial.exit_code == 0, initial.output
+    db_path = tmp_path / "landscape.db"
+    with LandscapeDB.from_url(f"sqlite:///{db_path}", create_tables=False) as db:
+        with db.engine.begin() as connection:
+            run_id = connection.execute(select(runs_table.c.run_id)).scalar_one()
+            connection.execute(update(runs_table).where(runs_table.c.run_id == run_id).values(status="running", completed_at=None))
+        RunCoordinationRepository(db.engine).acquire_run_leadership(
+            run_id=run_id,
+            worker_id=f"worker:{run_id}:leader",
+            window_seconds=10**9,
+        )
+        with patch("elspeth.cli._build_resume_graph", side_effect=ValueError("graph unavailable")):
+            result = CliRunner().invoke(app, ["join", run_id, "-s", str(settings), "--format", "json"])
+        with db.engine.connect() as connection:
+            followers = connection.execute(
+                select(run_workers_table.c.worker_id).where(run_workers_table.c.run_id == run_id, run_workers_table.c.role == "follower")
+            ).all()
+    assert result.exit_code == 1, result.output
+    assert "Error building execution graph: graph unavailable" in result.stderr
+    assert followers == []
+
+
+@pytest.mark.parametrize(
+    ("failure", "event"),
+    [
+        (ValueError("PROBE-CONFIG-INVALID"), "error"),
+        (contract_errors.AuditIntegrityError("PROBE-CONFIG-INVALID"), "fatal"),
+    ],
+)
+def test_join_pipeline_config_error_keeps_structured_event_without_follower(tmp_path: Path, failure: Exception, event: str) -> None:
+    settings = _make_jsonl_settings(tmp_path)
+    initial = CliRunner().invoke(app, ["run", "-s", str(settings), "--execute"])
+    assert initial.exit_code == 0, initial.output
+    db_path = tmp_path / "landscape.db"
+    with LandscapeDB.from_url(f"sqlite:///{db_path}", create_tables=False) as db:
+        with db.engine.begin() as connection:
+            run_id = connection.execute(select(runs_table.c.run_id)).scalar_one()
+            connection.execute(update(runs_table).where(runs_table.c.run_id == run_id).values(status="running", completed_at=None))
+        RunCoordinationRepository(db.engine).acquire_run_leadership(
+            run_id=run_id, worker_id=f"worker:{run_id}:leader", window_seconds=10**9
+        )
+        with patch("elspeth.engine.orchestrator.types.PipelineConfig", side_effect=failure):
+            result = CliRunner().invoke(app, ["join", run_id, "-s", str(settings), "--format", "json"])
+        with db.engine.connect() as connection:
+            followers = connection.execute(
+                select(run_workers_table.c.worker_id).where(run_workers_table.c.run_id == run_id, run_workers_table.c.role == "follower")
+            ).all()
+    assert result.exit_code == 4, result.output
+    payload = json.loads(result.stderr)
+    assert payload["event"] == event
+    assert payload["error_type"] == type(failure).__name__
+    assert payload["error"] == "PROBE-CONFIG-INVALID"
+    assert followers == []
+
+
+@pytest.mark.parametrize("command", ["resume", "abandon"])
+def test_cli_advisory_reports_old_version_as_not_resumable(tmp_path: Path, command: str) -> None:
+    settings = _make_jsonl_settings(tmp_path)
+    initial = CliRunner().invoke(app, ["run", "-s", str(settings), "--execute"])
+    assert initial.exit_code == 0, initial.output
+    db_path = tmp_path / "landscape.db"
+    with LandscapeDB.from_url(f"sqlite:///{db_path}", create_tables=False) as db, db.engine.begin() as connection:
+        run_id = connection.execute(select(runs_table.c.run_id)).scalar_one()
+        connection.execute(
+            update(runs_table)
+            .where(runs_table.c.run_id == run_id)
+            .values(
+                status="failed" if command == "resume" else "running",
+                completed_at=None,
+                canonical_version="sha256-rfc8785-previous",
+            )
+        )
+    result = CliRunner().invoke(app, [command, run_id, "-s", str(settings), "--format", "json"])
+    if command == "resume":
+        assert result.exit_code == 1, result.output
+        payload = json.loads(result.stderr)
+        assert payload["event"] == "not_resumable"
+        assert payload["reason"] == "canonical_version_changed"
+    else:
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)
+        assert payload["event"] == "abandon_preflight"
+        assert payload["resumable"] is False
+        assert "canonical version changed" in payload["resume_reason"]
 
 
 @pytest.mark.parametrize("exists, expected", [(False, "run_not_found"), (True, "run_terminal")])

@@ -12,6 +12,7 @@ from elspeth.contracts import NodeType, RunStatus
 from elspeth.contracts.audit import DISCARD_SINK_NAME, TokenRef
 from elspeth.contracts.enums import BatchStatus, NodeStateStatus, RoutingMode, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError, GracefulShutdownError
+from elspeth.contracts.hashing import CANONICAL_VERSION
 from elspeth.contracts.run_prompt_input import RunPromptInputEvidence
 from elspeth.contracts.run_start import RunStartPermitBinding
 from elspeth.contracts.runtime_val_manifest import build_runtime_val_manifest
@@ -299,7 +300,7 @@ def _setup_adr019_failed_resume_run(
     factory = RecorderFactory(db)
     factory.run_lifecycle.begin_run(
         config={},
-        canonical_version="v1",
+        canonical_version=CANONICAL_VERSION,
         run_id=run_id,
         source_schema_json=json.dumps({"properties": {"value": {"type": "integer"}}, "required": ["value"]}),
         openrouter_catalog_sha256="0" * 64,

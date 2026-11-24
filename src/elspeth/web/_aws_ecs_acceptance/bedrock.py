@@ -24,6 +24,7 @@ from elspeth.contracts import (
     RunStatus,
     TerminalOutcome,
     TerminalPath,
+    hashing,
 )
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
@@ -735,7 +736,7 @@ def run_bedrock_guardrails_live(
                 worker_id = mint_worker_id(run_id)
                 run = repositories.run_lifecycle.begin_run(
                     config={"acceptance": "bedrock-guardrails"},
-                    canonical_version="v1",
+                    canonical_version=hashing.CANONICAL_VERSION,
                     run_id=run_id,
                     openrouter_catalog_sha256=catalog_sha,
                     openrouter_catalog_source=catalog_source,

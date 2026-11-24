@@ -324,7 +324,7 @@ def _function_node(contract: _ArchitectureContract) -> ast.FunctionDef:
                 "FollowerProcessor",
                 "_drain_loop",
                 (
-                    "seat = self._run_coordination.live_leader(run_id=run_id)",
+                    "seat = self._run_coordination.seat_holder(run_id=run_id)",
                     "seat is None or not seat.seat_live",
                     "raise _SeatDeadError(worker_id, run_id)",
                 ),

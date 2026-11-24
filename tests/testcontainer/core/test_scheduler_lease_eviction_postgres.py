@@ -179,7 +179,7 @@ def _enqueue_ready_item(
     payload = TokenSchedulerRepository.serialize_row_payload(
         PipelineRow({"id": 1}, SchemaContract(mode="OBSERVED", fields=(), locked=True))
     )
-    leader = RunCoordinationRepository(engine).live_leader(run_id=run_id)
+    leader = RunCoordinationRepository(engine).seat_holder(run_id=run_id)
     assert leader is not None
     return repo.enqueue_ready(
         member_token=member_token_for(engine, worker_id=leader.leader_worker_id, run_id=run_id),

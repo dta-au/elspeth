@@ -693,7 +693,7 @@ class RunLifecycleRepository:
         admission = RunStartAdmissionRepository(self._db).observe(binding)
         if admission is None or admission.state is not RunStartAdmissionState.PREPARED:
             raise AuditIntegrityError("Cancellation materialization requires a prepared admission")
-        leader = self._coordination_repo.live_leader(run_id=binding.run_id)
+        leader = self._coordination_repo.seat_holder(run_id=binding.run_id)
         if leader is not None and leader.leader_worker_id == worker_id:
             # This invocation just minted this identity. No prior owner's
             # token can reach this arm, including an exact duplicate retry.

@@ -41,7 +41,11 @@ from elspeth.contracts.enums import TerminalPath
 from elspeth.contracts.errors import AbandonRefusedError
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.core.checkpoint import CheckpointManager
-from elspeth.core.checkpoint.recovery import check_run_status_resumable, check_source_lifecycle_resumable
+from elspeth.core.checkpoint.recovery import (
+    check_run_canonical_version_resumable,
+    check_run_status_resumable,
+    check_source_lifecycle_resumable,
+)
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
@@ -105,6 +109,9 @@ def _resume_verdict(db: LandscapeDB, run_id: str) -> ResumeCheck:
     _run_status, status_check = check_run_status_resumable(db, run_id)
     if not status_check.can_resume:
         return status_check
+    version_check = check_run_canonical_version_resumable(db, run_id)
+    if not version_check.can_resume:
+        return version_check
     lifecycle_gate = check_source_lifecycle_resumable(db, run_id)
     if not lifecycle_gate.check.can_resume:
         return lifecycle_gate.check
@@ -190,7 +197,7 @@ def inspect_leaderless_run(db: LandscapeDB, run_id: str) -> LeaderlessRunPreflig
             refusal_cause=ResumeRefusalCause.RUN_NOT_FOUND,
         )
 
-    leader = RunCoordinationRepository(db.engine).live_leader(run_id=run_id)
+    leader = RunCoordinationRepository(db.engine).seat_holder(run_id=run_id)
     source_lifecycle = check_source_lifecycle_resumable(db, run_id).lifecycle_by_source
     resume_check = _resume_verdict(db, run_id)
 
