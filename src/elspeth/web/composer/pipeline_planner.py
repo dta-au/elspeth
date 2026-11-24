@@ -46,7 +46,7 @@ from elspeth.contracts.composer_planner_audit import (
     ComposerPlannerCode,
     ComposerPlannerInformationClass,
 )
-from elspeth.contracts.composer_progress import ComposerProgressSink
+from elspeth.contracts.composer_progress import ComposerProgressSink, ProviderSizeReason
 from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.hashing import canonical_json as _primitive_canonical_json
@@ -164,7 +164,7 @@ from elspeth.web.composer.provider_context import capture_provider_context
 from elspeth.web.composer.provider_discovery_response import (
     argument_error_response,
 )
-from elspeth.web.composer.provider_errors import classify_provider_failure, request_size_rejection
+from elspeth.web.composer.provider_errors import classify_provider_failure, provider_size_reason, request_size_rejection
 from elspeth.web.composer.provider_gateway import _litellm_acompletion
 from elspeth.web.composer.provider_quota import (
     ProviderCallCustody,
@@ -788,6 +788,10 @@ class PipelinePlannerError(RuntimeError):
     the durable failure disposition so it never requires a temp diagnostic.
     Empty for non-rejection failures (timeout, provider error, ...).
 
+    ``provider_size_reason`` is set exactly on the refusal of a sent request
+    the provider rejected as too large (detail code ``context_ceiling_provider``):
+    over the model's context limit, or as a request (HTTP 413). The user's text
+    is chosen by it.
     """
 
     def __init__(
@@ -796,10 +800,12 @@ class PipelinePlannerError(RuntimeError):
         *,
         code: str,
         detail_codes: tuple[str, ...] = (),
+        provider_size_reason: ProviderSizeReason | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.detail_codes = detail_codes
+        self.provider_size_reason = provider_size_reason
 
 
 class PlannerDeclined(PipelinePlannerError):
@@ -3455,12 +3461,18 @@ def _planner_context_budget_components(
 
 
 def _planner_context_budget_exhausted(
-    ceiling: Literal["tokens", "bytes", "provider"], components: Mapping[str, int]
+    ceiling: Literal["tokens", "bytes", "provider"],
+    components: Mapping[str, int],
+    *,
+    provider_size_reason: ProviderSizeReason | None = None,
 ) -> PipelinePlannerError:
+    if (ceiling == "provider") != (provider_size_reason is not None):
+        raise AuditIntegrityError("A provider-ceiling refusal, and only one, carries the provider's size reason")
     return PipelinePlannerError(
         "planner context budget exhausted",
         code="CONTEXT_BUDGET_EXHAUSTED",
         detail_codes=(f"context_ceiling_{ceiling}", f"largest_component_{largest_component(components)}"),
+        provider_size_reason=provider_size_reason,
     )
 
 
@@ -4413,7 +4425,8 @@ async def _plan_pipeline_inner(
                     # An admitted dispatch still needs terminal evidence, but
                     # a first-party fault must retain its original type.
                     raise
-                if request_size_rejection(exc) is not None:
+                size_reason = provider_size_reason(exc)
+                if size_reason is not None:
                     unshed_history = request_conversation_context is not None and (
                         any(
                             request.history_index not in context_budget.shed_history_indices
@@ -4456,6 +4469,7 @@ async def _plan_pipeline_inner(
                             history_sheddable=0,
                             hatch_sheddable=0,
                         ),
+                        provider_size_reason=size_reason,
                     ) from None
                 if provider_failure.kind == "timeout":
                     raise PipelinePlannerError("planner provider call timed out", code="TIMEOUT") from None

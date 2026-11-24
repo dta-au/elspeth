@@ -18,7 +18,9 @@ context-limit rejection is.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from pathlib import Path
+from typing import cast
 
 import httpx
 import litellm
@@ -31,6 +33,12 @@ from litellm.llms.bedrock.common_utils import BedrockError
 from litellm.llms.openai.common_utils import OpenAIError
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
+from elspeth.contracts.composer_progress import (
+    CONTEXT_BUDGET_PROVIDER_REFUSAL_DETAIL,
+    CONTEXT_BUDGET_REQUEST_TOO_LARGE_DETAIL,
+    ProviderSizeReason,
+    context_budget_provider_refusal_detail,
+)
 from elspeth.contracts.provider_rejection import SafeRequestRejection
 from elspeth.web.composer import audit as composer_audit
 from elspeth.web.composer import provider_gateway
@@ -40,7 +48,7 @@ from elspeth.web.composer.provider_errors import classify_provider_failure, requ
 from elspeth.web.composer.provider_gateway import _BadRequestLLMError
 from tests.unit.web.composer.test_compose_loop_llm_audit import _make_llm_response
 from tests.unit.web.composer.test_endpoint_affordance import _service as _text_service
-from tests.unit.web.composer.test_gateway_capacity_rejection import _GENEROUS_SETTING, _compose, _ScriptedProvider, _service
+from tests.unit.web.composer.test_gateway_capacity_rejection import _GENEROUS_SETTING, _compose, _ScriptedProvider, _service, _too_long
 from tests.unit.web.composer.test_gateway_capacity_rejection import (
     _advisor_end_gate_clean as _advisor_end_gate_clean_fixture,
 )
@@ -145,6 +153,48 @@ async def test_a_413_with_nothing_left_to_leave_out_is_the_size_refusal_naming_t
     assert call.error_message == "request_too_large"
     assert call.to_dict()["rejection_reason_source"] == "http_status"
     assert _PROXY_BODY not in str(call.to_dict())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("rejection", "reason", "detail"),
+    [
+        pytest.param(lambda: mapped_provider_error("openai", 413), "request_too_large", CONTEXT_BUDGET_REQUEST_TOO_LARGE_DETAIL, id="413"),
+        pytest.param(
+            lambda: mapped_provider_error("bedrock", 413), "request_too_large", CONTEXT_BUDGET_REQUEST_TOO_LARGE_DETAIL, id="bedrock-413"
+        ),
+        pytest.param(_too_long, "context_length_exceeded", CONTEXT_BUDGET_PROVIDER_REFUSAL_DETAIL, id="context-limit"),
+    ],
+)
+async def test_the_compose_loop_refusal_text_is_chosen_by_the_typed_size_reason(
+    rejection: Callable[[], BaseException], reason: str, detail: str
+) -> None:
+    # The refusal evidence carries the provider's typed reason; the user's text
+    # (the route's ``detail`` is ``str(exc)``) is chosen by it, never by text.
+    service, session_id = _service(_GENEROUS_SETTING)
+    provider = _ScriptedProvider(rejection())
+
+    with pytest.raises(ComposerConvergenceError) as exc_info:
+        await _compose(service, session_id, provider)
+
+    assert exc_info.value.evidence["ceiling"] == "provider"
+    assert exc_info.value.evidence["provider_reason"] == reason
+    assert str(exc_info.value) == detail
+
+
+@pytest.mark.parametrize(
+    ("reason", "detail"),
+    [("request_too_large", CONTEXT_BUDGET_REQUEST_TOO_LARGE_DETAIL), ("context_length_exceeded", CONTEXT_BUDGET_PROVIDER_REFUSAL_DETAIL)],
+    ids=["request_too_large", "context_length_exceeded"],
+)
+def test_the_provider_refusal_detail_is_selected_by_reason(reason: ProviderSizeReason, detail: str) -> None:
+    assert context_budget_provider_refusal_detail(reason) == detail
+
+
+def test_control_the_two_provider_refusal_texts_differ_and_an_unknown_reason_is_refused() -> None:
+    assert CONTEXT_BUDGET_REQUEST_TOO_LARGE_DETAIL != CONTEXT_BUDGET_PROVIDER_REFUSAL_DETAIL
+    with pytest.raises(ValueError):
+        context_budget_provider_refusal_detail(cast(ProviderSizeReason, "invalid_request"))
 
 
 @pytest.mark.asyncio

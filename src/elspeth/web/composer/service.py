@@ -47,7 +47,7 @@ from elspeth.contracts.composer_llm_audit import (
     ComposerLLMCall,
     ComposerLLMRequestByteSplit,
 )
-from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressSink
+from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressSink, ProviderSizeReason
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.prompt_guard import (
@@ -168,7 +168,7 @@ from elspeth.web.composer.provider_config import (
     infer_provider_from_model_name,
     infer_provider_from_unprefixed_model_name,
 )
-from elspeth.web.composer.provider_errors import classify_provider_failure, request_size_rejection
+from elspeth.web.composer.provider_errors import classify_provider_failure, provider_size_reason, request_size_rejection
 from elspeth.web.composer.provider_gateway import (
     ProviderGateway,
     _BadRequestLLMError,
@@ -1929,13 +1929,16 @@ class ComposerServiceImpl:
         budget_record: ComposerContextBudgetRecord,
         component_bytes: Mapping[str, int],
         scope: _ContextBudgetRefusalScope,
+        provider_reason: ProviderSizeReason,
     ) -> ComposerConvergenceError:
-        """Build the refusal for a sent request the provider rejected as over the model's context limit.
+        """Build the refusal for a sent request the provider rejected as too large.
 
         The same refusal shape as the pre-dispatch one, with ``provider`` as
         the ceiling: the request was under ELSPETH's own maximum and was sent;
-        the limit that refused it is the gateway's or the model's. The sizes
-        are those of the request that was sent, from its own budget record.
+        the limit that refused it is the gateway's or the model's (over the
+        context limit), or the provider's or a proxy's (HTTP 413), as
+        ``provider_reason`` says. The sizes are those of the request that was
+        sent, from its own budget record.
         """
         return ComposerConvergenceError.capture(
             max_turns=scope.composition_turns_used + scope.discovery_turns_used,
@@ -1947,6 +1950,8 @@ class ComposerServiceImpl:
             reason="context_budget_exceeded",
             evidence={
                 "ceiling": "provider",
+                # The typed reason the user's text is chosen by.
+                "provider_reason": provider_reason,
                 "estimated_tokens": budget_record.estimated_tokens_after,
                 "request_bytes": budget_record.request_wire_bytes,
                 "max_prompt_tokens": self._context_budget_policy.max_prompt_tokens,
@@ -2035,7 +2040,8 @@ class ComposerServiceImpl:
                     context_budget=budget_record,
                 )
             except _BadRequestLLMError as rejection:
-                if request_size_rejection(rejection.__cause__) is None:
+                size_reason = provider_size_reason(rejection.__cause__)
+                if size_reason is None:
                     # Not recognised as a size rejection, so not called one. That the
                     # request went out above the estimate is carried for the user.
                     rejection.sent_over_estimate = budget_record.over_estimate is True
@@ -2077,6 +2083,7 @@ class ComposerServiceImpl:
                         failed_turn=failed_turn,
                         recorder=recorder,
                     ),
+                    size_reason,
                 ) from rejection
             break
         if last_chance:

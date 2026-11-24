@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING, Literal
 import httpx
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
+from elspeth.contracts.composer_progress import ProviderSizeReason
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.json_parser import parse_json_strict
 from elspeth.contracts.provider_rejection import RequestRejectionReason, SafeRequestRejection
 
@@ -190,6 +192,18 @@ def request_size_rejection(exc: BaseException | None) -> SafeRequestRejection | 
     if failure.request_rejection.reason_code in ("context_length_exceeded", "request_too_large"):
         return failure.request_rejection
     return None
+
+
+def provider_size_reason(exc: BaseException | None) -> ProviderSizeReason | None:
+    """The typed reason a provider failure is a size rejection; ``None`` for any other failure."""
+    rejection = request_size_rejection(exc)
+    if rejection is None:
+        return None
+    if rejection.reason_code == "context_length_exceeded":
+        return "context_length_exceeded"
+    if rejection.reason_code == "request_too_large":
+        return "request_too_large"
+    raise AuditIntegrityError(f"size rejection with a reason that is not a size reason: {rejection.reason_code!r}")
 
 
 def size_rejection_code(exc: BaseException | None) -> RequestRejectionReason | None:
