@@ -34,6 +34,7 @@ from elspeth.web.coordination.contracts import (
     CompatibilityKey,
     InstanceState,
 )
+from elspeth.web.coordination.upkeep_engine import LeaseUpkeepSiblingRefusal, LeaseUpkeepSiblingRefused
 from elspeth.web.deployment_profiles import deployment_startup_profile
 from elspeth.web.sessions.models import SESSION_SCHEMA_EPOCH, web_instances_table
 from elspeth.web.sessions.protocol import WebInstanceRecord
@@ -200,9 +201,9 @@ class RepositoryWebInstanceMembershipAuthority:
             raise NotImplementedError(f"web instance membership authority not implemented for {engine.dialect.name}")
         if lease_upkeep_authority is not None:
             if type(lease_upkeep_authority) is not RepositoryWebInstanceMembershipAuthority:
-                raise TypeError("lease_upkeep_authority must be the same authority class")
+                raise LeaseUpkeepSiblingRefused(LeaseUpkeepSiblingRefusal.WRONG_CLASS)
             if lease_upkeep_authority.lease_upkeep_authority is not None:
-                raise ValueError("lease_upkeep_authority must not carry its own upkeep authority")
+                raise LeaseUpkeepSiblingRefused(LeaseUpkeepSiblingRefusal.NESTED)
         self._engine = engine
         self._clock_sql = _DATABASE_CLOCK_SQL[engine.dialect.name]
         self._lease_upkeep_authority = lease_upkeep_authority

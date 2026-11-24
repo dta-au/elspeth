@@ -815,11 +815,13 @@ facts §7.1) and is recorded, not used.
 
 ## Connection budget
 
-Per replica the sessions and Landscape engines each pool
-`pool_size 5 + max_overflow 5`, and a third, sessions-database pool of
-2 connections (no overflow) serves session lease renewal, lease release
-and the membership heartbeat: at most 22 connections per replica; two
-replicas plus Jobs and the operator's `psql` (facts §4.5). `verify-connection-budget` reads
+The sessions engine and every Landscape engine (the replica's own and
+each running pipeline's) pool `pool_size 5 + max_overflow 5`. On the
+sessions database each replica also keeps a 2-connection pool (no
+overflow) for session lease renewal, lease release and the membership
+heartbeat, so the sessions side uses up to 12 connections per replica.
+The Landscape engines and the readiness probes' connections come on top,
+as do the second replica, Jobs and the operator's `psql` (facts §4.5). `verify-connection-budget` reads
 `az monitor metrics list --metric active_connections` on the server and
 passes the series through the shared validator against the SKU's
 `max_connections`.

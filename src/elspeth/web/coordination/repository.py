@@ -99,6 +99,7 @@ from elspeth.web.coordination.quota_authority import (
     session_storage_bytes_on_connection,
 )
 from elspeth.web.coordination.run_start_permit_authority import RepositoryRunStartPermitAuthority
+from elspeth.web.coordination.upkeep_engine import LeaseUpkeepSiblingRefusal, LeaseUpkeepSiblingRefused
 from elspeth.web.sessions.composer_operation_preconditions import check_composer_operation_preconditions_on_connection
 from elspeth.web.sessions.composer_operations import (
     ComposerOperationClaim,
@@ -5037,9 +5038,9 @@ class _SessionOperationAuthorityRepository:
     ) -> None:
         if lease_upkeep_authority is not None:
             if type(lease_upkeep_authority) is not type(self):
-                raise TypeError("lease_upkeep_authority must be the same authority class")
+                raise LeaseUpkeepSiblingRefused(LeaseUpkeepSiblingRefusal.WRONG_CLASS)
             if lease_upkeep_authority.lease_upkeep_authority is not None:
-                raise ValueError("lease_upkeep_authority must not carry its own upkeep authority")
+                raise LeaseUpkeepSiblingRefused(LeaseUpkeepSiblingRefusal.NESTED)
         self._engine = engine
         self._quota_exceeded_recorder = quota_exceeded_recorder
         self._approval_supersession_recorder = approval_supersession_recorder

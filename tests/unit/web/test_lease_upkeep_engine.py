@@ -34,6 +34,8 @@ from elspeth.web.coordination.membership_lifecycle import RegisteredWebInstanceM
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.coordination.upkeep_engine import (
     LeaseUpkeepCheckoutRefused,
+    LeaseUpkeepSiblingRefusal,
+    LeaseUpkeepSiblingRefused,
     create_lease_upkeep_engine,
     has_separate_lease_upkeep_pool,
     lease_upkeep_authority,
@@ -205,19 +207,25 @@ def test_sibling_must_be_the_same_class_and_must_not_nest(tmp_path: Path) -> Non
         assert carrier.lease_upkeep_authority is leaf
         assert lease_upkeep_authority(carrier) is leaf
         assert lease_upkeep_authority(leaf) is leaf
-        with pytest.raises(ValueError, match="must not carry its own upkeep authority"):
+        with pytest.raises(LeaseUpkeepSiblingRefused) as nested:
             SQLiteLocalSessionOperationAuthority(engine, lease_upkeep_authority=carrier)
+        assert nested.value.reason is LeaseUpkeepSiblingRefusal.NESTED
 
         class _Subclass(SQLiteLocalSessionOperationAuthority):
             pass
 
-        with pytest.raises(TypeError, match="same authority class"):
+        with pytest.raises(LeaseUpkeepSiblingRefused) as wrong_class:
             SQLiteLocalSessionOperationAuthority(engine, lease_upkeep_authority=_Subclass(engine))
+        assert wrong_class.value.reason is LeaseUpkeepSiblingRefusal.WRONG_CLASS
         membership_leaf = RepositoryWebInstanceMembershipAuthority(engine)
         membership = RepositoryWebInstanceMembershipAuthority(engine, lease_upkeep_authority=membership_leaf)
         assert membership.lease_upkeep_authority is membership_leaf
-        with pytest.raises(ValueError, match="must not carry its own upkeep authority"):
+        with pytest.raises(LeaseUpkeepSiblingRefused) as membership_nested:
             RepositoryWebInstanceMembershipAuthority(engine, lease_upkeep_authority=membership)
+        assert membership_nested.value.reason is LeaseUpkeepSiblingRefusal.NESTED
+        with pytest.raises(LeaseUpkeepSiblingRefused) as membership_wrong_class:
+            RepositoryWebInstanceMembershipAuthority(engine, lease_upkeep_authority=cast(RepositoryWebInstanceMembershipAuthority, leaf))
+        assert membership_wrong_class.value.reason is LeaseUpkeepSiblingRefusal.WRONG_CLASS
     finally:
         engine.dispose()
 
@@ -349,6 +357,10 @@ def test_wiring_check_fails_when_the_sibling_is_omitted(built_app: Callable[[], 
         _assert_upkeep_wiring(app, monkeypatch)
 
 
+class _UpkeepDisposeFailed(RuntimeError):
+    """Sentinel raised by the patched upkeep dispose."""
+
+
 def test_session_engine_finalizer_disposes_both_pools(built_app: Callable[[], FastAPI], monkeypatch: pytest.MonkeyPatch) -> None:
     app = built_app()
     disposed: list[str] = []
@@ -357,7 +369,7 @@ def test_session_engine_finalizer_disposes_both_pools(built_app: Callable[[], Fa
 
     def failing_upkeep_dispose() -> None:
         disposed.append("upkeep")
-        raise RuntimeError("upkeep dispose failed")
+        raise _UpkeepDisposeFailed
 
     real_main_dispose = main_engine.dispose
     real_upkeep_dispose = upkeep_engine.dispose
@@ -368,7 +380,7 @@ def test_session_engine_finalizer_disposes_both_pools(built_app: Callable[[], Fa
 
     monkeypatch.setattr(upkeep_engine, "dispose", failing_upkeep_dispose)
     monkeypatch.setattr(main_engine, "dispose", recording_main_dispose)
-    with pytest.raises(RuntimeError, match="upkeep dispose failed"):
+    with pytest.raises(_UpkeepDisposeFailed):
         app.state._session_engine_finalizer()
     assert disposed == ["upkeep", "main"]
     real_upkeep_dispose()
@@ -433,8 +445,8 @@ async def test_heartbeat_checks_out_from_the_upkeep_pool_and_register_does_not(
 ) -> None:
     main_engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.db'}")
     initialize_session_schema(main_engine)
-    upkeep_checkouts: list[str] = []
-    event.listen(guarded_engine, "checkout", lambda *_args: upkeep_checkouts.append(threading.current_thread().name))
+    upkeep_checkouts: list[bool] = []
+    event.listen(guarded_engine, "checkout", lambda *_args: upkeep_checkouts.append(async_workers.on_lease_upkeep_worker()))
     authority = RepositoryWebInstanceMembershipAuthority(
         main_engine, lease_upkeep_authority=RepositoryWebInstanceMembershipAuthority(guarded_engine)
     )
@@ -458,7 +470,7 @@ async def test_heartbeat_checks_out_from_the_upkeep_pool_and_register_does_not(
         await membership.start()
         assert upkeep_checkouts == []
         await _wait_until_true(lambda: len(upkeep_checkouts) >= 1, seconds=5)
-        assert all(name.startswith("lease-upkeep") for name in upkeep_checkouts)
+        assert all(upkeep_checkouts)
     finally:
         try:
             await asyncio.wait_for(membership.begin_drain(), timeout=5)

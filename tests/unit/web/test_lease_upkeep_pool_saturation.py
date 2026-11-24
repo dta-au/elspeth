@@ -1,8 +1,7 @@
 """Lease renewal and release reach the database while the main session pool is exhausted.
 
 Driven through ``create_app`` so the production wiring decides which pool
-renewal checks out from. Only names that also exist before the dedicated
-upkeep pool are imported, so this file measures red on the earlier tree.
+renewal and release check out from.
 """
 
 from __future__ import annotations

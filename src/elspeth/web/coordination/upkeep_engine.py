@@ -20,6 +20,7 @@ connected) before the listener runs.
 
 from __future__ import annotations
 
+from enum import StrEnum
 from typing import TYPE_CHECKING
 
 from sqlalchemy import Engine, event
@@ -39,6 +40,29 @@ class LeaseUpkeepCheckoutRefused(RuntimeError):
     Deliberately not an ``OperationalError``: callers that retry transient
     database contention must not retry a wiring defect.
     """
+
+
+class LeaseUpkeepSiblingRefusal(StrEnum):
+    """Why an authority refused the lease-upkeep sibling it was given."""
+
+    WRONG_CLASS = "wrong_class"
+    NESTED = "nested"
+
+
+_SIBLING_REFUSAL_MESSAGES = {
+    LeaseUpkeepSiblingRefusal.WRONG_CLASS: "lease_upkeep_authority must be the same authority class",
+    LeaseUpkeepSiblingRefusal.NESTED: "lease_upkeep_authority must not carry its own upkeep authority",
+}
+
+
+class LeaseUpkeepSiblingRefused(ValueError):
+    """An authority refused its lease-upkeep sibling; ``reason`` says why."""
+
+    def __init__(self, reason: LeaseUpkeepSiblingRefusal) -> None:
+        if type(reason) is not LeaseUpkeepSiblingRefusal:
+            raise TypeError("reason must be a LeaseUpkeepSiblingRefusal")
+        super().__init__(_SIBLING_REFUSAL_MESSAGES[reason])
+        self.reason = reason
 
 
 def has_separate_lease_upkeep_pool(url: str) -> bool:
