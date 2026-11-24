@@ -513,6 +513,13 @@ async def test_each_planner_call_persists_its_conservative_rate(tmp_path: Path, 
     assert [call.model_requested for call in recorder.llm_calls] == [_UNMARKED, _UNMARKED, "test/advisor"]
     ratios = [call.context_budget.bytes_per_token for call in recorder.llm_calls if call.context_budget is not None]
     assert ratios == [repr(1.0), repr(1.0), repr(1.0)]
+    budgets = [call.context_budget for call in recorder.llm_calls]
+    assert all(budget is not None for budget in budgets)
+    assert [budget.surface for budget in budgets if budget is not None] == ["planner", "planner", "hatch"]
+    # The first planner call has no earlier call to measure. The hatch's model has no call of
+    # its own yet, so it falls back too: another model's tokens are not its own.
+    first, _, hatch = (budget for budget in budgets if budget is not None)
+    assert (first.density_source, hatch.density_source) == ("fallback", "fallback")
 
 
 _CONTEXT_REDUCED_HEADLINE = "Earlier conversation is no longer visible to the composer."
@@ -659,6 +666,12 @@ def _repriced_estimate(budget: ComposerContextBudgetRecord, previous: ComposerLL
     measured = previous.context_budget.request_wire_bytes / previous.prompt_tokens
     if 1 <= measured <= 8:
         rate = measured * 0.9
+    # The record names where its density came from and the density itself, before the margin.
+    assert budget.surface == "planner"
+    if previous.status is ComposerLLMCallStatus.SUCCESS and 1 <= measured <= 8:
+        assert (budget.density_source, budget.measured_bytes_per_token) == ("live_call", repr(measured))
+    else:
+        assert (budget.density_source, budget.measured_bytes_per_token) == ("fallback", None)
     if budget.anchor_prompt_tokens <= budget.anchor_wire_bytes <= 8 * budget.anchor_prompt_tokens:
         rate = min(rate, budget.anchor_wire_bytes / budget.anchor_prompt_tokens)
     byte_arm = math.ceil(budget.decision_wire_bytes_after / rate)
@@ -721,6 +734,8 @@ async def test_six_producer_schema_results_fit_the_budget_and_labels_do_not_chan
     assert budget.estimated_tokens_after == _repriced_estimate(budget, recorder.llm_calls[0])
     assert budget.estimated_tokens_after <= budget.anchor_prompt_tokens + budget.decision_wire_bytes_after - budget.anchor_shared_bytes
     assert budget.estimated_tokens_after <= policy.max_prompt_tokens
+    # The lookup's count is plausible for its size, so this call was priced from it, and says so.
+    assert budget.density_source == "live_call"
 
     # Was: removing provenance from the same protected results cost more and was refused.
     # Now the labels do not enter the price: the same estimate, and no refusal.
@@ -1368,6 +1383,7 @@ def _fit_hatch_request(
         request_conversation_context=None,
         hatch_transcript_index=3,
         hatch_transcript=transcript,
+        surface="hatch",
         policy=policy,
         history=ContextBudgetHistory.empty(),
         model="test/advisor",
@@ -1531,6 +1547,7 @@ def test_a_hatch_message_that_is_not_the_labelled_transcript_is_a_framework_bug(
             request_conversation_context=None,
             hatch_transcript_index=3,
             hatch_transcript=transcript,
+            surface="hatch",
             policy=_context_policy(max_request_bytes=1_000_000),
             history=ContextBudgetHistory.empty(),
             model="test/advisor",

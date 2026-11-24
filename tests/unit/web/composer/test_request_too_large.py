@@ -27,6 +27,8 @@ from litellm.llms.openai.common_utils import OpenAIError
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.provider_rejection import SafeRequestRejection
+from elspeth.web.composer import audit as composer_audit
+from elspeth.web.composer.audit import llm_call_audit_envelope
 from elspeth.web.composer.protocol import ComposerConvergenceError
 from elspeth.web.composer.provider_errors import classify_provider_failure, request_size_rejection
 from tests.unit.web.composer.test_compose_loop_llm_audit import _make_llm_response
@@ -135,3 +137,26 @@ async def test_a_413_with_nothing_left_to_leave_out_is_the_size_refusal_naming_t
     assert call.error_message == "request_too_large"
     assert call.to_dict()["rejection_reason_source"] == "http_status"
     assert _PROXY_BODY not in str(call.to_dict())
+
+
+@pytest.mark.asyncio
+async def test_the_persisted_call_audit_names_what_recognised_the_rejection(monkeypatch: pytest.MonkeyPatch) -> None:
+    service, session_id = _service(_GENEROUS_SETTING)
+    provider = _ScriptedProvider(mapped_provider_error("openai", 413))
+
+    with pytest.raises(ComposerConvergenceError) as exc_info:
+        await _compose(service, session_id, provider)
+
+    (call,) = exc_info.value.llm_calls
+    persisted = llm_call_audit_envelope(call)["call"]
+    assert isinstance(persisted, dict)
+    assert persisted["rejection_reason_source"] == "http_status"
+    # Control: the instrument goes red when the public whitelist drops the field.
+    monkeypatch.setattr(
+        composer_audit,
+        "_LLM_CALL_PUBLIC_AUDIT_FIELDS",
+        tuple(name for name in composer_audit._LLM_CALL_PUBLIC_AUDIT_FIELDS if name != "rejection_reason_source"),
+    )
+    dropped = llm_call_audit_envelope(call)["call"]
+    assert isinstance(dropped, dict)
+    assert "rejection_reason_source" not in dropped

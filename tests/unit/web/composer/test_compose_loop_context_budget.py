@@ -1082,6 +1082,8 @@ async def test_the_reply_stage_request_quotes_every_tool_result_of_the_turn_in_f
 
     selected, tools, record = await _prepare_reply(service, llm_messages)
 
+    assert record.surface == "reply"
+    assert unshed_record.surface == "reply"
     assert record.stubbed_tool_call_ids == ()
     assert record.estimated_tokens_after == record.estimated_tokens_before
     assert record.estimated_tokens_before > service._context_budget_policy.shed_above * cap

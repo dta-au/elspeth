@@ -93,6 +93,14 @@ async def test_a_rejection_with_history_present_is_retried_once_with_every_earli
     assert retry_budget.stubbed_tool_call_ids == ()
     assert retry_budget.to_dict()["retry_after_provider_rejection"] is True
     assert "retry_after_provider_rejection" not in _budget(rejected).to_dict()
+    # Each budget record names its surface and what its density came from; a
+    # rejected call gives none, so the resend is priced as the first call was.
+    for call in (rejected, retried):
+        assert (_budget(call).surface, _budget(call).density_source, _budget(call).measured_bytes_per_token) == (
+            "compose_loop",
+            "fallback",
+            None,
+        )
 
 
 @pytest.mark.asyncio

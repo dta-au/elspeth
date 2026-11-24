@@ -1802,6 +1802,7 @@ class ComposerServiceImpl:
         # this fixed allowance: their savings are charged entirely per byte.
         authored_bytes = escaped_bytes(SYSTEM_PROMPT) + (message_wire_split([], sent_tools).tools_bytes or 0)
         authored_bytes += protected_reference_bytes(sent_messages, excluded_positions=frozenset({0, *sheddable_positions}))
+        measured = frame.history.measured_rate(calls=recorder.llm_calls, model=self._model, dialect=self._planner_dialect)
         try:
             decision = decide_context_budget(
                 policy=self._context_budget_policy,
@@ -1822,9 +1823,7 @@ class ComposerServiceImpl:
                 # A message under the byte maximum always goes: the estimate
                 # decides what is left out, the provider judges its own limit.
                 on_over_estimate="send",
-                measured_bytes_per_token=frame.history.measured_bytes_per_token(
-                    calls=recorder.llm_calls, model=self._model, dialect=self._planner_dialect
-                ),
+                measured_bytes_per_token=None if measured is None else measured.bytes_per_token,
             )
         except ContextBudgetRefusal as refusal:
             raise self._context_budget_refusal(
@@ -1864,6 +1863,9 @@ class ComposerServiceImpl:
             decision_wire_bytes=decision.request_bytes_before,
             decision_wire_bytes_after=decision.request_bytes_after,
             retry_after_provider_rejection=True if shed_all_history else None,
+            surface="reply" if reply_stage else "compose_loop",
+            density_source="fallback" if measured is None else measured.source,
+            measured_bytes_per_token=None if measured is None else repr(measured.bytes_per_token),
         )
         if not shed:
             return messages, record, decision.bytes_per_token_used

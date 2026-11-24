@@ -24,7 +24,7 @@ from elspeth.web.composer.context_budget import (
     SheddableSegment,
     decide_context_budget,
 )
-from elspeth.web.composer.context_budget_history import ContextBudgetHistory, MeasuredDensity
+from elspeth.web.composer.context_budget_history import ContextBudgetHistory, MeasuredDensity, MeasuredRate
 from tests.unit.web.composer.test_context_budget_history import _COMPOSER, _audit_row, _call
 
 # A recorded 0.8.17 session (one model, sizes and audit budget fields only). Its first shed:
@@ -155,9 +155,20 @@ def test_stored_history_keeps_the_newest_plausible_density_per_model_and_dialect
         MeasuredDensity(other_model, None, 3.5),
         MeasuredDensity(_COMPOSER, ToolContractDialect.NONE, 2.5),
     }
-    assert history.measured_bytes_per_token(calls=(), model=_COMPOSER, dialect=None) == 4.4
-    assert history.measured_bytes_per_token(calls=(), model=_COMPOSER, dialect=ToolContractDialect.NONE) == 2.5
-    assert history.measured_bytes_per_token(calls=(), model="never/seen", dialect=None) is None
+    assert history.measured_rate(calls=(), model=_COMPOSER, dialect=None) == MeasuredRate(4.4, "stored_call")
+    assert history.measured_rate(calls=(), model=_COMPOSER, dialect=ToolContractDialect.NONE) == MeasuredRate(2.5, "stored_call")
+    assert history.measured_rate(calls=(), model="never/seen", dialect=None) is None
+
+
+def test_a_density_from_this_exchange_is_named_a_live_call_and_wins_over_the_stored_one() -> None:
+    from tests.unit.contracts.test_composer_llm_audit import _budget_record, _make_call
+
+    history = ContextBudgetHistory.from_records([_audit_row(1, _call(total_bytes=4_400, prompt_tokens=1_000))])
+    live = _make_call(model_requested=_COMPOSER, prompt_tokens=1_000, context_budget=_budget_record(request_wire_bytes=3_000))
+
+    assert history.measured_rate(calls=(live,), model=_COMPOSER, dialect=None) == MeasuredRate(3.0, "live_call")
+    # Control: without the live call the stored density is the one used, and named so.
+    assert history.measured_rate(calls=(), model=_COMPOSER, dialect=None) == MeasuredRate(4.4, "stored_call")
 
 
 def test_a_record_without_a_dialect_key_is_read_as_dialect_free() -> None:

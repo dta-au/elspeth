@@ -3484,6 +3484,7 @@ def _fit_planner_context_budget(
     request_conversation_context: PlannerConversationContext | None,
     hatch_transcript_index: int | None,
     hatch_transcript: AdvisorVisibleTranscript | None,
+    surface: Literal["planner", "hatch"],
     policy: ContextBudgetPolicy,
     history: ContextBudgetHistory,
     model: str,
@@ -3600,6 +3601,7 @@ def _fit_planner_context_budget(
         tools=scratch_tools,
         mutable_positions=frozenset(mutable_positions),
     )
+    measured = history.measured_rate(calls=earlier_calls, model=model, dialect=dialect)
     try:
         decision = decide_context_budget(
             policy=policy,
@@ -3625,7 +3627,7 @@ def _fit_planner_context_budget(
             # loop: the estimate decides what is left out, the provider judges
             # its own limit.
             on_over_estimate="send",
-            measured_bytes_per_token=history.measured_bytes_per_token(calls=earlier_calls, model=model, dialect=dialect),
+            measured_bytes_per_token=None if measured is None else measured.bytes_per_token,
         )
     except ContextBudgetRefusal as refusal:
         raise _planner_context_budget_exhausted(
@@ -3664,6 +3666,9 @@ def _fit_planner_context_budget(
         anchor_shared_bytes=anchor.shared_bytes,
         decision_wire_bytes=decision.request_bytes_before,
         decision_wire_bytes_after=decision.request_bytes_after,
+        surface=surface,
+        density_source="fallback" if measured is None else measured.source,
+        measured_bytes_per_token=None if measured is None else repr(measured.bytes_per_token),
     )
     applied = list(messages)
     # History keys exist only when the request carries a conversation context.
@@ -4095,6 +4100,8 @@ async def _plan_pipeline_inner(
             request_conversation_context=request_conversation_context,
             hatch_transcript_index=hatch_transcript_index,
             hatch_transcript=hatch_transcript,
+            # The same condition that selects the hatch's model and route.
+            surface="hatch" if model_override is not None else "planner",
             policy=context_policy,
             history=context_budget_history,
             model=effective_model,

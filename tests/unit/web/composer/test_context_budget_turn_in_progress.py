@@ -490,6 +490,7 @@ def test_tool_keys_carried_from_an_earlier_planner_call_never_stub_a_result_of_t
             request_conversation_context=None,
             hatch_transcript_index=None,
             hatch_transcript=None,
+            surface="hatch",
             policy=policy,
             history=history,
             model="test/advisor",

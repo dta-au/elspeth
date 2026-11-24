@@ -28,7 +28,7 @@ import json
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, final
+from typing import Any, Literal, final
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus, ContextBudgetAnchorStatus, ToolContractDialect
 from elspeth.contracts.errors import AuditIntegrityError
@@ -157,6 +157,19 @@ class MeasuredDensity:
 
 @final
 @dataclass(frozen=True, slots=True)
+class MeasuredRate:
+    """The density a byte rate is priced from, and where it was measured.
+
+    ``live_call``: a successful call earlier in this exchange; ``stored_call``:
+    the session's stored calls.
+    """
+
+    bytes_per_token: float
+    source: Literal["live_call", "stored_call"]
+
+
+@final
+@dataclass(frozen=True, slots=True)
 class ContextBudgetHistory:
     """Previously shed history keys for one session, and its measured densities, newest first."""
 
@@ -167,9 +180,7 @@ class ContextBudgetHistory:
     def empty(cls) -> ContextBudgetHistory:
         return cls(previously_shed_history=frozenset())
 
-    def measured_bytes_per_token(
-        self, *, calls: Sequence[ComposerLLMCall], model: str, dialect: ToolContractDialect | None
-    ) -> float | None:
+    def measured_rate(self, *, calls: Sequence[ComposerLLMCall], model: str, dialect: ToolContractDialect | None) -> MeasuredRate | None:
         """The density the byte rate is priced from, or ``None`` for the fallback rate.
 
         The newest successful budgeted call of this model and dialect in this
@@ -188,10 +199,10 @@ class ContextBudgetHistory:
                 continue
             density = _measured_density(call.prompt_tokens, call.context_budget.request_wire_bytes)
             if density is not None:
-                return density
+                return MeasuredRate(density, "live_call")
         for measured in self.measured:
             if measured.model == model and measured.dialect == dialect:
-                return measured.bytes_per_token
+                return MeasuredRate(measured.bytes_per_token, "stored_call")
         return None
 
     def shed_history_after(self, calls: Sequence[ComposerLLMCall]) -> frozenset[str]:
