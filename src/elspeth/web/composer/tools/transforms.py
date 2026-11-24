@@ -16,6 +16,7 @@ from elspeth.contracts.enums import OutputMode
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.core.config import RuntimeNodeName
 from elspeth.core.templates import MAX_JINJA_TEMPLATE_BYTES, template_size_refusal
+from elspeth.web.composer._producer_resolver import source_producer_id
 from elspeth.web.composer.inventory_response_contracts import (
     PLUGIN_INDEX_DETAILS_TOOL,
     PLUGIN_INDEX_RESPONSE_CONTRACT,
@@ -1834,6 +1835,23 @@ def _execute_splice_transform(
 
 _SPLICE_VALIDATION_FAILED_MESSAGE: Final[str] = "Spliced pipeline failed context-aware validation."
 
+# Codes whose typed contract detail (producer, consumer, missing and extra
+# fields) identifies the defect completely, so a splice may compare them
+# without their message. A code outside this set, including one added later,
+# is compared by its message: a miss then reports a standing error as added,
+# never hides an added one. field_name_header_spelling stays out: its detail
+# carries only the authored spellings, not the arriving field the repair names.
+_SPLICE_COMPLETE_CONTRACT_DETAIL_CODES: Final[frozenset[str]] = frozenset(
+    {
+        "schema_contract_violation",
+        "sink_contract_violation",
+        "locked_input_extras",
+        "sink_locked_extras",
+        "transform_contract_violation",
+        "transform_declared_output_not_guaranteed",
+    }
+)
+
 
 def _rejection_subject_ref(component: str) -> str | None:
     """The ``rejected_component`` ref for a validation component, when it has one.
@@ -1850,7 +1868,7 @@ def _rejection_subject_ref(component: str) -> str | None:
 def _splice_error_identity(
     entry: ValidationEntry,
     *,
-    predecessor_id: str,
+    predecessor_producer_id: str,
     inserted_node_id: str | None,
 ) -> tuple[object, ...]:
     """The identity a splice compares an error by, before and after the insertion.
@@ -1859,21 +1877,28 @@ def _splice_error_identity(
     ``predecessor -> inserted -> successor``. An error the successor already
     had against the predecessor comes back naming the inserted node as its
     producer, with a reworded message and possibly another component. An
-    entry whose typed contract detail names fields is therefore identified by
-    its code, its producer (the inserted node counted as the predecessor it
-    stands in for), its consumer and those fields; component and message are
-    ignored. Errors from any other producer stay distinct, so an error the
-    insertion causes on another edge into the same consumer is still new.
+    entry whose code is in ``_SPLICE_COMPLETE_CONTRACT_DETAIL_CODES`` and whose
+    typed contract detail names fields is therefore identified by its code, its
+    producer (the inserted node counted as the predecessor it stands in for,
+    in the producer id space), its consumer and those fields; component and
+    message are ignored. Errors from any other producer stay distinct, so an
+    error the insertion causes on another edge into the same consumer is
+    still new.
 
-    Every other entry, including a contract detail that names no fields, is
-    identified by its component, code and message.
+    Every other entry, including a contract detail that names no fields or
+    whose code is outside that set, is identified by its component, code and
+    message.
 
     ``inserted_node_id`` is ``None`` before the insertion: the pre-splice
     state has no inserted node to map.
     """
     contract = entry.contract
-    if contract is not None and (contract.missing_fields or contract.extra_fields):
-        producer = predecessor_id if contract.producer == inserted_node_id else contract.producer
+    if (
+        contract is not None
+        and entry.error_code in _SPLICE_COMPLETE_CONTRACT_DETAIL_CODES
+        and (contract.missing_fields or contract.extra_fields)
+    ):
+        producer = predecessor_producer_id if contract.producer == inserted_node_id else contract.producer
         return (
             "contract",
             entry.error_code,
@@ -1912,7 +1937,12 @@ def _splice_validation_rejection(
 
     Whether an error was already there is decided by :func:`_splice_error_identity`.
     """
-    prior_keys = {_splice_error_identity(entry, predecessor_id=predecessor_id, inserted_node_id=None) for entry in prior_errors}
+    # Contract details name a source by its producer id (``source:<name>``),
+    # while a splice names it by its key in ``state.sources``.
+    predecessor_producer_id = source_producer_id(predecessor_id) if predecessor_id in state.sources else predecessor_id
+    prior_keys = {
+        _splice_error_identity(entry, predecessor_producer_id=predecessor_producer_id, inserted_node_id=None) for entry in prior_errors
+    }
     forwarded = tuple(
         replace(
             entry,
@@ -1921,7 +1951,8 @@ def _splice_validation_rejection(
             rejected_component=_rejection_subject_ref(entry.component),
         )
         for entry in candidate_errors
-        if _splice_error_identity(entry, predecessor_id=predecessor_id, inserted_node_id=inserted_node_id) not in prior_keys
+        if _splice_error_identity(entry, predecessor_producer_id=predecessor_producer_id, inserted_node_id=inserted_node_id)
+        not in prior_keys
     )
     rejection = _saved_graph_rejection_result(
         state, _SPLICE_VALIDATION_FAILED_MESSAGE, error_code="splice_validation_failed", rejected_component=None

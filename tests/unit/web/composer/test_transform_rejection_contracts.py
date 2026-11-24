@@ -19,7 +19,17 @@ from elspeth.web.composer.protocol import ComposerPluginCrashError
 from elspeth.web.composer.redaction import redact_tool_call_response
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.composer.service import ComposerAvailability
-from elspeth.web.composer.state import CompositionState, EdgeSpec, SchemaContractDetail, ValidationEntry, ValidationSummary
+from elspeth.web.composer.state import (
+    CompositionState,
+    EdgeSpec,
+    NodeSpec,
+    OutputSpec,
+    PipelineMetadata,
+    SchemaContractDetail,
+    SourceSpec,
+    ValidationEntry,
+    ValidationSummary,
+)
 from elspeth.web.composer.tools import execute_tool, transforms
 from elspeth.web.composer.tools._common import ToolContext, ToolResult, normalize_tool_result_validation
 from elspeth.web.composer.tools._dispatch import finalize_tool_result
@@ -574,11 +584,13 @@ def _successor_requiring(field: str) -> CompositionState:
     return replace(state, nodes=tuple(replace(node, options=options) if node.id == "after" else node for node in state.nodes))
 
 
-def _splice_args(options: dict[str, Any]) -> dict[str, Any]:
+def _splice_args(
+    options: dict[str, object], *, predecessor: str = "before", successor: str = "after", plugin: str = "passthrough"
+) -> dict[str, object]:
     return {
-        "predecessor_id": "before",
-        "successor_id": "after",
-        "node": {"id": "inserted", "plugin": "passthrough", "options": options, "on_error": "discard"},
+        "predecessor_id": predecessor,
+        "successor_id": successor,
+        "node": {"id": "inserted", "plugin": plugin, "options": options, "on_error": "discard"},
     }
 
 
@@ -614,6 +626,151 @@ def test_splice_forwards_the_error_it_adds_beside_a_standing_one(surface: Surfac
             SchemaContractDetail(producer="before", consumer="inserted", missing_fields=("other_field",)),
         )
     ]
+
+
+@pytest.mark.parametrize("surface", ["handler", "dispatch"])
+def test_splice_after_a_named_source_keeps_its_standing_error_out_of_the_added_ones(surface: Surface) -> None:
+    # A splice names a source by its key in state.sources; contract details
+    # name it by its producer id. The standing error must match across both.
+    base = splice_fixtures._state()
+    nodes = tuple(
+        replace(node, options={"schema": {"mode": "observed"}, "required_input_fields": ["ghost"]}) if node.id == "before" else node
+        for node in base.nodes
+    )
+    edges = tuple(replace(edge, from_node="primary") if edge.from_node == "source" else edge for edge in base.edges)
+    state = replace(base, sources={"primary": base.sources["source"]}, nodes=nodes, edges=edges)
+    context = _context()
+    standing = [entry.contract for entry in context.catalog.validate_composition_state(state).validation.errors if entry.contract]
+    # Control: the contract names the source by its producer id, not its key.
+    assert SchemaContractDetail(producer="source:primary", consumer="before", missing_fields=("ghost",)) in standing
+    args = _splice_args({"schema": {"mode": "observed"}}, predecessor="primary", successor="before")
+    result = _invoke(surface, "splice_transform", args, state, context)
+    assert not result.success and result.updated_state is state
+    assert result.validation.errors[0].error_code == "splice_validation_failed"
+    assert [entry for entry in result.validation.errors[1:] if entry.component == "rejected_mutation"] == []
+
+
+def _header_spelling_state() -> CompositionState:
+    """A fixed-schema source carries ``name``; its successor creates ``Name``, a header spelling of it."""
+    return CompositionState(
+        source=SourceSpec(
+            plugin="csv",
+            on_success="rows",
+            options={"path": "rows.csv", "schema": {"mode": "fixed", "fields": ["name: str"]}},
+            on_validation_failure="discard",
+        ),
+        nodes=(
+            NodeSpec(
+                id="after",
+                node_type="transform",
+                plugin="value_transform",
+                input="rows",
+                on_success="result",
+                on_error="discard",
+                options={"schema": {"mode": "observed"}, "operations": [{"target": "Name", "expression": "row['c']"}]},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            ),
+        ),
+        edges=(
+            EdgeSpec(id="source-after", from_node="source", to_node="after", edge_type="on_success", label=None),
+            EdgeSpec(id="after-result", from_node="after", to_node="result", edge_type="on_success", label=None),
+        ),
+        outputs=(
+            OutputSpec(
+                name="result",
+                plugin="json",
+                options={"path": "out.jsonl", "schema": {"mode": "observed"}, "mode": "write", "collision_policy": "auto_increment"},
+                on_write_failure="discard",
+            ),
+        ),
+        metadata=PipelineMetadata(),
+        version=9,
+    )
+
+
+@pytest.mark.parametrize("surface", ["handler", "dispatch"])
+def test_splice_forwards_a_header_spelling_error_whose_repair_it_changed(surface: Surface) -> None:
+    # The detail carries only the authored spelling ("Name"); the arriving
+    # field the repair names moves from "name" to "alias". The two entries
+    # differ, so the candidate's entry is reported as added.
+    state = _header_spelling_state()
+    context = _context()
+    standing = [
+        e for e in context.catalog.validate_composition_state(state).validation.errors if e.error_code == "field_name_header_spelling"
+    ]
+    assert [entry.contract for entry in standing] == [SchemaContractDetail(producer="source", consumer="after", missing_fields=("Name",))]
+    args = _splice_args({"schema": {"mode": "observed"}, "mapping": {"name": "alias"}}, predecessor="source", plugin="field_mapper")
+    result = _invoke(surface, "splice_transform", args, state, context)
+    assert not result.success and result.updated_state is state
+    forwarded = [entry for entry in result.validation.errors[1:] if entry.component == "rejected_mutation"]
+    assert [(entry.error_code, entry.contract) for entry in forwarded] == [
+        ("field_name_header_spelling", SchemaContractDetail(producer="inserted", consumer="after", missing_fields=("Name",)))
+    ]
+    assert forwarded[0].message != standing[0].message
+
+
+# Each code the splice compares by typed detail alone, and why that detail
+# identifies the defect completely. A code added to
+# transforms._SPLICE_COMPLETE_CONTRACT_DETAIL_CODES without an entry here
+# fails test_every_typed_identity_code_is_reviewed_complete.
+_REVIEWED_COMPLETE_CONTRACT_DETAILS: dict[str, str] = {
+    "schema_contract_violation": "the consumer lacks exactly the missing fields from that producer",
+    "sink_contract_violation": "the sink lacks exactly the missing fields from that producer",
+    "locked_input_extras": "the locked consumer refuses exactly the extra fields from that producer",
+    "sink_locked_extras": "the locked sink refuses exactly the extra fields from that producer",
+    "transform_contract_violation": "self-scoped (producer and consumer are the node); its fields are the defect",
+    "transform_declared_output_not_guaranteed": "self-scoped (producer and consumer are the node); its fields are the defect",
+}
+
+
+def test_every_typed_identity_code_is_reviewed_complete() -> None:
+    assert frozenset(_REVIEWED_COMPLETE_CONTRACT_DETAILS) == transforms._SPLICE_COMPLETE_CONTRACT_DETAIL_CODES
+    # The known-incomplete detail stays on the message.
+    assert "field_name_header_spelling" not in transforms._SPLICE_COMPLETE_CONTRACT_DETAIL_CODES
+
+
+@pytest.mark.parametrize("code", sorted(_REVIEWED_COMPLETE_CONTRACT_DETAILS))
+def test_splice_identity_of_each_typed_code_matches_moved_and_keeps_changed_fields(code: str) -> None:
+    # Explicit boundary injection, per typed code: the same detail with the
+    # inserted node as producer is standing; other extra fields are added.
+    def extras(producer: str, fields: tuple[str, ...], message: str) -> ValidationEntry:
+        return _contract_entry(code, "node:after", message, SchemaContractDetail(producer, "after", extra_fields=fields))
+
+    result = transforms._splice_validation_rejection(
+        splice_fixtures._state(),
+        candidate_errors=(extras("inserted", ("x",), "moved"), extras("inserted", ("y",), "changed")),
+        prior_errors=(extras("before", ("x",), "standing"),),
+        predecessor_id="before",
+        inserted_node_id="inserted",
+    )
+    forwarded = [entry for entry in result.validation.errors[1:] if entry.component == "rejected_mutation"]
+    assert [entry.message for entry in forwarded] == ["changed"]
+
+
+def test_splice_identity_of_a_code_outside_the_typed_set_stays_on_the_message() -> None:
+    # Explicit boundary injection: a field-naming detail whose code is not
+    # reviewed complete is compared by its message, so a reworded entry is
+    # reported as added rather than hidden.
+    standing = _contract_entry(
+        "field_name_header_spelling", "node:after", "arriving name", SchemaContractDetail("before", "after", missing_fields=("Name",))
+    )
+    reworded = _contract_entry(
+        "field_name_header_spelling", "node:after", "arriving alias", SchemaContractDetail("inserted", "after", missing_fields=("Name",))
+    )
+    result = transforms._splice_validation_rejection(
+        splice_fixtures._state(),
+        candidate_errors=(reworded,),
+        prior_errors=(standing,),
+        predecessor_id="before",
+        inserted_node_id="inserted",
+    )
+    forwarded = [entry for entry in result.validation.errors[1:] if entry.component == "rejected_mutation"]
+    assert [entry.message for entry in forwarded] == ["arriving alias"]
 
 
 def _contract_entry(code: str, component: str, message: str, contract: SchemaContractDetail) -> ValidationEntry:
