@@ -451,6 +451,10 @@ def _run(
             if accepted_second.status_code == 202:
                 second_settled = await _poll_terminal(app, session_id, second["operation_id"], seconds=20)
                 record["second_job"] = _job_fields(second_settled)
+                # The row goes terminal before the owner task has finished its own close;
+                # leaving the app before that would cancel the owner at shutdown.
+                second_key = (session_id, second["operation_id"])
+                record["second_owner_finished"] = await _wait_for(lambda: second_key not in worker._jobs, seconds=20)
             record["instance_draining_at_end"] = app.state.instance_draining.is_set()
             record["model_calls"] = model.calls
             record["model_cancelled"] = model.cancelled
@@ -493,6 +497,7 @@ def _released_and_next_turn_completes(record: dict[str, Any]) -> None:
     assert record["next_acquire"] == "ok", record
     assert record["second_admission_status"] == 202, record
     assert record["second_job"] is not None and record["second_job"]["status"] == "completed", record
+    assert record["second_owner_finished"] is True, record
     assert "lifespan_exit_error" not in record, record
 
 
@@ -518,6 +523,7 @@ def test_live_turn_is_untouched_by_the_reaper(
     assert record["first_job"]["settled_by"] == "owner_terminal", record
     assert record["fence_after_settle"]["released"] is True, record
     assert record["second_job"] is not None and record["second_job"]["status"] == "completed", record
+    assert record["second_owner_finished"] is True, record
     assert "lifespan_exit_error" not in record, record
 
 
@@ -572,6 +578,7 @@ def test_a_peer_that_settles_first_releases_its_own_fence_and_the_reaper_leaves_
     assert record["fence_after_settle"]["released"] is True, record
     assert record["next_acquire"] == "ok", record
     assert record["second_job"] is not None and record["second_job"]["status"] == "completed", record
+    assert record["second_owner_finished"] is True, record
     assert record["instance_draining_at_end"] is False, record
     # The owner's projection was not this reaper's to discharge: shutdown fails closed, as on base.
     assert RequiredWorkIncomplete in record["lifespan_exit_error"], record
