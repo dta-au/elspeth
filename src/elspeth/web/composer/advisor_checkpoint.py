@@ -9,6 +9,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Literal, cast
 
 from openai import OpenAIError
@@ -255,6 +256,36 @@ def _parse_advisor_checkpoint_guidance(guidance: str, *, phase: AdvisorCheckpoin
         email_redactions=sanitized.email_redactions,
         publication_verdict=response.publication_verdict if isinstance(response, AdvisorEndResponse) else None,
     )
+
+
+# Unrendered-verdict class for each END block reason, written out for every
+# member: a reason missing here raises instead of being silently relabelled
+# "malformed". Rendered reasons (publication_withheld and the flagged ones)
+# carry an ok verdict and do not reach the unrendered composers; they keep the
+# value the previous fall-through gave them.
+_UNRENDERED_FAILURE_CLASS_BY_REASON: Final[
+    Mapping[str, Literal["unavailable", "request_rejected", "malformed", "budget_exhausted", "prior_call_cost_unknown"]]
+] = MappingProxyType(
+    {
+        "unavailable": "unavailable",
+        "request_rejected": "request_rejected",
+        "malformed": "malformed",
+        "budget_exhausted": "budget_exhausted",
+        "prior_call_cost_unknown": "prior_call_cost_unknown",
+        "publication_withheld": "malformed",
+        "flagged_final_pass": "malformed",
+        "flagged_no_repair": "malformed",
+        "flagged_unrepairable": "malformed",
+    }
+)
+
+
+def _unrendered_failure_class(
+    reason: AdvisorTerminalBlockReason,
+) -> Literal["unavailable", "request_rejected", "malformed", "budget_exhausted", "prior_call_cost_unknown"]:
+    if reason not in _UNRENDERED_FAILURE_CLASS_BY_REASON:
+        raise AuditIntegrityError(f"END block reason {reason!r} has no unrendered verdict class")
+    return _UNRENDERED_FAILURE_CLASS_BY_REASON[reason]
 
 
 class AdvisorCheckpointOwner:
@@ -1174,6 +1205,7 @@ class AdvisorCheckpointOwner:
             "request_rejected": AdvisorBlockCause.REQUEST_REJECTED,
             "malformed": AdvisorBlockCause.MALFORMED,
             "budget_exhausted": AdvisorBlockCause.BUDGET_EXHAUSTED,
+            "prior_call_cost_unknown": AdvisorBlockCause.PRIOR_CALL_COST_UNKNOWN,
             "publication_withheld": AdvisorBlockCause.PUBLICATION_REJECTED,
             "flagged_unrepairable": AdvisorBlockCause.MESSAGE_REJECTED,
             "flagged_final_pass": AdvisorBlockCause.GRAPH_REJECTED,
@@ -1184,6 +1216,9 @@ class AdvisorCheckpointOwner:
             rejection is not None and reason not in {"request_rejected", "budget_exhausted"}
         ):
             raise AuditIntegrityError("Request rejection lost its owned safe descriptor")
+        # Typed draft fact for the review-not-run notices: they claim saved
+        # draft progress only when the draft has content.
+        draft_has_content = not state_is_structurally_empty(state)
         detail, suggestion = _advisor_policy.advisor_signoff_blocked_wording(
             reason=reason,
             findings=verdict.findings_text,
@@ -1191,6 +1226,7 @@ class AdvisorCheckpointOwner:
             category=verdict.category,
             step_ids=step_ids,
             request_rejection=rejection,
+            draft_has_content=draft_has_content,
         )
         decision = AdvisorGateBlocked(
             fact=AdvisorSignoffGateFact(
@@ -1212,6 +1248,7 @@ class AdvisorCheckpointOwner:
                 category=verdict.category,
                 step_ids=step_ids,
                 note=note,
+                draft_has_content=draft_has_content,
             )
             # Same verdict-class split as the red arm below: did-not-clear is
             # true only for a rendered FLAG; an unrendered verdict names its
@@ -1222,13 +1259,8 @@ class AdvisorCheckpointOwner:
             else:
                 augmented = compose_advisor_signoff_unrendered_pending_message(
                     raw_content,
-                    failure_class="budget_exhausted"
-                    if reason == "budget_exhausted"
-                    else "unavailable"
-                    if reason == "unavailable"
-                    else "request_rejected"
-                    if reason == "request_rejected"
-                    else "malformed",
+                    failure_class=_unrendered_failure_class(reason),
+                    draft_has_content=draft_has_content,
                 )
         elif runtime_preflight is not None and is_pending_interpretation_handoff(runtime_preflight):
             # Matches the discriminator EXACTLY, not merely ``not is_valid``:
@@ -1253,19 +1285,15 @@ class AdvisorCheckpointOwner:
                 category=verdict.category,
                 step_ids=step_ids,
                 note=note,
+                draft_has_content=draft_has_content,
             )
             if verdict.ok:
                 augmented = compose_advisor_signoff_unverified_message(raw_content)
             else:
                 augmented = compose_advisor_signoff_unrendered_unverified_message(
                     raw_content,
-                    failure_class="budget_exhausted"
-                    if reason == "budget_exhausted"
-                    else "unavailable"
-                    if reason == "unavailable"
-                    else "request_rejected"
-                    if reason == "request_rejected"
-                    else "malformed",
+                    failure_class=_unrendered_failure_class(reason),
+                    draft_has_content=draft_has_content,
                 )
         else:
             runtime_result = _advisor_policy.advisor_signoff_blocked_validation(
@@ -1275,6 +1303,7 @@ class AdvisorCheckpointOwner:
                 category=verdict.category,
                 step_ids=step_ids,
                 note=note,
+                draft_has_content=draft_has_content,
             )
             # elspeth-b61894d93d: the chat copy is composed from the turn's
             # ACTUAL red preflight, never from the synthesized
@@ -1724,7 +1753,9 @@ class AdvisorCheckpointOwner:
                 if attempt_dispatched:
                     # An attempt stopped before dispatch (a timeout in the guard or
                     # quota admission) leaves the last call's retryability standing.
-                    last_failure_retryable = failure is None or failure.retryable
+                    # Review retries are immediate, so a provider 429 is never re-sent
+                    # here: it would land inside the provider's own wait.
+                    last_failure_retryable = failure is None or (failure.retryable and not failure.rate_limited)
                 if request_size_rejection(exc) is not None and sent_earlier_turn and not leave_out_all_earlier:
                     leave_out_all_earlier = True
                     size_resend_pending = True

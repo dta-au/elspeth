@@ -1066,7 +1066,7 @@ def _assert_completed_trace_ledger(
     )
     assert result.raw_assistant_content == ""
     base = no_tool_policy.compose_review_reply_withheld_message(
-        no_tool_policy.compose_advisor_signoff_unrendered_unverified_message("", failure_class="unavailable"),
+        no_tool_policy.compose_advisor_signoff_unrendered_unverified_message("", failure_class="unavailable", draft_has_content=True),
         reason="unavailable",
     )
     notice = f"Checkpoint save status: {saved_scope} Checkpoint evidence does not establish task completion."

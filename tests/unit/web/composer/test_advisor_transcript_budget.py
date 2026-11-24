@@ -1261,7 +1261,7 @@ def test_a_budget_exhausted_review_keeps_the_existing_request_limit_wording() ->
     from elspeth.web.composer import advisor_policy
 
     detail, suggestion = advisor_policy.advisor_signoff_blocked_wording(
-        reason="budget_exhausted", findings="Final review cannot be admitted within the existing planner budget."
+        draft_has_content=True, reason="budget_exhausted", findings="Final review cannot be admitted within the existing planner budget."
     )
     assert detail == _STOP_DETAIL
     assert suggestion == "Saved draft progress remains available; continue in a new message."
@@ -1271,7 +1271,62 @@ def test_a_budget_exhausted_review_keeps_the_existing_request_limit_wording() ->
         "(composer_context_max_prompt_tokens). Earlier conversation was already left out of it; what remains is the "
         "pipeline's own content and this turn's evidence."
     )
-    assert advisor_policy.advisor_signoff_blocked_wording(reason="budget_exhausted", findings=legacy)[0] == _STOP_DETAIL
+    assert (
+        advisor_policy.advisor_signoff_blocked_wording(draft_has_content=True, reason="budget_exhausted", findings=legacy)[0]
+        == _STOP_DETAIL
+    )
+
+
+@pytest.mark.parametrize(
+    ("reason", "draft_has_content", "expected"),
+    [
+        (
+            "budget_exhausted",
+            True,
+            (
+                "The reply was withheld because the completion review could not run within the existing request limits.",
+                "Saved draft progress remains available; continue in a new message.",
+            ),
+        ),
+        (
+            "budget_exhausted",
+            False,
+            (
+                "The reply was withheld because the completion review could not run within the existing request limits.",
+                "Continue in a new message.",
+            ),
+        ),
+        (
+            "prior_call_cost_unknown",
+            True,
+            (
+                "The reply was withheld because the completion review could not run: the cost of an earlier model call "
+                "in this request could not be confirmed.",
+                "Saved draft progress remains available; continue in a new message.",
+            ),
+        ),
+        (
+            "prior_call_cost_unknown",
+            False,
+            (
+                "The reply was withheld because the completion review could not run: the cost of an earlier model call "
+                "in this request could not be confirmed.",
+                "Continue in a new message.",
+            ),
+        ),
+    ],
+)
+def test_review_not_run_blocker_claims_saved_draft_progress_only_with_a_draft(
+    reason: str, draft_has_content: bool, expected: tuple[str, str]
+) -> None:
+    from elspeth.web.composer import advisor_policy
+
+    assert (
+        advisor_policy.advisor_signoff_blocked_wording(
+            reason=reason, findings="Final review cannot be admitted.", draft_has_content=draft_has_content
+        )
+        == expected
+    )
 
 
 @pytest.mark.asyncio
@@ -1304,7 +1359,9 @@ def test_a_context_length_rejection_suggests_the_context_budget_recourse(reason_
         reason_disposition=disposition,
         reason_source="sdk_body" if reason_code is not None else "unavailable",
     )
-    detail, suggestion = advisor_signoff_blocked_wording(reason="request_rejected", findings="", request_rejection=rejection)
+    detail, suggestion = advisor_signoff_blocked_wording(
+        draft_has_content=True, reason="request_rejected", findings="", request_rejection=rejection
+    )
     assert detail == rejection.public_detail
     if reason_code == "context_length_exceeded":
         assert suggestion == CONTEXT_BUDGET_REFUSAL_DETAIL

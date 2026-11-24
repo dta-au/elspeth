@@ -175,6 +175,7 @@ from elspeth.web.composer.provider_quota import (
     quota_provider_calls,
     required_provider_audit_scope,
 )
+from elspeth.web.composer.provider_retry import retry_delay_seconds
 from elspeth.web.composer.reasoning import ReasoningEffort, apply_reasoning_kwargs
 from elspeth.web.composer.recovery_controls import parse_recovery_tool_call, recovery_context_message, recovery_tool_definitions
 from elspeth.web.composer.redaction import GetBlobContentArgumentsModel, ReadAttachmentArgumentsModel, SetPipelineArgumentsModel
@@ -4474,10 +4475,33 @@ async def _plan_pipeline_inner(
                 if provider_failure.kind == "timeout":
                     raise PipelinePlannerError("planner provider call timed out", code="TIMEOUT") from None
                 if provider_failure.retryable and attempt < model_config.max_api_attempts:
-                    retry_delay = model_config.api_retry_base_seconds * (2 ** (attempt - 1))
-                    if retry_delay > 0:
-                        await asyncio.sleep(min(retry_delay, max(0.0, deadline - _planner_deadline_time())))
-                    continue
+                    retry_delay = retry_delay_seconds(
+                        attempt=attempt,
+                        retry_after=provider_failure.retry_after,
+                        deadline=deadline,
+                        now=_planner_deadline_time(),
+                        base_delay_seconds=model_config.api_retry_base_seconds,
+                    )
+                    # With the call budget spent, the loop head's refusal is
+                    # certain: go straight to it, without a wait, so it is raised
+                    # there and carries no provider exception.
+                    call_budget_spent = total_calls >= budget_policy.max_total_provider_calls
+                    if retry_delay is not None:
+                        if retry_delay > 0 and not call_budget_spent:
+                            await asyncio.sleep(retry_delay)
+                        continue
+                    if not provider_failure.rate_limited:
+                        # A non-429 retry whose delay plus call margin does not fit
+                        # starts no call. It waits out the operation budget and the
+                        # loop head ends the run there, so callers see a spent
+                        # deadline. Under the Composer retry policy (1 s, then 2 s)
+                        # the delay ceiling never applies here, so only the
+                        # deadline declines it.
+                        if not call_budget_spent:
+                            remaining = deadline - _planner_deadline_time()
+                            if remaining > 0:
+                                await asyncio.sleep(remaining)
+                        continue
                 raise PipelinePlannerError(
                     f"planner provider call failed ({type(exc).__name__})",
                     code="PROVIDER_ERROR",

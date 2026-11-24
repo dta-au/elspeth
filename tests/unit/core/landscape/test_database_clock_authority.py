@@ -3362,11 +3362,13 @@ def _reviewed_call_created_at_transfers(sources: dict[str, str]) -> set[ClockVio
     Pin both facades and the complete final callee. Any new authority use,
     changed receiver, or altered forwarding body withdraws this admission.
     """
+    # record_operation_call re-derived by running this gate's digest on the tree after its
+    # index-reservation release came to cover the whole call; the created_at forward is unchanged.
     reviewed = {
         (
             "src/elspeth/core/landscape/execution/calls.py",
             "CallAuditRepository.record_operation_call",
-        ): "6ce94f10b9bbe8f2238b96765b2e47f2433853ade1053a3747310f9dd3d96a0b",
+        ): "80e1278ed195b24002b7ab6bcc22dde933f029ab4a010218e2b96f616c66174f",
         (
             "src/elspeth/core/landscape/execution_repository.py",
             "ExecutionRepository.record_operation_call",
@@ -7934,12 +7936,13 @@ def test_call_created_at_admission_withdraws_when_reviewed_audit_seam_changes(mu
     assert len(admitted) == 2
     assert not [violation for violation in _scan_sources(sources) if violation.kind == "caller-clock-forwarding"]
     if mutation == "authority_use":
-        marker = "        timestamp = now() if created_at is None else created_at"
+        marker = "            timestamp = now() if created_at is None else created_at"
         assert marker in sources[paths[0]]
         sources[paths[0]] = sources[paths[0]].replace(
             marker,
-            marker + "\n        conn.execute(update(run_workers_table).values(heartbeat_expires_at=created_at))",
+            marker + "\n            conn.execute(update(run_workers_table).values(heartbeat_expires_at=created_at))",
         )
+        ast.parse(sources[paths[0]])
     else:
         before = "created_at=created_at,"
         assert before in sources[paths[1]]
