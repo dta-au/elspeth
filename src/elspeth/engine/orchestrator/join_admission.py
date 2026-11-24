@@ -24,7 +24,7 @@ from elspeth.contracts.coordination import (
     WorkerMembershipToken,
     mint_worker_id,
 )
-from elspeth.contracts.errors import JoinNotReadyError, JoinRefusedError
+from elspeth.contracts.errors import AuditIntegrityError, JoinNotReadyError, JoinRefusedError
 from elspeth.core.canonical import stable_hash
 from elspeth.core.config import resolve_config
 from elspeth.core.landscape.factory import LandscapeReadRepositories, RecorderFactory
@@ -177,9 +177,9 @@ class JoinAdmissionService:
            - ``INSERT run_workers`` (role='follower', status='active') +
              ``worker_register`` event.  COMMIT.
 
-        A run that becomes eligible between the pre-read and admission is
-        re-checked afterward. A refusal then records registration and
-        departure for that follower.
+        After every admission, the run's version, graph, and plugin evidence
+        are checked again. A refusal then records registration and departure
+        for that follower.
 
         Args:
             run_id: Landscape run ID to join.
@@ -231,20 +231,20 @@ class JoinAdmissionService:
             config_hash=joiner_config_hash,
             window_seconds=_window,
         )
-        if run is None or run.status is not RunStatus.RUNNING or run.config_hash != joiner_config_hash:
+        try:
+            current_factory = RecorderFactory.read_only(self._db)
+            current_run = current_factory.run_lifecycle.get_run(run_id)
+            if current_run is None:
+                raise AuditIntegrityError(f"Admitted follower's run {run_id!r} is missing from the Landscape")
+            self._check_join_compatibility(current_factory, current_run, run_id, config, graph, defer_to_admission_on_dead_leader=False)
+        except Exception as refusal:
             try:
-                current_factory = RecorderFactory.read_only(self._db)
-                current_run = current_factory.run_lifecycle.get_run(run_id)
-                assert current_run is not None
-                self._check_join_compatibility(current_factory, current_run, run_id, config, graph, defer_to_admission_on_dead_leader=False)
-            except Exception as refusal:
-                try:
-                    factory.run_coordination.depart_worker(member_token=token)
-                except contract_errors.TIER_1_ERRORS as departure_error:
-                    raise departure_error from refusal
-                except Exception as departure_error:
-                    refusal.add_note(
-                        f"depart_worker failed for worker {token.worker_id!r}: {type(departure_error).__name__}: {departure_error}"
-                    )
-                raise
+                factory.run_coordination.depart_worker(member_token=token)
+            except contract_errors.TIER_1_ERRORS as departure_error:
+                raise departure_error from refusal
+            except Exception as departure_error:
+                refusal.add_note(
+                    f"depart_worker failed for worker {token.worker_id!r}: {type(departure_error).__name__}: {departure_error}"
+                )
+            raise
         return token

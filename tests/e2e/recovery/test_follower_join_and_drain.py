@@ -532,6 +532,100 @@ class TestJoinRunAdmissionRefusals:
         _assert_no_follower_mutation(setup, run_id=setup.run_id, seat_before=seat_before)
         setup.db.close()
 
+    @pytest.mark.parametrize("plugin_mismatch", [False, True])
+    def test_join_rechecks_after_expired_leader_heartbeats(self, plugin_mismatch: bool) -> None:
+        run_id = "run-join-heartbeat-recheck"
+        leader_id = f"worker:{run_id}:leader"
+        config, graph, _sink, _source = _build_pipeline(_SOURCE_ROWS)
+        db = make_landscape_db()
+        factory = RecorderFactory(db)
+        factory.run_lifecycle.begin_run(
+            config={},
+            canonical_version=CANONICAL_VERSION,
+            run_id=run_id,
+            leader_worker_id=leader_id,
+            openrouter_catalog_sha256="0" * 64,
+            openrouter_catalog_source="bundled",
+        )
+        leader_token = leader_token_for(db, run_id)
+        source_id_map = build_source_id_map(graph)
+        metadata = resolve_node_audit_metadata(
+            config,
+            graph,
+            source_id_map=source_id_map,
+            transform_id_map=graph.get_transform_id_map(),
+            sink_id_map=graph.get_sink_id_map(),
+            config_gate_node_ids=set(graph.get_config_gate_id_map().values()),
+            aggregation_node_ids=set(graph.get_aggregation_id_map().values()),
+            coalesce_node_ids=set(graph.get_coalesce_id_map().values()),
+            collector_id_map=graph.get_collector_id_map(),
+            collector_transforms=graph.get_collector_transform_map(),
+        )
+        register_nodes_with_landscape(
+            factory,
+            graph,
+            graph.topological_order(),
+            metadata,
+            resolve_source_contracts_by_node_id(config, source_id_map),
+            coordination_token=leader_token,
+        )
+        edges = graph.get_edges()
+        assert len(edges) > 1
+        factory.data_flow.register_edge(
+            coordination_token=leader_token,
+            from_node_id=edges[0].from_node,
+            to_node_id=edges[0].to_node,
+            label=edges[0].label,
+            mode=edges[0].mode,
+        )
+        expire_leader_seat(db, run_id)
+        original_live_leader = RunCoordinationRepository.live_leader
+        observed_dead = False
+
+        def heartbeat_after_dead_read(repo: RunCoordinationRepository, *, run_id: str) -> Any:
+            nonlocal observed_dead
+            leader = original_live_leader(repo, run_id=run_id)
+            observed_dead = leader is not None and not leader.seat_live
+            heartbeat = RunCoordinationRepository(db.engine).worker_heartbeat(
+                member_token=member_token_for(db.engine, run_id=run_id, worker_id=leader_id),
+                window_seconds=_GUARD_LIVE_SEAT_WINDOW_SECONDS,
+            )
+            assert heartbeat.seat_live
+            if plugin_mismatch:
+                for edge in edges[1:]:
+                    factory.data_flow.register_edge(
+                        coordination_token=leader_token,
+                        from_node_id=edge.from_node,
+                        to_node_id=edge.to_node,
+                        label=edge.label,
+                        mode=edge.mode,
+                    )
+                with db.engine.begin() as conn:
+                    conn.execute(
+                        update(nodes_table).where(nodes_table.c.run_id == run_id).values(source_file_hash="sha256:0000000000000000")
+                    )
+            return leader
+
+        with (
+            patch.object(RunCoordinationRepository, "live_leader", heartbeat_after_dead_read),
+            patch("elspeth.engine.orchestrator.join_admission.resolve_config", return_value={}),
+            pytest.raises(JoinRefusedError) as exc_info,
+        ):
+            Orchestrator(db).join_run(run_id=run_id, settings=cast(Any, types.SimpleNamespace()), config=config, graph=graph)
+        assert observed_dead
+        assert type(exc_info.value) is (JoinRefusedError if plugin_mismatch else JoinNotReadyError)
+        assert ("Plugin implementation changed" if plugin_mismatch else "not finished registering its graph") in exc_info.value.reason
+        with db.engine.connect() as conn:
+            statuses = (
+                conn.execute(
+                    select(run_workers_table.c.status).where(run_workers_table.c.run_id == run_id, run_workers_table.c.role == "follower")
+                )
+                .scalars()
+                .all()
+            )
+        assert statuses == ["departed"]
+        db.close()
+
     @pytest.mark.parametrize("mismatch", ["source_file_hash", "node_set", "plugin_version", "determinism"])
     def test_join_refused_on_plugin_implementation_difference(self, tmp_path: Path, mismatch: str) -> None:
         crashed = _run_to_interrupted_checkpoint(tmp_path, MockClock(start=_T0))

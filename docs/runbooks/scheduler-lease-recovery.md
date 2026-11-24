@@ -725,8 +725,8 @@ the authoritative preconditions and registers the follower only when all hold:
    must never be the first process on an abandoned run — barrier and ingest
    state need a leader. **Join and takeover are disjoint verbs.**
 
-If the pre-read did not qualify for the early checks but admission succeeds,
-the service re-checks the canonical version and graph after registration.
+After every successful admission, the service re-checks the canonical version,
+graph readiness, and plugin implementation after registration.
 A refusal at that point records follower registration followed by departure.
 
 A **filesystem-writability preflight runs first** (before the registry is
