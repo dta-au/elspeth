@@ -21,21 +21,28 @@ changes land and is not a release.
   run before is refused. Only pipelines the runtime was already refusing at
   run start are now refused earlier, at validation.
 - **Changed:** when a provider call fails, the composer's main loop and planner
-  decide whether a retry's wait plus 5 s still fits before the job deadline,
-  and retry only if it does. This also applies to their existing retries after
-  a provider 503. When the retry does not fit, the main loop reports the
-  provider failure at once. The planner, after a 503 whose retry does not fit,
-  waits until the deadline and reports a time-out instead of making one last
-  call; after a 429 whose retry does not fit, it reports the provider failure
-  at once. When the failed call used the last call the budget allows and
-  another attempt remains, the planner reports a call-budget refusal at once,
-  after a 503 or after a 429 whose retry would fit; on an escape-hatch turn it
-  reports the hatch's original exhaustion instead. The completion review keeps
-  its existing immediate retry and does not retry a 429.
+  decide whether a retry's wait plus 5 s still fits before the deadline (the
+  request's, or the planner's own time limit when that is earlier), and retry
+  only if it does. This also applies to the failures they already retried,
+  including a provider 503 and LiteLLM's general API error (see the 429 entry
+  under Fixed). Below, "a 503" means any of these. When the retry does not
+  fit, the main loop reports the provider failure at once. The planner, after a
+  503 whose retry does not fit, waits until the deadline and reports a time-out
+  instead of making one last call; after a 429 whose retry does not fit, it
+  reports the provider failure at once. When the failed call used the last call
+  the budget allows and another attempt remains, the planner reports a
+  call-budget refusal at once, after a 503 or after a 429 whose retry would
+  fit. On an escape-hatch turn, the planner reports the hatch's original
+  exhaustion in place of the provider failure or the call-budget refusal, as
+  it did before this release; the time-out still stands. The completion review
+  keeps its existing immediate retry and does not retry a 429.
 - **Do not enable a composer token quota yet.** With one configured, a failed
   provider call's usage is recorded as unknown, and that refuses the user's
   later model calls ("Token accounting is unavailable") until usage is
-  reconciled. A retry after a transient failure is refused the same way.
+  reconciled. A retry after a transient failure is refused the same way. Since
+  a 429 is now retried, a rate-limited turn with a quota configured waits for
+  the retry delay, up to 30 s, before that refusal; before this release the 429
+  was reported at once.
 
 ### Fixed
 
