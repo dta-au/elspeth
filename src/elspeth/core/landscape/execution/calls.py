@@ -16,7 +16,7 @@ from collections.abc import Collection, Iterator
 from concurrent.futures import Future
 from datetime import datetime
 from threading import Lock
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Literal, NamedTuple
 
 import structlog
 from sqlalchemy import func, or_, select
@@ -673,20 +673,13 @@ class CallAuditRepository:
                 raise FrameworkBugError("inserted state call returned a non-integer call_index")
             recorded_index = recorded_value
             call_index = recorded_index
-        except (SchedulerLeaseLostError, RunMembershipLostError) as refusal:
+        except SchedulerLeaseLostError:
             # The call already happened; with its row refused, the refusal
             # event is its only durable record.
-            record_refused_call(
-                self._db.engine,
-                run_id=member_token.run_id,
-                worker_id=member_token.worker_id,
-                leader_epoch=None,
-                verb="record_call",
-                fence="item" if isinstance(refusal, SchedulerLeaseLostError) else "membership",
-                refused_call=refused_call,
-                work_item_id=work_item.work_item_id,
-                attempt=work_item.attempt,
-            )
+            self._record_refused_state_call(member_token, work_item, refused_call, fence="item")
+            raise
+        except RunMembershipLostError:
+            self._record_refused_state_call(member_token, work_item, refused_call, fence="membership")
             raise
         finally:
             self._finish_allocation(
@@ -730,6 +723,26 @@ class CallAuditRepository:
             completion_tokens=token_usage.completion_tokens,
             cached_prompt_tokens=token_usage.cached_prompt_tokens,
             reasoning_tokens=token_usage.reasoning_tokens,
+        )
+
+    def _record_refused_state_call(
+        self,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
+        refused_call: RefusedCallRecord,
+        *,
+        fence: Literal["membership", "item"],
+    ) -> None:
+        record_refused_call(
+            self._db.engine,
+            run_id=member_token.run_id,
+            worker_id=member_token.worker_id,
+            leader_epoch=None,
+            verb="record_call",
+            fence=fence,
+            refused_call=refused_call,
+            work_item_id=work_item.work_item_id,
+            attempt=work_item.attempt,
         )
 
     def record_operation_call(
