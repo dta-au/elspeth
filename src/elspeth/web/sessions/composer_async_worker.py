@@ -91,8 +91,8 @@ _UNSETTLED_OWNERS_RETAINED = 1_024
 # (transient database contention) is retried after a full scan interval, at
 # most this many times in a row: the same bound as session-lease renewal, the
 # membership heartbeat and the orphan sweeper. Past it, on any other error, or
-# on an OperationalError inside a reap's session lease, the loop ends and the
-# process is restarted.
+# on an OperationalError inside a reap's session lease or its own-lapsed
+# settlement, the loop ends and the process is restarted.
 _POLL_MAX_CONSECUTIVE_TRANSIENT_FAILURES = 5
 # A probe Task sleeps this long, repeatedly; waking this much later than asked
 # means some callback held the event loop, and is logged.
@@ -100,13 +100,11 @@ _EVENT_LOOP_PROBE_SECONDS = 0.5
 _EVENT_LOOP_LAG_LOG_SECONDS = 1.0
 
 
-class ComposerReapLeaseCustodyUnknown(RuntimeError):
-    """An OperationalError inside a reap's session lease (acquire, settle or release).
+class ComposerReapCustodyUnknown(RuntimeError):
+    """A reap step's custody outcome is unknown after a database error.
 
-    Any of those statements may have committed before the error, so the lease's
-    fence may still be held under this instance with no local owner. The poll
-    loop never retries it: it ends, and the process restart that follows frees
-    the fence as on any lost owner. The original error is the cause.
+    The caller ends the worker; the poll loop never retries it. The original
+    error is the cause.
     """
 
 
@@ -379,8 +377,8 @@ class ComposerAsyncWorker:
                 except OperationalError as exc:
                     # Only custody-free statements reach here: each is its own
                     # transaction and holds no lease or fence when it raises
-                    # (a reap's session lease raises
-                    # ComposerReapLeaseCustodyUnknown instead). claim_next
+                    # (a reap's session lease and its own-lapsed settlement
+                    # raise ComposerReapCustodyUnknown instead). claim_next
                     # commits each candidate separately: a claim whose commit
                     # is unknown, and any committed before the failing one, are
                     # never run here, stay queued, and are taken again with a
@@ -1598,22 +1596,28 @@ class ComposerAsyncWorker:
             except OperationalError as exc:
                 # Acquire, settle or release may have committed: the fence's
                 # custody is unknown, so this is never a transient poll error.
-                raise ComposerReapLeaseCustodyUnknown("Reap session lease outcome is unknown") from exc
+                raise ComposerReapCustodyUnknown("Reap session lease outcome is unknown") from exc
             except SessionOperationConflictError:
                 if record.claim_owner_instance_id == self._owner_instance_id:
                     try:
-                        await _owned(
+                        settled = await _owned(
                             run_sync_in_worker(
                                 self._authority.settle_own_lapsed,
                                 session_id=record.session_id,
                                 operation_id=record.operation_id,
                                 owner_instance_id=self._owner_instance_id,
                                 failure=failure,
+                                release_lapsed_fence=True,
                             )
                         )
-                        count += 1
                     except ComposerOperationFenceLost:
                         pass
+                    except OperationalError as exc:
+                        # The settlement's custody outcome is unknown: end the worker.
+                        raise ComposerReapCustodyUnknown("Reap settlement outcome is unknown") from exc
+                    else:
+                        self._discharge_reaped_failure_projection((record.session_id, record.operation_id), settled)
+                        count += 1
             except SessionOperationFenceLost as exc:
                 if exc.reason is FenceLossReason.OWNER_INACTIVE:
                     await _owned(
@@ -1632,6 +1636,43 @@ class ComposerAsyncWorker:
             if count > settled_before:
                 self._unsettled_owners.pop((record.session_id, record.operation_id), None)
         return count
+
+    def _discharge_reaped_failure_projection(self, key: tuple[UUID, str], settled: ComposerOperationRecord) -> None:
+        """Complete a retained owner's failure projection from the reaper's own settlement.
+
+        The owner's failed-terminal write was refused before it wrote, so its
+        projection stayed open. The reaper's settle_own_lapsed transaction wrote
+        that job's failed terminal and released its fence; adoption recovery
+        discharges the same projection from the same kind of settlement.
+        """
+        coordinator = self._required_coordinators.get(key)
+        if coordinator is None:
+            return
+        if type(settled) is not ComposerOperationRecord:
+            raise AuditIntegrityError("Reaped settlement returned no nominal operation record")
+        if settled.settled_by != "settle_own_lapsed":
+            # Another settler finished this job first; its custody, not ours.
+            return
+        authority = coordinator.authority
+        fence = authority.context.fence
+        if (
+            (settled.session_id, settled.operation_id) != key
+            or authority.durable_operation_id != settled.operation_id
+            or authority.claim_attempt != settled.attempt
+            or fence.operation_id != settled.session_operation_id
+            or fence.operation_epoch != settled.session_operation_epoch
+            or settled.status != "failed"
+        ):
+            raise AuditIntegrityError("Reaped settlement does not match the retained owner's exact authority")
+        open_tickets = [ticket for ticket in coordinator.tickets if not ticket.complete]
+        if len(open_tickets) != 1 or open_tickets[0].key.source is not RequiredWorkSource.TERMINAL_FAILURE_PROJECTION:
+            raise AuditIntegrityError("Reaped settlement found retained work beyond its failure projection")
+        projection = open_tickets[0]
+        coordinator.validate_terminal_failure_work(projection_ticket=projection)
+        projection.begin_projection()
+        self._complete_reconciled_projection(projection, ())
+        coordinator.assert_completed()
+        del self._required_coordinators[key]
 
     def _reaped_failure(self, record: ComposerOperationRecord) -> ComposerOperationError:
         """A lost worker unless this live process saw the owner end unsettled."""

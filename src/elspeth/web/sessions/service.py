@@ -1290,6 +1290,21 @@ class SessionServiceImpl:
             )
         ).one_or_none()
         if exact is None:
+            # Identity first, then the deadline: this exact unreleased fence
+            # past its deadline has expired; any other miss is a mismatch.
+            expired = conn.execute(
+                select(session_operation_fences_table.c.session_id).where(
+                    session_operation_fences_table.c.session_id == fence.session_id,
+                    session_operation_fences_table.c.operation_id == fence.operation_id,
+                    session_operation_fences_table.c.lease_token == fence.lease_token,
+                    session_operation_fences_table.c.operation_epoch == fence.operation_epoch,
+                    session_operation_fences_table.c.operation_kind == expected_kind.value,
+                    session_operation_fences_table.c.released_at.is_(None),
+                    session_operation_fences_table.c.lease_expires_at <= now,
+                )
+            ).one_or_none()
+            if expired is not None:
+                raise SessionOperationFenceLost(FenceLossReason.LEASE_EXPIRED)
             raise SessionOperationFenceLost(FenceLossReason.TOKEN_MISMATCH)
 
         if not audit_only:

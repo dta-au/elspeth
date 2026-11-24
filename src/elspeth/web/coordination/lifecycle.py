@@ -19,7 +19,8 @@ from typing import TYPE_CHECKING, Any, Literal, Never, cast, final
 from uuid import UUID
 
 import structlog
-from sqlalchemy.exc import OperationalError, SQLAlchemyError
+from sqlalchemy.exc import DBAPIError, OperationalError, SQLAlchemyError
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from elspeth.contracts import errors as contract_errors
 from elspeth.contracts.errors import ComposerOwnedSettlementFailure
@@ -36,6 +37,7 @@ from elspeth.web.async_workers import (
 )
 from elspeth.web.coordination.contracts import (
     ArchiveDeleteReconciliation,
+    CloseReleaseOutcome,
     FenceLossReason,
     SessionOperationContext,
     SessionOperationFence,
@@ -336,6 +338,45 @@ def _safe_cleanup_context(context: object) -> SessionOperationContext | None:
         fence=fence,
         operation_kind=operation_kind,
     )
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class CloseReleaseAfterRenewalFailure:
+    """Renewal outcomes after which a closing lease still releases its own fence.
+
+    ``error_types`` are failures whose outcome is known and which leave the
+    fence row with this lease's exact identity: the database or its driver
+    refused the statement, the connection pool timed out, or the transport
+    (including the upkeep executor's admission wait) failed.
+    ``fence_loss_reasons`` are the fence losses that still leave this lease's
+    row in place. Every other failure, including an unknown physical outcome,
+    an integrity failure, a group retaining cancellations or a fence replaced
+    by another operation, leaves the fence untouched: nothing further is
+    written. ``excluded_operation_kinds`` keep the plain release and never
+    release after a failed renewal; an EXECUTE lease with its obligation
+    releases through that obligation and never reaches this check.
+    """
+
+    error_types: tuple[type[BaseException], ...]
+    fence_loss_reasons: frozenset[FenceLossReason]
+    excluded_operation_kinds: frozenset[SessionOperationKind]
+
+    def admits(self, renewal_error: BaseException | None, *, operation_kind: SessionOperationKind) -> bool:
+        if renewal_error is None:
+            return True
+        if operation_kind in self.excluded_operation_kinds:
+            return False
+        if type(renewal_error) is SessionOperationFenceLost:
+            return renewal_error.reason in self.fence_loss_reasons
+        return isinstance(renewal_error, self.error_types)
+
+
+CLOSE_RELEASE_AFTER_RENEWAL_FAILURE = CloseReleaseAfterRenewalFailure(
+    error_types=(DBAPIError, PoolTimeoutError, OSError),
+    fence_loss_reasons=frozenset({FenceLossReason.LEASE_EXPIRED}),
+    excluded_operation_kinds=frozenset({SessionOperationKind.EXECUTE}),
+)
 
 
 async def _release_acquired_context(
@@ -1241,11 +1282,25 @@ class SessionOperationLease:
                 _raise_lifecycle_originals(
                     list(outcome.deferred_cancellations), [outcome.error] if type(outcome) is RequiredSQLRaised else []
                 )
-            elif self._required_work is None:
-                await run_lease_upkeep_in_worker(self._upkeep_authority.release, self._context)
+            elif self._context.operation_kind in CLOSE_RELEASE_AFTER_RENEWAL_FAILURE.excluded_operation_kinds:
+                # An excluded kind keeps the plain release of a live fence.
+                if self._required_work is None:
+                    await run_lease_upkeep_in_worker(self._upkeep_authority.release, self._context)
+                else:
+                    ticket = self._required_work.prepare_lease_release()
+                    await run_required_sql_in_worker(ticket, self._authority.release, self._context)
             else:
-                ticket = self._required_work.prepare_lease_release()
-                await run_required_sql_in_worker(ticket, self._authority.release, self._context)
+                if self._required_work is None:
+                    released = await run_lease_upkeep_in_worker(self._upkeep_authority.release_at_close, self._context)
+                else:
+                    ticket = self._required_work.prepare_lease_release()
+                    released = await run_required_sql_in_worker(ticket, self._authority.release_at_close, self._context)
+                if type(released) is not CloseReleaseOutcome:
+                    raise contract_errors.AuditIntegrityError("Close release returned no owned outcome")
+                if released is CloseReleaseOutcome.RELEASED_AFTER_EXPIRY:
+                    # Released, but the deadline had passed: the operation's
+                    # authority was already lost, and the lease reports it so.
+                    raise SessionOperationFenceLost(FenceLossReason.LEASE_EXPIRED)
         except SessionOperationFenceLost:
             self._disposition = SessionOperationLeaseDisposition.LOST
             raise
@@ -1281,12 +1336,17 @@ class SessionOperationLease:
             except BaseException as error:
                 custody_error = error
                 self._disposition = SessionOperationLeaseDisposition.UNKNOWN
-            if custody_error is None and self._renewal_error is None:
+            if custody_error is None and CLOSE_RELEASE_AFTER_RENEWAL_FAILURE.admits(
+                self._renewal_error, operation_kind=self._context.operation_kind
+            ):
+                # Work and renewal have stopped and required work is complete,
+                # so the lease gives up its own fence even after a failed
+                # renewal; the renewal failure stays the primary error.
                 try:
                     await self._release_current()
                 except BaseException as error:
                     release_error = error
-            elif self._renewal_error is not None:
+            if self._renewal_error is not None:
                 self._disposition = SessionOperationLeaseDisposition.LOST
         finally:
             self._closed = True
@@ -1686,7 +1746,12 @@ class SessionOperationLease:
             raise
 
     async def close(self) -> None:
-        """Join children, stop renewal, and release only known-current authority."""
+        """Join children, stop renewal, and release this lease's own fence.
+
+        The release is a compare-and-swap on the fence's exact identity, so it
+        never touches a successor. After a failed renewal it runs only for the
+        outcomes in ``CLOSE_RELEASE_AFTER_RENEWAL_FAILURE``.
+        """
         obligation = self._execution_obligation
         cancellations: list[asyncio.CancelledError] = []
         allocation_failures: list[BaseException] = []
