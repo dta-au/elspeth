@@ -30,6 +30,7 @@ from elspeth.web.composer.bounded_json import (
     bounded_json_loads,
 )
 from elspeth.web.composer.protocol import ComposerAdmissionRefused
+from elspeth.web.credential_scan import CredentialScanSurface, scan_best_effort
 from elspeth.web.secrets.ref_policy import allowed_secret_ref_fields
 
 if TYPE_CHECKING:
@@ -119,20 +120,20 @@ def require_no_credential_material_in_native_thinking(blocks: Sequence[Mapping[s
 def require_no_credential_material(
     value: Any,
     *,
-    surface: str,
+    surface: CredentialScanSurface,
     env_ref_names: Collection[str] = frozenset(),
     additional_credential_fields: Collection[str] = frozenset(),
     max_string_bytes: int = 262_144,
 ) -> None:
-    """Atomically reject one bounded control-plane value before side effects."""
-    finding = find_credential_material(
+    """Refuse one control-plane value that matches a known credential pattern, before side effects."""
+    finding = scan_best_effort(
         value,
-        CredentialTraversalPolicy(
+        surface=surface,
+        policy=CredentialTraversalPolicy(
             env_ref_names=env_ref_names,
             additional_credential_fields=additional_credential_fields,
             max_string_bytes=max_string_bytes,
         ),
-        purpose="admission",
     )
     if finding is not None:
         raise CredentialMaterialRefused(surface=surface, finding=finding)
@@ -180,7 +181,7 @@ def require_no_credential_material_in_llm_metadata(
     provider_request_id: str | None,
     finish_reason: str | None,
     provider_served: str | None,
-    surface: str,
+    surface: CredentialScanSurface,
     thinking_replay_required: bool | None = None,
 ) -> ReasoningScrubOutcome:
     """Refuse control output; withhold credential-shaped diagnostic reasoning."""
@@ -416,7 +417,7 @@ def require_no_credential_material_for_tool(
     tool_name: str,
     arguments: Any,
     *,
-    surface: str,
+    surface: CredentialScanSurface,
     credential_state: CompositionState | None = None,
 ) -> None:
     """Apply the control-plane detector to one semantic tool invocation."""
@@ -430,7 +431,7 @@ def require_no_credential_material_in_tool_wire(
     tool_name: str,
     raw_arguments: Any,
     *,
-    surface: str,
+    surface: CredentialScanSurface,
     credential_state: CompositionState | None = None,
 ) -> None:
     """Scan one provider tool-argument wire value before audit or dispatch.
@@ -467,7 +468,7 @@ def _decode_bounded_tool_wire(raw_arguments: str) -> Any:
 def require_no_credential_material_in_state(
     state: CompositionState,
     *,
-    surface: str,
+    surface: CredentialScanSurface,
     env_ref_names: Collection[str] = frozenset(),
 ) -> None:
     """Reject credential material across one owned composition state.

@@ -77,6 +77,7 @@ from elspeth.web.composer.protocol import ComposerAdmissionRefused
 from elspeth.web.composer.provider_quota import ProviderCallCustody, bind_provider_attempt
 from elspeth.web.composer.provider_thinking import parse_native_thinking_blocks
 from elspeth.web.credential_guard import require_no_credential_material_in_llm_metadata
+from elspeth.web.credential_scan import CredentialScanSurface
 from elspeth.web.validation import _redact_sensitive_content
 
 if TYPE_CHECKING:
@@ -821,7 +822,7 @@ def build_llm_call_record(
     max_completion_tokens_requested: int | None = None,
     planner_policy_hash: str | None = None,
     planner_call_ordinal: int | None = None,
-    credential_surface: str = "composer_provider_response",
+    credential_surface: CredentialScanSurface = "composer_provider_response",
     provider_custody: ProviderCallCustody | None = None,
     failure: BaseException | None = None,
     private_request: PrivateProviderContext | None = None,

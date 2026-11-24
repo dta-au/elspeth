@@ -10,6 +10,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from elspeth.contracts.session_operation import SessionOperationKind
+from elspeth.web import credential_scan
 from elspeth.web.composer import provider_gateway
 from elspeth.web.composer.provider_gateway import ProviderGateway
 from elspeth.web.composer.provider_quota import ProviderCallCustody, ProviderInvocationFamily, ProviderInvocationOwner
@@ -226,10 +227,28 @@ def test_field_mapper_projection_is_bounded_before_config_validation(monkeypatch
     def forbidden_validation(*_args: object, **_kwargs: object) -> object:
         raise AssertionError("unbounded options reached plugin validation")
 
+    skips: list[dict[str, str]] = []
+
+    class _Recorder:
+        def add(self, value: int, attributes: dict[str, str]) -> None:
+            skips.append(dict(attributes))
+
     monkeypatch.setattr(FieldMapperConfig, "model_validate", forbidden_validation)
-    for mapping in ({f"customer_{index}_key": "field" for index in range(513)}, {"customer_key": "x" * 262_145}):
-        with pytest.raises(CredentialMaterialRefused):
-            require_no_credential_material_for_tool("upsert_node", _field_mapper_node(mapping), surface="test")
+    monkeypatch.setattr(credential_scan, "_CREDENTIAL_SCAN_SKIPPED_COUNTER", _Recorder())
+    # Plugin validation is never reached for an over-bound candidate. A mapping wider
+    # than the scan is a counted skip (best effort).
+    wide = {f"customer_{index}_key": "field" for index in range(513)}
+    require_no_credential_material_for_tool("upsert_node", _field_mapper_node(wide), surface="composer_tool_arguments")
+    assert skips == [{"surface": "composer_tool_arguments", "reason": "width"}]
+
+    # An over-long label leaves the options unprojected, so the ordinary walk reads
+    # the credential-named key with a literal value as a match.
+    with pytest.raises(CredentialMaterialRefused) as caught:
+        require_no_credential_material_for_tool(
+            "upsert_node", _field_mapper_node({"customer_key": "x" * 262_145}), surface="composer_tool_arguments"
+        )
+    assert caught.value.finding.category == "credential_field"
+    assert skips == [{"surface": "composer_tool_arguments", "reason": "width"}]
 
 
 @pytest.mark.asyncio
@@ -581,12 +600,9 @@ async def test_provider_request_is_refused_before_transport(monkeypatch: pytest.
         # except the credential, fits under the cap: it is scanned, and the
         # trailing credential is found.
         pytest.param("\U00010400" * (524_288 - 27) + "sk-" + "a" * 24, "token_shape", id="max_import_of_4_byte_chars"),
-        # Past the 2 MiB cap the string is refused unscanned, never skipped:
-        # the cap bounds work, it does not exempt content.
-        pytest.param(" " * (2 * 1024 * 1024 + 1), "traversal_limit", id="over_2MiB_cap"),
     ],
 )
-async def test_provider_request_scans_large_messages_and_refuses_over_cap(
+async def test_provider_request_scans_large_messages_under_the_cap(
     monkeypatch: pytest.MonkeyPatch, provider_custody: ProviderCallCustody, content: str, category: str
 ) -> None:
     transport_calls: list[dict[str, Any]] = []
@@ -611,6 +627,40 @@ async def test_provider_request_scans_large_messages_and_refuses_over_cap(
     assert caught.value.surface == "composer_provider_request"
     assert caught.value.finding.category == category
     assert transport_calls == []
+
+
+@pytest.mark.asyncio
+async def test_provider_request_over_the_cap_is_a_counted_skip_not_a_refusal(
+    monkeypatch: pytest.MonkeyPatch, provider_custody: ProviderCallCustody
+) -> None:
+    # Past the 2 MiB cap the scan stops (best effort): the request is not refused for
+    # credentials and continues to the next control, here the prompt guard.
+    skips: list[dict[str, str]] = []
+
+    class _Recorder:
+        def add(self, value: int, attributes: dict[str, str]) -> None:
+            skips.append(dict(attributes))
+
+    async def transport(**kwargs: Any) -> object:
+        raise AssertionError("request reached transport")
+
+    import litellm
+
+    from elspeth.web.composer.prompt_guard import PromptGuardRefused
+
+    monkeypatch.setattr(litellm, "acompletion", transport)
+    monkeypatch.setattr(credential_scan, "_CREDENTIAL_SCAN_SKIPPED_COUNTER", _Recorder())
+    with pytest.raises(PromptGuardRefused):
+        await provider_gateway._litellm_acompletion(
+            provider_custody=provider_custody,
+            model="openai/test-model",
+            prompt_guard_mount=None,
+            prompt_guard_mode="required",
+            prompt_guard_role="composer",
+            messages=[{"role": "user", "content": " " * (2 * 1024 * 1024 + 1)}],
+        )
+
+    assert skips == [{"surface": "composer_provider_request", "reason": "string_bytes"}]
 
 
 @pytest.mark.asyncio

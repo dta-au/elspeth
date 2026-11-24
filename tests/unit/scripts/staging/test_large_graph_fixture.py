@@ -26,11 +26,12 @@ from scripts.staging.opslib import REPO_ROOT, ApiError, HttpResponse, OperationF
 
 from elspeth.contracts.credential_material import CredentialTraversalPolicy, find_credential_material
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+from elspeth.web import credential_scan
 from elspeth.web.blobs.routes import create_blobs_router
 from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.composer.yaml_importer import MAX_RUNTIME_YAML_IMPORT_CHARS, composition_state_from_runtime_yaml
 from elspeth.web.config import WebSettings
-from elspeth.web.credential_guard import CredentialMaterialRefused, require_no_credential_material_in_state
+from elspeth.web.credential_guard import require_no_credential_material_in_state
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId
@@ -276,17 +277,22 @@ def test_query_names_go_past_the_criteria_without_repeating() -> None:
 
 
 @pytest.mark.parametrize(("queries", "values"), [(309, 4085), (310, 4098)])
-def test_the_scan_count_is_measured_with_the_server_s_own_scan(queries: int, values: int) -> None:
+def test_the_scan_count_is_measured_with_the_server_s_own_scan(queries: int, values: int, monkeypatch: pytest.MonkeyPatch) -> None:
     spec = lgf.preset_spec("single-node", queries_per_llm_step=queries, total_prompt_bytes=4_000 + 400 * queries, query_templates="inline")
     yaml_text = lgf.build_fixture(spec).yaml_text
     assert lgf.state_scan_values(yaml_text) == values
     # Control: the server's state guard agrees with the measure on which side of its limit the graph is.
+    # Over the limit the scan stops (best effort): nothing is refused and the skip is counted.
     state = composition_state_from_runtime_yaml(yaml_text)
-    if values <= SCAN_LIMIT:
-        require_no_credential_material_in_state(state, surface="fixture_test")
-    else:
-        with pytest.raises(CredentialMaterialRefused):
-            require_no_credential_material_in_state(state, surface="fixture_test")
+    skips: list[dict[str, str]] = []
+
+    class _Recorder:
+        def add(self, value: int, attributes: dict[str, str]) -> None:
+            skips.append(dict(attributes))
+
+    monkeypatch.setattr(credential_scan, "_CREDENTIAL_SCAN_SKIPPED_COUNTER", _Recorder())
+    require_no_credential_material_in_state(state, surface="composer_yaml_import")
+    assert skips == ([] if values <= SCAN_LIMIT else [{"surface": "composer_yaml_import", "reason": "nodes"}])
 
 
 def test_the_acceptance_positions_rotate_through_the_graph() -> None:
@@ -366,7 +372,7 @@ def test_the_single_node_fixture_imports_and_validates_at_its_default_size(tmp_p
     assert cycle.check_fixture(state, positions=[cycle.Position("source", "capacity_probe", "results", True)])["prompt_queries"] == 32
 
 
-def test_inline_queries_just_under_the_scan_limit_import_and_just_over_are_refused_at_import(tmp_path: Path) -> None:
+def test_inline_queries_on_both_sides_of_the_scan_limit_import(tmp_path: Path) -> None:
     server = _server(tmp_path / "server")
     client = _client(server)
     session = client.post_json("/api/sessions", {"title": "under"})["id"]
@@ -388,11 +394,11 @@ def test_inline_queries_just_under_the_scan_limit_import_and_just_over_are_refus
         lgf.preset_spec("single-node", queries_per_llm_step=310, total_prompt_bytes=4_000 + 400 * 310, query_templates="inline"),
         "over",
     )
-    # The size refusal arrives as a credential refusal (category traversal_limit); the message says "credential".
-    with pytest.raises(ApiError, match=r'/state/yaml returned HTTP 422.*"category":"traversal_limit"') as refused:
-        setup_fixture(client, other, over, emit=Events())
-    assert refused.value.status == 422
-    assert "credential_material_rejected" in str(refused.value)
+    # Past the scan limit the scan stops (best effort); the size is not refused as a credential.
+    over_summary = setup_fixture(client, other, over, emit=Events())
+    assert over_summary["valid"] is True
+    assert over_summary["measures"]["state_scan_values_at_import"] == 4098
+    assert client.get_json(f"/api/sessions/{other}/state") is not None
 
 
 # Near the aggregate cap each query file must also stay under the template
@@ -443,22 +449,21 @@ def test_251_file_held_queries_keep_the_stored_state_within_the_scan_bound(tmp_p
     assert summary["valid"] is True
     state = _stored_state(server, session)
     assert find_credential_material(state.to_dict(), purpose="admission") is None
-    require_no_credential_material_in_state(state, surface="fixture_test")
+    require_no_credential_material_in_state(state, surface="composer_yaml_import")
 
 
-def test_252_file_held_queries_are_refused_at_import_and_nothing_is_saved(tmp_path: Path) -> None:
-    """The import scans the state with its file markers bound, so a graph over the bound never reaches the store.
+def test_252_file_held_queries_import_and_the_saved_graph_opens(tmp_path: Path) -> None:
+    """The YAML alone is under the scan bound; the state with its file markers bound is over it.
 
-    The YAML alone is under the bound; the bound state is over it, and the
-    import refuses it (``credential_material_rejected``, category
-    ``traversal_limit``) instead of saving a graph that could not be opened.
+    The scan stops at the bound (best effort), so the import is not refused as
+    a credential: the graph is saved and opens.
     """
-    _, client, session, loaded = _file_held_queries(tmp_path, 252)
+    server, client, session, loaded = _file_held_queries(tmp_path, 252)
     assert loaded.manifest["measures"]["state_scan_values_at_import"] <= SCAN_LIMIT
-    with pytest.raises(ApiError, match=r'/state/yaml returned HTTP 422.*"category":"traversal_limit"') as refused:
-        setup_fixture(client, session, loaded, emit=Events())
-    assert "credential_material_rejected" in str(refused.value)
-    assert client.get_json(f"/api/sessions/{session}/state") is None
+    summary = setup_fixture(client, session, loaded, emit=Events())
+    assert summary["valid"] is True
+    assert lgf.scan_values_of_state(_stored_state(server, session)) > SCAN_LIMIT
+    assert client.get_json(f"/api/sessions/{session}/state") is not None
 
 
 def test_setup_refuses_a_session_that_already_has_a_graph(tmp_path: Path) -> None:

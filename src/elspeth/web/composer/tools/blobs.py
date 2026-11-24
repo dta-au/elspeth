@@ -110,6 +110,7 @@ from elspeth.web.composer.tools.declarations import (
     ToolKind,
 )
 from elspeth.web.credential_guard import CREDENTIAL_REFUSAL_DETAIL, CredentialMaterialRefused, require_no_credential_material
+from elspeth.web.credential_scan import CredentialScanSurface
 from elspeth.web.execution._validation_materialization import (
     FILE_INJECT_PLUGIN,
     FileInjectContentRefusal,
@@ -144,7 +145,7 @@ def _credential_safe_blob_discovery_result(
     state: CompositionState,
     payload: Any,
     *,
-    surface: str,
+    surface: CredentialScanSurface,
 ) -> ToolResult | None:
     """Return a fixed tool refusal when legacy blob output is unsafe."""
     try:

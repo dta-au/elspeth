@@ -32,7 +32,7 @@ Two presets:
 ``--queries-per-llm-step`` and ``--total-prompt-bytes`` build graphs near the
 server's limits on purpose. The manifest reports ``state_scan_values_at_import``
 (values the server's whole-state credential scan visits for the graph as the
-YAML import scans it, measured with that scan; the server refuses over 4,096)
+YAML import scans it, measured with that scan; past 4,096 the scan stops and the import goes ahead)
 and the server's per-file and aggregate caps on file-held text.
 
 The output directory holds ``pipeline.yaml`` (the import document),

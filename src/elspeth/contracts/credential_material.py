@@ -45,6 +45,9 @@ CredentialCategory = Literal[
 ]
 CredentialLocation = Literal["root", "mapping_key", "mapping_value", "sequence_item", "traversal_boundary"]
 CredentialScanPurpose = Literal["admission", "conservative"]
+# Which traversal limit stopped a scan. Set exactly when the category is
+# ``traversal_limit``; everything after a limit goes unscanned.
+CredentialScanBound = Literal["depth", "nodes", "width", "string_bytes", "reference_bytes"]
 
 SECRET_FIELD_NAMES: Final[frozenset[str]] = frozenset(
     {
@@ -197,6 +200,11 @@ class CredentialMaterialFinding:
     category: CredentialCategory
     location: CredentialLocation
     detector_version: str = CREDENTIAL_DETECTOR_VERSION
+    bound: CredentialScanBound | None = None
+
+    def __post_init__(self) -> None:
+        if (self.bound is None) == (self.category == "traversal_limit"):
+            raise ValueError("A credential finding names a bound exactly when it is a traversal limit")
 
 
 DEFAULT_CREDENTIAL_TRAVERSAL_POLICY: Final[CredentialTraversalPolicy] = CredentialTraversalPolicy()
@@ -247,8 +255,10 @@ def _find(
     credential_parent: bool,
 ) -> CredentialMaterialFinding | None:
     state.nodes += 1
-    if depth > state.policy.max_depth or state.nodes > state.policy.max_nodes:
-        return CredentialMaterialFinding("traversal_limit", "traversal_boundary")
+    if depth > state.policy.max_depth:
+        return _limit("depth")
+    if state.nodes > state.policy.max_nodes:
+        return _limit("nodes")
     if credential_parent:
         if _is_empty(value):
             return None
@@ -258,14 +268,14 @@ def _find(
         return CredentialMaterialFinding("credential_field", location)
     if type(value) is str:
         if len(value.encode("utf-8", errors="replace")) > state.policy.max_string_bytes:
-            return CredentialMaterialFinding("traversal_limit", "traversal_boundary")
+            return _limit("string_bytes")
         category = _classify_string(value, purpose=state.purpose)
         return CredentialMaterialFinding(category, location) if category is not None else None
     if value is None or type(value) in (bool, int, float):
         return None
     if type(value) in (dict, MappingProxyType):
         if len(value) > state.policy.max_width:
-            return CredentialMaterialFinding("traversal_limit", "traversal_boundary")
+            return _limit("width")
         object_id = id(value)
         if object_id in state.active_ids:
             return CredentialMaterialFinding("unsupported_value", "traversal_boundary")
@@ -275,7 +285,7 @@ def _find(
                 if type(key) is not str:
                     return CredentialMaterialFinding("unsupported_value", "mapping_key")
                 if len(key.encode("utf-8", errors="replace")) > state.policy.max_string_bytes:
-                    return CredentialMaterialFinding("traversal_limit", "traversal_boundary")
+                    return _limit("string_bytes")
                 key_category = _classify_string(key, purpose=state.purpose)
                 if key_category is not None:
                     return CredentialMaterialFinding(key_category, "mapping_key")
@@ -293,7 +303,7 @@ def _find(
         return None
     if type(value) in (list, tuple):
         if len(value) > state.policy.max_width:
-            return CredentialMaterialFinding("traversal_limit", "traversal_boundary")
+            return _limit("width")
         object_id = id(value)
         if object_id in state.active_ids:
             return CredentialMaterialFinding("unsupported_value", "traversal_boundary")
@@ -315,6 +325,21 @@ def _find(
     return CredentialMaterialFinding("unsupported_value", location)
 
 
+# A match refuses; a traversal limit or an unsupported value does not.
+CREDENTIAL_MATCH_CATEGORIES: Final[frozenset[CredentialCategory]] = frozenset(
+    {"credential_field", "token_shape", "private_key", "credential_url", "sensitive_url_parameter"}
+)
+
+
+def is_credential_match(finding: CredentialMaterialFinding) -> bool:
+    """Return whether a finding is a match (refusal), not a skipped scan."""
+    return finding.category in CREDENTIAL_MATCH_CATEGORIES
+
+
+def _limit(bound: CredentialScanBound) -> CredentialMaterialFinding:
+    return CredentialMaterialFinding("traversal_limit", "traversal_boundary", bound=bound)
+
+
 def _is_empty(value: Any) -> bool:
     if value is None or (type(value) is str and value == ""):
         return True
@@ -334,7 +359,7 @@ def _allowed_reference_finding(
             return False
         ref_size = len(ref.encode("utf-8", errors="replace"))
         if ref_size > policy.max_string_bytes:
-            return CredentialMaterialFinding("traversal_limit", "traversal_boundary")
+            return _limit("reference_bytes")
         if ref_size > _SECRET_REFERENCE_NAME_MAX_BYTES:
             # Longer than any reference name: not a reference, so the
             # credential field holds a literal.
@@ -351,7 +376,7 @@ def _allowed_reference_finding(
     if match is None or match.group(1) not in policy.env_ref_names:
         return False
     if len(value.encode("utf-8", errors="replace")) > policy.max_string_bytes:
-        return CredentialMaterialFinding("traversal_limit", "traversal_boundary")
+        return _limit("reference_bytes")
     return None
 
 
