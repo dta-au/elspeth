@@ -49,6 +49,18 @@ def test_splice_validation_failed_resolves_to_direct_guidance() -> None:
     assert "then retry splice_transform" not in suggested_fix
 
 
+def test_splice_description_discloses_the_whole_pipeline_validity_requirement() -> None:
+    # The handler validates the whole spliced pipeline and refuses on any
+    # error, including errors standing before the splice; the description is
+    # where the planner first learns the tool, so it states that precondition.
+    definitions = {definition["name"]: definition for definition in get_tool_definitions()}
+    description = " ".join(definitions["splice_transform"]["description"].split())
+    assert (
+        "The whole resulting pipeline must validate, including errors that were there before the splice, or the "
+        "splice is refused and nothing changes." in description
+    )
+
+
 def test_splice_node_id_declares_the_reserved_labels_like_set_pipeline_node_id() -> None:
     canonical_node_id = canonical_set_pipeline_schema()["properties"]["nodes"]["items"]["properties"]["id"]
     splice_node_id = _splice_node_id_schema()

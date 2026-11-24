@@ -3085,6 +3085,8 @@ _SPLICE_TRANSFORM_DECLARATION = ToolDeclaration(
         "Requires one direct logical on_success connection, no routed error branches on either endpoint, "
         "and no other consumers or visual branches on that path. When visual edges exist, exactly one must "
         "directly connect the endpoints; an entirely edge-free graph stays edge-free. "
+        "The whole resulting pipeline must validate, including errors that were there before the splice, or the "
+        "splice is refused and nothing changes. "
         "Use this for insert/between/before/after edits; the server derives input, on_success, connection, and edge IDs. "
         "Returns `inserted_node_id`, `predecessor_id`, `successor_id`, `derived_connection` (the on_success carried "
         "over), plus `replaced_edge_id` and `new_edge_id` only when visual edges were split; "
