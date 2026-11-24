@@ -62,12 +62,16 @@ def test_every_registered_token_pattern_has_a_positive_control() -> None:
         "sas_signature": "sig=" + "a" * 24,
         "connection_password": "PWD=hunter2",
         "credential_assignment": "client_secret=hunter2",
+        "libpq_password": "host=db password=hunter2",
     }
-    assert set(examples) == {name for name, _pattern in CONSERVATIVE_PATTERN_SPECS}
+    assert set(examples) - {"libpq_password"} == {name for name, _pattern in CONSERVATIVE_PATTERN_SPECS}
     for name, pattern in CONSERVATIVE_PATTERN_SPECS:
         assert pattern.search(examples[name]) is not None, name
         assert find_credential_material(examples[name], purpose="conservative") is not None, name
     assert {name for name, _pattern in ADMISSION_PATTERN_SPECS} == set(examples) - {"credential_assignment"}
+    # The libpq pair is an admission-only form of the version 1 password pair, so
+    # the conservative set still catches everything it catches.
+    assert find_credential_material(examples["libpq_password"], purpose="conservative") is not None
     for name, pattern in ADMISSION_PATTERN_SPECS:
         assert pattern.search(examples[name]) is not None, name
         assert find_credential_material(examples[name], purpose="admission") is not None, name
@@ -113,6 +117,8 @@ def test_conservative_patterns_are_the_version_one_set_in_order() -> None:
         "Authorization: Bearer header is added by the gateway",
         "Set password=<value> in the connection string.",
         "use pwd=current directory",
+        "set the password=<your value> in the form",
+        "the host is db and password=<your value> is what you type",
     ],
 )
 def test_prose_about_credentials_is_admitted_and_still_hidden_conservatively(prose: str) -> None:
@@ -124,10 +130,15 @@ def test_prose_about_credentials_is_admitted_and_still_hidden_conservatively(pro
 @pytest.mark.parametrize(
     "value",
     [
-        "Server=db;Uid=u;Password=Hunter2xyz;",
-        "Server=db;Uid=u;Pwd=Hunter2xyz;",
-        "password=hunter2",
-        "pwd=hunter2",
+        pytest.param("Server=db;Uid=u;Password=Hunter2xyz;", id="ado"),
+        pytest.param("Server=db;Uid=u;Pwd=Hunter2xyz;", id="odbc"),
+        pytest.param("password=hunter2", id="bare-pair"),
+        pytest.param("pwd=hunter2", id="bare-pwd"),
+        pytest.param("jdbc:postgresql://db/app?user=u&password=Hunter2xyz", id="jdbc-after-ampersand"),
+        pytest.param("jdbc:mysql://db/app?password=Hunter2xyz", id="jdbc-after-question-mark"),
+        pytest.param("host=db user=u password=Hunter2xyz dbname=app", id="libpq-middle"),
+        pytest.param("host=db password=Hunter2xyz", id="libpq-last"),
+        pytest.param("dbname=app\npassword=Hunter2xyz", id="libpq-newline"),
     ],
 )
 def test_connection_string_password_pairs_are_still_refused(value: str) -> None:
@@ -309,6 +320,48 @@ def test_an_unparseable_url_does_not_stop_admission_scanning(value: object) -> N
 
     assert finding is not None
     assert finding.category == "token_shape"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "host=db port=5432 dbname=app",
+        "the host is db and the user is app",
+        "Connect with host=db; the password is held by the operator.",
+    ],
+)
+def test_libpq_keywords_without_a_password_pair_are_admitted(value: str) -> None:
+    assert find_credential_material(value, purpose="admission") is None
+
+
+@pytest.mark.parametrize(
+    ("value", "category"),
+    [
+        pytest.param("http://app:Hunter2xyz@[db/x", "credential_url", id="userinfo-with-password"),
+        pytest.param("see http://app@[db/x", "credential_url", id="userinfo-user-only"),
+        pytest.param("http://[db/x?api_key=abc", "sensitive_url_parameter", id="query-parameter-name"),
+        pytest.param("http://[db/x#access_token=abc", "sensitive_url_parameter", id="fragment-parameter-name"),
+    ],
+)
+def test_url_text_the_parser_rejects_still_gets_the_userinfo_and_parameter_checks(value: str, category: str) -> None:
+    # The conservative result proves this input takes the parse-error path.
+    conservative = find_credential_material(value, purpose="conservative")
+    assert conservative is not None
+    assert conservative.category == "unsupported_value"
+
+    finding = find_credential_material(value, purpose="admission")
+
+    assert finding is not None
+    assert finding.category == category
+
+
+@pytest.mark.parametrize("value", ["ref://[section: 2", "http://[db/x and port: 5432"])
+def test_text_the_url_parser_rejects_without_credentials_is_admitted(value: str) -> None:
+    conservative = find_credential_material(value, purpose="conservative")
+    assert conservative is not None
+    assert conservative.category == "unsupported_value"
+
+    assert find_credential_material(value, purpose="admission") is None
 
 
 def test_an_over_long_secret_reference_is_a_literal_in_a_credential_field() -> None:

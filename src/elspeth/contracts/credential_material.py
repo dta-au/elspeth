@@ -125,13 +125,37 @@ CONSERVATIVE_PATTERN_SPECS: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
     ),
 )
 # The admission set: the conservative set without the keyword-assignment
-# pattern, and with the password pair only where it starts the value or
-# follows a ``;`` (a connection-string pair, not prose).
-_ADMISSION_CONNECTION_PASSWORD: Final[re.Pattern[str]] = re.compile(r"(?:^|;)\s*(?:password|pwd)=[^;\s]+", re.IGNORECASE)
-ADMISSION_PATTERN_SPECS: Final[tuple[tuple[str, re.Pattern[str]], ...]] = tuple(
-    (name, _ADMISSION_CONNECTION_PASSWORD if name == "connection_password" else pattern)
-    for name, pattern in CONSERVATIVE_PATTERN_SPECS
-    if name != "credential_assignment"
+# pattern, and with the password pair only where it is a connection-string
+# pair, not prose: at the start of the value or after a ``;`` (ADO.NET and
+# ODBC), ``&`` or ``?`` (JDBC and other URL query strings).
+_ADMISSION_CONNECTION_PASSWORD: Final[re.Pattern[str]] = re.compile(r"(?:^|[;&?])\s*(?:password|pwd)=[^;\s]+", re.IGNORECASE)
+# libpq keyword/value connection strings separate pairs with whitespace. A
+# whitespace-led ``password=`` pair counts only when the same value also holds
+# another libpq connection keyword as a ``key=value`` pair.
+_LIBPQ_CONNECTION_KEYWORDS: Final[tuple[str, ...]] = (
+    "host",
+    "hostaddr",
+    "port",
+    "dbname",
+    "user",
+    "sslmode",
+    "connect_timeout",
+    "application_name",
+    "options",
+    "service",
+    "target_session_attrs",
+)
+_ADMISSION_LIBPQ_PASSWORD: Final[re.Pattern[str]] = re.compile(
+    r"\A(?=(?:[\s\S]*\s)?(?:" + "|".join(_LIBPQ_CONNECTION_KEYWORDS) + r")=\S)(?=(?:[\s\S]*\s)?password=\S)",
+    re.IGNORECASE,
+)
+ADMISSION_PATTERN_SPECS: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
+    *(
+        (name, _ADMISSION_CONNECTION_PASSWORD if name == "connection_password" else pattern)
+        for name, pattern in CONSERVATIVE_PATTERN_SPECS
+        if name != "credential_assignment"
+    ),
+    ("libpq_password", _ADMISSION_LIBPQ_PASSWORD),
 )
 
 
@@ -144,6 +168,9 @@ def _pattern_specs(purpose: CredentialScanPurpose) -> tuple[tuple[str, re.Patter
 
 _PRIVATE_KEY_PATTERN = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
 _HTTP_URL_CANDIDATE_RE = re.compile(r"https?://[^\s'\"<>]+", re.IGNORECASE)
+# Userinfo in http(s) text the URL parser rejects: the parsed path's
+# ``username is not None`` rule, applied to the raw text.
+_UNPARSED_URL_USERINFO_RE = re.compile(r"https?://[^\s/?#@]*@", re.IGNORECASE)
 _CREDENTIAL_URL_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
     re.compile(r"postgres(?:ql)?://[^:/\s]+:[^@/\s]+@"),
     re.compile(r"mysql://[^:/\s]+:[^@/\s]+@"),  # secret-scan: allow-this-line
@@ -357,16 +384,26 @@ def _http_url_candidates(value: str) -> tuple[str, ...]:
 def _classify_http_url(value: str, *, purpose: CredentialScanPurpose) -> CredentialCategory | None:
     parsed = _parse_url(value)
     if parsed == _URL_PARSE_ERROR:
-        # Admission: text the URL parser rejects is not a URL, and the
-        # string's remaining checks still run. Conservative consumers keep
-        # hiding the whole value.
-        return None if purpose == "admission" else "unsupported_value"
+        if purpose == "conservative":
+            # Conservative consumers keep hiding the whole value.
+            return "unsupported_value"
+        # Admission: text the URL parser rejects still gets the userinfo and
+        # query/fragment parameter checks on its raw text, and the string's
+        # remaining checks still run.
+        if _UNPARSED_URL_USERINFO_RE.search(value):
+            return "credential_url"
+        encoded_parts = tuple(value.partition(separator)[2] for separator in ("?", "#") if separator in value)
+        return _classify_url_parameters(encoded_parts, purpose=purpose)
     assert type(parsed) is ParseResult
     if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
         return None
     if parsed.username is not None or parsed.password is not None:
         return "credential_url"
-    for encoded in (parsed.query, parsed.fragment):
+    return _classify_url_parameters((parsed.query, parsed.fragment), purpose=purpose)
+
+
+def _classify_url_parameters(encoded_parts: tuple[str, ...], *, purpose: CredentialScanPurpose) -> CredentialCategory | None:
+    for encoded in encoded_parts:
         # parse_qs performs the boundary's single percent-decoding pass.
         params = parse_qs(encoded, keep_blank_values=True)
         for key, values in params.items():
