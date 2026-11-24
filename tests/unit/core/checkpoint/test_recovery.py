@@ -19,6 +19,7 @@ from elspeth.contracts.barrier_scalars import AggregationNodeScalars, BarrierSca
 from elspeth.contracts.checkpoint import ResumeRefusalCause
 from elspeth.contracts.contract_records import ContractAuditRecord
 from elspeth.contracts.errors import EmptyResumeStateError, OrchestrationInvariantError
+from elspeth.contracts.hashing import CANONICAL_VERSION
 from elspeth.contracts.scheduler import TokenWorkStatus
 from elspeth.contracts.schema_contract import FieldContract, SchemaContract
 from elspeth.core.checkpoint import CheckpointCorruptionError, CheckpointManager, RecoveryManager
@@ -136,7 +137,7 @@ def _insert_run(
             started_at=datetime.now(UTC),
             config_hash=fake_sha256("cfg"),
             settings_json="{}",
-            canonical_version="sha256-rfc8785-v1",
+            canonical_version=CANONICAL_VERSION,
             status=status,
             openrouter_catalog_sha256="0" * 64,
             openrouter_catalog_source="bundled",

@@ -37,6 +37,7 @@ from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
 from elspeth.contracts.contract_records import ContractAuditRecord
 from elspeth.contracts.diversion import SinkWriteResult
 from elspeth.contracts.errors import GracefulShutdownError, IncompleteSourceResumeError
+from elspeth.contracts.hashing import CANONICAL_VERSION
 from elspeth.contracts.schema_contract import FieldContract, SchemaContract
 from elspeth.contracts.types import NodeID, SinkName
 from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
@@ -825,7 +826,7 @@ class TestCheckpointRecovery:
                     started_at=now,
                     config_hash=fake_sha256("test"),
                     settings_json="{}",
-                    canonical_version="sha256-rfc8785-v1",
+                    canonical_version=CANONICAL_VERSION,
                     status=RunStatus.FAILED,
                     source_schema_json=source_schema_json,
                     openrouter_catalog_sha256="0" * 64,
@@ -1029,7 +1030,7 @@ class TestAggregationRecovery:
         )
         run = factory.run_lifecycle.begin_run(
             config={"aggregation": {"trigger": {"count": 5}}},
-            canonical_version="sha256-rfc8785-v1",
+            canonical_version=CANONICAL_VERSION,
         )
 
         # Register nodes using raw SQL

@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from elspeth.contracts import hashing
 from elspeth.contracts.coordination import WorkerMembershipToken
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.events import RunStarted
@@ -840,8 +841,10 @@ def test_plugin_policy_acceptance_binds_effective_bedrock_policy_tutorial_and_sa
 
 @pytest.mark.parametrize("failure_mode", [None, "checker_failure", "claim_lost", "wrong_telemetry"])
 def test_guardrail_live_owner_persists_four_calls_before_forwarding_telemetry_and_closes_resources(
-    tmp_path: Path, failure_mode: str | None
+    tmp_path: Path, failure_mode: str | None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    patched_version = "sha256-rfc8785-test"
+    monkeypatch.setattr(hashing, "CANONICAL_VERSION", patched_version)
     from elspeth.plugins.transforms.aws.guardrail_profiles import BedrockGuardrailProfileSettings
     from elspeth.plugins.transforms.aws.guardrails_live_check import run_guardrail_live_check
     from tests.unit.plugins.transforms.aws.test_guardrails_client import CONTENT_FILTERS, response
@@ -968,6 +971,7 @@ def test_guardrail_live_owner_persists_four_calls_before_forwarding_telemetry_an
         with LandscapeDB.from_url(database_url, create_tables=False) as database:
             repositories = RecorderFactory.writable(database)
             run = repositories.run_lifecycle.list_runs()[0]
+            assert run.canonical_version == patched_version
             outcomes = repositories.query.get_all_token_outcomes_for_run(run.run_id)
         if failure_mode in ("checker_failure", "wrong_telemetry"):
             assert run.status.value == "failed"
@@ -990,6 +994,7 @@ def test_guardrail_live_owner_persists_four_calls_before_forwarding_telemetry_an
         runs = repositories.run_lifecycle.list_runs()
         assert len(runs) == 1
         assert runs[0].status.value == "completed"
+        assert runs[0].canonical_version == patched_version
         rows = repositories.query.get_rows(runs[0].run_id)
         tokens = repositories.query.get_tokens_for_rows(runs[0].run_id, [rows[0].row_id])
         states = repositories.query.get_node_states_for_tokens(runs[0].run_id, [tokens[0].token_id])

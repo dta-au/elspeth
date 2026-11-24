@@ -36,6 +36,7 @@ from elspeth.contracts.errors import GracefulShutdownError
 from elspeth.web.app import create_app
 from elspeth.web.composer.state import CompositionState, OutputSpec, PipelineMetadata, SourceSpec
 from elspeth.web.config import WebSettings
+from elspeth.web.coordination.upkeep_engine import lease_upkeep_authority
 from elspeth.web.execution import service as service_module
 from elspeth.web.execution.recovery import RunRecoveryCoordinator
 from elspeth.web.sessions.models import run_events_table, runs_table, session_operation_fences_table
@@ -140,6 +141,8 @@ class _HeldRun:
     #: Every call sent through the bridge, by name, in order.
     bridged: list[str] = field(default_factory=list)
     bridged_when_cancelled: int | None = None
+    #: Heartbeats refused after ``stop_lease_renewal``.
+    renewals_refused: int = 0
 
     async def status(self) -> dict[str, Any]:
         response = await self.client.get(f"/api/runs/{self.run_id}", headers=self.headers)
@@ -159,23 +162,32 @@ class _HeldRun:
             return [row.event_type for row in rows if row.event_type in _TERMINAL_EVENT_TYPES]
 
     def lease_has_lapsed(self) -> bool:
+        """The fence ran past its deadline while still held; a released fence has not lapsed."""
+        fences = session_operation_fences_table
         with self.session_engine.connect() as connection:
-            expires = connection.execute(
-                select(session_operation_fences_table.c.lease_expires_at).where(
-                    session_operation_fences_table.c.session_id == self.session_id
-                )
-            ).scalar_one()
+            fence = connection.execute(
+                select(fences.c.lease_expires_at, fences.c.released_at).where(fences.c.session_id == self.session_id)
+            ).one()
+        if fence.released_at is not None:
+            return False
+        expires = fence.lease_expires_at
         if expires.tzinfo is None:
             expires = expires.replace(tzinfo=UTC)
         return bool(expires + timedelta(seconds=0.3) < datetime.now(UTC))
 
     def stop_lease_renewal(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Make the next heartbeat fail, as it does when the store that stalled the write stalls it too."""
+        """Make the next heartbeat fail, as it does when the store that stalled the write stalls it too.
+
+        The heartbeat renews through the lease-upkeep authority, so that is the
+        one stopped; ``renewals_refused`` counts the heartbeats it refused.
+        """
 
         def renewal_stalled(*_args: Any, **_kwargs: Any) -> Any:
+            self.renewals_refused += 1
             raise RuntimeError("the test stopped lease renewal")
 
-        monkeypatch.setattr(self.app.state.session_service.session_operation_authority, "renew", renewal_stalled)
+        upkeep = lease_upkeep_authority(self.app.state.session_service.session_operation_authority)
+        monkeypatch.setattr(upkeep, "renew", renewal_stalled)
 
     def drop_the_unreleased_lease_obligation(self) -> None:
         """Let this test's app close after its lease ran out under a live thread.
@@ -657,6 +669,8 @@ async def test_a_lapsed_lease_neither_lets_recovery_take_a_waiting_run_nor_lets_
             # while the thread is still waiting on the bridge.
             run.stop_lease_renewal(monkeypatch)
             await run.until(run.lease_has_lapsed)
+            # The heartbeat really was stopped where it renews.
+            assert run.renewals_refused >= 1
 
             await run.recover()
 
