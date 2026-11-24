@@ -595,6 +595,81 @@ def test_sqlite_archive_capability_rejects_active_receipt_blockers(engine, block
     assert archived_at is None
 
 
+def _expire_receipt(engine, *, operation_id: str) -> None:
+    with engine.begin() as conn:
+        conn.execute(
+            update(session_operation_receipts_table)
+            .where(session_operation_receipts_table.c.operation_id == operation_id)
+            .values(lease_expires_at=datetime.now(UTC) - timedelta(hours=1))
+        )
+
+
+def test_sqlite_archive_soft_archives_past_own_expired_receipt_and_refuses_its_retry(engine) -> None:
+    """An abandoned receipt whose lease expired no longer blocks deletion.
+
+    The session is archived rather than removed, the receipt stays as history,
+    and the archived session refuses the fence a client retry would need.
+    """
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    target = _created(authority)
+    operation_id = str(uuid4())
+    _seed_fork_operation(engine, session_id=str(target.id), operation_id=operation_id)
+    _expire_receipt(engine, operation_id=operation_id)
+    context = authority.acquire(
+        session_id=target.id,
+        operation_kind=SessionOperationKind.ARCHIVE,
+        owner_instance_id="sqlite-owner",
+        lease_seconds=30,
+    )
+
+    disposition = authority.mutate(
+        context,
+        lambda transaction: transaction.session.decide_and_soft_archive(archived_at=datetime.now(UTC)),
+    )
+    authority.release(context)
+
+    assert disposition is SessionArchiveDisposition.SOFT_ARCHIVED
+    with engine.connect() as conn:
+        archived_at = conn.execute(select(sessions_table.c.archived_at).where(sessions_table.c.id == str(target.id))).scalar_one()
+        receipt_status = conn.execute(
+            select(session_operation_receipts_table.c.status).where(
+                session_operation_receipts_table.c.session_id == str(target.id),
+                session_operation_receipts_table.c.operation_id == operation_id,
+            )
+        ).scalar_one()
+    assert archived_at is not None
+    assert receipt_status == "in_progress"
+    with pytest.raises(SessionOperationFenceLost):
+        authority.acquire(
+            session_id=target.id,
+            operation_kind=SessionOperationKind.SESSION_FORK,
+            owner_instance_id="sqlite-retry",
+            lease_seconds=30,
+        )
+
+
+def test_sqlite_archive_still_refuses_an_expired_incoming_fork(engine) -> None:
+    """An incoming fork's child is still staged; a retried fork would reactivate it."""
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    target = _created(authority)
+    parent = _created(authority)
+    operation_id = str(uuid4())
+    _seed_fork_operation(engine, session_id=str(parent.id), operation_id=operation_id, result_session_id=str(target.id))
+    _expire_receipt(engine, operation_id=operation_id)
+    context = authority.acquire(
+        session_id=target.id,
+        operation_kind=SessionOperationKind.ARCHIVE,
+        owner_instance_id="sqlite-owner",
+        lease_seconds=30,
+    )
+
+    with pytest.raises(SessionReceiptInProgressError):
+        authority.mutate(
+            context,
+            lambda transaction: transaction.session.decide_and_soft_archive(archived_at=datetime.now(UTC)),
+        )
+
+
 @pytest.mark.parametrize(
     "attack_kind",
     (

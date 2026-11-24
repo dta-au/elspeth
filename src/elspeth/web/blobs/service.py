@@ -65,6 +65,7 @@ from elspeth.web.blobs.protocol import (
     names_same_blob,
 )
 from elspeth.web.composer.yaml_generator import LoweredPipelineDocument
+from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.coordination.quota_authority import (
     QuotaExceeded,
     admit_storage_bytes_on_connection,
@@ -2310,13 +2311,18 @@ def _row_to_blob_record(row: Any) -> BlobRecord:
 
 
 def _in_progress_session_fork_operation_id(conn: Connection, session_id: str) -> str | None:
-    """Return the operation retaining every blob in a session, if any."""
+    """Return the live fork operation retaining every blob in a session, if any.
+
+    A fork whose receipt lease has expired, judged by the database clock as a
+    receipt takeover judges it, no longer retains the session's blobs.
+    """
     return conn.execute(
         select(session_operation_receipts_table.c.operation_id)
         .where(
             session_operation_receipts_table.c.session_id == session_id,
             session_operation_receipts_table.c.kind == "session_fork",
             session_operation_receipts_table.c.status == "in_progress",
+            session_operation_receipts_table.c.lease_expires_at > database_now(conn),
         )
         .limit(1)
     ).scalar_one_or_none()
