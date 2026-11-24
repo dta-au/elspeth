@@ -280,12 +280,17 @@ class RefusedCallRecord:
     record is written. When the writer's authority has lapsed the fence keeps
     the row out of ``calls``, so the ``fence_refusal`` event carrying this is
     the call's only durable record. Values mirror the refused ``calls`` row.
+
+    ``call_index`` is ``None`` only when the fence refused the index
+    allocation itself (event verb ``allocate_operation_call_index``): no index
+    was ever assigned, so none is invented. ``call_id`` is then ``None`` too
+    unless the caller supplied an explicit attempt id.
     """
 
-    call_id: str
+    call_id: str | None
     state_id: str | None
     operation_id: str | None
-    call_index: int
+    call_index: int | None
     call_type: CallType
     status: CallStatus
     request_hash: str

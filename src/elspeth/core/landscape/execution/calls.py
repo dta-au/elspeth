@@ -102,10 +102,10 @@ class _LineageEvidence(NamedTuple):
 
 def _refused_call_record(
     *,
-    call_id: str,
+    call_id: str | None,
     state_id: str | None,
     operation_id: str | None,
-    call_index: int,
+    call_index: int | None,
     call_type: CallType,
     status: CallStatus,
     prepared: _PreparedCallData,
@@ -795,18 +795,13 @@ class CallAuditRepository:
         if not isinstance(token_usage, TokenUsage):
             raise TypeError("token_usage must be TokenUsage")
 
-        if call_index is None:
-            call_index = self.allocate_operation_call_index(operation_id, coordination_token=coordination_token)
         explicit_call_id = call_id is not None
         if explicit_call_id and (type(call_id) is not str or not call_id or len(call_id) > 64):
             raise ValueError("Explicit call_id must be a non-empty string of at most 64 characters")
         if explicit_call_id and (call_type is not CallType.LLM or source_call_id is not None):
             raise ValueError("Explicit call_id is reserved for physical LLM outcomes")
-        call_id = f"call_{operation_id}_{call_index}" if call_id is None else call_id
-        returned_model = response_data.model if isinstance(response_data, LLMCallResponse) else None
         if created_at is not None and (type(created_at) is not datetime or created_at.tzinfo is None):
             raise ValueError("Explicit call created_at must be an aware datetime")
-        timestamp = now() if created_at is None else created_at
         prepared = self._prepare_call_payloads(
             request_data,
             response_data,
@@ -814,6 +809,38 @@ class CallAuditRepository:
             request_ref,
             response_ref,
         )
+        if call_index is None:
+            try:
+                call_index = self.allocate_operation_call_index(operation_id, coordination_token=coordination_token)
+            except RunLeadershipLostError:
+                # The call already happened and no index was ever assigned to
+                # it: the record carries its index (and any generated id) as
+                # absent, never a placeholder.
+                record_refused_call(
+                    self._db.engine,
+                    run_id=coordination_token.run_id,
+                    worker_id=coordination_token.worker_id,
+                    leader_epoch=coordination_token.leader_epoch,
+                    verb="allocate_operation_call_index",
+                    fence="leader",
+                    refused_call=_refused_call_record(
+                        call_id=call_id,
+                        state_id=None,
+                        operation_id=operation_id,
+                        call_index=None,
+                        call_type=call_type,
+                        status=status,
+                        prepared=prepared,
+                        token_usage=token_usage,
+                        latency_ms=latency_ms,
+                    ),
+                    work_item_id=None,
+                    attempt=None,
+                )
+                raise
+        call_id = f"call_{operation_id}_{call_index}" if call_id is None else call_id
+        returned_model = response_data.model if isinstance(response_data, LLMCallResponse) else None
+        timestamp = now() if created_at is None else created_at
 
         values: dict[str, object] = {
             "call_id": call_id,

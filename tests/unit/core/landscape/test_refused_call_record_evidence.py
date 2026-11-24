@@ -201,8 +201,56 @@ def test_operation_call_record_refused_by_leader_fence_records_the_call() -> Non
     _assert_refused_call(context["refused_call"], call_id="attempt-late-2", state_id=None, operation_id=operation.operation_id)
 
 
+def test_source_call_refused_at_index_allocation_records_the_call_without_an_index() -> None:
+    """A source plugin's call (PluginContext.record_call allocates after the call) is not lost.
+
+    The fence refuses the index allocation itself, so no index or generated id
+    was ever assigned: the record carries both as absent, never a placeholder,
+    and its verb names the allocation.
+    """
+    from elspeth.contracts.plugin_context import PluginContext
+    from elspeth.core.landscape.plugin_audit_writer import PluginAuditWriterAdapter
+
+    setup = _setup()
+    recorder = setup.recorder
+    operation = recorder.execution.begin_operation(recorder.source_node_id, "source_load", coordination_token=recorder.coordination_token)
+    stale = replace(recorder.coordination_token, leader_epoch=recorder.coordination_token.leader_epoch + 1)
+    ctx = PluginContext(
+        run_id=recorder.run_id,
+        config={},
+        landscape=PluginAuditWriterAdapter(recorder.execution, recorder.data_flow, recorder.run_lifecycle),
+        node_id=recorder.source_node_id,
+        operation_id=operation.operation_id,
+        coordination_token=stale,
+    )
+    before = len(_fence_refusals(setup))
+
+    with pytest.raises(RunLeadershipLostError):
+        ctx.record_call(CallType.HTTP, CallStatus.SUCCESS, {"url": "https://example.test/object"}, {"status": 200}, latency_ms=8.0)
+
+    assert _call_count(setup) == 0
+    refusals = _fence_refusals(setup)[before:]
+    # The leader fence's own refusal of the allocation, then the call's record.
+    assert refusals[0] == {"verb": "allocate_operation_call_index"}
+    assert len(refusals) == 2
+    record = refusals[1]
+    assert record["verb"] == "allocate_operation_call_index"
+    assert record["fence"] == "leader"
+    refused = record["refused_call"]
+    assert isinstance(refused, dict)
+    assert refused["call_index"] is None
+    assert refused["call_id"] is None
+    assert refused["operation_id"] == operation.operation_id
+    assert refused["state_id"] is None
+    assert refused["call_type"] == "http"
+    assert refused["status"] == "success"
+    assert refused["request_hash"] == stable_hash({"url": "https://example.test/object"})
+    assert refused["response_hash"] == stable_hash({"status": 200})
+    assert refused["latency_ms"] == 8.0
+
+
 def test_refused_call_index_allocation_adds_no_item_refusal() -> None:
-    """Allocation precedes dispatch, so its item-lease refusal stays unevented as before."""
+    """A bare row-call index allocation names no call, so its item-lease refusal writes no record, as before."""
     setup = _setup()
     with setup.recorder.db.write_connection() as conn:
         conn.execute(
