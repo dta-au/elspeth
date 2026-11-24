@@ -23,6 +23,7 @@ no process re-exec.
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import types
 from datetime import UTC, datetime, timedelta
@@ -32,11 +33,19 @@ from unittest.mock import patch
 import pytest
 from sqlalchemy import insert, select, update
 
+from elspeth.contracts import ResumeCheck, RoutingMode
+from elspeth.contracts.audit import Edge
 from elspeth.contracts.coordination import WorkerMembershipToken, mint_worker_id
-from elspeth.contracts.errors import JoinRefusedError
+from elspeth.contracts.enums import NodeType
+from elspeth.contracts.errors import AuditIntegrityError, JoinNotReadyError, JoinRefusedError
+from elspeth.contracts.hashing import CANONICAL_VERSION
+from elspeth.contracts.routing import EdgeInfo
+from elspeth.contracts.types import NodeID
 from elspeth.core.landscape import run_coordination_repository as coordination_module
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.database_clock import read_landscape_decision_time, read_landscape_transaction_time
+from elspeth.core.landscape.factory import DataFlowReadRepository, RunLifecycleReadRepository
+from elspeth.core.landscape.run_lifecycle_repository import RunSourceLifecycleRecord
 from elspeth.core.landscape.schema import (
     run_coordination_events_table,
     run_coordination_table,
@@ -45,7 +54,7 @@ from elspeth.core.landscape.schema import (
 )
 from elspeth.engine.orchestrator.core import Orchestrator
 from tests.fixtures.audit_hashing import fake_sha256
-from tests.fixtures.landscape import expire_leader_seat, make_landscape_db
+from tests.fixtures.landscape import expire_leader_seat, make_landscape_db, make_recorder_with_run
 from tests.helpers.state_engine import capture_state_engine_image
 
 # ---------------------------------------------------------------------------
@@ -63,6 +72,33 @@ _SENTINEL_HASH = fake_sha256("sentinel-config-hash-abc123")
 # Patches for resolve_config+stable_hash so joiner_config_hash == _SENTINEL_HASH.
 _PATCH_RESOLVE = patch("elspeth.engine.orchestrator.join_admission.resolve_config", return_value={})
 _PATCH_HASH_SENTINEL = patch("elspeth.engine.orchestrator.join_admission.stable_hash", return_value=_SENTINEL_HASH)
+
+_GRAPH_EDGE = EdgeInfo(from_node=NodeID("source"), to_node=NodeID("sink"), label="default", mode=RoutingMode.MOVE)
+_RECORDED_EDGE = Edge(
+    edge_id="edge-1",
+    run_id=RUN_ID,
+    from_node_id="source",
+    to_node_id="sink",
+    label="default",
+    default_mode=RoutingMode.MOVE,
+    created_at=NOW,
+)
+# The leader has started loading its source, so graph registration is complete.
+_LOADING_SOURCE = RunSourceLifecycleRecord(source_node_id="source", source_name="primary", lifecycle_state="loading")
+_SOURCE_NODE = types.SimpleNamespace(node_id="source", node_type=NodeType.SOURCE)
+_SINK_NODE = types.SimpleNamespace(node_id="sink", node_type=NodeType.SINK)
+_JOIN_INPUTS = {"config": types.SimpleNamespace(), "graph": types.SimpleNamespace(get_edges=lambda: [_GRAPH_EDGE])}
+
+
+@pytest.fixture
+def _registered_graph_baseline() -> object:
+    with (
+        patch.object(RunLifecycleReadRepository, "get_run_source_lifecycle_records", return_value={"source": _LOADING_SOURCE}),
+        patch.object(DataFlowReadRepository, "get_nodes", return_value=[_SOURCE_NODE, _SINK_NODE]),
+        patch.object(DataFlowReadRepository, "get_edges", return_value=[_RECORDED_EDGE]),
+        patch("elspeth.engine.orchestrator.join_admission.check_implementation_compatibility", return_value=ResumeCheck(can_resume=True)),
+    ):
+        yield
 
 
 # ---------------------------------------------------------------------------
@@ -90,7 +126,7 @@ def _begin_run_with_leader(db: LandscapeDB, *, run_id: str = RUN_ID, config_hash
                 started_at=NOW,
                 config_hash=config_hash,
                 settings_json="{}",
-                canonical_version="v1",
+                canonical_version=CANONICAL_VERSION,
                 status="running",
                 openrouter_catalog_sha256="0" * 64,
                 openrouter_catalog_source="bundled",
@@ -138,11 +174,101 @@ def _coord_events(db: LandscapeDB, run_id: str = RUN_ID) -> list[dict[str, objec
     return [dict(r) for r in rows]
 
 
+class TestJoinRealReadiness:
+    """Exercise the recorded graph through the read-only Landscape repository."""
+
+    def test_live_leader_waits_for_recorded_edges(self) -> None:
+        setup = make_recorder_with_run(run_id=RUN_ID, leader_worker_id=f"worker:{RUN_ID}:leader")
+        with _PATCH_RESOLVE, pytest.raises(JoinNotReadyError, match="not finished registering its graph"):
+            _orchestrator(setup.db).join_run(run_id=RUN_ID, settings=types.SimpleNamespace(), **_JOIN_INPUTS)
+        assert [row for row in _worker_rows(setup.db) if row["role"] == "follower"] == []
+        setup.db.close()
+
+
+@pytest.mark.usefixtures("_registered_graph_baseline")
+class TestJoinSourceLifecycleEvidence:
+    """Stored lifecycle evidence is parsed in full and must cover the recorded source nodes."""
+
+    @pytest.mark.parametrize(
+        "records",
+        [
+            pytest.param({"source": dataclasses.replace(_LOADING_SOURCE, lifecycle_state="bogus")}, id="only-row-corrupt"),
+            pytest.param(
+                {
+                    "source": _LOADING_SOURCE,
+                    "second": dataclasses.replace(_LOADING_SOURCE, source_node_id="second", lifecycle_state="bogus"),
+                },
+                id="corrupt-after-non-ready",
+            ),
+        ],
+    )
+    def test_lifecycle_state_outside_enum_is_integrity_failure(self, records: dict[str, RunSourceLifecycleRecord]) -> None:
+        db = make_landscape_db()
+        _begin_run_with_leader(db)
+        with (
+            _PATCH_RESOLVE,
+            _PATCH_HASH_SENTINEL,
+            patch.object(RunLifecycleReadRepository, "get_run_source_lifecycle_records", return_value=records),
+            pytest.raises(AuditIntegrityError, match="outside RunSourceLifecycleState") as exc_info,
+        ):
+            _orchestrator(db).join_run(run_id=RUN_ID, settings=types.SimpleNamespace(), **_JOIN_INPUTS)
+        assert isinstance(exc_info.value.__cause__, ValueError)
+        assert [row for row in _worker_rows(db) if row["role"] == "follower"] == []
+        db.close()
+
+    @pytest.mark.parametrize(
+        "nodes",
+        [
+            pytest.param([_SINK_NODE], id="row-without-source-node"),
+            pytest.param(
+                [_SOURCE_NODE, types.SimpleNamespace(node_id="second", node_type=NodeType.SOURCE), _SINK_NODE],
+                id="source-node-without-row",
+            ),
+        ],
+    )
+    def test_registered_marker_requires_rows_for_exactly_the_source_nodes(self, nodes: list[types.SimpleNamespace]) -> None:
+        db = make_landscape_db()
+        _begin_run_with_leader(db)
+        with (
+            _PATCH_RESOLVE,
+            _PATCH_HASH_SENTINEL,
+            patch.object(DataFlowReadRepository, "get_nodes", return_value=nodes),
+            pytest.raises(AuditIntegrityError, match="do not cover its recorded source nodes"),
+        ):
+            _orchestrator(db).join_run(run_id=RUN_ID, settings=types.SimpleNamespace(), **_JOIN_INPUTS)
+        assert [row for row in _worker_rows(db) if row["role"] == "follower"] == []
+        db.close()
+
+    def test_ready_subset_mid_seeding_is_not_ready_not_integrity_failure(self) -> None:
+        """While every row is READY the leader may still be seeding: coverage is not checked yet."""
+        db = make_landscape_db()
+        _begin_run_with_leader(db)
+        with (
+            _PATCH_RESOLVE,
+            _PATCH_HASH_SENTINEL,
+            patch.object(
+                RunLifecycleReadRepository,
+                "get_run_source_lifecycle_records",
+                return_value={"source": dataclasses.replace(_LOADING_SOURCE, lifecycle_state="ready")},
+            ),
+            patch.object(
+                DataFlowReadRepository,
+                "get_nodes",
+                return_value=[_SOURCE_NODE, types.SimpleNamespace(node_id="second", node_type=NodeType.SOURCE), _SINK_NODE],
+            ),
+            pytest.raises(JoinNotReadyError, match="not finished registering its graph"),
+        ):
+            _orchestrator(db).join_run(run_id=RUN_ID, settings=types.SimpleNamespace(), **_JOIN_INPUTS)
+        assert [row for row in _worker_rows(db) if row["role"] == "follower"] == []
+        db.close()
+
+
 # ---------------------------------------------------------------------------
 # §H test #2(b): happy path — test_join_attaches_follower_to_running_run
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("_registered_graph_baseline")
 class TestJoinAdmissionHappyPath:
     """§H contract (b): join_run attaches a follower to a RUNNING run."""
 
@@ -154,7 +280,7 @@ class TestJoinAdmissionHappyPath:
         fake_settings = types.SimpleNamespace()
         with _PATCH_RESOLVE, _PATCH_HASH_SENTINEL:
             orch = _orchestrator(db)
-            member = orch.join_run(run_id=RUN_ID, settings=fake_settings)
+            member = orch.join_run(run_id=RUN_ID, settings=fake_settings, **_JOIN_INPUTS)
 
         # join_run returns the follower's membership token — the exact value
         # admit_follower established — naming the run and a fresh identity.
@@ -187,8 +313,8 @@ class TestJoinAdmissionHappyPath:
         fake_settings = types.SimpleNamespace()
         with _PATCH_RESOLVE, _PATCH_HASH_SENTINEL:
             orch = _orchestrator(db)
-            wid1 = orch.join_run(run_id=RUN_ID, settings=fake_settings)
-            wid2 = orch.join_run(run_id=RUN_ID, settings=fake_settings)
+            wid1 = orch.join_run(run_id=RUN_ID, settings=fake_settings, **_JOIN_INPUTS)
+            wid2 = orch.join_run(run_id=RUN_ID, settings=fake_settings, **_JOIN_INPUTS)
 
         assert wid1 != wid2
 
@@ -198,6 +324,7 @@ class TestJoinAdmissionHappyPath:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("_registered_graph_baseline")
 class TestJoinAdmissionRefusals:
     """Four refusal arms: terminal run, config_hash mismatch, dead/vacant seat,
     filesystem permission failure."""
@@ -213,8 +340,9 @@ class TestJoinAdmissionRefusals:
                     started_at=NOW,
                     config_hash=_SENTINEL_HASH,
                     settings_json="{}",
-                    canonical_version="v1",
+                    canonical_version=CANONICAL_VERSION,
                     status="completed",
+                    completed_at=NOW,
                     openrouter_catalog_sha256="0" * 64,
                     openrouter_catalog_source="bundled",
                 )
@@ -232,7 +360,7 @@ class TestJoinAdmissionRefusals:
         fake_settings = types.SimpleNamespace()
         with _PATCH_RESOLVE, _PATCH_HASH_SENTINEL, pytest.raises(JoinRefusedError) as exc_info:
             orch = _orchestrator(db)
-            orch.join_run(run_id=RUN_ID, settings=fake_settings)
+            orch.join_run(run_id=RUN_ID, settings=fake_settings, **_JOIN_INPUTS)
 
         assert exc_info.value.run_id == RUN_ID
         assert "terminal" in str(exc_info.value).lower()
@@ -247,7 +375,7 @@ class TestJoinAdmissionRefusals:
                     started_at=NOW,
                     config_hash=_SENTINEL_HASH,
                     settings_json="{}",
-                    canonical_version="v1",
+                    canonical_version=CANONICAL_VERSION,
                     status="failed",
                     openrouter_catalog_sha256="0" * 64,
                     openrouter_catalog_source="bundled",
@@ -266,7 +394,7 @@ class TestJoinAdmissionRefusals:
         fake_settings = types.SimpleNamespace()
         with _PATCH_RESOLVE, _PATCH_HASH_SENTINEL, pytest.raises(JoinRefusedError) as exc_info:
             orch = _orchestrator(db)
-            orch.join_run(run_id=RUN_ID, settings=fake_settings)
+            orch.join_run(run_id=RUN_ID, settings=fake_settings, **_JOIN_INPUTS)
 
         # Should mention resume (not terminal)
         assert "resume" in str(exc_info.value).lower()
@@ -283,7 +411,7 @@ class TestJoinAdmissionRefusals:
             pytest.raises(JoinRefusedError) as exc_info,
         ):
             orch = _orchestrator(db)
-            orch.join_run(run_id=RUN_ID, settings=fake_settings)
+            orch.join_run(run_id=RUN_ID, settings=fake_settings, **_JOIN_INPUTS)
 
         err = exc_info.value
         assert err.run_id == RUN_ID
@@ -306,7 +434,7 @@ class TestJoinAdmissionRefusals:
             pytest.raises(JoinRefusedError) as exc_info,
         ):
             orch = _orchestrator(db)
-            orch.join_run(run_id=RUN_ID, settings=fake_settings)
+            orch.join_run(run_id=RUN_ID, settings=fake_settings, **_JOIN_INPUTS)
 
         err = exc_info.value
         assert err.run_id == RUN_ID
@@ -327,7 +455,7 @@ class TestJoinAdmissionRefusals:
                     started_at=NOW,
                     config_hash=_SENTINEL_HASH,
                     settings_json="{}",
-                    canonical_version="v1",
+                    canonical_version=CANONICAL_VERSION,
                     status="running",
                     openrouter_catalog_sha256="0" * 64,
                     openrouter_catalog_source="bundled",
@@ -347,7 +475,7 @@ class TestJoinAdmissionRefusals:
         fake_settings = types.SimpleNamespace()
         with _PATCH_RESOLVE, _PATCH_HASH_SENTINEL, pytest.raises(JoinRefusedError) as exc_info:
             orch = _orchestrator(db)
-            orch.join_run(run_id=RUN_ID, settings=fake_settings)
+            orch.join_run(run_id=RUN_ID, settings=fake_settings, **_JOIN_INPUTS)
 
         assert "no live leader" in str(exc_info.value).lower()
 
@@ -368,7 +496,7 @@ class TestJoinAdmissionRefusals:
         with patch("elspeth.engine.orchestrator.join_admission.os.access", side_effect=fake_access):
             orch = _orchestrator(db)
             with pytest.raises(JoinRefusedError) as exc_info:
-                orch.join_run(run_id=RUN_ID, settings=fake_settings)
+                orch.join_run(run_id=RUN_ID, settings=fake_settings, **_JOIN_INPUTS)
 
         err = exc_info.value
         assert err.run_id == RUN_ID
@@ -395,7 +523,7 @@ class TestJoinAdmissionRefusals:
         with patch("elspeth.engine.orchestrator.join_admission.os.access", side_effect=fake_access):
             orch = _orchestrator(db)
             with pytest.raises(JoinRefusedError) as exc_info:
-                orch.join_run(run_id=RUN_ID, settings=fake_settings)
+                orch.join_run(run_id=RUN_ID, settings=fake_settings, **_JOIN_INPUTS)
 
         err = exc_info.value
         assert err.run_id == RUN_ID
@@ -407,6 +535,7 @@ class TestJoinAdmissionRefusals:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("_registered_graph_baseline")
 class TestJoinAdmissionAtomicity:
     """Admission is atomic: a refused join leaves ZERO mutation in the DB."""
 
@@ -424,7 +553,7 @@ class TestJoinAdmissionAtomicity:
             pytest.raises(JoinRefusedError),
         ):
             orch = _orchestrator(db)
-            orch.join_run(run_id=RUN_ID, settings=fake_settings)
+            orch.join_run(run_id=RUN_ID, settings=fake_settings, **_JOIN_INPUTS)
 
         # run_workers: still only the leader row
         workers = _worker_rows(db)
@@ -445,7 +574,7 @@ class TestJoinAdmissionAtomicity:
         fake_settings = types.SimpleNamespace()
         with _PATCH_RESOLVE, _PATCH_HASH_SENTINEL, pytest.raises(JoinRefusedError):
             orch = _orchestrator(db)
-            orch.join_run(run_id=RUN_ID, settings=fake_settings)
+            orch.join_run(run_id=RUN_ID, settings=fake_settings, **_JOIN_INPUTS)
 
         workers = _worker_rows(db)
         assert len(workers) == 1
@@ -453,6 +582,7 @@ class TestJoinAdmissionAtomicity:
         assert _coord_events(db) == events_before
 
 
+@pytest.mark.usefixtures("_registered_graph_baseline")
 class TestSeatLivenessBoundary:
     """ADR-047: admission decides ``leader_heartbeat_expires_at >= database_now`` on the Landscape clock.
 
@@ -478,7 +608,7 @@ class TestSeatLivenessBoundary:
         # real-clock PostgreSQL tests separately cover expiry during admission.
         monkeypatch.setattr(coordination_module, "read_landscape_decision_time", lambda _conn: database_now)
         with _PATCH_RESOLVE, _PATCH_HASH_SENTINEL:
-            worker_id = _orchestrator(db).join_run(run_id=RUN_ID, settings=fake_settings).worker_id
+            worker_id = _orchestrator(db).join_run(run_id=RUN_ID, settings=fake_settings, **_JOIN_INPUTS).worker_id
         assert worker_id.startswith(f"worker:{RUN_ID}:")
         assert [w["status"] for w in _worker_rows(db) if w["worker_id"] == worker_id] == ["active"]
 
@@ -491,7 +621,7 @@ class TestSeatLivenessBoundary:
             )
         before_refusal = capture_state_engine_image(db, run_id=RUN_ID)
         with _PATCH_RESOLVE, _PATCH_HASH_SENTINEL, pytest.raises(JoinRefusedError) as exc_info:
-            _orchestrator(db).join_run(run_id=RUN_ID, settings=fake_settings)
+            _orchestrator(db).join_run(run_id=RUN_ID, settings=fake_settings, **_JOIN_INPUTS)
         assert "no live leader" in str(exc_info.value).lower()
         assert len([w for w in _worker_rows(db) if w["role"] == "follower"]) == 1, "the refused join registered no second follower"
         assert capture_state_engine_image(db, run_id=RUN_ID) == before_refusal

@@ -6,7 +6,7 @@ from elspeth.contracts import ResumeCheck
 from elspeth.contracts.checkpoint import ResumeRefusalCause
 from elspeth.contracts.types import NodeID
 from elspeth.core.dag import ExecutionGraph
-from elspeth.core.landscape.factory import RecorderFactory
+from elspeth.core.landscape.factory import LandscapeReadRepositories, RecorderFactory
 from elspeth.engine.orchestrator.graph_wiring import build_source_id_map
 from elspeth.engine.orchestrator.landscape_registration import NodeAuditMetadata, resolve_node_audit_metadata
 from elspeth.engine.orchestrator.types import PipelineConfig
@@ -32,7 +32,9 @@ def compare_implementation_metadata(
     return ResumeCheck(can_resume=True)
 
 
-def check_implementation_compatibility(factory: RecorderFactory, run_id: str, config: PipelineConfig, graph: ExecutionGraph) -> ResumeCheck:
+def check_implementation_compatibility(
+    factory: RecorderFactory | LandscapeReadRepositories, run_id: str, config: PipelineConfig, graph: ExecutionGraph
+) -> ResumeCheck:
     """Read the original node baseline, never regenerate it from current code."""
     recorded = {
         NodeID(node.node_id): NodeAuditMetadata(
