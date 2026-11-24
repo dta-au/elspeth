@@ -181,11 +181,8 @@ from elspeth.web.composer.tools.generation import MalformedSourceProofClaim, _ad
 from elspeth.web.composer.tools.sessions import ADVISOR_TRIGGER_CANNOT_COMPLETE, RequestAdvisorHintArgumentsModel
 from elspeth.web.composer.tools.wire_projection import _WIRE_TOOL_DEFS, decode_wire_arguments, encode_semantic_arguments
 from elspeth.web.credential_guard import (
-    CREDENTIAL_REFUSAL_DETAIL,
-    CredentialMaterialRefused,
     require_no_credential_material,
     require_no_credential_material_in_llm_metadata,
-    require_no_credential_material_in_state,
     require_no_credential_material_in_tool_wire,
 )
 from elspeth.web.execution.schemas import ValidationResult
@@ -3328,34 +3325,7 @@ async def run_tool_batch(
                             turn_session_uuid, through_version=initial.version, exclude_version=initial.version
                         )
                 if candidate is not None:
-                    loaded_baseline = state_from_record(candidate)
-                    env_ref_names = (
-                        frozenset(item.name for item in ctx.custody.secret_service.list_refs(user_id))
-                        if ctx.custody.secret_service is not None and user_id is not None
-                        else frozenset()
-                    )
-                    try:
-                        require_no_credential_material_in_state(
-                            loaded_baseline,
-                            surface="composer_state_before_provider",
-                            env_ref_names=env_ref_names,
-                        )
-                    except CredentialMaterialRefused:
-                        # Keep the request alive, but never substitute request start
-                        # for a validated baseline that failed credential admission.
-                        diff_baseline = None
-                        await emit_progress(
-                            progress,
-                            ComposerProgressEvent(
-                                phase="using_tools",
-                                headline="The comparison baseline was refused by the admission policy.",
-                                evidence=(CREDENTIAL_REFUSAL_DETAIL,),
-                                likely_next="ELSPETH will continue without this comparison baseline.",
-                                reason="admission_refused",
-                            ),
-                        )
-                    else:
-                        diff_baseline = loaded_baseline
+                    diff_baseline = state_from_record(candidate)
                     diff_baseline_kind = "last_validated"
                 diff_baseline_resolved = True
                 if ctx.turn_evidence is not None:

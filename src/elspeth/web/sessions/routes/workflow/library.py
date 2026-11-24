@@ -346,15 +346,6 @@ def create_library_router() -> APIRouter:
             if state_record is None:
                 raise HTTPException(status_code=404, detail="No composition state exists")
             state = state_from_record(state_record)
-            secret_service = request.app.state.scoped_secret_resolver
-            env_ref_names = (
-                frozenset(item.name for item in secret_service.list_refs(user.user_id)) if secret_service is not None else frozenset()
-            )
-            require_no_credential_material_in_state(
-                state,
-                surface="composer_library_publication_state",
-                env_ref_names=env_ref_names,
-            )
             try:
                 entry = await run_sync_in_worker(
                     _authority(request).publish,

@@ -386,7 +386,6 @@ def test_model_output_refusal_identifies_model_and_keeps_evidence_closed(surface
     "surface",
     [
         "composer_provider_request",
-        "composer_state_before_provider",
         "composer_yaml_import",
         "web_message_ingress",
         "web_fork_message_ingress",

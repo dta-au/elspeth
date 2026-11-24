@@ -12,6 +12,7 @@ from uuid import UUID
 import pytest
 
 from elspeth.contracts.composer_progress import ComposerProgressEvent
+from elspeth.contracts.credential_material import find_credential_material
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
@@ -409,15 +410,15 @@ def test_missing_baseline_does_not_change_graph_validity(valid: bool) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("valid", [False, True])
-async def test_accepted_baseline_credential_refusal_is_recoverable(
+async def test_accepted_baseline_is_not_rescanned_for_the_diff(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-    capsys: pytest.CaptureFixture[str],
     valid: bool,
 ) -> None:
-    from elspeth.web.composer.protocol import ComposerPluginCrashError
-
+    # The comparison baseline is the session's own accepted state. It is not
+    # scanned again for credentials when it is read; bytes sent to a model are
+    # still scanned at the provider request, which this test does not reach
+    # because the provider call is mocked.
     monkeypatch.setattr(AdvisorCheckpointOwner, "_run_advisor_checkpoint", _clean_advisor_checkpoint)
     service, session_id = _composer_service_with_session(_mock_catalog(), _make_settings(data_dir=tmp_path))
     sessions = service._require_sessions_service()
@@ -488,62 +489,32 @@ async def test_accepted_baseline_credential_refusal_is_recoverable(
         return state_from_record(record), record.id
 
     await commit(clean, "older-clean")
-    await commit(poisoned, "refused-acceptance")
+    poisoned_id = await commit(poisoned, "accepted-baseline")
+    poisoned_version = (await sessions.get_state(poisoned_id)).version
     clean, current_id = await save_working_state(clean)
+    # Control: the accepted baseline really is credential-shaped.
+    assert find_credential_material(poisoned.to_dict(), purpose="admission") is not None
     events: list[ComposerProgressEvent] = []
 
     async def progress(event: ComposerProgressEvent) -> None:
         events.append(event)
 
-    for request in range(3):
-        if request == 2:
-            current_id = await commit(clean.with_metadata({"description": "Clean acceptance"}), "clean-acceptance")
-            clean, current_id = await save_working_state(state_from_record(await sessions.get_state(current_id)))
-        events.clear()
-        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as provider:
-            provider.side_effect = [
-                _response(_call("diff_pipeline", {}, f"diff_{request}_first"), _call("get_pipeline_state", {}, f"state_{request}_first")),
-                _response(_call("diff_pipeline", {}, f"diff_{request}_later"), _call("get_pipeline_state", {}, f"state_{request}_later")),
-                _admit_composer_llm_completion(_make_llm_response(content="Inspection complete.")),
-            ]
-            try:
-                result = await service.compose(
-                    "Inspect changes.", [], clean, session_id=session_id, current_state_id=str(current_id), progress=progress
-                )
-            except ComposerPluginCrashError as exc:
-                raise AssertionError("A refused comparison baseline must fail the tool call, not crash the turn") from exc
-            assert provider.await_count == 3
-            captured = capsys.readouterr()
-            exposed = repr(provider.call_args_list) + repr(result) + repr(events) + caplog.text + captured.out + captured.err
-        assert marker not in exposed
-        assert "refused-baseline-description" not in exposed
-        payloads = _diff_payloads(result)
-        assert len(payloads) == 2
-        for payload in payloads:
-            assert payload["success"] is (request == 2)
-            assert payload["validation"]["is_valid"] is valid
-            if request < 2:
-                assert payload["validation"]["errors"][0]["error_code"] == "diff_baseline_unavailable"
-                assert "refused by the credential policy" in payload["validation"]["errors"][0]["message"]
-                assert "data" not in payload or not payload["data"]
-            else:
-                assert payload["data"]["baseline_kind"] == "last_validated"
-                assert payload["data"]["total_changes"] == 0
-        inspections = [
-            json.loads(inv.result_canonical)
-            for inv in result.tool_invocations
-            if inv.tool_name == "get_pipeline_state" and inv.result_canonical is not None
+    with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as provider:
+        provider.side_effect = [
+            _response(_call("diff_pipeline", {}, "diff_first"), _call("get_pipeline_state", {}, "state_first")),
+            _admit_composer_llm_completion(_make_llm_response(content="Inspection complete.")),
         ]
-        assert len(inspections) == 2
-        assert all(item["success"] for item in inspections)
-        refusals = [event for event in events if event.reason == "admission_refused"]
-        assert len(refusals) == (1 if request < 2 else 0)
-        if refusals:
-            assert refusals[0].phase == "using_tools"
-        clean = result.state
-        head = await sessions.get_current_state(sid)
-        assert head is not None
-        current_id = head.id
+        result = await service.compose(
+            "Inspect changes.", [], clean, session_id=session_id, current_state_id=str(current_id), progress=progress
+        )
+    assert provider.await_count == 2
+    payloads = _diff_payloads(result)
+    assert len(payloads) == 1
+    payload = payloads[0]
+    assert payload["success"] is True
+    assert payload["data"]["baseline_kind"] == "last_validated"
+    assert payload["data"]["from_version"] == poisoned_version
+    assert [event for event in events if event.reason == "admission_refused"] == []
 
 
 @pytest.mark.asyncio
@@ -704,54 +675,6 @@ async def test_diff_selects_previous_validated_state(
     assert payload["data"]["baseline_kind"] == "last_validated"
     assert payload["data"]["from_version"] == records[-1 if edit_first else (1 if marker in ("unmarked", "strict") else 0)].version
     assert payload["data"]["metadata_changed"]
-
-
-@pytest.mark.asyncio
-async def test_baseline_guard_fault_is_an_audited_crash(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from elspeth.web.composer.protocol import ComposerPluginCrashError
-
-    monkeypatch.setattr(AdvisorCheckpointOwner, "_run_advisor_checkpoint", _clean_advisor_checkpoint)
-    service, _ = _composer_service_with_session(_mock_catalog(), _make_settings(data_dir=tmp_path))
-    sessions = service._require_sessions_service()
-    sid = (await sessions.create_session("test-user", "Guard fault", "local")).id
-    state = _stage1_valid_preview_state()
-    raw = state.to_dict()
-    records = []
-    for valid in (True, False):
-        async with _session_operation_context(sessions, sid, SessionOperationKind.COMPOSE) as context:
-            records.append(
-                await sessions.save_composition_state(
-                    sid,
-                    CompositionStateData(
-                        sources=raw["sources"],
-                        nodes=raw["nodes"],
-                        edges=raw["edges"],
-                        outputs=raw["outputs"],
-                        metadata_=raw["metadata"],
-                        is_valid=valid,
-                    ),
-                    provenance="session_seed",
-                    session_operation_context=context,
-                )
-            )
-    current = records[-1]
-    with (
-        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as provider,
-        patch(
-            "elspeth.web.composer.tool_batch.require_no_credential_material_in_state",
-            autospec=True,
-            side_effect=RuntimeError("guard defect"),
-        ),
-    ):
-        provider.side_effect = [
-            _response(_call("diff_pipeline", {}, "guard_fault"), _call("get_pipeline_state", {}, "guard_state")),
-            _admit_composer_llm_completion(_make_llm_response(content="Compared.")),
-        ]
-        with pytest.raises(ComposerPluginCrashError) as caught:
-            await service.compose("Compare.", [], state_from_record(current), session_id=str(sid), current_state_id=str(current.id))
-    assert isinstance(caught.value.original_exc, RuntimeError)
-    assert str(caught.value.original_exc) == "guard defect"
-    assert caught.value.failed_turn is not None
 
 
 @pytest.mark.asyncio
