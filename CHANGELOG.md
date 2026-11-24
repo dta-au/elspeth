@@ -20,6 +20,29 @@ changes land and is not a release.
   when the run started, now fails composer validation. No pipeline that could
   run before is refused. Only pipelines the runtime was already refusing at
   run start are now refused earlier, at validation.
+- **Changed:** when a provider call fails, the composer's main loop and planner
+  decide whether a retry's wait plus 5 s still fits before the deadline (the
+  request's, or the planner's own time limit when that is earlier), and retry
+  only if it does. This also applies to the failures they already retried,
+  including a provider 503 and LiteLLM's general API error (see the 429 entry
+  under Fixed). Below, "a 503" means any of these. When the retry does not
+  fit, the main loop reports the provider failure at once. The planner, after a
+  503 whose retry does not fit, waits until the deadline and reports a time-out
+  instead of making one last call; after a 429 whose retry does not fit, it
+  reports the provider failure at once. When the failed call used the last call
+  the budget allows and another attempt remains, the planner reports a
+  call-budget refusal at once, after a 503 or after a 429 whose retry would
+  fit. On an escape-hatch turn, the planner reports the hatch's original
+  exhaustion in place of the provider failure or the call-budget refusal, as
+  it did before this release; the time-out still stands. The completion review
+  keeps its existing immediate retry and does not retry a 429.
+- **Do not enable a composer token quota yet.** With one configured, a failed
+  provider call's usage is recorded as unknown, and that refuses the user's
+  later model calls ("Token accounting is unavailable") until usage is
+  reconciled. A retry after a transient failure is refused the same way. Since
+  a 429 is now retried, a rate-limited turn with a quota configured waits for
+  the retry delay, up to 30 s, before that refusal; before this release the 429
+  was reported at once.
 
 ### Fixed
 
@@ -35,6 +58,27 @@ changes land and is not a release.
 - When a stored conversation row fails the composer's history integrity
   check, the error now names the row (id, sequence number, role), so the
   damaged row can be found.
+- The composer's main loop and planner now retry a provider 429 within the
+  request's deadline, after 1 s and then 2 s. Where LiteLLM keeps the
+  provider's Retry-After header, which was measured only on Bedrock, they wait
+  for the longer of that header and the 1 s or 2 s step, when the header is
+  30 s or less; a longer Retry-After is not retried. A quota or credit refusal
+  arrives as an ordinary 429, so it is retried within the same bound before it
+  is reported. On the OpenAI and Anthropic routes a provider 500 and connection
+  failures are still not retried, because LiteLLM reports a failure to read an
+  already billed response the same way. On the OpenRouter route LiteLLM
+  reports all of these as a general API error, which was already retried
+  before this release and still is. On the Anthropic and Bedrock routes a 403
+  in the composer's main loop now tells the user to check provider access; the
+  planner still reports it as the provider being unavailable. On the OpenAI and
+  OpenRouter routes LiteLLM reports a 403 as a general API error, so it is
+  still retried and reported as unavailable.
+- When a planner reply was withheld because the cost of an earlier model call
+  in the same request could not be confirmed, the notice blamed "the existing
+  request limits". It now names that cause. The withheld-reply notice also no
+  longer claims "Saved draft progress remains available" when the pipeline
+  draft is empty. Both corrections also apply to the existing withhold after a
+  provider 503.
 
 ---
 

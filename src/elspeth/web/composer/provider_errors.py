@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from functools import lru_cache
 from typing import TYPE_CHECKING, Literal
 
 import httpx
+from openai import RateLimitError as OpenAIRateLimitError
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.json_parser import parse_json_strict
 from elspeth.contracts.provider_rejection import RequestRejectionReason, SafeRequestRejection
+from elspeth.contracts.trust_boundary import observation_boundary
 
 if TYPE_CHECKING:
     from openai import BadRequestError as OpenAIBadRequestError
@@ -36,6 +41,162 @@ class ProviderFailure:
     kind: Literal["auth", "bad_request", "unavailable", "timeout"]
     retryable: bool
     request_rejection: SafeRequestRejection | None = None
+    retry_after: RetryAfter | None = None
+    # A provider 429. Callers whose retries are immediate must not re-send it.
+    rate_limited: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class RetryAfter:
+    seconds: float
+
+
+@dataclass(frozen=True, slots=True)
+class _RateLimitObservation:
+    budget_exhausted: bool
+    retry_after: RetryAfter | None
+
+
+_DELTA_SECONDS = re.compile(r"[0-9]{1,6}")
+_MILLISECONDS = re.compile(r"[0-9]{1,9}")
+_IMF_FIXDATE = re.compile(
+    r"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), [0-9]{2} "
+    r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) "
+    r"[0-9]{4} [0-9]{2}:[0-9]{2}:[0-9]{2} GMT"
+)
+
+
+@observation_boundary(
+    tier=3,
+    source="structured SDK rate-limit fields and HTTP Retry-After headers",
+    source_param="exc",
+    suppresses=("R1", "R5"),
+    invariant="retains only exact budget evidence and a bounded full-match delay; malformed or absent headers yield no delay",
+)
+def observe_rate_limit(exc: OpenAIRateLimitError, *, now: datetime | None = None) -> _RateLimitObservation:
+    """Project foreign 429 evidence once; provider prose is never inspected.
+
+    The SDK classes declare ``response``, ``code`` and (on LiteLLM's subclass)
+    ``rate_limit_type``, so they are read as typed fields. Their values are
+    still foreign and are checked below before anything is retained.
+
+    The budget evidence is honoured only when an error arrives typed: raised
+    directly by the SDK or typed by a proxy. LiteLLM's exception mapper, which
+    every ``acompletion`` failure passes through, rebuilds a provider 429
+    without its body, code or rate-limit type, so a quota or credit refusal
+    from that path is indistinguishable from a transient 429 and is retried
+    within the same bound. The same rebuild drops the response headers on the
+    OpenAI, Anthropic and OpenRouter routes, so a Retry-After is seen only
+    where LiteLLM keeps them (Bedrock).
+    """
+    from litellm.exceptions import RateLimitError as LiteLLMRateLimitError
+    from litellm.exceptions import RateLimitType
+
+    rate_limit_type = exc.rate_limit_type if isinstance(exc, LiteLLMRateLimitError) else None
+    code = exc.code
+    # LiteLLM stores the enum's exact value as str; a foreign __eq__ must not
+    # impersonate either representation of the structured budget marker.
+    budget_exhausted = (
+        rate_limit_type is RateLimitType.BUDGET
+        or (type(rate_limit_type) is str and rate_limit_type == RateLimitType.BUDGET.value)
+        or (type(code) is str and code == "insufficient_quota")
+    )
+    response = exc.response
+    milliseconds = response.headers.get("retry-after-ms")
+    if type(milliseconds) is str and _MILLISECONDS.fullmatch(milliseconds) is not None:
+        return _RateLimitObservation(budget_exhausted, RetryAfter(int(milliseconds) / 1_000))
+    seconds = response.headers.get("retry-after")
+    if type(seconds) is not str:
+        return _RateLimitObservation(budget_exhausted, None)
+    if _DELTA_SECONDS.fullmatch(seconds) is not None:
+        return _RateLimitObservation(budget_exhausted, RetryAfter(float(seconds)))
+    if _IMF_FIXDATE.fullmatch(seconds) is None:
+        return _RateLimitObservation(budget_exhausted, None)
+    try:
+        date = datetime.strptime(seconds, "%a, %d %b %Y %H:%M:%S GMT").replace(tzinfo=UTC)
+    except ValueError:
+        return _RateLimitObservation(budget_exhausted, None)
+    if date.strftime("%a") != seconds[:3]:
+        return _RateLimitObservation(budget_exhausted, None)
+    reference = datetime.now(UTC) if now is None else now
+    return _RateLimitObservation(budget_exhausted, RetryAfter(max(0.0, (date - reference).total_seconds())))
+
+
+_Disposition = Literal["auth", "bad_request", "timeout", "bad_gateway", "retry", "rate_limit", "generic"]
+
+
+@lru_cache(maxsize=1)
+def _provider_error_arms() -> tuple[tuple[type[BaseException], _Disposition], ...]:
+    """Ordered SDK policies; specific subclasses precede their parent policy."""
+    import openai
+    from litellm import exceptions as le
+
+    return (
+        (le.AuthenticationError, "auth"),
+        (openai.BadRequestError, "bad_request"),
+        (le.Timeout, "timeout"),
+        (openai.APITimeoutError, "timeout"),
+        # 04c11a713: upstream_response_invalid 502 is deterministic. A class-only
+        # policy cannot distinguish it from a transient gateway response.
+        (le.BadGatewayError, "bad_gateway"),
+        (le.MidStreamFallbackError, "retry"),
+        (le.ServiceUnavailableError, "retry"),
+        # LiteLLM's OpenAI and Anthropic handlers rewrap a transport failure, or
+        # a billed response they could not read, as a status-500 error. A class
+        # policy cannot tell that from a provider 500, so it is not retried.
+        (openai.InternalServerError, "generic"),
+        # LiteLLM wraps every exception it cannot map, including a failure to
+        # read a response the provider already billed, as APIConnectionError.
+        # The class carries no typed transport evidence, so it is not retried.
+        (openai.APIConnectionError, "generic"),
+        (openai.PermissionDeniedError, "auth"),
+        (openai.NotFoundError, "generic"),
+        (openai.UnprocessableEntityError, "generic"),
+        (openai.APIResponseValidationError, "generic"),
+        (le.APIError, "retry"),
+        (le.RateLimitError, "rate_limit"),
+        (openai.RateLimitError, "rate_limit"),
+    )
+
+
+@lru_cache(maxsize=1)
+def _deliberately_generic() -> dict[type[BaseException], str]:
+    """Known SDK classes for which the generic unavailable disposition is intentional."""
+    import openai
+    from litellm import exceptions as le
+    from openai._exceptions import SubjectTokenProviderError
+    from openai._extras._common import MissingDependencyError
+    from openai._response import StreamAlreadyConsumed
+    from openai.lib._old_api import APIRemovedInV1
+    from openai.lib.azure import MutuallyExclusiveAuthError
+
+    return {
+        openai.OpenAIError: "abstract SDK root",
+        openai.APIError: "abstract API root",
+        openai.APIStatusError: "status without a specific policy",
+        openai.AuthenticationError: "base SDK authentication class kept at existing generic disposition",
+        openai.OAuthError: "OAuth subclass kept at existing generic disposition",
+        openai.ConflictError: "conflict is not an availability signal",
+        openai.ContentFilterFinishReasonError: "content refusal is not transient",
+        openai.LengthFinishReasonError: "output length is not transient",
+        openai.WebSocketConnectionClosedError: "stream closure has no replay policy",
+        openai.WebSocketQueueFullError: "stream queue has no replay policy",
+        openai._AmbiguousModuleClientUsageError: "client configuration defect",
+        SubjectTokenProviderError: "identity provider configuration defect",
+        MissingDependencyError: "missing optional SDK dependency is a client installation defect",
+        StreamAlreadyConsumed: "stream lifecycle defect",
+        APIRemovedInV1: "removed API use is a client defect",
+        MutuallyExclusiveAuthError: "conflicting authentication configuration",
+        le.OpenAIError: "LiteLLM root without a specific policy",
+        le.MockException: "test-only simulated failure has no replay policy",
+    }
+
+
+def _provider_error_disposition(cls: type[BaseException]) -> _Disposition | None:
+    """Resolve the same policy used by classification and the SDK tree pin."""
+    if cls in _deliberately_generic():
+        return "generic"
+    return next((policy for arm, policy in _provider_error_arms() if issubclass(cls, arm)), None)
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,17 +348,17 @@ def classify_provider_failure(exc: BaseException) -> ProviderFailure | None:
     # LiteLLM initializes its model cost map on import. Keep that side effect
     # out of Composer startup; this function is reached only after a failure
     # at an actual provider dispatch boundary.
-    from openai import APITimeoutError, OpenAIError
-    from openai import BadRequestError as OpenAIBadRequestError
+    from openai import OpenAIError
 
     if not isinstance(exc, OpenAIError):
         return None
-    from litellm.exceptions import APIError as LiteLLMAPIError
-    from litellm.exceptions import AuthenticationError, BadGatewayError, ServiceUnavailableError
-
-    if isinstance(exc, AuthenticationError):
+    disposition = _provider_error_disposition(type(exc))
+    if disposition == "auth":
         return ProviderFailure(ComposerLLMCallStatus.AUTH_ERROR, "auth", False)
-    if isinstance(exc, OpenAIBadRequestError):
+    if disposition == "bad_request":
+        from openai import BadRequestError as OpenAIBadRequestError
+
+        assert isinstance(exc, OpenAIBadRequestError)
         admitted, specific_code_seen = _admit_request_rejection(exc)
         return ProviderFailure(
             ComposerLLMCallStatus.BAD_REQUEST_ERROR,
@@ -205,12 +366,20 @@ def classify_provider_failure(exc: BaseException) -> ProviderFailure | None:
             False,
             _admit_context_length_evidence(exc, admitted, specific_code_seen=specific_code_seen),
         )
-    if isinstance(exc, APITimeoutError):
+    if disposition == "timeout":
         return ProviderFailure(ComposerLLMCallStatus.TIMEOUT, "timeout", False)
-    if isinstance(exc, BadGatewayError):
+    if disposition == "bad_gateway":
         return ProviderFailure(ComposerLLMCallStatus.API_ERROR, "unavailable", False)
-    if isinstance(exc, ServiceUnavailableError):
+    if disposition == "retry":
         return ProviderFailure(ComposerLLMCallStatus.API_ERROR, "unavailable", True)
-    if isinstance(exc, LiteLLMAPIError):
-        return ProviderFailure(ComposerLLMCallStatus.API_ERROR, "unavailable", True)
+    if disposition == "rate_limit":
+        assert isinstance(exc, OpenAIRateLimitError)
+        observed = observe_rate_limit(exc)
+        return ProviderFailure(
+            ComposerLLMCallStatus.API_ERROR,
+            "unavailable",
+            not observed.budget_exhausted,
+            retry_after=observed.retry_after,
+            rate_limited=True,
+        )
     return ProviderFailure(ComposerLLMCallStatus.API_ERROR, "unavailable", False)

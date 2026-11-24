@@ -23,7 +23,7 @@ from elspeth.web.composer.pipeline_planner import PlannerBudgetPolicy, PlannerCo
 from elspeth.web.composer.planning_application import _freeform_planner_conversation_context
 from elspeth.web.composer.protocol import ComposerResult, PipelineCommitIntent
 from elspeth.web.composer.service import ComposerServiceImpl, _announce_staged_review_handoff
-from elspeth.web.composer.state import OutputSpec, PipelineMetadata, SourceSpec
+from elspeth.web.composer.state import CompositionState, OutputSpec, PipelineMetadata, SourceSpec
 from elspeth.web.composer.turn_effects import TurnEvidence
 from elspeth.web.execution._validation_authoring import validate_path_policy
 from elspeth.web.execution._validation_model import PhaseFailure
@@ -125,6 +125,106 @@ async def test_real_withheld_callers_publish_system_notice(path, unavailable, ma
     assert result.message.count("Checkpoint save status: ") == 1
     assert result.message.count(evidence.render_saved_scope()) == 1
     assert candidate not in result.message
+
+
+_COST_UNKNOWN_DETAIL = (
+    "The reply was withheld because the completion review could not run: "
+    "the cost of an earlier model call in this request could not be confirmed."
+)
+_BUDGET_DETAIL = "The reply was withheld because the completion review could not run within the existing request limits."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("draft", ["draft", "empty"])
+@pytest.mark.parametrize(
+    ("cost_known", "reserved_calls", "deadline_offset", "validated_cost", "expected_reason"),
+    [
+        pytest.param(False, 0, 60.0, "0", "prior_call_cost_unknown", id="cost_unknown"),
+        pytest.param(False, 1, 60.0, "0", "budget_exhausted", id="cost_unknown_and_call_count_reached"),
+        pytest.param(False, 0, -1.0, "0", "budget_exhausted", id="cost_unknown_and_deadline_passed"),
+        pytest.param(False, 0, 60.0, "1", "budget_exhausted", id="cost_unknown_and_cost_at_cap"),
+        pytest.param(True, 0, 60.0, "2", "budget_exhausted", id="known_cost_over_cap"),
+    ],
+)
+async def test_planner_decline_names_an_unknown_earlier_cost_only_when_it_alone_refuses_the_review(
+    make_service,
+    simple_state,
+    draft: str,
+    cost_known: bool,
+    reserved_calls: int,
+    deadline_offset: float,
+    validated_cost: str,
+    expected_reason: str,
+) -> None:
+    service = make_service()
+    reviews: list[object] = []
+
+    async def refused_review(**kwargs):
+        # The continuation budget refuses the review before any provider call.
+        reviews.append(kwargs["continuation_budget"])
+        return AdvisorCheckpointVerdict(
+            ok=False,
+            blocking=False,
+            failure_class="budget_exhausted",
+            findings_text="Final review cannot be admitted within the existing planner budget.",
+        )
+
+    service._advisor_checkpoint._run_advisor_checkpoint = refused_review
+    state = (
+        simple_state
+        if draft == "draft"
+        else CompositionState(nodes=(), edges=(), outputs=(), metadata=simple_state.metadata, version=simple_state.version, sources={})
+    )
+    assert policy.state_is_structurally_empty(state) is (draft == "empty")
+    request = "Hello"
+    candidate = "I can explain pipelines."
+    evidence = TurnEvidence(
+        session_id=None,
+        session_operation_context=None,
+        request_id="request",
+        request=request,
+        initial_state_id=None,
+        initial_state=state,
+    )
+    deadline = asyncio.get_running_loop().time() + deadline_offset
+    budget = PlannerContinuationBudget(
+        policy=PlannerBudgetPolicy(1, 1_000_000, 100, Decimal("1")),
+        session_id=None,
+        request_id="request",
+        request_hash=stable_hash(request),
+        provider_owner=None,
+        evidence_owner=evidence,
+        deadline=deadline,
+        reserved_calls=reserved_calls,
+        validated_cost=Decimal(validated_cost),
+        cost_known=cost_known,
+    )
+    blocked = await service._planning_application._review_planner_decline(
+        declined=PlannerDeclined("declined", decline_text=candidate, continuation_budget=budget),
+        candidate=candidate,
+        request=request,
+        request_id="request",
+        state=state,
+        session_id=None,
+        session_operation_context=None,
+        recorder=BufferingRecorder(),
+        progress=None,
+        provider_owner=None,
+        turn_evidence=evidence,
+        deadline=deadline,
+        plugin_snapshot=None,
+    )
+    assert blocked.advisor_terminal_publication is not None
+    assert blocked.advisor_terminal_publication.reason == expected_reason
+    assert len(reviews) == 1
+    detail = _COST_UNKNOWN_DETAIL if expected_reason == "prior_call_cost_unknown" else _BUDGET_DETAIL
+    suggestion = "Saved draft progress remains available; continue in a new message." if draft == "draft" else "Continue in a new message."
+    segments = policy.visible_message_segments(content=blocked.message, raw_content=blocked.raw_assistant_content)
+    assert [(segment.kind, segment.content) for segment in segments] == [
+        ("trusted_system_notice", f"{detail} {suggestion}"),
+        ("trusted_system_notice", "The completion review could not finish, so the reply was withheld."),
+    ]
+    assert candidate not in blocked.message
 
 
 def _provider_history(content: str, raw: str | None) -> str:
@@ -488,14 +588,41 @@ def test_receipt_keeps_authorized_backend_copy_and_excludes_commit_intent() -> N
     "producer", [policy.compose_advisor_signoff_unrendered_pending_message, policy.compose_advisor_signoff_unrendered_unverified_message]
 )
 @pytest.mark.parametrize("raw", ["A retained reply.", ""])
-def test_budget_fixed_copy_has_a_canonical_base_before_receipt(producer, raw: str) -> None:
-    notice = (
-        "The reply was withheld because the completion review could not run within the existing request limits. "
-        "Saved draft progress remains available; continue in a new message."
-    )
+@pytest.mark.parametrize(
+    ("failure_class", "draft_has_content", "notice"),
+    [
+        (
+            "budget_exhausted",
+            True,
+            "The reply was withheld because the completion review could not run within the existing request limits. "
+            "Saved draft progress remains available; continue in a new message.",
+        ),
+        (
+            "budget_exhausted",
+            False,
+            "The reply was withheld because the completion review could not run within the existing request limits. "
+            "Continue in a new message.",
+        ),
+        (
+            "prior_call_cost_unknown",
+            True,
+            "The reply was withheld because the completion review could not run: the cost of an earlier model call "
+            "in this request could not be confirmed. Saved draft progress remains available; continue in a new message.",
+        ),
+        (
+            "prior_call_cost_unknown",
+            False,
+            "The reply was withheld because the completion review could not run: the cost of an earlier model call "
+            "in this request could not be confirmed. Continue in a new message.",
+        ),
+    ],
+)
+def test_budget_fixed_copy_has_a_canonical_base_before_receipt(
+    producer, raw: str, failure_class: str, draft_has_content: bool, notice: str
+) -> None:
     old_content = raw + notice
     assert policy.visible_message_segments(content=old_content, raw_content=raw) == (policy.AssistantTextSegment(old_content),)
-    content = producer(raw, failure_class="budget_exhausted")
+    content = producer(raw, failure_class=failure_class, draft_has_content=draft_has_content)
     base_segments = policy.visible_message_segments(content=content, raw_content=raw)
     assert isinstance(base_segments[-1], policy.TrustedSystemNoticeSegment)
     assert base_segments[-1].content == notice

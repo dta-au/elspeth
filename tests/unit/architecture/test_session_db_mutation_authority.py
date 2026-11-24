@@ -6500,7 +6500,9 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "dc8fccf0123f2410",
         1,
         None,
-        line=1221,
+        # fix/0818-late-call-record: +273 lines (refused-call record and its
+        # helpers added above); POSITION only.
+        line=1494,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -6512,7 +6514,8 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         1,
         None,
         # 039c88bd0: +18 lines (live_leader added above); POSITION only.
-        line=1720,
+        # fix/0818-late-call-record: +273 lines; POSITION only.
+        line=1993,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -6524,7 +6527,8 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         1,
         None,
         # 039c88bd0: +18 lines (live_leader added above); POSITION only.
-        line=1745,
+        # fix/0818-late-call-record: +273 lines; POSITION only.
+        line=2018,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/run_lifecycle_repository.py",

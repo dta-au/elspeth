@@ -802,7 +802,11 @@ _EXPECTED_DML_COUNT = 166
 # _EXPECTED_DML_COUNT.
 # QR merged with release/0.8.1: 6a08f651… (release) -> the value below, the one
 # arrival named at _EXPECTED_DML_COUNT.
-_EXPECTED_DML_INVENTORY_SHA256 = "913e9295eafa5185df205e3c5920242d66753d5c21e4ad0eaf8aa9a230ac88b0"
+# The item fence compares exact copies of the claimed work item id and attempt:
+# fenced_item_transaction's token_work_items update moves 604cf90ec1a6c2d4 ->
+# b9c5b2e0c7e8f6e8. Measured by the gate's scanner against git archives of
+# 9ef3350d9 and the fence change: one moved, no arrivals/departures, write set unchanged.
+_EXPECTED_DML_INVENTORY_SHA256 = "3e6ec85b9f2ffe2e502d6a3b2547b94c47b48b1a6d3d6f4180a4e527b441e621"
 _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
     {
         ("aggregation_result_members", "insert"),
@@ -1056,7 +1060,12 @@ _EXPECTED_SUBORDINATE_EDGE_COUNT = 154
 # Measured by the gate's scanner against 49c184508: one moved, no arrivals/departures.
 # Durable quota accounting forwards preserve_call_id=explicit_call_id through
 # the existing record_call/record_operation_call -> _insert_allocated_call edges.
-_EXPECTED_SUBORDINATE_EDGE_SHA256 = "99e14aae3b82aca256018fc9c4c58da2db08a76ccc8724e47d7291d19d16e94b"
+# Call recording passes the exact reservation parent to _insert_allocated_call:
+# record_call's edge moves 63156560466dddd0 -> bc9259abf3b8ab82 and
+# record_operation_call's f52090af30050563 -> 9a5bac204144c859. Measured by the
+# gate's scanner against git archives of 9ef3350d9 and the change: two moved,
+# no arrivals/departures.
+_EXPECTED_SUBORDINATE_EDGE_SHA256 = "f804c04dbc2ba798bf2d0439d9b8a5c83b78e5f1fbe9d55f05eccff0634d6400"
 # X1 join admission records departure after a post-admission refusal:
 # JoinAdmissionService.join_run -> depart_worker joins the existing admit_follower call.
 # Measured against a02f25747: 43/0ff714e7… -> 44/a980dd0f…; one arrival.
