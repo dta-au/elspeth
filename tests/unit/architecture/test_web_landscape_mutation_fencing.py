@@ -17829,7 +17829,6 @@ _COORDINATION_FINALIZATION_DEPENDENCIES[
 _CANCELLED_PERMIT_CALLER_RECIPE = """
 async def _materialize_durable_cancellation(self, run: RunRecord, lease: SessionOperationLease) -> None:
     from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, mint_worker_id
-    from elspeth.contracts.hashing import CANONICAL_VERSION
     from elspeth.core.landscape.run_start_admission import RunStartAdmissionRepository, RunStartAdmissionState
     from elspeth.web.coordination.contracts import StartPermitState
     from elspeth.web.execution.envelope import EnvelopeRecoveryReason
@@ -17857,7 +17856,7 @@ async def _materialize_durable_cancellation(self, run: RunRecord, lease: Session
                 return
             existing = repositories.run_lifecycle.get_run(str(run.id))
             config = json.loads(existing.settings_json) if existing is not None else deep_thaw(cancellation.audit_safe_config)
-            repositories.run_lifecycle.materialize_cancelled_permit(binding, config, CANONICAL_VERSION, openrouter_catalog_sha256=cancellation.openrouter_catalog_sha256, openrouter_catalog_source=cancellation.openrouter_catalog_source, initiated_by_user_id=cancellation.user_id, auth_provider_type=cancellation.auth_provider_type, web_plugin_policy_evidence=replace(cancellation.web_plugin_policy_evidence, admission_decision=permit.admission_decision) if cancellation.web_plugin_policy_evidence is not None else None, pre_effect_guard=lease.guard_external_effect)
+            repositories.run_lifecycle.materialize_cancelled_permit(binding, config, hashing.CANONICAL_VERSION, openrouter_catalog_sha256=cancellation.openrouter_catalog_sha256, openrouter_catalog_source=cancellation.openrouter_catalog_source, initiated_by_user_id=cancellation.user_id, auth_provider_type=cancellation.auth_provider_type, web_plugin_policy_evidence=replace(cancellation.web_plugin_policy_evidence, admission_decision=permit.admission_decision) if cancellation.web_plugin_policy_evidence is not None else None, pre_effect_guard=lease.guard_external_effect)
     await run_sync_in_worker(materialize)
 """
 
@@ -17897,9 +17896,12 @@ def _cancelled_permit_caller_is_proven(unit: SourceUnit, call: ast.Call, proof: 
     )
     if outer is None or _finalization_recipe_dump(outer) != _finalization_recipe_dump(ast.parse(_CANCELLED_PERMIT_CALLER_RECIPE).body[0]):
         return False
-    if _resolver_for_unit(unit).qualified_name(ast.Name(id="replace", ctx=ast.Load()), use=outer) != "dataclasses.replace":
+    resolver = _resolver_for_unit(unit)
+    if resolver.qualified_name(ast.Name(id="hashing", ctx=ast.Load()), use=outer) != "elspeth.contracts.hashing":
         return False
-    target = proof.called_function(call, _resolver_for_unit(unit), call)
+    if resolver.qualified_name(ast.Name(id="replace", ctx=ast.Load()), use=outer) != "dataclasses.replace":
+        return False
+    target = proof.called_function(call, resolver, call)
     if target is None or (target[1].unit.path, _symbol(target[0])) != (
         "src/elspeth/core/landscape/run_lifecycle_repository.py",
         "RunLifecycleRepository.materialize_cancelled_permit",
@@ -18540,6 +18542,29 @@ def test_cancelled_permit_facade_refuses_removed_external_authority_guard():
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "materialize_cancelled_permit"
     )
     assert not _cancelled_permit_caller_is_proven(mutated, call, proof)
+
+
+def test_cancelled_permit_caller_requires_current_hashing_module():
+    units = _production_units()
+    path = "src/elspeth/web/execution/service.py"
+    unit = next(unit for unit in units if unit.path == path)
+    call = next(
+        node
+        for node in ast.walk(unit.tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "materialize_cancelled_permit"
+    )
+    assert _cancelled_permit_caller_is_proven(unit, call, _AuthorityProof(units))
+
+    old = "from elspeth.contracts import hashing"
+    assert unit.source.count(old) == 1
+    mutated = _parse_source(path, unit.source.replace(old, "from elspeth.core import hashing", 1))
+    mutated_units = tuple(mutated if original.path == path else original for original in units)
+    mutated_call = next(
+        node
+        for node in ast.walk(mutated.tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "materialize_cancelled_permit"
+    )
+    assert not _cancelled_permit_caller_is_proven(mutated, mutated_call, _AuthorityProof(mutated_units))
 
 
 @pytest.mark.parametrize(
