@@ -77,7 +77,7 @@ from elspeth.contracts.coordination import (
     WorkerMembershipLost,
     WorkerMembershipToken,
 )
-from elspeth.contracts.enums import RunStatus
+from elspeth.contracts.enums import CallStatus, CallType, RunStatus
 from elspeth.contracts.errors import (
     AuditIntegrityError,
     JoinRefusedError,
@@ -105,10 +105,12 @@ from elspeth.core.landscape.schema import (
 )
 
 __all__ = [
+    "RefusedCallRecord",
     "RunCoordinationRepository",
     "fenced_leader_transaction",
     "fenced_member_transaction",
     "record_coordination_event",
+    "record_refused_call",
     "verify_and_extend_leader_fence",
     "verify_membership_fence",
 ]
@@ -267,6 +269,48 @@ class CoordinationEventRow:
 
     def __post_init__(self) -> None:
         freeze_fields(self, "context")
+
+
+@dataclass(frozen=True, slots=True)
+class RefusedCallRecord:
+    """Identity and usage of an external call whose ``calls`` row a fence refused.
+
+    The call already happened (and may have been billed) by the time its
+    record is written. When the writer's authority has lapsed the fence keeps
+    the row out of ``calls``, so the ``fence_refusal`` event carrying this is
+    the call's only durable record. Values mirror the refused ``calls`` row.
+    """
+
+    call_id: str
+    state_id: str | None
+    operation_id: str | None
+    call_index: int
+    call_type: CallType
+    status: CallStatus
+    request_hash: str
+    response_hash: str | None
+    prompt_tokens: int | None
+    completion_tokens: int | None
+    cached_prompt_tokens: int | None
+    reasoning_tokens: int | None
+    latency_ms: float | None
+
+    def event_context(self) -> dict[str, str | int | float | None]:
+        return {
+            "call_id": self.call_id,
+            "state_id": self.state_id,
+            "operation_id": self.operation_id,
+            "call_index": self.call_index,
+            "call_type": self.call_type.value,
+            "status": self.status.value,
+            "request_hash": self.request_hash,
+            "response_hash": self.response_hash,
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "cached_prompt_tokens": self.cached_prompt_tokens,
+            "reasoning_tokens": self.reasoning_tokens,
+            "latency_ms": self.latency_ms,
+        }
 
 
 def record_coordination_events(conn: Connection, *, run_id: str, events: Sequence[CoordinationEventRow]) -> None:
@@ -608,6 +652,56 @@ def fenced_member_transaction(
             context={"verb": verb, "fence": "membership"},
         )
         raise
+
+
+def record_refused_call(
+    engine: Tier1Engine,
+    *,
+    run_id: str,
+    worker_id: str,
+    leader_epoch: int | None,
+    verb: str,
+    fence: Literal["leader", "membership", "item"],
+    refused_call: RefusedCallRecord,
+    work_item_id: str | None,
+    attempt: int | None,
+) -> BestEffortEventOutcome:
+    """Record a call whose ``calls`` row a fence refused; fresh connection, never raises.
+
+    Called after the refused transaction has rolled back. Unlike the fences'
+    own refusal events, this one explains durable state outside the database:
+    the call already happened, and this event is its only record. The leader
+    and membership fences have already written their own ``fence_refusal``
+    naming only the verb (and fence); the row carrying ``refused_call`` is the
+    call's, and the item-lease fence writes no row of its own. If a DB
+    fault loses the event too, the audit store cannot hold the call, so the
+    last-resort log carries the call's identity and usage at ERROR.
+    """
+    outcome = _record_best_effort_event(
+        engine,
+        run_id=run_id,
+        event_type="fence_refusal",
+        worker_id=worker_id,
+        leader_epoch=leader_epoch,
+        recorded_at=datetime.now(UTC),
+        context={
+            "verb": verb,
+            "fence": fence,
+            "work_item_id": work_item_id,
+            "attempt": attempt,
+            "refused_call": refused_call.event_context(),
+        },
+    )
+    if outcome is BestEffortEventOutcome.LOST_TO_DB_FAULT:
+        logger.error(
+            "refused call record for run %r (worker %r, verb %r, fence %r) was not recorded: %s",
+            run_id,
+            worker_id,
+            verb,
+            fence,
+            canonical_json(refused_call.event_context()),
+        )
+    return outcome
 
 
 class RunCoordinationRepository:

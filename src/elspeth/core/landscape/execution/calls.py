@@ -28,7 +28,7 @@ from elspeth.contracts.audit import CallVerification, validate_approved_prompt_a
 from elspeth.contracts.call_data import CallPayload, LLMCallResponse
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.enums import RunMode, RunStatus
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.errors import AuditIntegrityError, RunLeadershipLostError, RunMembershipLostError, SchedulerLeaseLostError
 from elspeth.contracts.hashing import canonical_json_loads
 from elspeth.contracts.payload_store import IntegrityError as PayloadIntegrityError
 from elspeth.contracts.payload_store import PayloadNotFoundError
@@ -43,7 +43,7 @@ from elspeth.core.landscape.execution.sink_effect_identity import MAX_LINEAGE_DE
 from elspeth.core.landscape.item_fencing import fenced_item_transaction
 from elspeth.core.landscape.model_loaders import CallLoader
 from elspeth.core.landscape.row_data import CallDataResult, CallDataState
-from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
+from elspeth.core.landscape.run_coordination_repository import RefusedCallRecord, fenced_leader_transaction, record_refused_call
 from elspeth.core.landscape.schema import (
     call_verifications_table,
     calls_table,
@@ -98,6 +98,36 @@ class _LineageEvidence(NamedTuple):
     join_group_id: str | None
     parents: tuple[_LineageParent, ...]
     has_frame: bool
+
+
+def _refused_call_record(
+    *,
+    call_id: str,
+    state_id: str | None,
+    operation_id: str | None,
+    call_index: int,
+    call_type: CallType,
+    status: CallStatus,
+    prepared: _PreparedCallData,
+    token_usage: TokenUsage,
+    latency_ms: float | None,
+) -> RefusedCallRecord:
+    """The call's identity and usage, kept by the refusal event if a fence refuses its row."""
+    return RefusedCallRecord(
+        call_id=call_id,
+        state_id=state_id,
+        operation_id=operation_id,
+        call_index=call_index,
+        call_type=call_type,
+        status=status,
+        request_hash=prepared.request_hash,
+        response_hash=prepared.response_hash,
+        prompt_tokens=token_usage.prompt_tokens,
+        completion_tokens=token_usage.completion_tokens,
+        cached_prompt_tokens=token_usage.cached_prompt_tokens,
+        reasoning_tokens=token_usage.reasoning_tokens,
+        latency_ms=latency_ms,
+    )
 
 
 def _reject_non_finite_json_constant(value: str) -> None:
@@ -609,6 +639,17 @@ class CallAuditRepository:
             operation=False,
         )
         recorded_index: int | None = None
+        refused_call = _refused_call_record(
+            call_id=call_id,
+            state_id=state_id,
+            operation_id=None,
+            call_index=call_index,
+            call_type=call_type,
+            status=status,
+            prepared=prepared,
+            token_usage=token_usage,
+            latency_ms=latency_ms,
+        )
         try:
             with fenced_item_transaction(
                 self._db.engine,
@@ -632,6 +673,21 @@ class CallAuditRepository:
                 raise FrameworkBugError("inserted state call returned a non-integer call_index")
             recorded_index = recorded_value
             call_index = recorded_index
+        except (SchedulerLeaseLostError, RunMembershipLostError) as refusal:
+            # The call already happened; with its row refused, the refusal
+            # event is its only durable record.
+            record_refused_call(
+                self._db.engine,
+                run_id=member_token.run_id,
+                worker_id=member_token.worker_id,
+                leader_epoch=None,
+                verb="record_call",
+                fence="item" if isinstance(refusal, SchedulerLeaseLostError) else "membership",
+                refused_call=refused_call,
+                work_item_id=work_item.work_item_id,
+                attempt=work_item.attempt,
+            )
+            raise
         finally:
             self._finish_allocation(
                 parent_id=state_id,
@@ -776,6 +832,17 @@ class CallAuditRepository:
             operation=True,
         )
         recorded_index = None
+        refused_call = _refused_call_record(
+            call_id=call_id,
+            state_id=None,
+            operation_id=operation_id,
+            call_index=call_index,
+            call_type=call_type,
+            status=status,
+            prepared=prepared,
+            token_usage=token_usage,
+            latency_ms=latency_ms,
+        )
         try:
             with fenced_leader_transaction(
                 self._db.engine,
@@ -799,6 +866,21 @@ class CallAuditRepository:
                 raise FrameworkBugError("inserted operation call returned a non-integer call_index")
             recorded_index = recorded_value
             call_index = recorded_index
+        except RunLeadershipLostError:
+            # The call already happened; with its row refused, the refusal
+            # event is its only durable record.
+            record_refused_call(
+                self._db.engine,
+                run_id=coordination_token.run_id,
+                worker_id=coordination_token.worker_id,
+                leader_epoch=coordination_token.leader_epoch,
+                verb="record_operation_call",
+                fence="leader",
+                refused_call=refused_call,
+                work_item_id=None,
+                attempt=None,
+            )
+            raise
         finally:
             self._finish_allocation(
                 parent_id=operation_id,
