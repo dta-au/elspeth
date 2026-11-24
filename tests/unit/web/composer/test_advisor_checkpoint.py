@@ -405,6 +405,106 @@ async def test_rejection_survives_simultaneous_cost_refusal(make_service, clean_
     assert publication.to_dict()["request_rejection"] == verdict.provider_failure.details.to_wire()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dispatch_refused", [False, True], ids=["size-rejection", "control-dispatch-refused"])
+async def test_a_size_rejection_under_a_continuation_budget_is_withheld_with_the_rejection_kept(
+    make_service, clean_runnable_state, physical_advisor, monkeypatch, dispatch_refused
+):
+    """A size rejection under a continuation budget is withheld before any resend can be refused at dispatch.
+
+    The rejected call has no response, so its cost is unknown, and the cost check withholds the
+    pass before a second attempt reaches ``check_dispatch``. The dispatch-refusal handler with a
+    retained rejection is therefore not reached today; if a rejection ever carries a known cost,
+    the ``cost_known`` assertion fails and points at that handler. The budget, custody and
+    recorder are real; ``check_dispatch`` is wrapped only to count its refusals.
+
+    The ``control-dispatch-refused`` case controls that counter only: it forces one refusal on
+    a first attempt, with no rejection retained, so the count is shown to see a refusal. It does
+    not exercise the dispatch-refusal handler with a retained rejection.
+    """
+    from decimal import Decimal
+
+    from litellm.exceptions import BadRequestError
+
+    from elspeth.web.composer import advisor_checkpoint
+    from elspeth.web.composer.pipeline_planner import PlannerBudgetPolicy, PlannerContinuationBudget, PlannerContinuationUnavailable
+
+    service = make_service()
+    fenced = physical_advisor.bind(service)
+    request = "Review this graph"
+    evidence = TurnEvidence(
+        session_id=fenced["session_id"],
+        session_operation_context=fenced["session_operation_context"],
+        request_id="size-rejection-budget",
+        request=request,
+        initial_state_id=None,
+        initial_state=clean_runnable_state,
+    )
+    review = evidence.review_candidate(candidate="UNREVIEWED_CANDIDATE", request=request, current_state=clean_runnable_state)
+    budget = PlannerContinuationBudget(
+        policy=PlannerBudgetPolicy(3, 1_000_000, 100, Decimal("1")),
+        session_id=fenced["session_id"],
+        request_id="size-rejection-budget",
+        request_hash=stable_hash(request),
+        provider_owner=fenced["provider_owner"],
+        evidence_owner=evidence,
+        deadline=asyncio.get_running_loop().time() + 60,
+        reserved_calls=0,
+        validated_cost=Decimal("0"),
+        cost_known=True,
+    )
+    budget.validate_for(
+        session_id=fenced["session_id"],
+        request_id="size-rejection-budget",
+        request=request,
+        provider_owner=fenced["provider_owner"],
+        evidence_owner=evidence,
+    )
+    budget.bind_publication(review)
+    refusals: list[PlannerContinuationUnavailable] = []
+    check_dispatch = PlannerContinuationBudget.check_dispatch
+
+    def counted_check_dispatch(self: PlannerContinuationBudget, *, now: float) -> None:
+        try:
+            check_dispatch(self, now=now)
+        except PlannerContinuationUnavailable as refused:
+            refusals.append(refused)
+            raise
+
+    monkeypatch.setattr(PlannerContinuationBudget, "check_dispatch", counted_check_dispatch)
+    if dispatch_refused:
+        # The first reading admits the reservation; every later one is past the deadline.
+        readings: list[float] = []
+
+        def clock() -> float:
+            readings.append(0.0)
+            return 0.0 if len(readings) == 1 else 1e12
+
+        monkeypatch.setattr(advisor_checkpoint, "_compose_deadline_time", clock)
+    size = BadRequestError("PRIVATE_BODY", model="advisor", llm_provider="openai", body={"code": "context_length_exceeded"})
+    calls = _install_budget_advisor_transport(monkeypatch, [size, size, size])
+    recorder = make_recorder()
+    with prompt_guard_user_scope(request):
+        verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
+            phase="end",
+            state=clean_runnable_state,
+            publication_review=review,
+            continuation_budget=budget,
+            recorder=recorder,
+            **fenced,
+        )
+    if dispatch_refused:
+        assert (len(refusals), len(calls), verdict.provider_failure) == (1, 0, None)
+        return
+    assert (len(calls), len(recorder.llm_calls), len(refusals)) == (1, 1, 0)
+    assert recorder.llm_calls[0].provider_cost is None
+    assert budget.cost_known is False
+    assert (verdict.ok, verdict.failure_class, verdict.retryable) == (False, "budget_exhausted", False)
+    assert verdict.provider_failure is not None
+    assert verdict.provider_failure.original is size
+    assert verdict.provider_failure.details.reason_code == "context_length_exceeded"
+
+
 _ROOT = Path(__file__).resolve().parents[4]
 
 
