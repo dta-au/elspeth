@@ -63,11 +63,11 @@ ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing \
 elspeth run --settings examples/<name>/settings.yaml --execute
 ```
 
-### Canonical scripts: worktree cleanup, branch safety, full-suite gate
+### Canonical scripts: worktree cleanup, branch safety, full-suite gate, examples gate
 
-Three scripts under `scripts/` are the canonical way to do the tasks agents
+Four scripts under `scripts/` are the canonical way to do the tasks agents
 otherwise improvise by hand (the header of each one cites the transcript
-measurement and the incident behind every rule it enforces). All three are
+measurement and the incident behind every rule it enforces). All four are
 **dry-run by default** and print the exact commands they would run; nothing
 changes without `--execute`. Prefer them over retyping the underlying git and
 pytest incantations, and fix the script when a rule is wrong rather than
@@ -103,6 +103,13 @@ working around it.
   `-o pythonpath` and an exported `PYTHONPATH`, workers capped when sibling
   suites are on the box. From an agent shell use `--execute --detach` and poll
   the printed `.done` path. The suite is never piped through `tail`.
+- `scripts/examples-gate.sh [--execute] [--root DIR] [--only IDS] [--tmp-root DIR] [--log-dir DIR]`
+  runs every offline shipped example the way its documentation says and checks
+  its documented result, each in a fresh copy of an exported tree. Case copies
+  go under `--tmp-root` (default `${XDG_CACHE_HOME:-$HOME/.cache}/elspeth-examples-gate`;
+  never `/tmp`, never inside the checkout). `summary.txt` records one PASS, FAIL,
+  NOTRUN or SKIP line per case, and a tree that changed during the run makes the
+  run fail (`frozen=NO`).
 
 ## Gotchas
 

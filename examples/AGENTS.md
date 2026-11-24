@@ -1,6 +1,6 @@
 # Examples — Agent Guide
 
-Instructions for running the examples in this directory.
+Instructions for running the examples in this directory. To run every offline example and check its documented result: `scripts/examples-gate.sh`.
 
 ## Prerequisites
 
