@@ -3363,12 +3363,12 @@ def _reviewed_call_created_at_transfers(sources: dict[str, str]) -> set[ClockVio
     changed receiver, or altered forwarding body withdraws this admission.
     """
     # record_operation_call re-derived by running this gate's digest on the tree after its
-    # refused-call record moved ahead of the index allocation; the created_at forward is unchanged.
+    # index-reservation release came to cover the whole call; the created_at forward is unchanged.
     reviewed = {
         (
             "src/elspeth/core/landscape/execution/calls.py",
             "CallAuditRepository.record_operation_call",
-        ): "f1241ff0f7084fc919f75ed1a96a1527f4767d1c2242b102ba20e9bed7c535d9",
+        ): "80e1278ed195b24002b7ab6bcc22dde933f029ab4a010218e2b96f616c66174f",
         (
             "src/elspeth/core/landscape/execution_repository.py",
             "ExecutionRepository.record_operation_call",

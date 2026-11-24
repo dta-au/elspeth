@@ -878,3 +878,206 @@ def test_unrecognised_latency_is_refused_when_no_fence_refuses_either(kind: str)
         _record_state_call(setup, latency_ms=_unrecognised(kind))
 
     assert _coordination_state(setup) == before
+
+
+def _pending_reservations(setup: _Setup) -> tuple[set[tuple[str, int]], set[tuple[str, int]]]:
+    calls = setup.recorder.execution.calls
+    return set(calls._pending_call_indices), set(calls._pending_operation_call_indices)
+
+
+_ENTRY_REFUSALS = pytest.mark.parametrize("entry_refusal", ["unrecognised_latency", "malformed_prompt_anchor"])
+
+
+def _entry_refusal(entry_refusal: str) -> dict[str, Any]:
+    if entry_refusal == "unrecognised_latency":
+        return {"latency_ms": _unrecognised("decimal")}
+    return {"latency_ms": 12.5, "approved_prompt_artifact_hash": "not-a-hash"}
+
+
+@_ENTRY_REFUSALS
+def test_state_call_refused_at_entry_releases_the_callers_reserved_index(entry_refusal: str) -> None:
+    """An index the caller reserved is released when the call fails at entry, not left marked as this repository's."""
+    setup = _setup()
+    repo = setup.recorder.execution
+    index = repo.allocate_call_index(setup.state_id, member_token=setup.member, work_item=setup.item)
+
+    with pytest.raises((TypeError, ValueError)):
+        repo.record_call(
+            setup.state_id,
+            index,
+            CallType.LLM,
+            CallStatus.SUCCESS,
+            RawCallPayload(_REQUEST),
+            RawCallPayload(_RESPONSE),
+            member_token=setup.member,
+            work_item=setup.item,
+            **_entry_refusal(entry_refusal),
+        )
+
+    assert _pending_reservations(setup) == (set(), set())
+    assert repo.allocate_call_index(setup.state_id, member_token=setup.member, work_item=setup.item) == index + 1
+
+
+@_ENTRY_REFUSALS
+def test_operation_call_refused_at_entry_releases_the_callers_reserved_index(entry_refusal: str) -> None:
+    setup = _setup()
+    repo = setup.recorder.execution
+    token = setup.recorder.coordination_token
+    operation_id = _begin_operation(setup)
+    index = repo.allocate_operation_call_index(operation_id, coordination_token=token)
+
+    with pytest.raises((TypeError, ValueError)):
+        repo.record_operation_call(
+            operation_id,
+            CallType.LLM,
+            CallStatus.SUCCESS,
+            RawCallPayload(_REQUEST),
+            RawCallPayload(_RESPONSE),
+            call_index=index,
+            coordination_token=token,
+            **_entry_refusal(entry_refusal),
+        )
+
+    assert _pending_reservations(setup) == (set(), set())
+    assert repo.allocate_operation_call_index(operation_id, coordination_token=token) == index + 1
+
+
+def _hash_trap_index(trap_on_use: int) -> int:
+    """Index 0 whose own ``__hash__`` raises on its first, or its second, use."""
+
+    class _HashTrapIndex(int):
+        uses = 0
+
+        def __hash__(self) -> int:
+            type(self).uses += 1
+            if type(self).uses >= trap_on_use:
+                raise RuntimeError("the call index's own hash ran")
+            return int.__hash__(self)
+
+    return _HashTrapIndex(0)
+
+
+@pytest.mark.parametrize("trap_on_use", [1, 2], ids=["first_use", "second_use"])
+@pytest.mark.parametrize("fence", ["item", "membership", "leader"])
+def test_call_index_subclass_cannot_replace_a_fence_refusal(fence: str, trap_on_use: int) -> None:
+    """The reservation bookkeeping keys on an exact copy of the index, so the index's own hash never runs."""
+    setup = _setup()
+    repo = setup.recorder.execution
+    index = _hash_trap_index(trap_on_use)
+    before = len(_fence_refusals(setup))
+    payloads = (CallType.LLM, CallStatus.SUCCESS, RawCallPayload(_REQUEST), RawCallPayload(_RESPONSE))
+
+    if fence == "leader":
+        token = setup.recorder.coordination_token
+        operation_id = _begin_operation(setup)
+        with pytest.raises(RunLeadershipLostError):
+            repo.record_operation_call(
+                operation_id,
+                *payloads,
+                latency_ms=12.5,
+                token_usage=_USAGE,
+                call_id="attempt-late-2",
+                call_index=index,
+                coordination_token=replace(token, leader_epoch=token.leader_epoch + 1),
+            )
+        expected: tuple[str | None, str | None] = (None, operation_id)
+    else:
+        refusal: type[Exception]
+        if fence == "item":
+            _terminate_item(setup)
+            refusal = SchedulerLeaseLostError
+        else:
+            setup.recorder.factory.run_coordination.depart_worker(member_token=setup.member)
+            refusal = RunMembershipLostError
+        with pytest.raises(refusal):
+            repo.record_call(
+                setup.state_id,
+                index,
+                *payloads,
+                latency_ms=12.5,
+                token_usage=_USAGE,
+                call_id="attempt-late-2",
+                member_token=setup.member,
+                work_item=setup.item,
+            )
+        expected = (setup.state_id, None)
+
+    assert _call_count(setup) == 0
+    refused = _fence_refusals(setup)[before:][-1]
+    assert refused["fence"] == fence
+    _assert_refused_call(refused["refused_call"], call_id="attempt-late-2", state_id=expected[0], operation_id=expected[1])
+    assert _pending_reservations(setup) == (set(), set())
+
+
+class _FormatTrapStr(str):
+    def __format__(self, format_spec: str) -> str:
+        raise RuntimeError("the operation id's own __format__ ran")
+
+
+def test_generated_operation_call_id_is_built_from_an_exact_operation_id() -> None:
+    """Formatting the id runs no subclass code, so it cannot fail between the index allocation and its release."""
+    setup = _setup()
+    operation_id = _begin_operation(setup)
+
+    recorded = setup.recorder.execution.record_operation_call(
+        _FormatTrapStr(operation_id),
+        CallType.HTTP,
+        CallStatus.SUCCESS,
+        RawCallPayload(_REQUEST),
+        RawCallPayload(_RESPONSE),
+        latency_ms=12.5,
+        coordination_token=setup.recorder.coordination_token,
+    )
+
+    assert recorded.call_id == "call_" + operation_id + "_0"
+    assert _pending_reservations(setup) == (set(), set())
+
+
+class _MarkedStr(str):
+    pass
+
+
+def test_index_reservations_are_keyed_by_exact_builtins() -> None:
+    setup = _setup()
+    repo = setup.recorder.execution
+    operation_id = _begin_operation(setup)
+
+    repo.allocate_call_index(_MarkedStr(setup.state_id), member_token=setup.member, work_item=setup.item)
+    repo.allocate_operation_call_index(_MarkedStr(operation_id), coordination_token=setup.recorder.coordination_token)
+
+    state_pending, operation_pending = _pending_reservations(setup)
+    assert [(type(parent), type(index)) for parent, index in (*state_pending, *operation_pending)] == [(str, int), (str, int)]
+
+
+class _ReprTrapStr(str):
+    def __repr__(self) -> str:
+        raise RuntimeError("the work item id's own __repr__ ran")
+
+
+def test_item_fence_refusal_is_built_from_the_exact_work_item_id() -> None:
+    """The item fence names the work item in its refusal; it is given the exact id, so building the refusal cannot fail."""
+    setup = _setup()
+    _terminate_item(setup)
+    item = replace(setup.item, work_item_id=_ReprTrapStr(setup.item.work_item_id))
+    before = len(_fence_refusals(setup))
+
+    with pytest.raises(SchedulerLeaseLostError) as excinfo:
+        setup.recorder.execution.record_call(
+            setup.state_id,
+            0,
+            CallType.LLM,
+            CallStatus.SUCCESS,
+            RawCallPayload(_REQUEST),
+            RawCallPayload(_RESPONSE),
+            latency_ms=12.5,
+            token_usage=_USAGE,
+            call_id="attempt-late-1",
+            member_token=setup.member,
+            work_item=item,
+        )
+
+    assert type(excinfo.value.work_item_id) is str
+    refusals = _fence_refusals(setup)[before:]
+    assert len(refusals) == 1
+    assert refusals[0]["work_item_id"] == setup.item.work_item_id
+    _assert_refused_call(refusals[0]["refused_call"], call_id="attempt-late-1", state_id=setup.state_id, operation_id=None)
