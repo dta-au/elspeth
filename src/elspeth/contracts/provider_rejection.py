@@ -65,7 +65,9 @@ class SafeRequestRejection(BaseModel):
         if self.reason_code == "context_length_exceeded":
             return "The request exceeded the model's context limit. Reduce the review context before trying again."
         if self.reason_code == "request_too_large":
-            return "The request was larger than the provider, or a proxy in front of it, accepts. Reduce the review context before trying again."
+            return (
+                "The provider, or a proxy in front of it, refused the request as too large. Reduce the review context before trying again."
+            )
         if self.reason_code == "unsupported_parameter":
             return "The request included an unsupported parameter. Check the provider request configuration before trying again."
         if self.reason_code == "invalid_request":

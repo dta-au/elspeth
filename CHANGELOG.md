@@ -24,18 +24,28 @@ changes land and is not a release.
   set, the Composer's request byte maximum is now derived from
   `ELSPETH_WEB__COMPOSER_CONTEXT_MAX_PROMPT_TOKENS` (8 bytes per token:
   1,600,000 bytes for a 200,000-token limit) instead of the fixed 983,040.
-  If a proxy in front of your model gateway limits request bodies (nginx's
-  default is 1 MiB), set the byte maximum below that limit. A request a
-  provider or proxy refuses with HTTP 413 is now treated as too large: it is
-  sent once more with earlier turns left out, then refused as too large,
-  instead of being retried unchanged. On the direct Anthropic route a 413 is
-  reported as an ordinary rejected request.
+  An explicit value is used as set. If a proxy in front of your model gateway
+  limits request bodies (nginx's default is 1 MiB), set the byte maximum
+  below that limit.
+- **Changed:** a request that a provider or proxy refuses with HTTP 413 is
+  now a size rejection: it is sent once more with earlier turns left out and
+  is never resent unchanged. On the direct Anthropic route a 413 is not
+  recognised and stays an ordinary rejected request.
+- **Changed:** the Composer's context budget now prices a request at the
+  session's measured bytes per token (the newest successful call to the same
+  model, less a 10% margin) instead of a fixed 3.0. A recognised size
+  rejection (over the context limit, or HTTP 413) is now resent once with
+  earlier turns left out for planner, optional reply, advisor review and
+  last-composition requests too, not only the compose loop. If the resend is
+  rejected again, a compose-loop or planner turn is refused as too large,
+  the reply is reported unavailable as before, and the review is recorded as
+  a rejected request.
 - **Added:** each Composer call's audit record now says what recognised a
   size rejection (a structured code, the exception class, the HTTP status or
-  a fixed provider wording), and its context-budget record names the call it
+  a fixed provider wording). Each context-budget record names the call it
   was made for (compose loop, reply, planner or escape hatch) and where the
-  density it was priced from came from. Advisor review calls have no
-  context-budget record, so they carry no surface or density. Records written
+  bytes-per-token density it was priced at came from. Advisor review calls
+  have no context-budget record, so they carry neither. Records written
   before this release carry none of these fields; their absence means
   unknown.
 
