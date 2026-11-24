@@ -174,6 +174,7 @@ from elspeth.web.composer.provider_quota import (
     quota_provider_calls,
     required_provider_audit_scope,
 )
+from elspeth.web.composer.provider_retry import retry_delay_seconds
 from elspeth.web.composer.reasoning import ReasoningEffort, apply_reasoning_kwargs
 from elspeth.web.composer.recovery_controls import parse_recovery_tool_call, recovery_context_message, recovery_tool_definitions
 from elspeth.web.composer.redaction import GetBlobContentArgumentsModel, ReadAttachmentArgumentsModel, SetPipelineArgumentsModel
@@ -4408,10 +4409,17 @@ async def _plan_pipeline_inner(
                 if provider_failure.kind == "timeout":
                     raise PipelinePlannerError("planner provider call timed out", code="TIMEOUT") from None
                 if provider_failure.retryable and attempt < model_config.max_api_attempts:
-                    retry_delay = model_config.api_retry_base_seconds * (2 ** (attempt - 1))
-                    if retry_delay > 0:
-                        await asyncio.sleep(min(retry_delay, max(0.0, deadline - _planner_deadline_time())))
-                    continue
+                    retry_delay = retry_delay_seconds(
+                        attempt=attempt,
+                        retry_after=provider_failure.retry_after,
+                        deadline=deadline,
+                        now=_planner_deadline_time(),
+                        base_delay_seconds=model_config.api_retry_base_seconds,
+                    )
+                    if retry_delay is not None:
+                        if retry_delay > 0:
+                            await asyncio.sleep(retry_delay)
+                        continue
                 raise PipelinePlannerError(
                     f"planner provider call failed ({type(exc).__name__})",
                     code="PROVIDER_ERROR",
