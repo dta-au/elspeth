@@ -55,6 +55,22 @@ docs/audit/triage/
 docs-archive/
 # Local review notes and reports.
 /docs/reviews/
+/docs/agents/*
+# Linked from AGENTS.md, CONTRIBUTING.md and the explore-and-pin skill, so they stay tracked.
+!/docs/agents/recent-code-hints.md
+!/docs/agents/explore-and-pin-methodology.md
+/docs/architecture/composer-remediation/
+/docs/architecture/composer-tool-assessment/
+/docs/superpowers/plans/
+# Dated development working papers and their supporting directories.
+/docs/development/composer-any-type-divergence-20??-??-??*
+/docs/development/crap-baseline-20??-??-??*
+/docs/development/crap-hotspot-risk-assessment-20??-??-??*
+/docs/development/executor-bug-sweep-20??-??-??*
+/docs/development/test-redesign-notes-20??-??-??*
+/docs/development/test-suite-review-20??-??-??*
+/docs/development/vulture-disposition-20??-??-??*
+/docs/development/vulture-evaluation-20??-??-??*
 # Local debugging screenshots.
 /images/
 
