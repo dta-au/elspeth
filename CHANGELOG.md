@@ -31,9 +31,16 @@ changes land and is not a release.
   now a size rejection: it is sent once more with earlier turns left out and
   is never resent unchanged. On the direct Anthropic route a 413 is not
   recognised and stays an ordinary rejected request.
+- **Changed:** a request a provider or proxy refuses as too large is now
+  reported as too large, without a Retry button; an administrator can raise
+  that limit.
 - **Changed:** the Composer's context budget now prices a request at the
-  session's measured bytes per token (the newest successful call to the same
-  model, less a 10% margin) instead of a fixed 3.0. A recognised size
+  bytes per token measured on the newest successful call to the same model
+  and tool dialect (a call earlier in the same turn first, otherwise the
+  session's stored calls), less a 10% margin, and at 3.0 when there is no
+  such call. Before, it used 3.0. In both, the rate is lowered to the density
+  the provider counted on an earlier call in the same turn, when that is
+  lower. A recognised size
   rejection (over the context limit, or HTTP 413) is now resent once with
   earlier turns left out for planner, optional reply, advisor review and
   last-composition requests too, not only the compose loop. If the resend is
@@ -41,8 +48,9 @@ changes land and is not a release.
   the reply is reported unavailable as before, and the review is recorded as
   a rejected request.
 - **Added:** each Composer call's audit record now says what recognised a
-  size rejection (a structured code, the exception class, the HTTP status or
-  a fixed provider wording). Each context-budget record names the call it
+  size rejection: a structured code, the HTTP status, the client library's
+  context-window exception (which it can assign from the provider's message)
+  or a fixed provider wording. Each context-budget record names the call it
   was made for (compose loop, reply, planner or escape hatch) and where the
   bytes-per-token density it was priced at came from. Advisor review calls
   have no context-budget record, so they carry neither. Records written
