@@ -106,6 +106,7 @@ function makeBlob(overrides: Partial<BlobMetadata> = {}): BlobMetadata {
 /** Two categories, two rows each: Source (user) then Output (pipeline). */
 function renderTwoCategories() {
   useBlobStore.setState({
+    listCurrent: true,
     blobs: [
       makeBlob({ id: "s1", filename: "first-source.csv", created_by: "user" }),
       makeBlob({ id: "s2", filename: "last-source.csv", created_by: "user" }),

@@ -40,6 +40,7 @@ function setBlobState(blobs: BlobMetadata[]) {
   useBlobStore.setState({
     blobs,
     activeSessionId: "session-1",
+    listCurrent: true,
     isLoading: false,
     error: null,
     listError: null,
@@ -105,6 +106,37 @@ describe("BlobManager selected-node highlighting", () => {
     expect(screen.getByRole("status")).toHaveTextContent("1 attached file is not in this session");
     act(() => useBlobStore.setState({ isLoading: true }));
     expect(screen.queryByText(/attached file is not in this session/)).not.toBeInTheDocument();
+  });
+
+  it("keeps the list loading after a chat upload into an unread activation", async () => {
+    const list = vi.spyOn(api, "listBlobs").mockResolvedValueOnce([]);
+    const upload = vi.spyOn(api, "uploadBlob").mockResolvedValueOnce(makeBlob());
+    onTestFinished(() => { list.mockRestore(); upload.mockRestore(); });
+    useBlobStore.setState({ loadBlobs: useBlobStore.getInitialState().loadBlobs });
+    await act(async () => { render(<BlobManager onUseAsInput={vi.fn()} />); });
+    expect(list).toHaveBeenCalledTimes(1);
+    list.mockClear();
+
+    // The manager stays mounted across the blob-store activation so its
+    // mount-time read cannot mask the unread state under test.
+    await act(async () => {
+      useBlobStore.getState().clearBlobs();
+      useBlobStore.getState().activateSession("session-1");
+      await useBlobStore.getState().uploadBlob("session-1", new File(["rows"], "data.csv"));
+    });
+
+    expect(list).not.toHaveBeenCalled();
+    expect(screen.queryByText(/not in this session/)).not.toBeInTheDocument();
+    expect(screen.queryByText("Files (1)")).not.toBeInTheDocument();
+    expect(screen.queryByText(/No files yet/)).not.toBeInTheDocument();
+    expect(screen.getByText("Loading files…")).toBeInTheDocument();
+
+    act(() => {
+      useBlobStore.getState().clearBlobs();
+      useBlobStore.getState().activateSession("session-1");
+    });
+    expect(screen.queryByText(/No files yet/)).not.toBeInTheDocument();
+    expect(screen.getByText("Loading files…")).toBeInTheDocument();
   });
 
   it("omits attachment counts and the empty-file message after a failed list read", async () => {
@@ -240,6 +272,70 @@ describe("BlobManager reveal request", () => {
       makeBlob({ id: "two", filename: "user.txt", mime_type: "text/plain" }), makeBlob({ id: "three" })]);
   });
 
+  it("keeps the rows visible and editable while a turn has made the list stale", () => {
+    const { container } = render(<BlobManager onUseAsInput={vi.fn()} />);
+    expect(screen.getByText("Files (3)")).toBeInTheDocument();
+    // A Composer turn marks the list stale before its graph is published.
+    act(() => useBlobStore.getState().markListStale("session-1"));
+    expect(screen.queryByText("Loading files…")).not.toBeInTheDocument();
+    expect(container.querySelector('[data-blob-id="one"]')).toBeInTheDocument();
+    expect(container.querySelector('[data-blob-id="two"]')).toBeInTheDocument();
+    expect(container.querySelector('[data-blob-id="three"]')).toBeInTheDocument();
+    expect(within(container.querySelector('[data-blob-id="two"]') as HTMLElement)
+      .getByRole("button", { name: /^Edit prompt/ })).not.toHaveAttribute("aria-disabled", "true");
+    // Only the total, which a turn may have changed, is withheld.
+    expect(screen.queryByText("Files (3)")).not.toBeInTheDocument();
+    expect(screen.getByText("Files", { selector: ".blob-manager-title" })).toBeInTheDocument();
+  });
+
+  it("scrolls to a newly selected step's file once a stale list that lacks it is current", () => {
+    const scroll = vi.fn();
+    const original = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = scroll;
+    try {
+      const { container } = render(<BlobManager onUseAsInput={vi.fn()} />);
+      act(() => useBlobStore.getState().markListStale("session-1"));
+      scroll.mockClear();
+      // The step's file ("other") is not in the stale list yet.
+      act(() => useSessionStore.setState({ selectedNodeId: "inject" }));
+      expect(scroll).not.toHaveBeenCalled();
+      act(() => useBlobStore.setState((state) => ({ listCurrent: true, listStale: false,
+        blobs: [...state.blobs, makeBlob({ id: "other", filename: "notes.txt", mime_type: "text/plain" })] })));
+      expect(scroll).toHaveBeenCalledTimes(1);
+      expect(scroll.mock.contexts[0]).toBe(container.querySelector('[data-blob-id="other"]'));
+    } finally { Element.prototype.scrollIntoView = original; }
+  });
+
+  it("does not say there are no files while an empty list is stale", () => {
+    setBlobState([]);
+    render(<BlobManager onUseAsInput={vi.fn()} />);
+    expect(screen.getByText(/No files yet/)).toBeInTheDocument();
+    act(() => useBlobStore.getState().markListStale("session-1"));
+    expect(screen.queryByText(/No files yet/)).not.toBeInTheDocument();
+    expect(screen.getByText("Loading files…")).toBeInTheDocument();
+  });
+
+  it("reveals a listed file at once while the list is stale", () => {
+    const { container } = render(<BlobManager onUseAsInput={vi.fn()} />);
+    act(() => useBlobStore.getState().markListStale("session-1"));
+    act(() => useBlobStore.getState().revealBlob("session-1", "two", "user.txt"));
+    expect(container.querySelector('[data-blob-id="two"]')).toHaveFocus();
+    expect(useBlobStore.getState().revealRequest).toBeNull();
+  });
+
+  it("holds a reveal of a file the stale list lacks and shows it once the list is current", () => {
+    const { container } = render(<BlobManager onUseAsInput={vi.fn()} />);
+    act(() => useBlobStore.getState().markListStale("session-1"));
+    act(() => useBlobStore.getState().revealBlob("session-1", "four", "created.txt"));
+    expect(screen.queryByText("File name unavailable")).not.toBeInTheDocument();
+    expect(screen.queryByText(/is no longer in this session/)).not.toBeInTheDocument();
+    expect(useBlobStore.getState().revealRequest).not.toBeNull();
+    act(() => useBlobStore.setState((state) => ({ listCurrent: true, listStale: false,
+      blobs: [...state.blobs, makeBlob({ id: "four", filename: "created.txt", mime_type: "text/plain" })] })));
+    expect(container.querySelector('[data-blob-id="four"]')).toHaveFocus();
+    expect(useBlobStore.getState().revealRequest).toBeNull();
+  });
+
   it("focuses and scrolls the requested row while sibling files remain highlighted", () => {
     const scroll = vi.fn();
     const original = Element.prototype.scrollIntoView;
@@ -311,7 +407,7 @@ describe("BlobManager reveal request", () => {
     useBlobStore.getState().revealBlob("session-1", "two", "user.txt");
     const { container } = render(<BlobManager onUseAsInput={vi.fn()} />);
     expect(useBlobStore.getState().revealRequest).not.toBeNull();
-    act(() => useBlobStore.setState({ blobs: [makeBlob({ id: "two", filename: "user.txt" })], isLoading: false }));
+    act(() => useBlobStore.setState({ blobs: [makeBlob({ id: "two", filename: "user.txt" })], isLoading: false, listCurrent: true }));
     expect(container.querySelector('[data-blob-id="two"]')).toHaveFocus();
     expect(useBlobStore.getState().revealRequest).toBeNull();
   });
@@ -490,7 +586,7 @@ describe("BlobManager upload affordance (elspeth-29eef452a8)", () => {
     expect(screen.queryByText(/Files \(0\)/)).not.toBeInTheDocument();
     expect(screen.getByText("Loading files…")).toHaveAttribute("role", "status");
     act(() => useBlobStore.setState({
-      isLoading: false, error: "Failed to load files.", listError: "Failed to load files.", listLoadFailed: true,
+      isLoading: false, listCurrent: true, error: "Failed to load files.", listError: "Failed to load files.", listLoadFailed: true,
     }));
     rerender(<BlobManager onUseAsInput={vi.fn()} />);
     expect(screen.getByText("Files", { selector: ".blob-manager-title" })).toBeInTheDocument();

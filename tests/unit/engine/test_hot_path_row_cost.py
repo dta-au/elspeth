@@ -44,8 +44,10 @@ from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
 from elspeth.contracts.hashing import canonical_json as contracts_canonical_json
 from elspeth.contracts.hashing import stable_hash as contracts_stable_hash
 from elspeth.core.canonical import canonical_json as core_canonical_json
+from elspeth.core.canonical import compute_full_topology_hash
 from elspeth.core.canonical import stable_hash as core_stable_hash
 from elspeth.core.checkpoint import CheckpointManager
+from elspeth.core.checkpoint.compatibility import CheckpointCompatibilityValidator
 from elspeth.core.config import CheckpointSettings, CoalesceSettings, ElspethSettings, GateSettings, SinkSettings, SourceSettings
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.landscape.database import LandscapeDB
@@ -89,9 +91,9 @@ _PINS: dict[str, dict[str, dict[str, object]]] = {
                 "statements": (586, 97),
                 "commits": (67, 13),
                 "core.canonical.canonical_json": (20, 14),
-                "core.canonical.stable_hash": (16, 19),
-                "contracts.hashing.canonical_json": (92, 50),
-                "contracts.hashing.stable_hash": (29, 20),
+                "core.canonical.stable_hash": (16, 14),
+                "contracts.hashing.canonical_json": (92, 45),
+                "contracts.hashing.stable_hash": (29, 15),
             },
             "sql_buckets": _bucket_pins("""
 BEGIN <expression> 75 13
@@ -159,12 +161,12 @@ UPDATE token_work_items 1 2
         },
         "fork": {
             "counters": {
-                "statements": (620, 338),
+                "statements": (621, 338),
                 "commits": (70, 45),
                 "core.canonical.canonical_json": (24, 36),
-                "core.canonical.stable_hash": (20, 28),
-                "contracts.hashing.canonical_json": (100, 82),
-                "contracts.hashing.stable_hash": (33, 29),
+                "core.canonical.stable_hash": (20, 21),
+                "contracts.hashing.canonical_json": (100, 75),
+                "contracts.hashing.stable_hash": (33, 22),
             },
             "sql_buckets": _bucket_pins("""
 BEGIN <expression> 83 53
@@ -222,7 +224,7 @@ SELECT sink_effect_streams 11 0
 SELECT sink_effects 51 0
 SELECT token_lineage_frames 1 8
 SELECT token_outcomes 4 4
-SELECT token_parents 0 4
+SELECT token_parents 1 4
 SELECT token_work_items 9 26
 SELECT tokens 2 17
 UPDATE coalesce_effects 0 1
@@ -244,12 +246,12 @@ UPDATE token_work_items 1 11
     "postgres": {
         "linear": {
             "counters": {
-                "statements": (500, 79),
+                "statements": (501, 79),
                 "commits": (67, 13),
                 "core.canonical.canonical_json": (20, 14),
-                "core.canonical.stable_hash": (16, 19),
-                "contracts.hashing.canonical_json": (92, 50),
-                "contracts.hashing.stable_hash": (29, 20),
+                "core.canonical.stable_hash": (16, 14),
+                "contracts.hashing.canonical_json": (92, 45),
+                "contracts.hashing.stable_hash": (29, 15),
             },
             "sql_buckets": {
                 "DELETE checkpoints": (1, 0),
@@ -297,7 +299,7 @@ UPDATE token_work_items 1 11
                 "SELECT token_parents": (0, 1),
                 "SELECT token_work_items": (5, 7),
                 "SELECT tokens": (3, 4),
-                "SET <expression>": (27, 5),
+                "SET <expression>": (28, 5),
                 "UPDATE node_states": (1, 2),
                 "UPDATE nodes": (1, 0),
                 "UPDATE operations": (2, 0),
@@ -314,12 +316,12 @@ UPDATE token_work_items 1 11
         },
         "fork": {
             "counters": {
-                "statements": (526, 263),
+                "statements": (528, 263),
                 "commits": (70, 45),
                 "core.canonical.canonical_json": (24, 36),
-                "core.canonical.stable_hash": (20, 28),
-                "contracts.hashing.canonical_json": (100, 82),
-                "contracts.hashing.stable_hash": (33, 29),
+                "core.canonical.stable_hash": (20, 21),
+                "contracts.hashing.canonical_json": (100, 75),
+                "contracts.hashing.stable_hash": (33, 22),
             },
             "sql_buckets": {
                 "DELETE checkpoints": (1, 0),
@@ -373,10 +375,10 @@ UPDATE token_work_items 1 11
                 "SELECT sink_effects": (51, 0),
                 "SELECT token_lineage_frames": (1, 8),
                 "SELECT token_outcomes": (4, 4),
-                "SELECT token_parents": (0, 4),
+                "SELECT token_parents": (1, 4),
                 "SELECT token_work_items": (9, 26),
                 "SELECT tokens": (3, 20),
-                "SET <expression>": (27, 24),
+                "SET <expression>": (28, 24),
                 "UPDATE coalesce_effects": (0, 1),
                 "UPDATE node_states": (1, 3),
                 "UPDATE nodes": (1, 0),
@@ -688,3 +690,68 @@ def test_oracle_names_a_quadratic_function() -> None:
     profiles = {size: {function: size * size} for size in _SIZES}
     with pytest.raises(AssertionError, match=r"synthetic/quadratic\.py:1:helper"):
         _assert_oracle(profiles, "synthetic measurement")
+
+
+@pytest.mark.parametrize("shape", ("linear", "fork"))
+def test_topology_hash_computed_once_for_fifty_checkpoints(shape: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 50-row every-row run hashes its topology once and stores that digest 51 times.
+
+    E-9a (maintainer ruling 2026-11-20: the checkpoint topology hash is fixed
+    at run start). The expected digest is recomputed independently after the
+    run, so the only computation counted is the one the coordinator made.
+    """
+    calls: list[str] = []
+    stored: list[str] = []
+    graphs: list[ExecutionGraph] = []
+    original_hash = CheckpointCompatibilityValidator.compute_full_topology_hash
+    original_create = CheckpointManager.create_checkpoint
+
+    def count_hash(self: CheckpointCompatibilityValidator, graph: ExecutionGraph) -> str:
+        digest = original_hash(self, graph)
+        calls.append(digest)
+        graphs.append(graph)
+        return digest
+
+    def record_checkpoint(self: CheckpointManager, *, draft: Any, coordination_token: Any) -> Any:
+        stored.append(draft.upstream_topology_hash)
+        return original_create(self, draft=draft, coordination_token=coordination_token)
+
+    monkeypatch.setattr(CheckpointCompatibilityValidator, "compute_full_topology_hash", count_hash)
+    monkeypatch.setattr(CheckpointManager, "create_checkpoint", record_checkpoint)
+    db = LandscapeDB.from_url(f"sqlite:///{tmp_path / 'audit.db'}")
+    try:
+        _pipeline(shape, 50, db, tmp_path)
+    finally:
+        db.close()
+
+    assert graphs
+    expected = compute_full_topology_hash(graphs[0])
+    assert len(stored) == 51
+    assert calls == [expected]
+    assert set(stored) == {expected}
+
+
+def test_distinct_runs_do_not_share_topology_hash(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two runs with different topologies in one process store their own baseline digests.
+
+    The cached hash belongs to one coordinator's installed graph, not to the
+    process: a module-level or graph-shared cache would hand the second run
+    the first run's digest.
+    """
+    hashes: list[str] = []
+    original_create = CheckpointManager.create_checkpoint
+
+    def record_checkpoint(self: CheckpointManager, *, draft: Any, coordination_token: Any) -> Any:
+        if draft.sequence_number == 0:
+            hashes.append(draft.upstream_topology_hash)
+        return original_create(self, draft=draft, coordination_token=coordination_token)
+
+    monkeypatch.setattr(CheckpointManager, "create_checkpoint", record_checkpoint)
+    for shape in ("linear", "fork"):
+        db = LandscapeDB.from_url(f"sqlite:///{tmp_path / f'{shape}.db'}")
+        try:
+            _pipeline(shape, 2, db, tmp_path / shape)
+        finally:
+            db.close()
+    assert len(hashes) == 2
+    assert hashes[0] != hashes[1]

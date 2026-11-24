@@ -213,6 +213,7 @@ function PromptSlotActions({ value, nodeId, fieldPath, label, showInFiles }: {
   const blobs = useBlobStore((state) => state.blobs);
   const blobSessionId = useBlobStore((state) => state.activeSessionId);
   const isLoading = useBlobStore((state) => state.isLoading);
+  const listCurrent = useBlobStore((state) => state.activeSessionId === sessionId && state.listCurrent);
   const listError = useBlobStore((state) => state.activeSessionId === sessionId ? state.listError : null);
   const pending = useInterpretationEventsStore((state) => sessionId ? state.pendingBySession[sessionId] : undefined);
   // Show in files needs a mounted file manager to reveal into: a host
@@ -222,7 +223,7 @@ function PromptSlotActions({ value, nodeId, fieldPath, label, showInFiles }: {
   if (!isRecord(value) || value.mode !== "inline_content" || typeof value.blob_ref !== "string" || sessionId === null) return null;
   return <BoundPromptActions blobId={value.blob_ref} nodeId={nodeId} fieldPath={fieldPath} label={label}
     sessionId={sessionId} state={compositionState} blobs={blobSessionId === sessionId ? blobs : []}
-    loading={blobSessionId !== sessionId || isLoading} listIncomplete={listError !== null} pendingEvents={Object.values(pending ?? {})}
+    loading={blobSessionId !== sessionId || !listCurrent || isLoading} listIncomplete={listError !== null} pendingEvents={Object.values(pending ?? {})}
     showInFiles={showInFiles && fileManagerReachable} />;
 }
 

@@ -30,7 +30,7 @@ function unload(): boolean {
 
 beforeEach(() => {
   usePromptDraftStore.getState().reset();
-  useBlobStore.setState({ activeSessionId: "session-1", isLoading: false, error: null,
+  useBlobStore.setState({ activeSessionId: "session-1", listCurrent: true, isLoading: false, error: null,
     blobs: [{ id: "file-a", filename: "score.txt", content_hash: SHA } as BlobMetadata] });
   useSessionStore.setState({ activeSessionId: "session-1", compositionStateLoaded: true,
     compositionState: graph([{ id: "score", options: { prompt_template: marker("file-a"), queries: [{ name: "C1", template: marker("file-a") }] } }]) });
