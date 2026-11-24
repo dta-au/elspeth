@@ -6076,7 +6076,9 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "write_connection",
         # 73d844a2c: the cancelled-permit header now keeps the run's prompt
         # evidence (run_prompt_inputs); acquisition, domain and escape unchanged.
-        "407d144e00e6877d",
+        # 9e9509309: its seat read is renamed live_leader -> seat_holder (body
+        # text only); 407d144e… -> the value below, line unchanged.
+        "4ed1cfc16f58ffe9",
         1,
         None,
         line=656,
@@ -6470,10 +6472,13 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "RunCoordinationRepository.seat_holder",
         "<non-session-write-connection>",
         "write_connection",
-        "29604692b4790788",
+        # 9e9509309: renamed from live_leader (29604692… -> the value below;
+        # body unchanged); 039c88bd0: +2 lines (the LiveLeader import and the
+        # verb-table line above it). Acquisition, domain and escape unchanged.
+        "dc8fccf0123f2410",
         1,
         None,
-        line=1219,
+        line=1221,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -6484,7 +6489,8 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "46816ecaea62a2e3",
         1,
         None,
-        line=1702,
+        # 039c88bd0: +18 lines (live_leader added above); POSITION only.
+        line=1720,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -6495,7 +6501,8 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "e69348a5794c1998",
         1,
         None,
-        line=1727,
+        # 039c88bd0: +18 lines (live_leader added above); POSITION only.
+        line=1745,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/run_lifecycle_repository.py",
