@@ -540,14 +540,19 @@ async def _litellm_acompletion(
             credential_messages.append(message)
     if prepared_advisor_content is not None:
         credential_messages = scan_prepared_advisor_content(credential_messages, prepared_advisor_content, role=prompt_guard_role)
-    require_no_credential_material(
-        credential_messages,
-        surface="composer_provider_request",
-        # 2 MiB covers a maximum-size runtime YAML import (524,288 characters,
-        # MAX_RUNTIME_YAML_IMPORT_CHARS) at 4 UTF-8 bytes per character. A
-        # longer string ends the scan as a counted skip (best effort), not a refusal.
-        max_string_bytes=2 * 1024 * 1024,
-    )
+    # One traversal per message: the list itself is never one tree, so its
+    # length cannot reach the width limit, and a limit inside one message
+    # skips only that message (counted, best effort) while the others are
+    # still scanned. Every message is scanned, whatever its role or trust.
+    for credential_message in credential_messages:
+        require_no_credential_material(
+            credential_message,
+            surface="composer_provider_request",
+            # 2 MiB covers a maximum-size runtime YAML import (524,288 characters,
+            # MAX_RUNTIME_YAML_IMPORT_CHARS) at 4 UTF-8 bytes per character. A
+            # longer string ends that message's scan as a counted skip, not a refusal.
+            max_string_bytes=2 * 1024 * 1024,
+        )
     await enforce_prompt_guard(
         mount=prompt_guard_mount,
         mode=prompt_guard_mode,

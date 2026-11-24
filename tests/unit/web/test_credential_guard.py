@@ -662,6 +662,111 @@ async def test_provider_request_over_the_cap_is_a_counted_skip_not_a_refusal(
     assert skips == [{"surface": "composer_provider_request", "reason": "string_bytes"}]
 
 
+class _SkipRecorder:
+    def __init__(self) -> None:
+        self.skips: list[dict[str, str]] = []
+
+    def add(self, value: int, attributes: dict[str, str]) -> None:
+        assert value == 1
+        self.skips.append(dict(attributes))
+
+
+def _long_conversation(count: int) -> list[dict[str, Any]]:
+    return [{"role": "user" if index % 2 == 0 else "assistant", "content": f"turn {index}"} for index in range(count)]
+
+
+async def _refuse_transport(**kwargs: Any) -> object:
+    raise AssertionError("request reached transport")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "last_message",
+    [
+        pytest.param({"role": "user", "content": "sk-" + "a" * 24}, id="user_message"),
+        pytest.param({"role": "assistant", "content": "sk-" + "a" * 24}, id="assistant_message"),
+    ],
+)
+async def test_provider_request_scans_every_message_of_a_long_request(
+    monkeypatch: pytest.MonkeyPatch, provider_custody: ProviderCallCustody, last_message: dict[str, Any]
+) -> None:
+    # Message 600 of 600. Scanned as one tree, the 600-item list stopped at the
+    # width limit (512) before any message was read, so this went unscanned.
+    import litellm
+
+    monkeypatch.setattr(litellm, "acompletion", _refuse_transport)
+    recorder = _SkipRecorder()
+    monkeypatch.setattr(credential_scan, "_CREDENTIAL_SCAN_SKIPPED_COUNTER", recorder)
+    with pytest.raises(CredentialMaterialRefused) as caught:
+        await provider_gateway._litellm_acompletion(
+            provider_custody=provider_custody,
+            model="openai/test-model",
+            prompt_guard_mount=None,
+            prompt_guard_mode="required",
+            prompt_guard_role="composer",
+            messages=[*_long_conversation(599), last_message],
+        )
+
+    assert caught.value.surface == "composer_provider_request"
+    assert caught.value.finding.category == "token_shape"
+    assert recorder.skips == []
+
+
+@pytest.mark.asyncio
+async def test_provider_request_with_many_messages_is_scanned_without_a_skip(
+    monkeypatch: pytest.MonkeyPatch, provider_custody: ProviderCallCustody
+) -> None:
+    # A request of more than 512 messages is not a traversal limit: it is
+    # accepted by the credential scan and goes on to the next control.
+    import litellm
+
+    from elspeth.web.composer.prompt_guard import PromptGuardRefused
+
+    monkeypatch.setattr(litellm, "acompletion", _refuse_transport)
+    recorder = _SkipRecorder()
+    monkeypatch.setattr(credential_scan, "_CREDENTIAL_SCAN_SKIPPED_COUNTER", recorder)
+    with pytest.raises(PromptGuardRefused):
+        await provider_gateway._litellm_acompletion(
+            provider_custody=provider_custody,
+            model="openai/test-model",
+            prompt_guard_mount=None,
+            prompt_guard_mode="required",
+            prompt_guard_role="composer",
+            messages=_long_conversation(600),
+        )
+
+    assert recorder.skips == []
+
+
+@pytest.mark.asyncio
+async def test_provider_request_keeps_scanning_the_messages_after_a_skipped_one(
+    monkeypatch: pytest.MonkeyPatch, provider_custody: ProviderCallCustody
+) -> None:
+    # A limit inside one message skips that message only (counted); a
+    # credential in a later message is still refused.
+    import litellm
+
+    monkeypatch.setattr(litellm, "acompletion", _refuse_transport)
+    recorder = _SkipRecorder()
+    monkeypatch.setattr(credential_scan, "_CREDENTIAL_SCAN_SKIPPED_COUNTER", recorder)
+    with pytest.raises(CredentialMaterialRefused) as caught:
+        await provider_gateway._litellm_acompletion(
+            provider_custody=provider_custody,
+            model="openai/test-model",
+            prompt_guard_mount=None,
+            prompt_guard_mode="required",
+            prompt_guard_role="composer",
+            messages=[
+                {"role": "user", "content": " " * (2 * 1024 * 1024 + 1)},
+                {"role": "assistant", "content": "noted"},
+                {"role": "user", "content": "sk-" + "a" * 24},
+            ],
+        )
+
+    assert caught.value.finding.category == "token_shape"
+    assert recorder.skips == [{"surface": "composer_provider_request", "reason": "string_bytes"}]
+
+
 @pytest.mark.asyncio
 async def test_serialized_state_credential_is_refused_before_provider_transport(
     monkeypatch: pytest.MonkeyPatch, provider_custody: ProviderCallCustody
