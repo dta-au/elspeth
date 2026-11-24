@@ -248,16 +248,16 @@ class _StubRunCoordRepo:
         self._seat_present = seat_present
         self._lifecycle_events = lifecycle_events
         self.depart_calls: list[dict[str, Any]] = []
-        self.live_leader_calls: list[dict[str, Any]] = []
+        self.seat_holder_calls: list[dict[str, Any]] = []
         self.worker_heartbeat_calls: list[dict[str, Any]] = []
 
         # Override per-call via a list (pops first element each call)
-        self.live_leader_results: list[LeaderInfo | None] = []
+        self.seat_holder_results: list[LeaderInfo | None] = []
 
     def seat_holder(self, *, run_id: str) -> LeaderInfo | None:
-        self.live_leader_calls.append({"run_id": run_id})
-        if self.live_leader_results:
-            return self.live_leader_results.pop(0)
+        self.seat_holder_calls.append({"run_id": run_id})
+        if self.seat_holder_results:
+            return self.seat_holder_results.pop(0)
         if not self._seat_present:
             return None
         return LeaderInfo(
@@ -587,7 +587,7 @@ class TestFollowerSeatDead:
             follower.run(ctx=_ctx())
 
         assert processor.claim_checks == 3
-        assert len(coord_repo.live_leader_calls) == 4
+        assert len(coord_repo.seat_holder_calls) == 4
         assert len(coord_repo.depart_calls) == 1
 
     def test_seat_dead_between_hot_claims_stops_follower_drain_inside_throttle_interval(self) -> None:
@@ -607,7 +607,7 @@ class TestFollowerSeatDead:
 
         processor = _CallbackDrainProcessor()
         coord_repo = _StubRunCoordRepo()
-        coord_repo.live_leader_results = [
+        coord_repo.seat_holder_results = [
             LeaderInfo(
                 run_id=RUN_ID,
                 leader_worker_id=f"worker:{RUN_ID}:leader",
@@ -646,7 +646,7 @@ class TestFollowerSeatDead:
             follower.run(ctx=_ctx())
 
         assert processor.claim_checks == 1
-        assert len(coord_repo.live_leader_calls) == 3
+        assert len(coord_repo.seat_holder_calls) == 3
         assert len(coord_repo.depart_calls) == 1
 
     def test_seat_dead_between_claims_stops_follower_drain(self) -> None:
@@ -666,7 +666,7 @@ class TestFollowerSeatDead:
 
         processor = _CallbackDrainProcessor()
         coord_repo = _StubRunCoordRepo()
-        coord_repo.live_leader_results = [
+        coord_repo.seat_holder_results = [
             LeaderInfo(
                 run_id=RUN_ID,
                 leader_worker_id=f"worker:{RUN_ID}:leader",
@@ -702,7 +702,7 @@ class TestFollowerSeatDead:
             follower.run(ctx=_ctx())
 
         assert processor.claim_checks == 1
-        assert len(coord_repo.live_leader_calls) == 3
+        assert len(coord_repo.seat_holder_calls) == 3
         assert len(coord_repo.depart_calls) == 1
 
 

@@ -41,7 +41,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from elspeth.contracts.checkpoint import ResumeRefusalCause
-from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipLost, WorkerMembershipToken, mint_worker_id
+from elspeth.contracts.coordination import CoordinationToken, LiveLeader, WorkerMembershipLost, WorkerMembershipToken, mint_worker_id
 from elspeth.contracts.enums import RunStatus
 from elspeth.contracts.errors import (
     AuditIntegrityError,
@@ -803,7 +803,7 @@ class TestWriteLockHeld:
         assert _seat_row(engine)["leader_epoch"] == 1
 
 
-class TestReleaseSeatAndLiveLeader:
+class TestReleaseSeatAndSeatHolder:
     def test_release_vacates_seat_departs_worker_and_events(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
         _seed_run(engine)
         token = register_run_leader(repo, run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), window_seconds=WINDOW)
@@ -951,7 +951,7 @@ class TestReleaseSeatAndLiveLeader:
         # No incumbent to evict on the vacant-seat arm.
         assert [e for e in _events(engine) if e["event_type"] == "worker_evict"] == []
 
-    def test_live_leader_views(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
+    def test_seat_holder_views(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
         _seed_run(engine)
         assert repo.seat_holder(run_id=RUN_ID) is None  # no seat row yet
 
@@ -969,6 +969,32 @@ class TestReleaseSeatAndLiveLeader:
 
         repo.release_seat(token=token)
         assert repo.seat_holder(run_id=RUN_ID) is None  # vacant
+
+    def test_live_leader_returns_only_a_live_seat(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
+        # live_leader is the liveness read: a lapsed seat's incumbent is not a live leader.
+        _seed_run(engine)
+        assert repo.live_leader(run_id=RUN_ID) is None  # no seat row yet
+
+        token = register_run_leader(repo, run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), window_seconds=WINDOW)
+        holder = repo.seat_holder(run_id=RUN_ID)
+        live = repo.live_leader(run_id=RUN_ID)
+        assert holder is not None
+        assert type(live) is LiveLeader
+        assert (live.run_id, live.leader_worker_id, live.leader_epoch, live.leader_heartbeat_expires_at) == (
+            holder.run_id,
+            holder.leader_worker_id,
+            holder.leader_epoch,
+            holder.leader_heartbeat_expires_at,
+        )
+
+        _expire_seat(engine)
+        lapsed = repo.seat_holder(run_id=RUN_ID)
+        assert lapsed is not None
+        assert lapsed.seat_live is False  # the incumbent is still seated
+        assert repo.live_leader(run_id=RUN_ID) is None
+
+        repo.release_seat(token=token)
+        assert repo.live_leader(run_id=RUN_ID) is None  # vacant
 
 
 class TestRegistryVerbs:

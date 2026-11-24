@@ -38,7 +38,7 @@ def _seed_run(landscape_url: str, run_id: str, *, status: RunStatus, seat: str) 
             repositories.run_coordination.release_seat(token=token)
 
 
-@pytest.mark.parametrize("status", [RunStatus.RUNNING, RunStatus.FAILED], ids=["running", "failed"])
+@pytest.mark.parametrize("status", [RunStatus.RUNNING, RunStatus.FAILED, RunStatus.INTERRUPTED], ids=["running", "failed", "interrupted"])
 @pytest.mark.parametrize(("seat", "expected_live"), [("live", True), ("lapsed", False), ("released", False)])
 def test_observe_run_reports_a_live_leader_only_for_a_live_seat(tmp_path: Path, status: RunStatus, seat: str, expected_live: bool) -> None:
     landscape_url = f"sqlite:///{tmp_path / 'audit.db'}"

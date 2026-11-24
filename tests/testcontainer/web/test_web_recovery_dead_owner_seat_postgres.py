@@ -411,6 +411,15 @@ def test_dead_owner_run_resumes_whether_its_seat_was_released_or_lapsed(recovery
     # Resumed, not re-run: no source row was ingested again.
     assert record["app1"]["landscape"]["source_rows"] == 2
     assert record["app1"]["output_bytes"] == _INPUT_CSV.decode().replace("\n", "\r\n")
+    # Later apps leave the completed run alone: none recovers anything at startup,
+    # and the run's web and Landscape records stay exactly as app 1 left them.
+    for name in ("app2", "app3", "app4"):
+        assert record[name]["live_after_startup"] == []
+        assert record[name]["web"] == record["app1"]["web"]
+        assert record[name]["landscape"] == record["app1"]["landscape"]
+    # App 3 only starts and stops: nothing to settle, and no output written since app 2.
+    assert record["app3"]["settled_after_startup"] == {"live": [], "still_live_at_bound": [], "saga_open_at_bound": []}
+    assert record["app3"]["output_bytes"] == record["app2"]["output_bytes"]
     for name in ("app2", "app4"):
         assert record[name]["execute"][0] == 202
         assert record[name]["settled_after_execute"]["saga_open_at_bound"] == []

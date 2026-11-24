@@ -2,14 +2,16 @@
 
 ``RunCoordinationRepository.seat_holder`` returns the incumbent of a lapsed seat
 too, so ``seat_holder(...) is not None`` would treat a dead owner as live. Web
-code has no use for the incumbent's identity, so it may not reach the seat any
-other way: not through ``seat_holder``, not by reading the coordination table or
-its expiry column, and not by reading a ``seat_live`` flag. ``live_leader``
-returns a ``LiveLeader`` only for a live seat, and its type carries no liveness
-flag to forget.
+code has no use for the incumbent's identity, so it may not name the other
+routes to the seat: ``seat_holder``, the coordination table, its expiry column,
+or a ``seat_live`` flag. ``live_leader`` returns a ``LiveLeader`` only for a
+live seat, and its type carries no liveness flag to forget.
 
-The scan matches exact identifiers in the AST (attribute names, bare names and
-imported names), not source text.
+The scan matches those exact identifiers in the AST (attribute names, bare names
+and imported names), not source text. It does not see string-keyed routes:
+``getattr(repo, "seat_holder")`` is left to the tree-wide dynamic-attribute
+gate, and a table looked up by name (``metadata.tables["run_coordination"]``)
+or raw SQL is not covered here.
 """
 
 from __future__ import annotations
@@ -50,11 +52,30 @@ def test_web_reaches_seat_liveness_only_through_live_leader() -> None:
     assert _web_references(_SEAT_LIVENESS_IDENTIFIERS) == {}, "web code must decide leader liveness with live_leader() only"
 
 
-def test_scan_sees_the_web_liveness_reads() -> None:
-    # Known positive: the recovery observation and the recovery-refusal handler.
-    found = _web_references(frozenset({"live_leader"}))
-    assert "src/elspeth/web/execution/recovery.py" in found
-    assert "src/elspeth/web/execution/service.py" in found
+def _live_leader_calls(source: str) -> int:
+    """Number of ``<expr>.live_leader(...)`` calls; a field or attribute named ``live_leader`` is not a call."""
+    return sum(
+        1
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "live_leader"
+    )
+
+
+def test_web_liveness_reads_are_the_reviewed_live_leader_calls() -> None:
+    # Known positive, pinned per file: the two recovery observations (RUNNING;
+    # FAILED/INTERRUPTED) and the recovery-refusal handler. A new web liveness
+    # read is a reviewed addition here.
+    calls: dict[str, int] = {}
+    for path in sorted(_WEB.rglob("*.py")):
+        count = _live_leader_calls(path.read_text(encoding="utf-8"))
+        if count:
+            calls[str(path.relative_to(_ROOT))] = count
+    assert calls == {"src/elspeth/web/execution/recovery.py": 2, "src/elspeth/web/execution/service.py": 1}
+
+
+def test_call_count_ignores_a_live_leader_field() -> None:
+    assert _live_leader_calls("observation.live_leader\nlive_leader: bool\n") == 0
+    assert _live_leader_calls("repositories.run_coordination.live_leader(run_id=run_id) is not None\n") == 1
 
 
 def test_scanner_flags_every_other_route_to_seat_liveness() -> None:

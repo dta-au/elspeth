@@ -731,12 +731,12 @@ class TestJoinRunAdmissionRefusals:
             mode=edges[0].mode,
         )
         expire_leader_seat(db, run_id)
-        original_live_leader = RunCoordinationRepository.seat_holder
+        original_seat_holder = RunCoordinationRepository.seat_holder
         observed_dead = False
 
         def heartbeat_after_dead_read(repo: RunCoordinationRepository, *, run_id: str) -> Any:
             nonlocal observed_dead
-            leader = original_live_leader(repo, run_id=run_id)
+            leader = original_seat_holder(repo, run_id=run_id)
             observed_dead = leader is not None and not leader.seat_live
             heartbeat = RunCoordinationRepository(db.engine).worker_heartbeat(
                 member_token=member_token_for(db.engine, run_id=run_id, worker_id=leader_id),
