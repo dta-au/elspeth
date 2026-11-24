@@ -22,7 +22,10 @@ changes land and is not a release.
   run start are now refused earlier, at validation.
 - **Changed:** the composer's main loop and planner start a provider retry only
   when its wait plus 5 s still fits before the job deadline. This also applies
-  to their existing retries after a provider 503. The completion review keeps
+  to their existing retries after a provider 503. When it does not fit, the main
+  loop reports the provider failure at once. After a 503 the planner waits
+  until the deadline and reports a time-out instead of making one last call;
+  after a 429 it reports the provider failure at once. The completion review keeps
   its existing immediate retry and does not retry a 429.
 - **Do not enable a composer token quota yet.** With one configured, a failed
   provider call's usage is recorded as unknown, and that refuses the user's

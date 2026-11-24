@@ -5272,8 +5272,8 @@ async def test_each_transient_api_retry_consumes_and_audits_a_wire_attempt(
         ({"retry-after-ms": "1500", "retry-after": "3"}, "success", 2, [1.5]),
         ({"retry-after-ms": "bad", "retry-after": "3"}, "success", 2, [3.0]),
         ({"retry-after": "bad"}, "success", 2, [1.0]),
-        # A Retry-After shorter than the step waits the step. Delta-seconds are
-        # whole, so a shorter header arrives as milliseconds.
+        # A Retry-After shorter than the step waits the step. This row sends it in
+        # milliseconds; "retry-after: 0" or a near HTTP date are other routes.
         ({"retry-after-ms": "500"}, "success", 2, [1.0]),
         ({}, "exhausted", 2, [1.0]),
         # The 30 s ceiling admits a Retry-After of exactly 30 s and refuses 31 s.
@@ -5416,6 +5416,9 @@ async def test_planner_does_not_wait_out_a_retry_delay_before_a_certain_call_bud
             model_overrides={"max_api_attempts": 2, "api_retry_base_seconds": 1.0, "timeout_seconds": timeout_seconds},
         )
     assert caught.value.code == code
+    if code == "PROVIDER_CALLS_EXHAUSTED":
+        # Raised by the loop head, so it carries no provider exception.
+        assert caught.value.__context__ is None
     assert len(completion.requests) == len(recorder.llm_calls) == 1
     retry_sleep.assert_not_awaited()
 
@@ -5424,33 +5427,47 @@ _DISCOVERY = [ComposerLLMCallStatus.SUCCESS, ComposerLLMCallStatus.SUCCESS]
 _FAILED = [ComposerLLMCallStatus.API_ERROR]
 
 
+_SUCCEEDED = [ComposerLLMCallStatus.SUCCESS]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("hatch", "remaining_after_failure", "max_total_provider_calls", "max_api_attempts", "code", "sleeps", "statuses"),
+    ("hatch", "remaining_after_failures", "max_total_provider_calls", "max_api_attempts", "code", "sleeps", "statuses"),
     [
         # The 1 s delay exceeds the time left: the planner sleeps to the deadline
         # and its loop head refuses there.
-        pytest.param(False, 0.5, 4, 3, "TIMEOUT", [0.5], _FAILED, id="delay-past-deadline"),
+        pytest.param(False, (0.5,), 4, 3, "TIMEOUT", [0.5], _FAILED, id="delay-past-deadline"),
         # The call budget is spent: the certain refusal comes without a wait.
-        pytest.param(False, 0.5, 1, 3, "PROVIDER_CALLS_EXHAUSTED", [], _FAILED, id="delay-past-deadline-at-call-cap"),
+        pytest.param(False, (0.5,), 1, 3, "PROVIDER_CALLS_EXHAUSTED", [], _FAILED, id="delay-past-deadline-at-call-cap"),
+        pytest.param(False, (None,), 1, 3, "PROVIDER_CALLS_EXHAUSTED", [], _FAILED, id="delay-fits-at-call-cap"),
+        # The refusal comes from the final attempt's loop head, not past the loop.
+        pytest.param(False, (0.5,), 1, 2, "PROVIDER_CALLS_EXHAUSTED", [], _FAILED, id="call-cap-before-final-attempt"),
         # The delay fits but the 5 s call margin does not: no call is started.
-        pytest.param(False, 5.99, 4, 3, "TIMEOUT", [5.99], _FAILED, id="inside-call-margin"),
+        pytest.param(False, (5.99,), 4, 3, "TIMEOUT", [5.99], _FAILED, id="inside-call-margin"),
         # Exactly the delay plus the call margin: the retry is made.
-        pytest.param(False, 6.0, 4, 3, None, [1.0], [*_FAILED, ComposerLLMCallStatus.SUCCESS], id="delay-plus-margin-fits"),
+        pytest.param(False, (6.0,), 4, 3, None, [1.0], [*_FAILED, *_SUCCEEDED], id="delay-plus-margin-fits"),
         # The last attempt is never retried, so the provider error stands.
-        pytest.param(False, 0.5, 4, 1, "PROVIDER_ERROR", [], _FAILED, id="last-attempt"),
+        pytest.param(False, (0.5,), 4, 1, "PROVIDER_ERROR", [], _FAILED, id="last-attempt"),
+        # The second attempt waits 2 s, so its call margin ends 7 s before the deadline.
+        pytest.param(False, (None, 4.0), 4, 3, "TIMEOUT", [1.0, 4.0], _FAILED * 2, id="attempt-2-inside-call-margin"),
+        pytest.param(False, (None, 6.99), 4, 3, "TIMEOUT", [1.0, 6.99], _FAILED * 2, id="attempt-2-margin-edge"),
+        pytest.param(False, (None, 7.0), 4, 3, None, [1.0, 2.0], [*_FAILED, *_FAILED, *_SUCCEEDED], id="attempt-2-fits"),
         # On an escape-hatch turn the spent deadline is a time-out, not the
         # hatch's original exhaustion.
-        pytest.param(True, 0.5, 10, 3, "TIMEOUT", [0.5], [*_DISCOVERY, *_FAILED], id="hatch-delay-past-deadline"),
-        pytest.param(True, 3.0, 10, 3, "TIMEOUT", [3.0], [*_DISCOVERY, *_FAILED], id="hatch-inside-call-margin"),
-        pytest.param(True, 0.5, 3, 3, "DISCOVERY_EXHAUSTED", [], [*_DISCOVERY, *_FAILED], id="hatch-at-call-cap"),
+        pytest.param(True, (0.5,), 10, 3, "TIMEOUT", [0.5], [*_DISCOVERY, *_FAILED], id="hatch-delay-past-deadline"),
+        pytest.param(True, (3.0,), 10, 3, "TIMEOUT", [3.0], [*_DISCOVERY, *_FAILED], id="hatch-inside-call-margin"),
+        pytest.param(
+            True, (None, 4.0), 10, 3, "TIMEOUT", [1.0, 4.0], [*_DISCOVERY, *_FAILED, *_FAILED], id="hatch-attempt-2-inside-call-margin"
+        ),
+        pytest.param(True, (0.5,), 3, 3, "DISCOVERY_EXHAUSTED", [], [*_DISCOVERY, *_FAILED], id="hatch-at-call-cap"),
+        pytest.param(True, (None,), 3, 3, "DISCOVERY_EXHAUSTED", [], [*_DISCOVERY, *_FAILED], id="hatch-delay-fits-at-call-cap"),
     ],
 )
 async def test_planner_503_whose_retry_does_not_fit_ends_with_the_loop_head_outcome(
     tmp_path: Path,
     tool_context: ToolContext,
     hatch: bool,
-    remaining_after_failure: float,
+    remaining_after_failures: tuple[float | None, ...],
     max_total_provider_calls: int,
     max_api_attempts: int,
     code: str | None,
@@ -5460,13 +5477,16 @@ async def test_planner_503_whose_retry_does_not_fit_ends_with_the_loop_head_outc
     timeout_seconds = 60.0
     clock = {"now": 1_000.0}
     slept: list[float] = []
-    failing_call = 3 if hatch else 1
+    first_failing_call = 3 if hatch else 1
 
     class _ClockedCompletion(_ScriptedCompletion):
         async def __call__(self, **kwargs: Any) -> _Response | ModelResponse:
-            if len(self.requests) + 1 == failing_call:
-                # The failing call uses up the time, leaving exactly this much.
-                clock["now"] = 1_000.0 + timeout_seconds - remaining_after_failure
+            failure_index = len(self.requests) + 1 - first_failing_call
+            if 0 <= failure_index < len(remaining_after_failures):
+                remaining = remaining_after_failures[failure_index]
+                if remaining is not None:
+                    # The failing call uses up the time, leaving exactly this much.
+                    clock["now"] = 1_000.0 + timeout_seconds - remaining
             return await super().__call__(**kwargs)
 
     async def _advancing_sleep(delay: float) -> None:
@@ -5480,15 +5500,16 @@ async def test_planner_503_whose_retry_does_not_fit_ends_with_the_loop_head_outc
         "api_retry_base_seconds": 1.0,
         "timeout_seconds": timeout_seconds,
     }
+    failures = [failure] * len(remaining_after_failures)
     if hatch:
-        script = [_response(("list_sources", {})), _response(("list_sinks", {})), failure, proposal_reply]
+        script = [_response(("list_sources", {})), _response(("list_sinks", {})), *failures, proposal_reply]
         model_overrides |= {
             "max_discovery_turns": 1,
             "escape_hatch_model": "anthropic/claude-planner",
             "escape_hatch_provider": "test-provider",
         }
     else:
-        script = [failure, proposal_reply]
+        script = [*failures, proposal_reply]
     completion = _ClockedCompletion(*script)
     recorder = BufferingRecorder()
     retry_asyncio = SimpleNamespace(**(vars(asyncio) | {"sleep": _advancing_sleep}))
@@ -5511,6 +5532,14 @@ async def test_planner_503_whose_retry_does_not_fit_ends_with_the_loop_head_outc
             with pytest.raises(PipelinePlannerError) as caught:
                 await planning
             assert caught.value.code == code
+            if code == "PROVIDER_CALLS_EXHAUSTED" or (hatch and code == "DISCOVERY_EXHAUSTED"):
+                # The call-budget refusal is raised by the loop head, outside the
+                # provider failure's handler, so it carries no provider exception.
+                # On a hatch turn it is the context of the hatch's own exhaustion.
+                refusal = caught.value.__context__ if hatch else caught.value
+                assert isinstance(refusal, PipelinePlannerError)
+                assert refusal.code == "PROVIDER_CALLS_EXHAUSTED"
+                assert refusal.__context__ is None
     assert slept == pytest.approx(sleeps)
     assert len(completion.requests) == len(statuses)
     assert [call.status for call in recorder.llm_calls] == statuses

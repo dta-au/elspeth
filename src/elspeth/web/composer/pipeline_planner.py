@@ -4416,11 +4416,12 @@ async def _plan_pipeline_inner(
                         now=_planner_deadline_time(),
                         base_delay_seconds=model_config.api_retry_base_seconds,
                     )
+                    # With the call budget spent, the loop head's refusal is
+                    # certain: go straight to it, without a wait, so it is raised
+                    # there and carries no provider exception.
+                    call_budget_spent = total_calls >= budget_policy.max_total_provider_calls
                     if retry_delay is not None:
-                        if total_calls >= budget_policy.max_total_provider_calls:
-                            # Do not wait out a delay before a refusal that is already certain.
-                            raise PipelinePlannerError("planner provider call budget exhausted", code="PROVIDER_CALLS_EXHAUSTED") from None
-                        if retry_delay > 0:
+                        if retry_delay > 0 and not call_budget_spent:
                             await asyncio.sleep(retry_delay)
                         continue
                     if not provider_failure.rate_limited:
@@ -4430,12 +4431,10 @@ async def _plan_pipeline_inner(
                         # deadline. Under the Composer retry policy (1 s, then 2 s)
                         # the delay ceiling never applies here, so only the
                         # deadline declines it.
-                        if total_calls >= budget_policy.max_total_provider_calls:
-                            # Do not wait out the budget before a refusal that is already certain.
-                            raise PipelinePlannerError("planner provider call budget exhausted", code="PROVIDER_CALLS_EXHAUSTED") from None
-                        remaining = deadline - _planner_deadline_time()
-                        if remaining > 0:
-                            await asyncio.sleep(remaining)
+                        if not call_budget_spent:
+                            remaining = deadline - _planner_deadline_time()
+                            if remaining > 0:
+                                await asyncio.sleep(remaining)
                         continue
                 raise PipelinePlannerError(
                     f"planner provider call failed ({type(exc).__name__})",

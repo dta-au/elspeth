@@ -6293,8 +6293,8 @@ class TestComposerAvailabilityAndBadRequest:
             ({"retry-after-ms": "1500", "retry-after": "3"}, None, "success", 2, [1.5]),
             ({"retry-after-ms": "bad", "retry-after": "3"}, None, "success", 2, [3.0]),
             ({"retry-after": "bad"}, None, "success", 2, [1.0]),
-            # A Retry-After shorter than the step waits the step. Delta-seconds are
-            # whole, so a shorter header arrives as milliseconds.
+            # A Retry-After shorter than the step waits the step. This row sends it in
+            # milliseconds; "retry-after: 0" or a near HTTP date are other routes.
             ({"retry-after-ms": "500"}, None, "success", 2, [1.0]),
             ({}, None, "exhausted", 3, [1.0, 2.0]),
             # The 30 s ceiling admits a Retry-After of exactly 30 s and refuses 31 s.
