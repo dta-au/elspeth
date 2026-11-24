@@ -3827,11 +3827,34 @@ class TestValidationErrorRedaction:
         assert candidate not in resp.text
         assert "<redacted-secret>" in resp.text
 
-    def test_malformed_url_in_request_is_a_fixed_value_free_refusal(self, tmp_path) -> None:
+    def test_malformed_url_without_credential_material_is_not_a_credential_refusal(self, tmp_path) -> None:
+        # Admission treats text the URL parser rejects as text: with no userinfo
+        # or credential parameter in it, it is not credential material.
         from elspeth.web.auth.models import UserIdentity
 
         client = self._authed_client(tmp_path)
-        candidate = "http://["
+        identity = UserIdentity(user_id="test-user", username="test-user")
+
+        with (
+            patch("elspeth.web.auth.admin_routes.get_current_user", autospec=True, return_value=identity),
+            patch("elspeth.web.auth.admin_routes.can_manage_local_accounts", autospec=True, return_value=True),
+        ):
+            resp = client.request(
+                "DELETE",
+                "/api/auth/admin/users/another-user",
+                headers={"X-Request-ID": "malformed-url-admitted"},
+                json={"reason": "http://["},
+            )
+
+        assert resp.status_code != 422, resp.text
+        assert "credential_material_rejected" not in resp.text
+
+    def test_malformed_url_with_userinfo_in_request_is_a_fixed_value_free_refusal(self, tmp_path) -> None:
+        from elspeth.web.auth.models import UserIdentity
+
+        client = self._authed_client(tmp_path)
+        # The URL parser rejects the bracket; the raw-text userinfo check still finds the credential.
+        candidate = "http://[operator:" + "hunter2" + "@db.example"
         identity = UserIdentity(user_id="test-user", username="test-user")
 
         with (
