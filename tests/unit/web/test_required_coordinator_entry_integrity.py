@@ -11,6 +11,7 @@ from fastapi import HTTPException
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
+from elspeth.web.coordination.contracts import CloseReleaseOutcome
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.required_work import RequiredAuthorityKind, RequiredWorkAuthority, RequiredWorkCoordinator
 from elspeth.web.sessions import composer_turn
@@ -61,6 +62,10 @@ class _Authority:
         self.releases.append(context)
         if self.release_error is not None:
             raise self.release_error
+
+    def release_at_close(self, context: SessionOperationContext) -> CloseReleaseOutcome:
+        self.release(context)
+        return CloseReleaseOutcome.RELEASED_LIVE
 
     def renew(self, context: SessionOperationContext, *, lease_seconds: int) -> SessionOperationContext:
         return context
