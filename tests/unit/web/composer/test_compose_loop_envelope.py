@@ -122,7 +122,18 @@ ENVELOPE_MAX_PROMPT_TOKENS_TRIVIAL_PROMPT = 50_000
 # caching reduces the provider's billable token accounting, not the bytes
 # we send. This envelope is a pure regression gate, independent of
 # whether prompt caching is wired.
-ENVELOPE_MAX_PRODUCTION_BYTES_TRIVIAL_PROMPT = 300_000
+#
+# Rebaselined 2026-11-24 by the measured growth of the largest turn (+374 B,
+# 299,998 → 300,372): the explicit-approval teaching (its narrow-change rule
+# and the set_pipeline and splice_transform conditions) and the
+# splice_transform description's whole-pipeline condition.
+# Rebaselined 2026-11-24 by the measured growth of the largest turn (+88 B,
+# 300,372 → 300,460): the approval passage says the condition is not a
+# closed list (other changes refuse an invalid node configuration).
+# Rebaselined 2026-11-25 by the measured growth of the largest turn (+69 B,
+# 300,460 → 300,529): the approval passage and the splice_transform
+# description say a splice may repair errors that were there before it.
+ENVELOPE_MAX_PRODUCTION_BYTES_TRIVIAL_PROMPT = 300_531
 
 # Keep the existing two-payload allowance for catalog discovery followed by a
 # concrete clarification. The scenario has two legitimate provider transitions;
@@ -136,6 +147,14 @@ def _serialize_call(messages: Any, tools: Any) -> int:
 
     payload = {"messages": messages, "tools": tools}
     return len(json.dumps(payload, default=str).encode("utf-8"))
+
+
+def _within_production_byte_envelope(per_turn_byte_sizes: Sequence[int]) -> bool:
+    """The production byte gate: every turn under the per-turn cap and the run under the total cap."""
+    return (
+        all(size <= ENVELOPE_MAX_PRODUCTION_BYTES_TRIVIAL_PROMPT for size in per_turn_byte_sizes)
+        and sum(per_turn_byte_sizes) <= ENVELOPE_MAX_PRODUCTION_BYTES_ROOTLESS_RECOVERY
+    )
 
 
 @dataclass(frozen=True)
@@ -318,8 +337,7 @@ class TestEnvelopeHarness:
         """
         run = await _run_envelope(_ROOTLESS_TRIVIAL_SCRIPT)
         total_bytes = sum(run.per_turn_byte_sizes)
-        assert all(size <= ENVELOPE_MAX_PRODUCTION_BYTES_TRIVIAL_PROMPT for size in run.per_turn_byte_sizes)
-        assert total_bytes <= ENVELOPE_MAX_PRODUCTION_BYTES_ROOTLESS_RECOVERY, (
+        assert _within_production_byte_envelope(run.per_turn_byte_sizes), (
             f"Trivial first-turn creation emitted {total_bytes} bytes of "
             f"messages+tools across {len(run.per_turn_byte_sizes)} turns "
             f"({run.per_turn_byte_sizes}); exceeded named envelope "
@@ -435,3 +453,27 @@ class TestEnvelopeHarnessSelfTests:
             "but neither the envelope assertion nor the turn ceiling fired. "
             "The harness would not catch the original elspeth-4e79436719 regression."
         )
+
+    def test_byte_sensor_measures_the_payload_and_the_gate_fires_over_each_cap(self) -> None:
+        # The sensor counts the bytes it is given: a larger message measures larger by exactly the added bytes.
+        small = _serialize_call([{"role": "user", "content": "x"}], [])
+        assert small > 0
+        assert _serialize_call([{"role": "user", "content": "x" * 1_001}], []) == small + 1_000
+        # It counts the tool block too: a tool definition adds at least its own bytes.
+        assert _serialize_call([{"role": "user", "content": "x"}], [{"description": "y" * 1_000}]) > small + 1_000
+        # The gate passes at each cap and fails one byte over it.
+        per_turn_cap = ENVELOPE_MAX_PRODUCTION_BYTES_TRIVIAL_PROMPT
+        assert _within_production_byte_envelope((per_turn_cap,))
+        assert not _within_production_byte_envelope((per_turn_cap + 1,))
+        turns = ENVELOPE_MAX_PRODUCTION_BYTES_ROOTLESS_RECOVERY // per_turn_cap + 1
+        at_total = (per_turn_cap,) * (turns - 1) + (ENVELOPE_MAX_PRODUCTION_BYTES_ROOTLESS_RECOVERY - per_turn_cap * (turns - 1),)
+        assert sum(at_total) == ENVELOPE_MAX_PRODUCTION_BYTES_ROOTLESS_RECOVERY and max(at_total) <= per_turn_cap
+        assert _within_production_byte_envelope(at_total)
+        assert not _within_production_byte_envelope((*at_total, 1))
+
+    @pytest.mark.asyncio
+    async def test_the_measured_turns_are_the_real_payload(self) -> None:
+        # A sensor that stopped measuring would report tiny turns; the real
+        # trivial-prompt payload is the skill plus tool definitions, far above this floor.
+        run = await _run_envelope(_ROOTLESS_TRIVIAL_SCRIPT)
+        assert min(run.per_turn_byte_sizes) > ENVELOPE_MAX_PRODUCTION_BYTES_TRIVIAL_PROMPT // 2
