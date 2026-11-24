@@ -49,7 +49,7 @@ from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.composer import yaml_generator
-from elspeth.web.composer.audit import CREDENTIAL_REFUSAL_ERROR_MESSAGE, build_canonicalization_sentinel
+from elspeth.web.composer.audit import CREDENTIAL_REFUSAL_ERROR_MESSAGE
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import redact_source_storage_path
@@ -772,16 +772,10 @@ def create_server(
             arguments_hash = stable_hash(arguments)
             canonicalization_failed: BaseException | None = None
         except (ValueError, TypeError) as canon_exc:
-            # Shared sentinel discipline (see web.composer.audit
-            # build_canonicalization_sentinel docstring): captures
-            # type-name + ``str(exc)`` only for the base rfc8785
-            # CanonicalizationError (its messages are type/rule strings;
-            # the domain subclasses echo the value) + sorted top-level
-            # argument keys.
-            # Audit-trail forensic fingerprint without leak risk.
-            sentinel = build_canonicalization_sentinel(canon_exc, arguments)
-            arguments_canonical = canonical_json(sentinel)
-            arguments_hash = stable_hash(sentinel)
+            # Store only the argument-error class and top-level field count.
+            projection = arg_error_arguments_projection(error_class=type(canon_exc).__name__, field_count=len(arguments))
+            arguments_canonical = canonical_json(projection)
+            arguments_hash = stable_hash(projection)
             canonicalization_failed = canon_exc
 
         result_dict: dict[str, Any] | None = None
@@ -797,6 +791,12 @@ def create_server(
         clear_session_after_audit = False
         checkout_refused = False
 
+        def _store_value_free_arguments(error_class: str) -> None:
+            nonlocal arguments_canonical, arguments_hash
+            projection = arg_error_arguments_projection(error_class=error_class, field_count=len(arguments))
+            arguments_canonical = canonical_json(projection)
+            arguments_hash = stable_hash(projection)
+
         def _argument_error_result(exc: BaseException, category: ToolArgumentErrorCategory) -> CallToolResult:
             nonlocal status, error_class, error_category, error_message, error_payload_for_audit
             # Bad LLM arguments only. ToolArgumentError messages are
@@ -805,6 +805,7 @@ def create_server(
             # uses class-name only to avoid echoing raw argument values.
             status = ComposerToolStatus.ARG_ERROR
             error_class = type(exc).__name__
+            _store_value_free_arguments(error_class)
             error_category = category
             error_message = type(exc).__name__
             # Build a structured payload so the LLM and the audit row
@@ -899,9 +900,7 @@ def create_server(
                 error_class = type(exc).__name__
                 error_category = ToolArgumentErrorCategory.CREDENTIAL_MATERIAL
                 error_message = CREDENTIAL_REFUSAL_ERROR_MESSAGE
-                projection = arg_error_arguments_projection(error_class=error_class, field_count=len(arguments))
-                arguments_canonical = canonical_json(projection)
-                arguments_hash = stable_hash(projection)
+                _store_value_free_arguments(error_class)
                 raise
             except Exception as exc:
                 _capture_plugin_crash(exc)
@@ -978,8 +977,8 @@ def create_server(
                 # is our own handler's output, so an un-canonicalizable
                 # value is a bug in our code — reclassify as PLUGIN_CRASH
                 # and re-raise after the audit row lands, never substitute
-                # synthesized evidence under a SUCCESS status. The sentinel
-                # form is reserved for the Tier-3 *arguments* path above.
+                # synthesized evidence under a SUCCESS status. Argument
+                # canonicalization failures use the value-free projection above.
                 try:
                     result_canonical = canonical_json(result_dict)
                     result_hash = stable_hash(result_dict)
