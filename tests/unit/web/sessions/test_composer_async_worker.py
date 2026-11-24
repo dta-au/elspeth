@@ -833,8 +833,12 @@ async def _poll_loop_reaping_one_lease(tmp_path, monkeypatch, *, fault: str):
     own = fault in ("own_lapsed", "own_lapsed_committed")
     listed = record
     if own:
-        # The listing reports this instance as the job's claim owner, with a
-        # complete claim: token, expiry and a first attempt.
+        # The listing reports this instance as the job's claim owner. This is
+        # the queued claimed shape (token, owner, expiry, first attempt), not
+        # the running shape list_expired_running returns: the reap routing
+        # reads only the claim owner and request id. The committed case's
+        # real settle_unstarted write stands in for the settlement's commit;
+        # the real committed state is covered by the PostgreSQL test.
         listed = replace(
             record,
             claim_token_present=True,

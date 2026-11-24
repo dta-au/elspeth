@@ -1379,8 +1379,9 @@ async def _assert_renewal_error_escalates(
     """Inject ``error`` and return how many renewal attempts ran before the lease was lost.
 
     ``lease_seconds_per_attempt`` advances the lifecycle's clock by that much
-    inside every renewal attempt after the injection (the fixture counts the
-    attempt in its renew SQL), so on the lifecycle's clock each failed attempt
+    inside every renewal attempt that raises the injected error (the fixture
+    counts each one in its renew SQL; a renewal that succeeds around the
+    injection is not counted), so on the lifecycle's clock each failed attempt
     takes that long. Lease headroom then runs out on a fixed attempt whatever
     the host load, while the database lease never actually lapses and the
     release still succeeds.
@@ -1391,11 +1392,11 @@ async def _assert_renewal_error_escalates(
         service, execution_fixture, session_id=session_id, renew_interval_seconds=renew_interval_seconds, lease_seconds=lease_seconds
     )
     worker_shutdown_event = await _submit_canonical_execute(service, session_service, executor, lease)
-    attempts_before = authority.renew_attempts
+    failures_before = authority.renew_failures_injected
     real_monotonic = time.monotonic
 
     def lifecycle_clock() -> float:
-        return real_monotonic() + lease_seconds_per_attempt * (authority.renew_attempts - attempts_before)
+        return real_monotonic() + lease_seconds_per_attempt * (authority.renew_failures_injected - failures_before)
 
     with patch.object(lifecycle_module, "time", SimpleNamespace(monotonic=lifecycle_clock)):
         if one_shot:
@@ -1410,9 +1411,10 @@ async def _assert_renewal_error_escalates(
         lease.raise_if_lost()
     assert raised.value is error
     assert await asyncio.wait_for(run_sync_in_worker(worker_shutdown_event.wait, 5), timeout=6), "a lost lease must cancel the run"
-    attempts = authority.renew_attempts - attempts_before
+    attempts = authority.renew_failures_injected - failures_before
+    attempts_at_loss = authority.renew_attempts
     await asyncio.sleep(10 * renew_interval_seconds)
-    assert authority.renew_attempts - attempts_before == attempts, "renewal must stop once the lease is lost"
+    assert authority.renew_attempts == attempts_at_loss, "renewal must stop once the lease is lost"
 
     authority.renew_error = None
     await _finish_execute_run(lease, authority, executor)

@@ -18,6 +18,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web import async_workers
 from elspeth.web.coordination import lifecycle
+from elspeth.web.coordination.contracts import SessionOperationLeaseDisposition
 from elspeth.web.required_sql_outcomes import RequiredSQLRaised, RequiredSQLReturned
 from elspeth.web.required_work import (
     RequiredAuthorityKind,
@@ -119,6 +120,13 @@ async def test_a_fault_logging_a_renewal_retry_records_the_loss_before_it_escape
             await asyncio.wait({renewal})
         assert loss is transient and lease.renewal_error is transient, "the loss is recorded before the log fault escapes"
         assert renewal.exception() is log_fault, "the log fault is not suppressed"
+        # Renewal ended on the log fault, so close does not release: the fence
+        # stays until its expiry, the renewal error is raised and the lease is lost.
+        with pytest.raises(OperationalError) as closing:
+            await lease.close()
+        assert closing.value is transient
+        assert lease.disposition is SessionOperationLeaseDisposition.LOST
+        assert _read_actual_fence(engine, context).released_at is None
     finally:
         if not lease.closed:
             with suppress(Exception):
