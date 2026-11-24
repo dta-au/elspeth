@@ -14,7 +14,7 @@ from functools import partial
 from uuid import UUID
 
 import structlog
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from starlette.applications import Starlette
 
 from elspeth.contracts.errors import AuditIntegrityError, ComposerOwnedSettlementFailure
@@ -89,6 +89,12 @@ _OWNER_UNSETTLED_LOGGED_LEAVES = 8
 _UNSETTLED_OWNERS_RETAINED = 1_024
 # A probe Task sleeps this long, repeatedly; waking this much later than asked
 # means some callback held the event loop, and is logged.
+# A poll whose reap or claim raises OperationalError (transient database
+# contention) is retried at the next scan, at most this many times in a row:
+# the same bound as session-lease renewal, the membership heartbeat and the
+# orphan sweeper. Past it, or on any other error, the loop ends and the
+# process is restarted.
+_POLL_MAX_CONSECUTIVE_TRANSIENT_FAILURES = 5
 _EVENT_LOOP_PROBE_SECONDS = 0.5
 _EVENT_LOOP_LAG_LOG_SECONDS = 1.0
 
@@ -347,11 +353,35 @@ class ComposerAsyncWorker:
     async def _loop(self) -> None:
         # Logging only; it holds no custody and ends with this loop.
         probe = asyncio.create_task(_probe_event_loop_lag(), name="composer-event-loop-probe")
+        consecutive_failures = 0
         try:
             while not self._stopping and not self._instance_draining.is_set():
                 self._wake.clear()
-                await self.reap_once()
-                await self._claim_once()
+                try:
+                    await self.reap_once()
+                    await self._claim_once()
+                except OperationalError as exc:
+                    # Each reap and claim statement is its own transaction and
+                    # leaves no local custody behind when it raises; a claim
+                    # whose commit outcome is unknown keeps its job queued, and
+                    # claim_next takes it again once its claim lease lapses.
+                    # exc_info is deliberately omitted: SQLAlchemy cause chains
+                    # carry the database URL.
+                    consecutive_failures += 1
+                    if consecutive_failures >= _POLL_MAX_CONSECUTIVE_TRANSIENT_FAILURES:
+                        slog.error(
+                            "composer_operation.worker_poll_escalating",
+                            exc_class=type(exc).__name__,
+                            consecutive_failures=consecutive_failures,
+                        )
+                        raise
+                    slog.warning(
+                        "composer_operation.worker_poll_retrying",
+                        exc_class=type(exc).__name__,
+                        consecutive_failures=consecutive_failures,
+                    )
+                else:
+                    consecutive_failures = 0
                 with suppress(TimeoutError):
                     await asyncio.wait_for(self._wake.wait(), timeout=self._scan_interval)
         finally:

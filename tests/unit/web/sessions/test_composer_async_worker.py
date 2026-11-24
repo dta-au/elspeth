@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from uuid import uuid4
 
 import pytest
+from sqlalchemy.exc import OperationalError
 
 from elspeth.contracts.composer_progress import ComposerProgressEvent
 from elspeth.web.auth.models import UserIdentity
@@ -15,6 +16,7 @@ from elspeth.web.composer.progress import ComposerProgressRegistry
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.process_recovery import ProcessRecovery
+from elspeth.web.process_watchdog_codec import RecoveryReason
 from elspeth.web.required_work import RequiredWorkSource, required_failure_leaves
 from elspeth.web.sessions import composer_async_worker as worker_module
 from elspeth.web.sessions.composer_async_worker import ComposerAsyncWorker
@@ -652,3 +654,91 @@ async def test_cancel_unclaimed_job_never_dispatches_provider(tmp_path) -> None:
         assert composer.calls == 0
     finally:
         engine.dispose()
+
+
+def _transient_claim_error() -> OperationalError:
+    return OperationalError("UPDATE composer_operations", {}, Exception("database is locked"))
+
+
+async def _poll_loop_with_claim_failures(tmp_path, monkeypatch, failures: list[BaseException]):
+    """Start a worker whose first ``len(failures)`` claim scans raise, in order.
+
+    Returns the admitted record, the worker, its watchdog, the authority and
+    the engine, plus the list of claim scans attempted.
+    """
+    app, service, engine, _composer = _file_app(tmp_path)
+    authority = ComposerAsyncOperationAuthority(
+        engine, owner_instance_id=service.session_operation_owner_instance_id, claim_lease_seconds=30
+    )
+    record = await _admit(app, service, authority, operation_id=str(uuid4()))
+    worker = _worker(app, authority)
+    actual_claim_next = authority.claim_next
+    scans: list[int] = []
+    pending = list(failures)
+
+    def claim_next(*, limit: int):
+        scans.append(limit)
+        if pending:
+            raise pending.pop(0)
+        return actual_claim_next(limit=limit)
+
+    monkeypatch.setattr(authority, "claim_next", claim_next)
+    worker.start()
+    return record, worker, worker._process_recovery.watchdog, authority, engine, scans
+
+
+async def _until(predicate, *, seconds: float = 10.0) -> bool:
+    deadline = asyncio.get_running_loop().time() + seconds
+    while not predicate():
+        if asyncio.get_running_loop().time() >= deadline:
+            return False
+        await asyncio.sleep(0.01)
+    return True
+
+
+@pytest.mark.asyncio
+async def test_poll_loop_survives_one_transient_claim_error(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    record, worker, watchdog, authority, engine, scans = await _poll_loop_with_claim_failures(
+        tmp_path, monkeypatch, [_transient_claim_error()]
+    )
+    try:
+
+        def completed() -> bool:
+            current = authority.get(session_id=record.session_id, operation_id=record.operation_id)
+            return current is not None and current.status == "completed"
+
+        settled = await _until(lambda: completed() or worker._loop_task.done())
+        assert not worker._loop_task.done(), f"one transient claim error ended the poll loop; recovery reasons {watchdog.reasons}"
+        assert settled and completed(), "the admitted job must still run after the transient error"
+        assert len(scans) >= 2
+        assert watchdog.reasons == [] and watchdog.signals == []
+    finally:
+        await worker.stop()
+        engine.dispose()
+
+
+async def _assert_poll_loop_escalates(tmp_path, monkeypatch, failures: list[BaseException]) -> int:
+    _record, worker, watchdog, _authority, engine, scans = await _poll_loop_with_claim_failures(tmp_path, monkeypatch, failures)
+    try:
+        assert await _until(lambda: worker._loop_task.done()), "the poll loop must end"
+        assert type(worker._loop_task.exception()) is type(failures[-1])
+        assert await _until(lambda: bool(watchdog.signals))
+        assert watchdog.reasons == [RecoveryReason.REQUIRED_WORKER_LOST]
+        return len(scans)
+    finally:
+        await worker.stop()
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_poll_loop_escalates_at_the_consecutive_transient_cap(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Five in a row: the bound shared with session-lease renewal, membership
+    # and the orphan sweeper.
+    scans = await _assert_poll_loop_escalates(tmp_path, monkeypatch, [_transient_claim_error() for _ in range(5)])
+    assert scans == 5
+
+
+@pytest.mark.asyncio
+async def test_poll_loop_escalates_on_one_non_transient_claim_error(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    scans = await _assert_poll_loop_escalates(tmp_path, monkeypatch, [RuntimeError("claim defect")])
+    assert scans == 1
