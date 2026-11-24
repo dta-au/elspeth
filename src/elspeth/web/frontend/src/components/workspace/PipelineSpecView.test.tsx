@@ -670,7 +670,7 @@ describe("PipelineSpecView", () => {
 
   it("renders a bound prompt filename through the shared Spec options renderer", () => {
     const blobId = "f976fd8b-4432-4f8f-bbc3-2d8a9f2114e0";
-    useBlobStore.setState({ activeSessionId: "session-1", blobs: [{ id: blobId, filename: "prompt.md", content_hash: "a".repeat(64) } as BlobMetadata] });
+    useBlobStore.setState({ activeSessionId: "session-1", listCurrent: true, blobs: [{ id: blobId, filename: "prompt.md", content_hash: "a".repeat(64) } as BlobMetadata] });
     useSessionStore.setState({ compositionState: makeComposition(7, { nodes: [{
       id: "classify", node_type: "transform", plugin: "llm", input: "raw", on_success: "out", on_error: null,
       options: { prompt_template: { blob_ref: blobId, mode: "inline_content", sha256: "a".repeat(64) } },

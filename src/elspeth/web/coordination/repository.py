@@ -99,6 +99,7 @@ from elspeth.web.coordination.quota_authority import (
     session_storage_bytes_on_connection,
 )
 from elspeth.web.coordination.run_start_permit_authority import RepositoryRunStartPermitAuthority
+from elspeth.web.coordination.upkeep_engine import LeaseUpkeepSiblingRefusal, LeaseUpkeepSiblingRefused
 from elspeth.web.sessions.composer_operation_preconditions import check_composer_operation_preconditions_on_connection
 from elspeth.web.sessions.composer_operations import (
     ComposerOperationClaim,
@@ -5033,10 +5034,26 @@ class _SessionOperationAuthorityRepository:
         *,
         quota_exceeded_recorder: Callable[[QuotaExceeded], None] = refuse_unrecorded_quota_exceeded,
         approval_supersession_recorder: Callable[[ApprovalSupersession], None] = refuse_unrecorded_approval_supersession,
+        lease_upkeep_authority: _SessionOperationAuthorityRepository | None = None,
     ) -> None:
+        if lease_upkeep_authority is not None:
+            if type(lease_upkeep_authority) is not type(self):
+                raise LeaseUpkeepSiblingRefused(LeaseUpkeepSiblingRefusal.WRONG_CLASS)
+            if lease_upkeep_authority.lease_upkeep_authority is not None:
+                raise LeaseUpkeepSiblingRefused(LeaseUpkeepSiblingRefusal.NESTED)
         self._engine = engine
         self._quota_exceeded_recorder = quota_exceeded_recorder
         self._approval_supersession_recorder = approval_supersession_recorder
+        self._lease_upkeep_authority = lease_upkeep_authority
+
+    @property
+    def lease_upkeep_authority(self) -> _SessionOperationAuthorityRepository | None:
+        """The same authority bound to the dedicated lease-upkeep pool, when wired.
+
+        ``create_app`` always wires it. Only lease renewal and plain release on
+        the lease-upkeep workers use it; every other verb stays on this authority.
+        """
+        return self._lease_upkeep_authority
 
     def _locked_transaction(self, session_id: str) -> AbstractContextManager[Connection]:
         """The dialect's same-session locked transaction (process + transaction lock).
@@ -6256,6 +6273,7 @@ class PostgresSessionOperationRepository(_SessionOperationAuthorityRepository):
         *,
         quota_exceeded_recorder: Callable[[QuotaExceeded], None] = refuse_unrecorded_quota_exceeded,
         approval_supersession_recorder: Callable[[ApprovalSupersession], None] = refuse_unrecorded_approval_supersession,
+        lease_upkeep_authority: PostgresSessionOperationRepository | None = None,
     ) -> None:
         if engine.dialect.name != "postgresql":
             raise ValueError("PostgresSessionOperationRepository requires PostgreSQL")
@@ -6263,6 +6281,7 @@ class PostgresSessionOperationRepository(_SessionOperationAuthorityRepository):
             engine,
             quota_exceeded_recorder=quota_exceeded_recorder,
             approval_supersession_recorder=approval_supersession_recorder,
+            lease_upkeep_authority=lease_upkeep_authority,
         )
 
     @contextmanager

@@ -234,6 +234,20 @@ def test_archived_admission_refuses_unfinished_runs(archived_pipeline, damage):
         db.close()
 
 
+def test_archive_version_refusal_precedes_settings_hash(archived_pipeline):
+    from elspeth.plugins.infrastructure.power_automate_nonlive import admit_power_automate_archive
+
+    _, url = archived_pipeline
+    db = LandscapeDB.from_url(url)
+    try:
+        with db.engine.begin() as connection:
+            connection.execute(update(runs_table).values(canonical_version="sha256-rfc8785-previous", config_hash="b" * 64))
+        with pytest.raises(AuditIntegrityError, match="power_automate_archive_canonical_version_invalid"):
+            admit_power_automate_archive(RecorderFactory.read_only(db), "old-run")
+    finally:
+        db.close()
+
+
 @pytest.mark.parametrize(
     "damage",
     ["settings_hash", "canonical_version", "node_hash", "source_file_hash", "plugin_version", "source_config_hash", "source_lifecycle"],

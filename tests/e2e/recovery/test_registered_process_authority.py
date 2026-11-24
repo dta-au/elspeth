@@ -22,6 +22,7 @@ from sqlalchemy import event, select
 from elspeth.contracts import PipelineRow
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.errors import AuditIntegrityError, RunLeadershipLostError, RunMembershipLostError
+from elspeth.contracts.hashing import CANONICAL_VERSION
 from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkStatus
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
@@ -48,6 +49,7 @@ from tests.e2e.recovery.harness import (
 )
 from tests.e2e.recovery.test_follower_join_and_drain import (
     _join_follower,
+    _join_inputs,
     _seat_run_with_live_leader,
     _seed_ready_row,
 )
@@ -312,6 +314,7 @@ def _join_follower_process(
             run_id=run_id,
             settings=types.SimpleNamespace(),  # type: ignore[arg-type]  # resolved settings are patched at this process boundary
             window_seconds=10**9,
+            **_join_inputs(),
         )
     Path(worker_id_path).write_text(member_token.worker_id, encoding="utf-8")
 
@@ -352,7 +355,7 @@ def _begin_run_with_registered_leader_process(
     prepare_for_run()
     run = RecorderFactory(db).run_lifecycle.begin_run(
         config={"process_authority": True},
-        canonical_version="v1",
+        canonical_version=CANONICAL_VERSION,
         run_id=run_id,
         openrouter_catalog_sha256="0" * 64,
         openrouter_catalog_source="bundled",

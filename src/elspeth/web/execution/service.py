@@ -41,6 +41,7 @@ from sqlalchemy.exc import DBAPIError, DisconnectionError, InterfaceError, Opera
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
 from elspeth.config_loading import load_settings_from_config_dict, load_settings_from_yaml_string
+from elspeth.contracts import hashing
 from elspeth.contracts.audit import SecretResolutionInput
 from elspeth.contracts.aws_s3 import S3ProfiledAuditIdentities
 from elspeth.contracts.aws_textract import TextractProfiledAuditIdentities
@@ -51,7 +52,7 @@ from elspeth.contracts.cli import ProgressEvent
 from elspeth.contracts.enums import CallType, NodeStateStatus, RunStatus, is_llm_authored_creation_modality
 from elspeth.contracts.errors import AuditIntegrityError, GracefulShutdownError, IncompleteSourceResumeError
 from elspeth.contracts.freeze import deep_thaw
-from elspeth.contracts.hashing import CANONICAL_VERSION, stable_hash
+from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.plugin_capabilities import PluginCapability
 from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
 from elspeth.contracts.plugin_semantics import SemanticOutcome, UnknownSemanticPolicy
@@ -1586,7 +1587,7 @@ class ExecutionServiceImpl:
         return ApprovalGateInputs(
             evidence=_build_web_plugin_policy_evidence(snapshot=frozen.plugin_snapshot, policy=self._web_plugin_policy),
             config_hash=stable_hash(audit_config),
-            canonical_version=CANONICAL_VERSION,
+            canonical_version=hashing.CANONICAL_VERSION,
             openrouter_catalog_sha256=catalog_sha,
             runtime_val_manifest_sha256=runtime_val_manifest_sha256(),
         )
@@ -3309,7 +3310,6 @@ class ExecutionServiceImpl:
 
     async def _materialize_durable_cancellation(self, run: RunRecord, lease: SessionOperationLease) -> None:
         from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, mint_worker_id
-        from elspeth.contracts.hashing import CANONICAL_VERSION
         from elspeth.core.landscape.run_start_admission import RunStartAdmissionRepository, RunStartAdmissionState
         from elspeth.web.coordination.contracts import StartPermitState
         from elspeth.web.execution.envelope import EnvelopeRecoveryReason
@@ -3346,7 +3346,7 @@ class ExecutionServiceImpl:
                 repositories.run_lifecycle.materialize_cancelled_permit(
                     binding,
                     config,
-                    CANONICAL_VERSION,
+                    hashing.CANONICAL_VERSION,
                     openrouter_catalog_sha256=cancellation.openrouter_catalog_sha256,
                     openrouter_catalog_source=cancellation.openrouter_catalog_source,
                     initiated_by_user_id=cancellation.user_id,

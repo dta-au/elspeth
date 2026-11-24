@@ -3,6 +3,10 @@
 Extracted from Orchestrator (core.py) — these methods own:
 - ``_sequence_number``: monotonic counter for checkpoint ordering
 - ``_active_graph``: the current ExecutionGraph (late-bound at fire time)
+- ``_active_topology_hash``: the run's checkpoint topology hash, computed
+  when ``set_active_graph`` installs a graph and reused by every checkpoint of
+  that run (maintainer ruling 2026-11-20: the topology hash is fixed at run
+  start); every install or clear resets it
 - ``_checkpoint_manager``: persists checkpoints to the database
 - ``_checkpoint_config``: determines whether/how often to checkpoint
 
@@ -50,10 +54,23 @@ class CheckpointCoordinator:
         self._checkpoint_config = checkpoint_config
         self._sequence_number = 0
         self._active_graph: ExecutionGraph | None = None  # relocated from Orchestrator._current_graph; late-bound at fire time
+        self._active_topology_hash: str | None = None
 
     def set_active_graph(self, graph: ExecutionGraph | None) -> None:
-        """Set (or clear) the active execution graph for late-bound checkpoint calls."""
+        """Set (or clear) the active execution graph for late-bound checkpoint calls.
+
+        Installing or clearing a graph discards the cached topology hash.
+        When checkpointing can write, installing a graph also hashes it here,
+        once: this is run start (maintainer ruling 2026-11-20). A fresh run
+        installs immediately before its sequence-0 checkpoint; a resumed run
+        installs the graph that resume has just validated against the run's
+        latest checkpoint, before any plugin lifecycle code runs, so every
+        checkpoint of both segments stores the run-start hash.
+        """
         self._active_graph = graph
+        self._active_topology_hash = None
+        if graph is not None and self._checkpoint_config and self._checkpoint_config.enabled and self._checkpoint_manager is not None:
+            self._active_topology_hash = CheckpointCompatibilityValidator().compute_full_topology_hash(graph)
 
     def _checkpoint_gate(self, *, action: str) -> tuple[RuntimeCheckpointConfig, CheckpointManager, ExecutionGraph] | None:
         """Shared enabled/manager/graph precondition gate for checkpoint writes.
@@ -80,12 +97,24 @@ class CheckpointCoordinator:
         barrier_scalars: BarrierScalars | None,
         graph: ExecutionGraph,
     ) -> CheckpointDraft:
-        """Build persistence-ready checkpoint data at the topology boundary."""
+        """Build persistence-ready checkpoint data at the topology boundary.
+
+        The topology hash is fixed at run start (maintainer ruling
+        2026-11-20): ``set_active_graph`` computes it at install and every
+        draft of the run, including the graceful-shutdown checkpoint, reuses
+        it. It therefore records the configuration as of run start, as the
+        Landscape ``nodes`` rows do. The fallback below fills the cache only
+        for a graph that did not arrive through ``set_active_graph``.
+        """
+        topology_hash = self._active_topology_hash
+        if topology_hash is None:
+            topology_hash = CheckpointCompatibilityValidator().compute_full_topology_hash(graph)
+            self._active_topology_hash = topology_hash
         return CheckpointDraft(
             run_id=coordination_token.run_id,
             sequence_number=sequence_number,
             barrier_scalars=barrier_scalars,
-            upstream_topology_hash=CheckpointCompatibilityValidator().compute_full_topology_hash(graph),
+            upstream_topology_hash=topology_hash,
         )
 
     def reset_sequence(self) -> None:

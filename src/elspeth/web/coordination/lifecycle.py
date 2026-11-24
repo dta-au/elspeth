@@ -28,6 +28,7 @@ from elspeth.web.async_workers import (
     _retain_cancellation,
     outstanding_admissions,
     run_execution_lease_sql_finish_once,
+    run_lease_upkeep_in_worker,
     run_required_sql_finish_once,
     run_required_sql_in_worker,
     run_stream_read_in_worker,
@@ -43,6 +44,7 @@ from elspeth.web.coordination.contracts import (
     SessionOperationLeaseDisposition,
     SessionOperationTerminalOutcomeUnknown,
 )
+from elspeth.web.coordination.upkeep_engine import lease_upkeep_authority
 from elspeth.web.execution_lease_cleanup import ExecutionAcquisitionObligation
 from elspeth.web.required_sql_outcomes import RequiredSQLFinishOnce, RequiredSQLRaised
 from elspeth.web.required_work import RequiredWorkCoordinator, RequiredWorkSource, RequiredWorkTicket
@@ -333,7 +335,7 @@ async def _release_acquired_context(
     safe_context = _safe_cleanup_context(context)
     if safe_context is None:
         raise TypeError("acquired result does not contain a safe exact SessionOperationContext cleanup capability")
-    await run_stream_read_in_worker(authority.release, safe_context)
+    await run_lease_upkeep_in_worker(lease_upkeep_authority(authority).release, safe_context)
 
 
 async def _finish_cancelled_acquire(
@@ -378,7 +380,7 @@ async def _capture_adopt_release_error(
 ) -> BaseException | None:
     """Release an exact adopted context and return its failure, if any."""
     try:
-        await run_stream_read_in_worker(authority.release, context)
+        await run_lease_upkeep_in_worker(lease_upkeep_authority(authority).release, context)
     except BaseException as error:
         return error
     return None
@@ -488,6 +490,7 @@ class SessionOperationLease:
         "_renewal_task",
         "_required_work",
         "_stop_renewal",
+        "_upkeep_authority",
     )
 
     def __init__(
@@ -515,6 +518,7 @@ class SessionOperationLease:
         self._required_work = required_work
         self._renewal_ordinal = 0
         self._authority = authority
+        self._upkeep_authority = lease_upkeep_authority(authority)
         self._context = context
         self._lease_seconds = lease_seconds
         self._renew_interval_seconds = renew_interval_seconds
@@ -992,7 +996,9 @@ class SessionOperationLease:
             try:
                 if self._fork_authority is None:
                     if self._required_work is None:
-                        renewed = await run_stream_read_in_worker(self._authority.renew, self._context, lease_seconds=self._lease_seconds)
+                        renewed = await run_lease_upkeep_in_worker(
+                            self._upkeep_authority.renew, self._context, lease_seconds=self._lease_seconds
+                        )
                     else:
                         ticket = self._required_work.reserve(RequiredWorkSource.LEASE_RENEWAL, recurrence_ordinal=self._renewal_ordinal)
                         self._renewal_ordinal += 1
@@ -1020,8 +1026,8 @@ class SessionOperationLease:
                             raise contract_errors.AuditIntegrityError("Renewal attempt omitted its actual context")
                         renewed = attempt.returned
                 else:
-                    renewed = await run_stream_read_in_worker(
-                        self._authority.renew_fork_child_lease,
+                    renewed = await run_lease_upkeep_in_worker(
+                        self._upkeep_authority.renew_fork_child_lease,
                         self._fork_authority,
                         lease_seconds=self._lease_seconds,
                     )
@@ -1143,7 +1149,7 @@ class SessionOperationLease:
                     list(outcome.deferred_cancellations), [outcome.error] if type(outcome) is RequiredSQLRaised else []
                 )
             elif self._required_work is None:
-                await run_stream_read_in_worker(self._authority.release, self._context)
+                await run_lease_upkeep_in_worker(self._upkeep_authority.release, self._context)
             else:
                 ticket = self._required_work.prepare_lease_release()
                 await run_required_sql_in_worker(ticket, self._authority.release, self._context)

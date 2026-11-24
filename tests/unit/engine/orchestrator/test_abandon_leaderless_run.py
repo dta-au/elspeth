@@ -23,6 +23,7 @@ from elspeth.contracts import RunStatus
 from elspeth.contracts.checkpoint import CheckpointDraft, ResumeRefusalCause
 from elspeth.contracts.enums import TerminalPath
 from elspeth.contracts.errors import AbandonRefusedError
+from elspeth.contracts.hashing import CANONICAL_VERSION
 from elspeth.core.checkpoint import CheckpointManager
 from elspeth.core.checkpoint.recovery import NonResumableRunError
 from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
@@ -55,7 +56,7 @@ def _leaderless_run(
     expire_seat: bool = True,
 ) -> tuple[RecorderSetup, list[str]]:
     """RUNNING run + ``loading`` source + undecided tokens + active follower, leader seat lapsed."""
-    setup = make_recorder_with_run(run_id="run-leaderless", leader_worker_id=_LEADER_WORKER_ID)
+    setup = make_recorder_with_run(run_id="run-leaderless", canonical_version=CANONICAL_VERSION, leader_worker_id=_LEADER_WORKER_ID)
     setup.factory.run_lifecycle.record_run_source(
         source_node_id=setup.source_node_id,
         source_name="primary",
@@ -184,6 +185,16 @@ class TestInspectLeaderlessRun:
 
 
 class TestAbandonLeaderlessRun:
+    def test_different_canonical_version_can_be_abandoned(self) -> None:
+        setup, token_ids = _leaderless_run()
+        with setup.db.engine.begin() as conn:
+            conn.execute(update(runs_table).where(runs_table.c.run_id == setup.run_id).values(canonical_version="sha256-rfc8785-previous"))
+
+        outcome = abandon_leaderless_run(setup.db, setup.run_id)
+
+        assert outcome.run_status is RunStatus.INTERRUPTED
+        assert _abandoned_token_ids(setup) == sorted(token_ids)
+
     def test_finalizes_interrupted_abandons_undecided_tokens_and_vacates_the_seat(self) -> None:
         setup, token_ids = _leaderless_run()
 

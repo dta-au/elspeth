@@ -131,6 +131,52 @@ def test_audit_wait_does_not_block_event_loop_and_shutdown_drains_it() -> None:
     asyncio.run(scenario())
 
 
+def test_audit_is_refused_after_shutdown_starts_without_a_new_executor() -> None:
+    started = threading.Event()
+    release = threading.Event()
+    late_calls = 0
+
+    def record() -> str:
+        started.set()
+        assert release.wait(10)
+        return "recorded"
+
+    def late_record() -> str:
+        nonlocal late_calls
+        late_calls += 1
+        return "late"
+
+    async def scenario() -> None:
+        task = asyncio.create_task(async_workers.run_auth_audit_in_worker(record))
+        shutdown: asyncio.Task[None] | None = None
+        try:
+            await _wait_until(started.is_set)
+            shutdown = asyncio.create_task(async_workers.shutdown_async_workers())
+            await _wait_until(lambda: async_workers._SHARED_SHUTDOWN_STARTED)
+            assert not shutdown.done()
+            with pytest.raises(async_workers.RequiredGenerationUnavailable, match="Shared executor shutdown has started"):
+                await asyncio.wait_for(async_workers.run_auth_audit_in_worker(late_record), timeout=2)
+            assert async_workers._AUTH_AUDIT_WORKERS.executor is None
+            assert _audit_outstanding() == 1
+            release.set()
+            await asyncio.wait_for(shutdown, timeout=2)
+            assert await asyncio.wait_for(task, timeout=2) == "recorded"
+            assert late_calls == 0
+            await _wait_until(lambda: _audit_outstanding() == 0)
+        finally:
+            release.set()
+            try:
+                await asyncio.wait_for(task, timeout=5)
+            finally:
+                try:
+                    if shutdown is not None:
+                        await asyncio.wait_for(shutdown, timeout=5)
+                finally:
+                    await asyncio.wait_for(async_workers.shutdown_async_workers(), timeout=5)
+
+    asyncio.run(scenario())
+
+
 def test_audit_errors_propagate_and_capacity_recovers() -> None:
     def failed_audit() -> None:
         raise RuntimeError("audit persistence failed")

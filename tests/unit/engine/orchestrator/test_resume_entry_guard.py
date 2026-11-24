@@ -37,12 +37,14 @@ from typing import Any, cast
 from unittest.mock import patch
 
 import pytest
+from sqlalchemy import update
 
 from elspeth.contracts import Checkpoint, RunStatus
 from elspeth.contracts.checkpoint import ResumeRefusalCause
 from elspeth.contracts.errors import OrchestrationInvariantError
+from elspeth.contracts.hashing import CANONICAL_VERSION
 from elspeth.core.checkpoint.manager import CheckpointCorruptionError
-from elspeth.core.checkpoint.recovery import NonResumableRunError, check_run_status_resumable
+from elspeth.core.checkpoint.recovery import NonResumableRunError, RecoveryManager, check_run_status_resumable
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.schema import runs_table
 from elspeth.engine.orchestrator.resume import ResumeCoordinator
@@ -66,7 +68,7 @@ def _insert_run(db: LandscapeDB, run_id: str, *, status: RunStatus | str) -> Non
                 started_at=datetime.now(UTC),
                 config_hash=fake_sha256("cfg"),
                 settings_json="{}",
-                canonical_version="sha256-rfc8785-v1",
+                canonical_version=CANONICAL_VERSION,
                 status=status,
                 openrouter_catalog_sha256="0" * 64,
                 openrouter_catalog_source="bundled",
@@ -267,6 +269,41 @@ class TestCheckRunStatusResumable:
 
 
 class TestResumeEntryGuard:
+    @pytest.mark.parametrize("stale_format", [False, True])
+    def test_advisory_refuses_old_version_before_checkpoint_format(self, db: LandscapeDB, stale_format: bool) -> None:
+        run_id = "run-advisory-canonical-version"
+        _insert_run(db, run_id, status=RunStatus.FAILED)
+        with db.write_connection() as conn:
+            conn.execute(update(runs_table).where(runs_table.c.run_id == run_id).values(canonical_version="sha256-rfc8785-previous"))
+        latest = _latest_checkpoint(run_id) if stale_format else None
+        if latest is not None:
+            latest.format_version = -1
+        recovery = RecoveryManager(db, cast(Any, _StubCheckpointManager(latest)))
+
+        check = recovery.can_resume(run_id, cast(Any, None))
+
+        assert check.can_resume is False
+        assert check.cause is ResumeRefusalCause.CANONICAL_VERSION_CHANGED
+        assert check.reason == f"canonical version changed from 'sha256-rfc8785-previous' to {CANONICAL_VERSION!r}"
+
+    def test_different_canonical_version_refused_before_checkpoint_checks(self, db: LandscapeDB) -> None:
+        run_id = "run-canonical-version"
+        _insert_run(db, run_id, status=RunStatus.FAILED)
+        with db.write_connection() as conn:
+            conn.execute(update(runs_table).where(runs_table.c.run_id == run_id).values(canonical_version="sha256-rfc8785-previous"))
+        coordinator, checkpoints = _coordinator(db)
+
+        with pytest.raises(NonResumableRunError, match="canonical version") as exc_info:
+            coordinator.resume(
+                _resume_point_for(run_id),
+                cast(Any, None),
+                cast(Any, None),
+                payload_store=MockPayloadStore(),
+            )
+
+        assert exc_info.value.cause.value == "canonical_version_changed"
+        assert checkpoints.rebase_calls == []
+
     """resume() refusal semantics, pinned ahead of the first mutation."""
 
     def test_refuses_running_run_with_live_seat_before_rebase_sequence(self, db: LandscapeDB) -> None:

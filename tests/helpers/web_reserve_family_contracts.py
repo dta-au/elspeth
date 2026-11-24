@@ -847,6 +847,7 @@ def _lease_contracts():
                 assign(s("_required_work"), n("required_work")),
                 assign(s("_renewal_ordinal"), c(0)),
                 assign(s("_authority"), n("authority")),
+                assign(s("_upkeep_authority"), call("lease_upkeep_authority", n("authority"))),
                 assign(s("_context"), n("context")),
                 assign(s("_lease_seconds"), n("lease_seconds")),
                 assign(s("_renew_interval_seconds"), n("renew_interval_seconds")),
@@ -1133,8 +1134,8 @@ def _renew_contract():
                                                 n("renewed"),
                                                 await_(
                                                     call(
-                                                        "run_stream_read_in_worker",
-                                                        a(s("_authority"), "renew"),
+                                                        "run_lease_upkeep_in_worker",
+                                                        a(s("_upkeep_authority"), "renew"),
                                                         s("_context"),
                                                         lease_seconds=s("_lease_seconds"),
                                                     )
@@ -1216,8 +1217,8 @@ def _renew_contract():
                                         n("renewed"),
                                         await_(
                                             call(
-                                                "run_stream_read_in_worker",
-                                                a(s("_authority"), "renew_fork_child_lease"),
+                                                "run_lease_upkeep_in_worker",
+                                                a(s("_upkeep_authority"), "renew_fork_child_lease"),
                                                 s("_fork_authority"),
                                                 lease_seconds=s("_lease_seconds"),
                                             )
@@ -1900,6 +1901,7 @@ def family_local_contracts(units):
                     "_renewal_task",
                     "_required_work",
                     "_stop_renewal",
+                    "_upkeep_authority",
                 ),
                 ("final",),
             )

@@ -17,7 +17,6 @@ from tests.fixtures.process_watchdog import OwnedTestProcessWatchdog
 
 from elspeth.web import async_workers
 from elspeth.web.application_finalizers import ApplicationFinalizerOwner
-from elspeth.web.async_workers import run_sync_in_worker as real_run_sync_in_worker
 from elspeth.web.config import WebSettings
 from elspeth.web.coordination import membership_lifecycle as lifecycle_module
 from elspeth.web.coordination.contracts import CompatibilityKey, InstanceState
@@ -544,14 +543,12 @@ class TestRegisteredMembership:
         identity = _identity()
         calls = 0
 
-        async def contended_worker(func: Any, *args: Any, **kwargs: Any) -> Any:
+        def unavailable_heartbeat(self: RepositoryWebInstanceMembershipAuthority, instance_id: str, *, lease_seconds: int) -> None:
             nonlocal calls
-            if func == authority.heartbeat:
-                calls += 1
-                raise OperationalError("heartbeat", {}, Exception("database unavailable"))
-            return await real_run_sync_in_worker(func, *args, **kwargs)
+            calls += 1
+            raise OperationalError("heartbeat", {}, Exception("database unavailable"))
 
-        monkeypatch.setattr(lifecycle_module, "run_sync_in_worker", contended_worker)
+        monkeypatch.setattr(RepositoryWebInstanceMembershipAuthority, "heartbeat", unavailable_heartbeat)
         monkeypatch.setattr(lifecycle_module, "_HEARTBEAT_MAX_CONSECUTIVE_FAILURES", 3)
         membership = membership_factory(authority, identity, lease_seconds=30, interval_seconds=1)
         recovery_requested = asyncio.Event()

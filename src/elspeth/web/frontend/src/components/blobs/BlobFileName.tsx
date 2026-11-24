@@ -13,12 +13,9 @@ export function useBlobFilename(blobId: string): string | null {
 }
 
 /**
- * Read the active session's file list when a name is needed and the list was
- * never read for this session. Selecting a session, each Composer turn and
- * each run already read it, so in the app this is a fallback that fires at
- * most once: the read itself marks the list as this session's, so neither a
- * re-render nor a second mounted caller reads again. Only a complete list
- * can establish that a file is missing.
+ * Read the active session's file list when a name is needed and a read has
+ * yet to settle or start for this activation. A second mounted caller sees
+ * the running read and skips it. Only a complete list establishes absence.
  */
 export function useSessionFileList(needed: boolean): void {
   const sessionId = useSessionStore((state) => state.activeSessionId);
@@ -27,8 +24,9 @@ export function useSessionFileList(needed: boolean): void {
     if (!needed || sessionId === null) return;
     // The store as it is now, not as this render saw it: another caller may
     // have started the read in the same commit.
-    if (useBlobStore.getState().activeSessionId === sessionId) return;
-    void useBlobStore.getState().loadBlobs(sessionId);
+    const state = useBlobStore.getState();
+    if (state.activeSessionId === sessionId && (state.listCurrent || state.isLoading)) return;
+    void state.loadBlobs(sessionId);
   }, [needed, sessionId, listSessionId]);
 }
 
@@ -40,7 +38,7 @@ export function BlobFileName({ blobId, sha256, fallback, bare = false }: { blobI
       ? state.blobs.find((item) => item.id.toLowerCase() === blobId.toLowerCase())
       : undefined,
   );
-  const loading = useBlobStore((state) => sessionId === null || state.activeSessionId !== sessionId || state.isLoading);
+  const loading = useBlobStore((state) => sessionId === null || state.activeSessionId !== sessionId || !state.listCurrent || state.isLoading);
   const listIncomplete = useBlobStore((state) => sessionId !== null && state.activeSessionId === sessionId && state.listError !== null);
   if (blob === undefined) {
     const defaultName = loading ? "Loading file name…" : listIncomplete ? "File name unavailable" : "File not in this session";

@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 
 from elspeth.contracts import NodeType
+from elspeth.contracts.hashing import CANONICAL_VERSION
 
 
 @pytest.mark.parametrize("with_leader", [False, True])
@@ -238,6 +239,9 @@ class TestMakeRecorderWithRun:
         assert setup.source_node_id is not None
         assert setup.db is not None
         assert setup.factory is not None
+        run = setup.run_lifecycle.get_run(setup.run_id)
+        assert run is not None
+        assert run.canonical_version == CANONICAL_VERSION
 
     def test_explicit_run_id(self) -> None:
         from tests.fixtures.landscape import make_recorder_with_run

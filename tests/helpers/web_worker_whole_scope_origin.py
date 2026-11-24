@@ -18,7 +18,7 @@ TURN = "src/elspeth/web/sessions/composer_turn.py"
 # The complete app body now mounts the owner-scoped prompt-text router beside
 # the existing blob router; worker construction and admission stay in place.
 GRAMMARS = {
-    "_create_app": "eb9ae693fcf5e6151c8f612e8811e9d3e51810b3a302d985d0520f53141dadf4",
+    "_create_app": "25183b8434c86b7f3949da1b61762064706836b62a5c2370b3e72f070616ea64",
     "ComposerAsyncWorker._run_started_under_lease": "daf38d630a65beb59e65af3a81a44ee074492814371c532a285113ad897c2b68",
     "run_composer_turn": "3076e583c646de8005d6b1e20cd0df431c22384cd0ada0e9a96bf79b0aaae07a",
 }
