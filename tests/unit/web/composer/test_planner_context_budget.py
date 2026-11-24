@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import math
 import time
+from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -486,6 +487,67 @@ async def test_the_escape_hatch_request_sheds_its_conversation_context_and_keeps
     for call in recorder.llm_calls:
         assert call.context_budget is not None and call.context_budget.shed_history_indices == (1,)
         assert call.context_budget.shed_hatch_event_indices == ()
+
+
+def _hatch_context_limit() -> BaseException:
+    from litellm.exceptions import ContextWindowExceededError
+
+    return ContextWindowExceededError(message="prompt is too long", model="test/advisor", llm_provider="anthropic")
+
+
+def _hatch_proxy_413() -> BaseException:
+    from tests.unit.web.composer.test_request_too_large import mapped_provider_error
+
+    return mapped_provider_error("openai", 413)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cause", "reason", "source"),
+    [(_hatch_context_limit, "context_length_exceeded", "sdk_class"), (_hatch_proxy_413, "request_too_large", "http_status")],
+    ids=["context-limit", "http-413"],
+)
+async def test_an_escape_hatch_size_rejection_is_resent_once_with_every_earlier_turn_left_out(
+    tmp_path: Path, tool_context: ToolContext, cause: Callable[[], BaseException], reason: str, source: str
+) -> None:
+    context = _context(users={0: "Convert the data."}, assistants={1: "Which format do you want?"})
+    completion = _ScriptedCompletion(
+        _response_with_call_id("state", "get_pipeline_state", {}),
+        _response_with_call_id("sources", "list_sources", {}),
+        cause(),
+        _text_response("Please upload the input for JSON conversion."),
+    )
+    recorder = BufferingRecorder()
+    with pytest.raises(PlannerDeclined):
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            recorder=recorder,
+            intent="The latter.",
+            conversation_context=context,
+            model_overrides={
+                "model_identifier": _UNMARKED,
+                "max_discovery_turns": 1,
+                "escape_hatch_model": "test/advisor",
+                "escape_hatch_provider": "test-provider",
+            },
+        )
+
+    assert [request["model"] for request in completion.requests] == [_UNMARKED, _UNMARKED, "test/advisor", "test/advisor"]
+    rejected, resent = recorder.llm_calls[2], recorder.llm_calls[3]
+    assert rejected.status is ComposerLLMCallStatus.BAD_REQUEST_ERROR
+    assert (rejected.error_message, rejected.rejection_reason_source) == (reason, source)
+    assert rejected.context_budget is not None and resent.context_budget is not None
+    assert rejected.context_budget.surface == resent.context_budget.surface == "hatch"
+    assert rejected.context_budget.shed_history_indices == ()
+    # The resend leaves out every earlier turn; the rejected request is never sent unchanged.
+    assert resent.context_budget.retry_after_provider_rejection is True
+    assert resent.context_budget.shed_history_indices == (0, 1)
+    assert "conversation_context" in _payload(completion.requests[2])
+    sent = _payload(completion.requests[3])["conversation_context"]
+    assert sent["prior_user_requests"] == [] and "prior_assistant_messages" not in sent
+    assert (sent["additional_prior_user_requests_omitted"], sent["prior_assistant_messages_omitted"]) == (1, 1)
 
 
 @pytest.mark.asyncio
