@@ -46,17 +46,18 @@ changes land and is not a release.
 - The composer's main loop and planner now retry a provider 429 within the
   request's deadline, after 1 s and then 2 s. Where LiteLLM keeps the
   provider's Retry-After header, which was measured only on Bedrock, they wait
-  for it instead when it is 30 s or less; a longer Retry-After is not retried.
-  A quota or credit refusal arrives as an ordinary
-  429, so it is retried within the same bound before it is reported. On the
-  OpenAI and Anthropic routes a provider 500 and connection failures are still
-  not retried, because LiteLLM reports a failure to read an already billed
-  response the same way. On the OpenRouter route LiteLLM reports all of these
-  as a general API error, which was already retried before this release and
-  still is. On the Anthropic and Bedrock routes a 403 now tells the user to
-  check provider access. On the OpenAI and OpenRouter routes LiteLLM reports a
-  403 as a general API error, so it is still retried and reported as
-  unavailable.
+  for the longer of that header and the 1 s or 2 s step, when the header is
+  30 s or less; a longer Retry-After is not retried. A quota or credit refusal
+  arrives as an ordinary 429, so it is retried within the same bound before it
+  is reported. On the OpenAI and Anthropic routes a provider 500 and connection
+  failures are still not retried, because LiteLLM reports a failure to read an
+  already billed response the same way. On the OpenRouter route LiteLLM
+  reports all of these as a general API error, which was already retried
+  before this release and still is. On the Anthropic and Bedrock routes a 403
+  in the composer's main loop now tells the user to check provider access; the
+  planner still reports it as the provider being unavailable. On the OpenAI and
+  OpenRouter routes LiteLLM reports a 403 as a general API error, so it is
+  still retried and reported as unavailable.
 - When a planner reply was withheld because the cost of an earlier model call
   in the same request could not be confirmed, the notice blamed "the existing
   request limits". It now names that cause. The withheld-reply notice also no

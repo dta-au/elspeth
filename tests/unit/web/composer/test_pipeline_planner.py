@@ -5272,6 +5272,9 @@ async def test_each_transient_api_retry_consumes_and_audits_a_wire_attempt(
         ({"retry-after-ms": "1500", "retry-after": "3"}, "success", 2, [1.5]),
         ({"retry-after-ms": "bad", "retry-after": "3"}, "success", 2, [3.0]),
         ({"retry-after": "bad"}, "success", 2, [1.0]),
+        # A Retry-After shorter than the step waits the step. Delta-seconds are
+        # whole, so a shorter header arrives as milliseconds.
+        ({"retry-after-ms": "500"}, "success", 2, [1.0]),
         ({}, "exhausted", 2, [1.0]),
         # The 30 s ceiling admits a Retry-After of exactly 30 s and refuses 31 s.
         ({"retry-after": "30"}, "success", 2, [30.0]),
@@ -5279,15 +5282,27 @@ async def test_each_transient_api_retry_consumes_and_audits_a_wire_attempt(
         ({"retry-after": "6"}, "deadline", 1, []),
         ({}, "budget", 1, []),
     ],
-    ids=("seconds", "ms-wins", "malformed-ms", "malformed-seconds", "exhausted", "at-ceiling", "over-ceiling", "deadline", "budget"),
+    ids=(
+        "seconds",
+        "ms-wins",
+        "malformed-ms",
+        "malformed-seconds",
+        "below-step",
+        "exhausted",
+        "at-ceiling",
+        "over-ceiling",
+        "deadline",
+        "budget",
+    ),
 )
 async def test_planner_rate_limit_retries_after_header_and_records_both_physical_calls(
     tmp_path: Path, tool_context: ToolContext, headers: dict[str, str], scenario: str, calls: int, delays: list[float]
 ) -> None:
     rate_limit: Exception
     if scenario == "budget":
-        # LiteLLM's own in-process budget limiter raises this typed 429. A
-        # provider's 429 never carries the type: LiteLLM strips it on every route.
+        # A budget-typed 429 exists only inside the LiteLLM proxy server; it never
+        # reaches the Composer, which receives a plain 429 on every route. This row
+        # covers the classifier's handling of the typed form, hand-built.
         rate_limit = RateLimitError(
             message="private rate limit",
             llm_provider="bedrock",
@@ -5405,44 +5420,78 @@ async def test_planner_does_not_wait_out_a_retry_delay_before_a_certain_call_bud
     retry_sleep.assert_not_awaited()
 
 
+_DISCOVERY = [ComposerLLMCallStatus.SUCCESS, ComposerLLMCallStatus.SUCCESS]
+_FAILED = [ComposerLLMCallStatus.API_ERROR]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("remaining_after_failure", "max_total_provider_calls", "code", "calls"),
+    ("hatch", "remaining_after_failure", "max_total_provider_calls", "max_api_attempts", "code", "sleeps", "statuses"),
     [
-        # The 1 s delay exceeds the time left: the planner used to sleep to the
-        # deadline and its loop head refused there, on the call budget first.
-        pytest.param(0.5, 4, "TIMEOUT", 1, id="delay-past-deadline"),
-        pytest.param(0.5, 1, "PROVIDER_CALLS_EXHAUSTED", 1, id="delay-past-deadline-at-call-cap"),
-        # The delay fits but the call margin does not: the planner's own time-out.
-        pytest.param(5.99, 4, "TIMEOUT", 1, id="inside-call-margin"),
-        # Exactly the delay plus the 5 s call margin: the retry is made.
-        pytest.param(6.0, 4, None, 2, id="delay-plus-margin-fits"),
+        # The 1 s delay exceeds the time left: the planner sleeps to the deadline
+        # and its loop head refuses there.
+        pytest.param(False, 0.5, 4, 3, "TIMEOUT", [0.5], _FAILED, id="delay-past-deadline"),
+        # The call budget is spent: the certain refusal comes without a wait.
+        pytest.param(False, 0.5, 1, 3, "PROVIDER_CALLS_EXHAUSTED", [], _FAILED, id="delay-past-deadline-at-call-cap"),
+        # The delay fits but the 5 s call margin does not: no call is started.
+        pytest.param(False, 5.99, 4, 3, "TIMEOUT", [5.99], _FAILED, id="inside-call-margin"),
+        # Exactly the delay plus the call margin: the retry is made.
+        pytest.param(False, 6.0, 4, 3, None, [1.0], [*_FAILED, ComposerLLMCallStatus.SUCCESS], id="delay-plus-margin-fits"),
+        # The last attempt is never retried, so the provider error stands.
+        pytest.param(False, 0.5, 4, 1, "PROVIDER_ERROR", [], _FAILED, id="last-attempt"),
+        # On an escape-hatch turn the spent deadline is a time-out, not the
+        # hatch's original exhaustion.
+        pytest.param(True, 0.5, 10, 3, "TIMEOUT", [0.5], [*_DISCOVERY, *_FAILED], id="hatch-delay-past-deadline"),
+        pytest.param(True, 3.0, 10, 3, "TIMEOUT", [3.0], [*_DISCOVERY, *_FAILED], id="hatch-inside-call-margin"),
+        pytest.param(True, 0.5, 3, 3, "DISCOVERY_EXHAUSTED", [], [*_DISCOVERY, *_FAILED], id="hatch-at-call-cap"),
     ],
 )
 async def test_planner_503_whose_retry_does_not_fit_ends_with_the_loop_head_outcome(
     tmp_path: Path,
     tool_context: ToolContext,
+    hatch: bool,
     remaining_after_failure: float,
     max_total_provider_calls: int,
+    max_api_attempts: int,
     code: str | None,
-    calls: int,
+    sleeps: list[float],
+    statuses: list[ComposerLLMCallStatus],
 ) -> None:
     timeout_seconds = 60.0
     clock = {"now": 1_000.0}
+    slept: list[float] = []
+    failing_call = 3 if hatch else 1
 
     class _ClockedCompletion(_ScriptedCompletion):
         async def __call__(self, **kwargs: Any) -> _Response | ModelResponse:
-            # The provider call uses up the time, leaving exactly this much.
-            clock["now"] = 1_000.0 + timeout_seconds - remaining_after_failure
+            if len(self.requests) + 1 == failing_call:
+                # The failing call uses up the time, leaving exactly this much.
+                clock["now"] = 1_000.0 + timeout_seconds - remaining_after_failure
             return await super().__call__(**kwargs)
 
-    completion = _ClockedCompletion(
-        await provider_failure("openai", "503"),
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
-    )
+    async def _advancing_sleep(delay: float) -> None:
+        slept.append(delay)
+        clock["now"] += delay
+
+    proposal_reply = _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)}))
+    failure = await provider_failure("openai", "503")
+    model_overrides: dict[str, object] = {
+        "max_api_attempts": max_api_attempts,
+        "api_retry_base_seconds": 1.0,
+        "timeout_seconds": timeout_seconds,
+    }
+    if hatch:
+        script = [_response(("list_sources", {})), _response(("list_sinks", {})), failure, proposal_reply]
+        model_overrides |= {
+            "max_discovery_turns": 1,
+            "escape_hatch_model": "anthropic/claude-planner",
+            "escape_hatch_provider": "test-provider",
+        }
+    else:
+        script = [failure, proposal_reply]
+    completion = _ClockedCompletion(*script)
     recorder = BufferingRecorder()
-    retry_sleep = AsyncMock(spec=asyncio.sleep)
-    retry_asyncio = SimpleNamespace(**(vars(asyncio) | {"sleep": retry_sleep}))
+    retry_asyncio = SimpleNamespace(**(vars(asyncio) | {"sleep": _advancing_sleep}))
     with (
         patch.object(pipeline_planner, "_planner_deadline_time", lambda: clock["now"]),
         patch.object(pipeline_planner, "asyncio", retry_asyncio),
@@ -5453,18 +5502,18 @@ async def test_planner_503_whose_retry_does_not_fit_ends_with_the_loop_head_outc
             completion=completion,
             recorder=recorder,
             budget=_budget(max_total_provider_calls=max_total_provider_calls),
-            model_overrides={"max_api_attempts": 3, "api_retry_base_seconds": 1.0, "timeout_seconds": timeout_seconds},
+            model_overrides=model_overrides,
         )
         if code is None:
             proposal = await planning
             assert deep_thaw(proposal.proposal.pipeline) == _pipeline(tmp_path)
-            assert [call.args[0] for call in retry_sleep.await_args_list] == [1.0]
         else:
             with pytest.raises(PipelinePlannerError) as caught:
                 await planning
             assert caught.value.code == code
-            retry_sleep.assert_not_awaited()
-    assert len(completion.requests) == calls
+    assert slept == pytest.approx(sleeps)
+    assert len(completion.requests) == len(statuses)
+    assert [call.status for call in recorder.llm_calls] == statuses
 
 
 @pytest.mark.asyncio

@@ -4425,13 +4425,18 @@ async def _plan_pipeline_inner(
                         continue
                     if not provider_failure.rate_limited:
                         # A non-429 retry whose delay plus call margin does not fit
-                        # ends as the next loop head would: on the call budget
-                        # first, then on the deadline, without waiting. Under the
-                        # Composer retry policy (1 s, then 2 s) the delay ceiling
-                        # never applies here, so only the deadline declines it.
+                        # starts no call. It waits out the operation budget and the
+                        # loop head ends the run there, so callers see a spent
+                        # deadline. Under the Composer retry policy (1 s, then 2 s)
+                        # the delay ceiling never applies here, so only the
+                        # deadline declines it.
                         if total_calls >= budget_policy.max_total_provider_calls:
+                            # Do not wait out the budget before a refusal that is already certain.
                             raise PipelinePlannerError("planner provider call budget exhausted", code="PROVIDER_CALLS_EXHAUSTED") from None
-                        raise PipelinePlannerError("planner wall-clock budget exhausted", code="TIMEOUT") from None
+                        remaining = deadline - _planner_deadline_time()
+                        if remaining > 0:
+                            await asyncio.sleep(remaining)
+                        continue
                 raise PipelinePlannerError(
                     f"planner provider call failed ({type(exc).__name__})",
                     code="PROVIDER_ERROR",

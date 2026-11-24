@@ -6293,6 +6293,9 @@ class TestComposerAvailabilityAndBadRequest:
             ({"retry-after-ms": "1500", "retry-after": "3"}, None, "success", 2, [1.5]),
             ({"retry-after-ms": "bad", "retry-after": "3"}, None, "success", 2, [3.0]),
             ({"retry-after": "bad"}, None, "success", 2, [1.0]),
+            # A Retry-After shorter than the step waits the step. Delta-seconds are
+            # whole, so a shorter header arrives as milliseconds.
+            ({"retry-after-ms": "500"}, None, "success", 2, [1.0]),
             ({}, None, "exhausted", 3, [1.0, 2.0]),
             # The 30 s ceiling admits a Retry-After of exactly 30 s and refuses 31 s.
             ({"retry-after": "30"}, 60.0, "success", 2, [30.0]),
@@ -6300,7 +6303,18 @@ class TestComposerAvailabilityAndBadRequest:
             ({"retry-after": "6"}, 10.0, "deadline", 1, []),
             ({}, None, "budget", 1, []),
         ],
-        ids=("seconds", "ms-wins", "malformed-ms", "malformed-seconds", "exhausted", "at-ceiling", "over-ceiling", "deadline", "budget"),
+        ids=(
+            "seconds",
+            "ms-wins",
+            "malformed-ms",
+            "malformed-seconds",
+            "below-step",
+            "exhausted",
+            "at-ceiling",
+            "over-ceiling",
+            "deadline",
+            "budget",
+        ),
     )
     async def test_real_rate_limit_uses_bounded_retry_and_audits_each_call(
         self, headers: dict[str, str], budget_seconds: float | None, outcome: str, calls: int, delays: list[float]
@@ -6312,8 +6326,9 @@ class TestComposerAvailabilityAndBadRequest:
         service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
         failure: Exception
         if outcome == "budget":
-            # LiteLLM's own in-process budget limiter raises this typed 429. A
-            # provider's 429 never carries the type: LiteLLM strips it on every route.
+            # A budget-typed 429 exists only inside the LiteLLM proxy server; it never
+            # reaches the Composer, which receives a plain 429 on every route. This row
+            # covers the classifier's handling of the typed form, hand-built.
             failure = RateLimitError(
                 message="private rate limit",
                 model="bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0",

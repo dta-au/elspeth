@@ -3,13 +3,15 @@
 The Composer retries by exception class. Each row sends one failure through
 real ``litellm.acompletion`` (mock transport, no network) and pins the arriving
 class, whether the Composer retries it, and whether the provider's Retry-After
-reached the classifier. A failing row means the provider library's error shape
-changed: recheck retry safety before updating the row.
+reached the classifier. A failing row means either the provider library's
+error shape or the Composer's classification changed: recheck retry safety
+before updating the row.
 
 On the OpenAI, Anthropic and Bedrock routes, a failure to read an already
 billed response arrives in a class the Composer does not retry. On the
-OpenRouter route it does not: every one of these failures arrives as a general
-API error, which the Composer already retried before bounded 429 retries, so
+OpenRouter route it does not: a 500, a connection failure, a read failure and
+a malformed 200 all arrive as a general API error, which the Composer already
+retried before bounded 429 retries, so
 the OpenRouter rows pin existing retries of failures that may follow a billed
 response. They are not evidence that those retries are safe. A 403 also
 arrives as a general API error on the OpenAI and OpenRouter routes, so there
