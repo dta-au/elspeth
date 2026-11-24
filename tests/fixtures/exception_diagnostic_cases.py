@@ -11,6 +11,8 @@ from collections.abc import Mapping
 from contextlib import redirect_stderr
 from functools import partial
 from io import StringIO
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 from uuid import uuid4
 
@@ -98,6 +100,14 @@ def _exercise_join_not_ready_inherited() -> None:
     except errors.JoinRefusedError as error:
         assert error.run_id == "fixed-run"
         assert error.reason == "graph registration is pending"
+
+
+def _exercise_join_departure_failure() -> None:
+    from tests.unit.cli.test_refusal_causes import test_join_refusal_reports_departure_failure
+
+    with TemporaryDirectory() as temp_dir:
+        test_join_refusal_reports_departure_failure(Path(temp_dir), "json", "SQLAlchemyError: departure unavailable")
+        test_join_refusal_reports_departure_failure(Path(temp_dir), "console", "SQLAlchemyError: departure unavailable")
 
 
 def _exercise_structured(
@@ -468,6 +478,13 @@ DIAGNOSTIC_CASES = (
         "reason",
     ),
     *_text_cases(errors.JoinRefusedError, {"run_id": "fixed-run", "reason": "fixed-reason"}, "run_id", "reason"),
+    DiagnosticCase(
+        errors.JoinRefusedError,
+        frozenset({"departure_failure"}),
+        "operator",
+        "The CLI join refusal handler renders the departure failure in both output formats.",
+        _exercise_join_departure_failure,
+    ),
     DiagnosticCase(
         errors.JoinNotReadyError,
         frozenset(),

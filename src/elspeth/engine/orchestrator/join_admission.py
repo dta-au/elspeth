@@ -17,6 +17,8 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from sqlalchemy.exc import SQLAlchemyError
+
 from elspeth.contracts import RunStatus, hashing
 from elspeth.contracts import errors as contract_errors
 from elspeth.contracts.coordination import (
@@ -241,9 +243,9 @@ class JoinAdmissionService:
                 factory.run_coordination.depart_worker(member_token=token)
             except contract_errors.TIER_1_ERRORS as departure_error:
                 raise departure_error from refusal
-            except Exception as departure_error:
-                refusal.add_note(
-                    f"depart_worker failed for worker {token.worker_id!r}: {type(departure_error).__name__}: {departure_error}"
-                )
+            except SQLAlchemyError as departure_error:
+                if isinstance(refusal, JoinRefusedError):
+                    refusal.departure_failure = f"{type(departure_error).__name__}: {departure_error}"
+                raise refusal from departure_error
             raise
         return token

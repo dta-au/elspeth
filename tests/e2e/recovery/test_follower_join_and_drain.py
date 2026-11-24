@@ -50,6 +50,7 @@ from unittest.mock import patch
 
 import pytest
 from sqlalchemy import select, update
+from sqlalchemy.exc import SQLAlchemyError
 
 from elspeth.contracts import NodeType, RunStatus
 from elspeth.contracts.config import RuntimeRetryConfig
@@ -411,7 +412,9 @@ class TestJoinRunAdmissionRefusals:
                     conn.execute(update(runs_table).where(runs_table.c.run_id == run_id).values(status=RunStatus.RUNNING.value))
             return run
 
-        departure_error = AuditIntegrityError("departure integrity failure") if integrity_failure else ValueError("departure unavailable")
+        departure_error = (
+            AuditIntegrityError("departure integrity failure") if integrity_failure else SQLAlchemyError("departure unavailable")
+        )
         with (
             patch.object(RunLifecycleReadRepository, "get_run", resume_between_reads),
             patch.object(RunCoordinationRepository, "depart_worker", side_effect=departure_error),
@@ -433,7 +436,8 @@ class TestJoinRunAdmissionRefusals:
             assert "canonical version" in str(exc_info.value.__cause__)
         else:
             assert "canonical version" in str(exc_info.value)
-            assert any("departure unavailable" in note and rows[0].worker_id in note for note in exc_info.value.__notes__)
+            assert exc_info.value.departure_failure == "SQLAlchemyError: departure unavailable"
+            assert exc_info.value.__cause__ is departure_error
         crashed.db.close()
 
     def test_join_rechecks_graph_after_run_appears(self) -> None:

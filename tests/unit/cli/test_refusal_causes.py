@@ -38,6 +38,37 @@ def test_join_not_ready_has_distinct_json_event(tmp_path: Path) -> None:
     assert payload["run_id"] == "run-join"
 
 
+@pytest.mark.parametrize("output_format", ["json", "console"])
+@pytest.mark.parametrize("departure_failure", [None, "SQLAlchemyError: departure unavailable"])
+def test_join_refusal_reports_departure_failure(tmp_path: Path, output_format: str, departure_failure: str | None) -> None:
+    settings = _make_jsonl_settings(tmp_path)
+    initial = CliRunner().invoke(app, ["run", "-s", str(settings), "--execute"])
+    assert initial.exit_code == 0, initial.output
+    refusal = contract_errors.JoinRefusedError("run-join", "graph registration incomplete")
+    refusal.departure_failure = departure_failure
+    with patch.object(Orchestrator, "join_run", side_effect=refusal):
+        result = CliRunner().invoke(app, ["join", "run-join", "-s", str(settings), "--format", output_format])
+    assert result.exit_code == 1, result.output
+    if output_format == "json":
+        payload = json.loads(result.stderr)
+        assert payload["event"] == "join_refused"
+        assert payload["reason"] == "graph registration incomplete"
+        if departure_failure is None:
+            assert "departure_failed" not in payload
+            assert "departure_failure" not in payload
+        else:
+            assert payload["departure_failed"] is True
+            assert payload["departure_failure"] == departure_failure
+    else:
+        assert "graph registration incomplete" in result.stderr
+        if departure_failure is None:
+            assert "seat could not be released" not in result.stderr
+        else:
+            assert "seat could not be released" in result.stderr
+            assert "heartbeat expiry" in result.stderr
+            assert departure_failure in result.stderr
+
+
 def test_join_graph_build_failure_writes_no_follower_row(tmp_path: Path) -> None:
     settings = _make_jsonl_settings(tmp_path)
     initial = CliRunner().invoke(app, ["run", "-s", str(settings), "--execute"])

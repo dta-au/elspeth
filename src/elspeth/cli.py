@@ -4637,18 +4637,25 @@ def join(
             if output_format == "json":
                 import json as json_mod
 
+                refusal_event: dict[str, str | bool] = {
+                    "event": "join_not_ready" if isinstance(e, JoinNotReadyError) else "join_refused",
+                    "run_id": run_id,
+                    "reason": e.reason,
+                }
+                if e.departure_failure is not None:
+                    refusal_event["departure_failed"] = True
+                    refusal_event["departure_failure"] = e.departure_failure
                 typer.echo(
-                    json_mod.dumps(
-                        {
-                            "event": "join_not_ready" if isinstance(e, JoinNotReadyError) else "join_refused",
-                            "run_id": run_id,
-                            "reason": e.reason,
-                        }
-                    ),
+                    json_mod.dumps(refusal_event),
                     err=True,
                 )
             else:
                 typer.echo(f"Cannot join run {run_id}: {e.reason}", err=True)
+                if e.departure_failure is not None:
+                    typer.echo(
+                        f"Follower seat could not be released and will lapse at heartbeat expiry: {e.departure_failure}",
+                        err=True,
+                    )
             raise typer.Exit(1) from None
         except contract_errors.TIER_1_ERRORS:
             raise

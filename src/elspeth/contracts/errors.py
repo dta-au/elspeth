@@ -1209,9 +1209,10 @@ class JoinRefusedError(Exception):
     actionable filesystem-writability failure) without parsing text.
     """
 
-    def __init__(self, run_id: str, reason: str) -> None:
+    def __init__(self, run_id: str, reason: str, *, departure_failure: str | None = None) -> None:
         self.run_id = run_id
         self.reason = reason
+        self.departure_failure = departure_failure
         super().__init__(f"Cannot join run {run_id!r}: {reason}")
 
 
