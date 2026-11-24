@@ -1360,6 +1360,8 @@ def _fit_hatch_request(
         policy = _context_policy(max_prompt_tokens=math.ceil(size / _FALLBACK_RATIO / 0.7), max_request_bytes=1_000_000)
         assert policy.shed_to * policy.max_prompt_tokens < size / _FALLBACK_RATIO <= policy.shed_above * policy.max_prompt_tokens
     before = deepcopy(messages)
+    # Passed only when set, so the tests that do not set it also run against a base tree.
+    resend: dict[str, bool] = {"shed_all_history": True} if shed_all_history else {}
     applied, record = _fit_planner_context_budget(
         messages=messages,
         tools=[],
@@ -1371,7 +1373,7 @@ def _fit_hatch_request(
         model="test/advisor",
         earlier_calls=earlier_calls,
         mark_for_cache=False,
-        shed_all_history=shed_all_history,
+        **resend,
     )
     assert messages == before  # the caller's messages are never shed in place
     return applied, record, policy
