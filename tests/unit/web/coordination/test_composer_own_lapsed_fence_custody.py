@@ -109,12 +109,15 @@ def _settle(authority: ComposerAsyncOperationAuthority, sid: UUID, operation_id:
 def test_the_exact_lapsed_compose_fence_is_settled_and_released(store) -> None:
     engine, _repository, authority, sid = store
     operation_id, _context = _start_lapsed(store)
+    before = _fence_row(engine, sid)
 
     settled = _settle(authority, sid, operation_id)
 
     assert (settled.status, settled.settled_by) == ("failed", "settle_own_lapsed")
-    with engine.connect() as conn:
-        assert conn.execute(select(fences.c.released_at).where(fences.c.session_id == str(sid))).scalar_one() is not None
+    after = _fence_row(engine, sid)
+    assert after["released_at"] is not None
+    # The release never moves the lapsed deadline.
+    assert after["lease_expires_at"] == before["lease_expires_at"]
 
 
 @pytest.mark.parametrize("release", [True, False], ids=["reaper", "flagless"])
