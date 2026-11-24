@@ -102,6 +102,7 @@ from elspeth.contracts.coordination import (
     DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
     WorkerMembershipToken,
 )
+from elspeth.contracts.enums import RunStatus
 from elspeth.contracts.errors import AuditIntegrityError, FollowerSeatDeadError, RunMembershipLostError, RunWorkerEvictedError
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.engine.orchestrator.heartbeat import RunHeartbeatThread
@@ -231,15 +232,20 @@ class FollowerProcessor:
         self._clock = clock if clock is not None else DEFAULT_CLOCK
         self._span_factory = span_factory if span_factory is not None else SpanFactory()
         self._trace_started_at = trace_started_at
+        # The terminal status the last _run_is_terminal() read; None until a
+        # terminal read, and None when the run row was absent.
+        self._observed_terminal_status: RunStatus | None = None
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def run(self, ctx: PluginContext) -> None:
+    def run(self, ctx: PluginContext) -> RunStatus | None:
         """Start the heartbeat thread and drive the follower drain loop.
 
-        Returns normally when the run is terminal (depart + exit 0 semantics).
+        Returns normally when the run is terminal (depart + exit 0 semantics),
+        with the terminal run status the follower read, or ``None`` when the
+        run row was absent.
         Raises :class:`RunWorkerEvictedError` when the heartbeat thread detects
         eviction.  Propagates :class:`KeyboardInterrupt` after a clean depart.
 
@@ -250,8 +256,10 @@ class FollowerProcessor:
             and return.
 
         ``seat_dead``
-            Leader seat expired (heartbeat snapshot or direct poll).  Finish or
-            abandon the current claim, take no new claims, depart, return.
+            No live leader seat (heartbeat snapshot or direct poll).  If the run
+            is terminal (the leader released its seat after finalizing), depart
+            and return.  Otherwise depart and raise
+            :class:`FollowerSeatDeadError`.
 
         ``evicted``
             Heartbeat thread latched coordination-lost.  Caller receives
@@ -267,16 +275,15 @@ class FollowerProcessor:
         if self._trace_started_at is None:
             # Direct test construction predates telemetry-backed spans. The
             # production builder always supplies the durable run start below.
-            self._run_bound(ctx)
-            return
+            return self._run_bound(ctx)
 
         # Followers do not fabricate a leader/run parent. The scope binds the
         # joined run's durable trace identity so follower row spans are honest
         # roots in the same trace even though they execute in another process.
         with self._span_factory.trace_scope(self._token.run_id, self._trace_started_at):
-            self._run_bound(ctx)
+            return self._run_bound(ctx)
 
-    def _run_bound(self, ctx: PluginContext) -> None:
+    def _run_bound(self, ctx: PluginContext) -> RunStatus | None:
         """Drive the follower while any production trace scope is active."""
         heartbeat = RunHeartbeatThread(
             self._run_coordination,
@@ -300,12 +307,12 @@ class FollowerProcessor:
             # reporting a true eviction.
             if self._run_is_terminal():
                 logger.info(
-                    "follower %r: membership lost mid-drain but run %r is terminal (finalize-departure) — exiting cleanly",
+                    "follower %r: membership lost, run %r is terminal — exiting cleanly",
                     self._token.worker_id,
                     self._token.run_id,
                 )
                 terminal_exit = True
-                return
+                return self._observed_terminal_status
             # True eviction: leader's housekeeping sweep evicted us while the
             # run is still RUNNING (design case b). Report it as the eviction
             # it is (CLI exit 3), whichever fence observed it.
@@ -324,8 +331,20 @@ class FollowerProcessor:
             )
             raise
         except _SeatDeadError:
-            # The leader seat expired while we were draining. Depart cleanly,
-            # then raise FollowerSeatDeadError so the CLI can surface the
+            # No live leader seat. A leader that finished the run releases its
+            # seat after finalizing, so a follower that read RUNNING before the
+            # finish can find the seat gone with the run already terminal:
+            # recheck the run before reporting a dead leader.
+            if self._run_is_terminal():
+                logger.info(
+                    "follower %r: no live leader seat, run %r is terminal — exiting cleanly",
+                    self._token.worker_id,
+                    self._token.run_id,
+                )
+                terminal_exit = True
+                return self._observed_terminal_status
+            # The seat is gone while the run is still RUNNING. Depart, then
+            # raise FollowerSeatDeadError so the CLI can surface the
             # "use elspeth resume" guidance and exit with a distinct code
             # (design §B.1 step 5).
             raise FollowerSeatDeadError(
@@ -335,6 +354,7 @@ class FollowerProcessor:
         else:
             # Clean terminal exit.
             terminal_exit = True
+            return self._observed_terminal_status
         finally:
             try:
                 if terminal_exit:
@@ -409,7 +429,7 @@ class FollowerProcessor:
             if heartbeat.coordination_lost:
                 if self._run_is_terminal():
                     logger.info(
-                        "follower %r: heartbeat latch set + run %r is terminal (finalize-departure) — exiting cleanly",
+                        "follower %r: heartbeat latch set, run %r is terminal — exiting cleanly",
                         worker_id,
                         run_id,
                     )
@@ -462,14 +482,16 @@ class FollowerProcessor:
             self._wait_fn(self._idle_poll_seconds)
 
     def _run_is_terminal(self) -> bool:
-        """Return True when the run's status is no longer RUNNING."""
-        from elspeth.contracts.enums import RunStatus
-
+        """Return True when the run's status is no longer RUNNING, recording the status read."""
         run = self._factory.run_lifecycle.get_run(self._token.run_id)
         if run is None:
-            # Run disappeared — treat as terminal.
+            # Run disappeared — treat as terminal, with no status to report.
+            self._observed_terminal_status = None
             return True
-        return run.status != RunStatus.RUNNING
+        if run.status == RunStatus.RUNNING:
+            return False
+        self._observed_terminal_status = run.status
+        return True
 
     def _best_effort_depart(self) -> None:
         """Call depart_worker, recording operational DB failures during teardown.

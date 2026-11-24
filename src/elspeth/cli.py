@@ -24,7 +24,7 @@ from elspeth import __version__
 from elspeth.config_loading import load_settings
 from elspeth.contracts import ExecutionResult, SecretResolutionInput
 from elspeth.contracts.auth import AuthProviderType
-from elspeth.contracts.enums import RunMode
+from elspeth.contracts.enums import RunMode, RunStatus
 from elspeth.contracts.errors import (
     AbandonRefusedError,
     CommencementGateFailedError,
@@ -4762,6 +4762,7 @@ def join(
         # PluginContractViolation("Transform 'X' was called before on_start()")
         # on the first process() call.
         follower_run_entered = False
+        final_run_status: RunStatus | None = None
         started_follower_transforms: list[RowPlugin] = []
         started_follower_sinks: dict[str, SinkProtocol] = {}
         cleanup_pending_exc: BaseException | None = None
@@ -4778,7 +4779,7 @@ def join(
             )
 
             follower_run_entered = True
-            follower_proc.run(ctx)
+            final_run_status = follower_proc.run(ctx)
         except RunWorkerEvictedError as e:
             try:
                 _emit_worker_evicted_event(e, output_format)
@@ -4872,7 +4873,12 @@ def join(
                 started_sinks=started_follower_sinks,
             )
 
-        # Clean departure (run reached terminal state).
+        # Clean departure: the follower left a run it read as terminal. Exit 0
+        # reports the departure, not the run's outcome, so name the status read.
+        if final_run_status is None:
+            departure = "run is no longer recorded, departed cleanly"
+        else:
+            departure = f"run ended with status {final_run_status.value}, departed cleanly"
         if output_format == "json":
             import json as json_mod
 
@@ -4882,12 +4888,13 @@ def join(
                         "event": "departed",
                         "run_id": run_id,
                         "worker_id": worker_id,
-                        "message": "run completed, departed cleanly",
+                        "run_status": None if final_run_status is None else final_run_status.value,
+                        "message": departure,
                     }
                 )
             )
         else:
-            typer.echo(f"\nJoined run {run_id} as follower {worker_id}, run completed, departed cleanly.")
+            typer.echo(f"\nJoined run {run_id} as follower {worker_id}; {departure}.")
 
     except contract_errors.TIER_1_ERRORS as e:
         if output_format == "json":
