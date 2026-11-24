@@ -304,7 +304,7 @@ def test_replaced_web_owner_with_live_landscape_seat_cannot_start_later_sink_eff
             owner.wait_until_ready(timeout=60)
             with LandscapeDB.from_url(landscape_url, create_tables=False) as db:
                 before = _effect_snapshot(db, binding.run_id)
-                leader = RecorderFactory(db).run_coordination.live_leader(run_id=binding.run_id)
+                leader = RecorderFactory(db).run_coordination.seat_holder(run_id=binding.run_id)
                 assert leader is not None and leader.seat_live
             _expire_fence(engine, UUID(context.fence.session_id))
             with engine.connect() as conn:

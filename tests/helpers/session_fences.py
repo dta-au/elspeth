@@ -199,6 +199,12 @@ class RecordingSessionOperationAuthority:
         if context in self.active:
             self.active.remove(context)
 
+    def release_at_close(self, context):
+        from elspeth.web.coordination.contracts import CloseReleaseOutcome
+
+        self.release(context)
+        return CloseReleaseOutcome.RELEASED_LIVE
+
     def validate_fork_child_lease(self, *args, **kwargs):
         self.calls.append(("validate_fork_child_lease", (args, kwargs)))
 

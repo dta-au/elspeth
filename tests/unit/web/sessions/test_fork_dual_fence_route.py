@@ -59,7 +59,8 @@ def _failing_lease(label: str, calls: list[str], error: BaseException | None = N
             raise error
         raise SessionOperationFenceLost(FenceLossReason.STALE_EPOCH)
 
-    authority.release.side_effect = fail_release
+    # The lease's close releases through release_at_close.
+    authority.release_at_close.side_effect = fail_release
     return SessionOperationLease(authority, context, lease_seconds=30, renew_interval_seconds=10)
 
 
