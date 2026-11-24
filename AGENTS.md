@@ -105,7 +105,9 @@ working around it.
   the printed `.done` path. The suite is never piped through `tail`.
 - `scripts/examples-gate.sh [--execute] [--root DIR] [--only IDS] [--tmp-root DIR] [--log-dir DIR]`
   runs every offline shipped example the way its documentation says and checks
-  its documented result, each in a fresh copy of an exported tree. Case copies
+  its documented result, each in a fresh copy of an exported tree and, with
+  `--execute`, inside a bubblewrap (`bwrap`) private network the gate
+  self-tests first; it refuses to run without one. Case copies
   go under `--tmp-root` (default `${XDG_CACHE_HOME:-$HOME/.cache}/elspeth-examples-gate`;
   never `/tmp`, never inside the checkout). `summary.txt` records one PASS, FAIL,
   NOTRUN or SKIP line per case, and a tree that changed during the run makes the
