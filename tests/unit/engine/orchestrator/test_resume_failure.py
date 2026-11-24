@@ -26,6 +26,7 @@ from elspeth.contracts.coordination import CoordinationSnapshot, CoordinationTok
 from elspeth.contracts.enums import NodeType, RunMode, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError
 from elspeth.contracts.events import RunSummary
+from elspeth.contracts.hashing import CANONICAL_VERSION
 from elspeth.contracts.payload_store import PayloadStore
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.plugin_protocols import SinkProtocol, SourceProtocol, TransformProtocol
@@ -129,7 +130,7 @@ def _insert_failed_run(db: LandscapeDB, run_id: str) -> None:
                 started_at=datetime.now(UTC),
                 config_hash=fake_sha256("cfg"),
                 settings_json="{}",
-                canonical_version="sha256-rfc8785-v1",
+                canonical_version=CANONICAL_VERSION,
                 status=RunStatus.FAILED,
                 openrouter_catalog_sha256="0" * 64,
                 openrouter_catalog_source="bundled",
@@ -232,7 +233,7 @@ def test_post_acquisition_resume_failure_finalizes_and_releases(failure_stage: s
 
     from elspeth.core.landscape.schema import run_coordination_table, run_workers_table
 
-    setup = make_recorder_with_run()
+    setup = make_recorder_with_run(canonical_version=CANONICAL_VERSION)
     db, factory, run_id = setup.db, setup.factory, setup.run_id
     factory.run_lifecycle.finalize_run(RunStatus.FAILED, coordination_token=setup.coordination_token)
     factory.run_coordination.release_seat(token=setup.coordination_token)
@@ -502,6 +503,7 @@ class TestResumeFinalizesAsFailed:
 
         # Mock factory to capture finalize_run calls
         mock_factory = MagicMock(spec=RecorderFactory)
+        mock_factory.run_lifecycle.get_run.return_value.canonical_version = CANONICAL_VERSION
         mock_factory.run_lifecycle.get_source_schema.return_value = '{"mode": "observed"}'
         # ADR-025 §3 Decision 5 (G6): the run-level singleton contract was
         # deleted; ``_reconstruct_resume_state`` now reads per-source records

@@ -29,6 +29,7 @@ import pytest
 # reloading that module replays every production contract registration in one
 # place.
 import elspeth.engine.executors.declaration_contract_bootstrap  # noqa: F401
+from elspeth.contracts.hashing import CANONICAL_VERSION
 from tests.fixtures.audit_hashing import fake_sha256
 
 
@@ -484,7 +485,7 @@ def test_resume_calls_prepare_for_run() -> None:
                     started_at=datetime.now(UTC),
                     config_hash=fake_sha256("cfg"),
                     settings_json="{}",
-                    canonical_version="sha256-rfc8785-v1",
+                    canonical_version=CANONICAL_VERSION,
                     status=RunStatus.FAILED,
                     openrouter_catalog_sha256="0" * 64,
                     openrouter_catalog_source="bundled",

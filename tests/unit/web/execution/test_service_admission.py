@@ -15,7 +15,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from elspeth.contracts import SinkProtocol, SourceProtocol
+from elspeth.contracts import SinkProtocol, SourceProtocol, hashing
 from elspeth.contracts.chargeable_admission import AdmissionRefusalReason
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.hashing import stable_hash
@@ -1707,7 +1707,11 @@ class TestGovernedExecutionAdmission:
         settle.assert_awaited_once()
         payload_store.return_value.store.assert_not_called()
 
-    def test_inline_content_is_compiled_from_verified_bytes(self, service: ExecutionServiceImpl, mock_session_service: MagicMock) -> None:
+    def test_inline_content_is_compiled_from_verified_bytes(
+        self, service: ExecutionServiceImpl, mock_session_service: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        patched_version = "sha256-rfc8785-test"
+        monkeypatch.setattr(hashing, "CANONICAL_VERSION", patched_version)
         content = b"Verified user prompt"
         blob_id = uuid4()
         session_id = uuid4()
@@ -1766,6 +1770,7 @@ class TestGovernedExecutionAdmission:
             prompt_template=content.decode(), system_prompt=None
         )
         assert inputs.config_hash == stable_hash(loaded[0])
+        assert inputs.canonical_version == patched_version
         (snapshot,) = [call.args[0] for call in mock_session_service.assert_prompt_file_approvals.call_args_list]
         assert snapshot.node_id == "classify"
         blob_service.get_blob.assert_awaited_once()

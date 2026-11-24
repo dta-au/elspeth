@@ -34,6 +34,7 @@ from tests.integration.pipeline.test_barrier_intake_dispositions import (
 from elspeth.contracts import NodeType, RunStatus
 from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
 from elspeth.contracts.enums import FrameKind
+from elspeth.contracts.hashing import CANONICAL_VERSION
 from elspeth.contracts.scheduler import TokenWorkStatus
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
@@ -72,7 +73,7 @@ def test_postgres_recovers_completed_coalesce_effect_without_remerge(
     factory = RecorderFactory(db, payload_store=FilesystemPayloadStore(tmp_path / "payloads"))
     factory.run_lifecycle.begin_run(
         config={},
-        canonical_version="v1",
+        canonical_version=CANONICAL_VERSION,
         run_id="test-run",
         leader_worker_id="seeder",
     )

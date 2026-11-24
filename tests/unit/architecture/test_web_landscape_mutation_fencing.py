@@ -1057,8 +1057,15 @@ _EXPECTED_SUBORDINATE_EDGE_COUNT = 154
 # Durable quota accounting forwards preserve_call_id=explicit_call_id through
 # the existing record_call/record_operation_call -> _insert_allocated_call edges.
 _EXPECTED_SUBORDINATE_EDGE_SHA256 = "99e14aae3b82aca256018fc9c4c58da2db08a76ccc8724e47d7291d19d16e94b"
-_EXPECTED_COORDINATION_CALL_COUNT = 43
-_EXPECTED_COORDINATION_CALL_SHA256 = "0ff714e77188e7496cd3543a78e637d4a7107921bff7656e4af3100980af6d9e"
+# X1 join admission records departure after a post-admission refusal:
+# JoinAdmissionService.join_run -> depart_worker joins the existing admit_follower call.
+# Measured against a02f25747: 43/0ff714e7… -> 44/a980dd0f…; one arrival.
+# The post-admission handler has separate Tier-1, refusal and ordinary-error arms,
+# each departing the follower: depart_worker ordinals 2 and 3 in join_run arrive.
+# Measured by scripts/fencing_inventory.py --baseline against a git archive of
+# 398655945: 44/a980dd0f… -> 46/d7f7be08…; arrived 2, departed 0, moved 0.
+_EXPECTED_COORDINATION_CALL_COUNT = 46
+_EXPECTED_COORDINATION_CALL_SHA256 = "d7f7be08c9f2c7b6460235c5d9268d5203df0beb93f25afb3b2c852a4508bd20"
 _EXPECTED_INTERNAL_EDGE_COUNT = 93
 # QR (lane 5887): d1af3e66… -> the value below, 92 -> 93: the internal
 # insert_row_with_token_on edge moves from DataFlowRepository.create_quarantine_row_with_token
@@ -17826,7 +17833,6 @@ _COORDINATION_FINALIZATION_DEPENDENCIES[
 _CANCELLED_PERMIT_CALLER_RECIPE = """
 async def _materialize_durable_cancellation(self, run: RunRecord, lease: SessionOperationLease) -> None:
     from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, mint_worker_id
-    from elspeth.contracts.hashing import CANONICAL_VERSION
     from elspeth.core.landscape.run_start_admission import RunStartAdmissionRepository, RunStartAdmissionState
     from elspeth.web.coordination.contracts import StartPermitState
     from elspeth.web.execution.envelope import EnvelopeRecoveryReason
@@ -17854,7 +17860,7 @@ async def _materialize_durable_cancellation(self, run: RunRecord, lease: Session
                 return
             existing = repositories.run_lifecycle.get_run(str(run.id))
             config = json.loads(existing.settings_json) if existing is not None else deep_thaw(cancellation.audit_safe_config)
-            repositories.run_lifecycle.materialize_cancelled_permit(binding, config, CANONICAL_VERSION, openrouter_catalog_sha256=cancellation.openrouter_catalog_sha256, openrouter_catalog_source=cancellation.openrouter_catalog_source, initiated_by_user_id=cancellation.user_id, auth_provider_type=cancellation.auth_provider_type, web_plugin_policy_evidence=replace(cancellation.web_plugin_policy_evidence, admission_decision=permit.admission_decision) if cancellation.web_plugin_policy_evidence is not None else None, pre_effect_guard=lease.guard_external_effect)
+            repositories.run_lifecycle.materialize_cancelled_permit(binding, config, hashing.CANONICAL_VERSION, openrouter_catalog_sha256=cancellation.openrouter_catalog_sha256, openrouter_catalog_source=cancellation.openrouter_catalog_source, initiated_by_user_id=cancellation.user_id, auth_provider_type=cancellation.auth_provider_type, web_plugin_policy_evidence=replace(cancellation.web_plugin_policy_evidence, admission_decision=permit.admission_decision) if cancellation.web_plugin_policy_evidence is not None else None, pre_effect_guard=lease.guard_external_effect)
     await run_sync_in_worker(materialize)
 """
 
@@ -17894,9 +17900,12 @@ def _cancelled_permit_caller_is_proven(unit: SourceUnit, call: ast.Call, proof: 
     )
     if outer is None or _finalization_recipe_dump(outer) != _finalization_recipe_dump(ast.parse(_CANCELLED_PERMIT_CALLER_RECIPE).body[0]):
         return False
-    if _resolver_for_unit(unit).qualified_name(ast.Name(id="replace", ctx=ast.Load()), use=outer) != "dataclasses.replace":
+    resolver = _resolver_for_unit(unit)
+    if resolver.qualified_name(ast.Name(id="hashing", ctx=ast.Load()), use=outer) != "elspeth.contracts.hashing":
         return False
-    target = proof.called_function(call, _resolver_for_unit(unit), call)
+    if resolver.qualified_name(ast.Name(id="replace", ctx=ast.Load()), use=outer) != "dataclasses.replace":
+        return False
+    target = proof.called_function(call, resolver, call)
     if target is None or (target[1].unit.path, _symbol(target[0])) != (
         "src/elspeth/core/landscape/run_lifecycle_repository.py",
         "RunLifecycleRepository.materialize_cancelled_permit",
@@ -18537,6 +18546,29 @@ def test_cancelled_permit_facade_refuses_removed_external_authority_guard():
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "materialize_cancelled_permit"
     )
     assert not _cancelled_permit_caller_is_proven(mutated, call, proof)
+
+
+def test_cancelled_permit_caller_requires_current_hashing_module():
+    units = _production_units()
+    path = "src/elspeth/web/execution/service.py"
+    unit = next(unit for unit in units if unit.path == path)
+    call = next(
+        node
+        for node in ast.walk(unit.tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "materialize_cancelled_permit"
+    )
+    assert _cancelled_permit_caller_is_proven(unit, call, _AuthorityProof(units))
+
+    old = "from elspeth.contracts import hashing"
+    assert unit.source.count(old) == 1
+    mutated = _parse_source(path, unit.source.replace(old, "from elspeth.core import hashing", 1))
+    mutated_units = tuple(mutated if original.path == path else original for original in units)
+    mutated_call = next(
+        node
+        for node in ast.walk(mutated.tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "materialize_cancelled_permit"
+    )
+    assert not _cancelled_permit_caller_is_proven(mutated, mutated_call, _AuthorityProof(mutated_units))
 
 
 @pytest.mark.parametrize(
