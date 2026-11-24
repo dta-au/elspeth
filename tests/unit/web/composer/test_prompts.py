@@ -1681,9 +1681,11 @@ class TestSkillFollowsCurrentToolBehaviour:
         # invalid node configuration, so the text is not a closed list.
         assert (
             "A `set_pipeline` or `splice_transform` must leave the whole pipeline valid, or it is refused with no "
-            "proposal; a `splice_transform` is refused even for errors that were there before it. Some other changes "
-            "also refuse an invalid node configuration anywhere in the pipeline, even one already there." in flattened
+            "proposal; for a `splice_transform`, that includes errors that were there before it, unless the insertion "
+            "repairs them. Some other changes also refuse an invalid node configuration anywhere in the pipeline, "
+            "even one already there." in flattened
         )
+        assert "a `splice_transform` is refused even for errors that were there before it" not in flattened
         assert "The exceptions are `set_pipeline` and `splice_transform`" not in flattened
         assert "Two changes must leave the whole pipeline valid" not in flattened
         assert "A `set_pipeline` replaces the whole pipeline and must validate on its own" not in flattened

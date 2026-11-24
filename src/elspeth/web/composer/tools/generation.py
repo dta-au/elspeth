@@ -1720,9 +1720,10 @@ _DIRECT_VALIDATION_GUIDANCE: Final = (
         "before the splice. Nothing was mutated.",
         "Repair each error the insertion added: fix the inserted node's options (for a schema_contract_violation, "
         "remove or satisfy the fields it names) or splice at a position whose producer supplies those fields. Errors "
-        "that were there before the splice, reworded or not, also refuse it, and the same splice is refused again until "
-        "they are repaired: repair them first, or add the step with upsert_node and use upsert_node with "
-        "routing_only=true to re-point the successor's input.",
+        "that were there before the splice, reworded or not, also refuse it unless the insertion repairs them, and the "
+        "same splice is refused again until they are repaired: repair them first, or, when no node configuration is "
+        "invalid, add the step with upsert_node and use upsert_node with routing_only=true to re-point the successor's "
+        "input.",
     ),
     DirectValidationGuidance(
         "batch_dependency_refused",

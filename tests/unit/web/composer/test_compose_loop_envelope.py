@@ -130,7 +130,10 @@ ENVELOPE_MAX_PROMPT_TOKENS_TRIVIAL_PROMPT = 50_000
 # Rebaselined 2026-11-24 by the measured growth of the largest turn (+88 B,
 # 300,372 → 300,460): the approval passage says the condition is not a
 # closed list (other changes refuse an invalid node configuration).
-ENVELOPE_MAX_PRODUCTION_BYTES_TRIVIAL_PROMPT = 300_462
+# Rebaselined 2026-11-25 by the measured growth of the largest turn (+69 B,
+# 300,460 → 300,529): the approval passage and the splice_transform
+# description say a splice may repair errors that were there before it.
+ENVELOPE_MAX_PRODUCTION_BYTES_TRIVIAL_PROMPT = 300_531
 
 # Keep the existing two-payload allowance for catalog discovery followed by a
 # concrete clarification. The scenario has two legitimate provider transitions;

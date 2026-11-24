@@ -160,9 +160,11 @@ async def test_batch_with_two_staged_edits_is_refused_before_effects_then_one_co
         )
         assert (
             "A set_pipeline or splice_transform must leave the whole pipeline valid, or it is refused with no "
-            "proposal; a splice_transform is refused even for errors that were there before it. Some other changes "
-            "also refuse an invalid node configuration anywhere in the pipeline, even one already there." in message
+            "proposal; for a splice_transform, that includes errors that were there before it, unless the insertion "
+            "repairs them. Some other changes also refuse an invalid node configuration anywhere in the pipeline, "
+            "even one already there." in message
         )
+        assert "a splice_transform is refused even for errors that were there before it" not in message
         assert "The exceptions are set_pipeline and splice_transform" not in message
         assert "Two changes must leave the whole pipeline valid" not in message
         assert "A set_pipeline replaces the whole pipeline and must validate on its own" not in message
