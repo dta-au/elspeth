@@ -7,7 +7,7 @@ it must carry enough to identify the call and its usage.
 """
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import pytest
 from sqlalchemy import func, select
@@ -15,7 +15,7 @@ from sqlalchemy import func, select
 from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.call_data import RawCallPayload
 from elspeth.contracts.coordination import WorkerMembershipToken
-from elspeth.contracts.errors import RunMembershipLostError, SchedulerLeaseLostError
+from elspeth.contracts.errors import RunLeadershipLostError, RunMembershipLostError, SchedulerLeaseLostError
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.token_usage import TokenUsage
@@ -105,10 +105,11 @@ def _call_count(setup: _Setup) -> int:
         return conn.execute(select(func.count()).select_from(calls_table)).scalar_one()
 
 
-def _assert_refused_call(refused: object, *, call_id: str, state_id: str) -> None:
+def _assert_refused_call(refused: object, *, call_id: str, state_id: str | None, operation_id: str | None) -> None:
     assert refused == {
         "call_id": call_id,
         "state_id": state_id,
+        "operation_id": operation_id,
         "call_index": 0,
         "call_type": "llm",
         "status": "success",
@@ -142,7 +143,7 @@ def test_call_record_refused_by_item_lease_records_the_call() -> None:
     assert context["fence"] == "item"
     assert context["work_item_id"] == setup.item.work_item_id
     assert context["attempt"] == setup.item.attempt
-    _assert_refused_call(context["refused_call"], call_id="attempt-late-1", state_id=setup.state_id)
+    _assert_refused_call(context["refused_call"], call_id="attempt-late-1", state_id=setup.state_id, operation_id=None)
 
 
 def test_call_record_refused_by_departed_membership_records_the_call() -> None:
@@ -163,7 +164,41 @@ def test_call_record_refused_by_departed_membership_records_the_call() -> None:
     assert context["fence"] == "membership"
     assert context["work_item_id"] == setup.item.work_item_id
     assert context["attempt"] == setup.item.attempt
-    _assert_refused_call(context["refused_call"], call_id="attempt-late-1", state_id=setup.state_id)
+    _assert_refused_call(context["refused_call"], call_id="attempt-late-1", state_id=setup.state_id, operation_id=None)
+
+
+def test_operation_call_record_refused_by_leader_fence_records_the_call() -> None:
+    setup = _setup()
+    repo = setup.recorder.execution
+    operation = repo.begin_operation(setup.recorder.source_node_id, "source_load", coordination_token=setup.recorder.coordination_token)
+    stale = replace(setup.recorder.coordination_token, leader_epoch=setup.recorder.coordination_token.leader_epoch + 1)
+    before = len(_fence_refusals(setup))
+
+    with pytest.raises(RunLeadershipLostError):
+        repo.record_operation_call(
+            operation.operation_id,
+            CallType.LLM,
+            CallStatus.SUCCESS,
+            RawCallPayload(_REQUEST),
+            RawCallPayload(_RESPONSE),
+            latency_ms=12.5,
+            token_usage=_USAGE,
+            call_id="attempt-late-2",
+            call_index=0,
+            coordination_token=stale,
+        )
+
+    assert _call_count(setup) == 0
+    refusals = _fence_refusals(setup)[before:]
+    # The leader fence's own refusal, then the refused call's record.
+    assert refusals[0] == {"verb": "record_operation_call"}
+    assert len(refusals) == 2
+    context = refusals[1]
+    assert context["verb"] == "record_operation_call"
+    assert context["fence"] == "leader"
+    assert context["work_item_id"] is None
+    assert context["attempt"] is None
+    _assert_refused_call(context["refused_call"], call_id="attempt-late-2", state_id=None, operation_id=operation.operation_id)
 
 
 def test_refused_call_index_allocation_adds_no_item_refusal() -> None:

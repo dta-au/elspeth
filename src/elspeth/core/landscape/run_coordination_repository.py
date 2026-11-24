@@ -282,7 +282,8 @@ class RefusedCallRecord:
     """
 
     call_id: str
-    state_id: str
+    state_id: str | None
+    operation_id: str | None
     call_index: int
     call_type: CallType
     status: CallStatus
@@ -298,6 +299,7 @@ class RefusedCallRecord:
         return {
             "call_id": self.call_id,
             "state_id": self.state_id,
+            "operation_id": self.operation_id,
             "call_index": self.call_index,
             "call_type": self.call_type.value,
             "status": self.status.value,
@@ -657,8 +659,9 @@ def record_refused_call(
     *,
     run_id: str,
     worker_id: str,
+    leader_epoch: int | None,
     verb: str,
-    fence: Literal["membership", "item"],
+    fence: Literal["leader", "membership", "item"],
     refused_call: RefusedCallRecord,
     work_item_id: str | None,
     attempt: int | None,
@@ -667,10 +670,10 @@ def record_refused_call(
 
     Called after the refused transaction has rolled back. Unlike the fences'
     own refusal events, this one explains durable state outside the database:
-    the call already happened, and this event is its only record. The
-    membership fence has already written its own ``fence_refusal`` naming only
-    the verb and fence; the row carrying ``refused_call`` is the call's. The
-    item-lease fence writes no row of its own. If a DB
+    the call already happened, and this event is its only record. The leader
+    and membership fences have already written their own ``fence_refusal``
+    naming only the verb (and fence); the row carrying ``refused_call`` is the
+    call's, and the item-lease fence writes no row of its own. If a DB
     fault loses the event too, the audit store cannot hold the call, so the
     last-resort log carries the call's identity and usage at ERROR.
     """
@@ -679,7 +682,7 @@ def record_refused_call(
         run_id=run_id,
         event_type="fence_refusal",
         worker_id=worker_id,
-        leader_epoch=None,
+        leader_epoch=leader_epoch,
         recorded_at=datetime.now(UTC),
         context={
             "verb": verb,

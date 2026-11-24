@@ -28,7 +28,7 @@ from elspeth.contracts.audit import CallVerification, validate_approved_prompt_a
 from elspeth.contracts.call_data import CallPayload, LLMCallResponse
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.enums import RunMode, RunStatus
-from elspeth.contracts.errors import AuditIntegrityError, RunMembershipLostError, SchedulerLeaseLostError
+from elspeth.contracts.errors import AuditIntegrityError, RunLeadershipLostError, RunMembershipLostError, SchedulerLeaseLostError
 from elspeth.contracts.hashing import canonical_json_loads
 from elspeth.contracts.payload_store import IntegrityError as PayloadIntegrityError
 from elspeth.contracts.payload_store import PayloadNotFoundError
@@ -103,7 +103,8 @@ class _LineageEvidence(NamedTuple):
 def _refused_call_record(
     *,
     call_id: str,
-    state_id: str,
+    state_id: str | None,
+    operation_id: str | None,
     call_index: int,
     call_type: CallType,
     status: CallStatus,
@@ -115,6 +116,7 @@ def _refused_call_record(
     return RefusedCallRecord(
         call_id=call_id,
         state_id=state_id,
+        operation_id=operation_id,
         call_index=call_index,
         call_type=call_type,
         status=status,
@@ -640,6 +642,7 @@ class CallAuditRepository:
         refused_call = _refused_call_record(
             call_id=call_id,
             state_id=state_id,
+            operation_id=None,
             call_index=call_index,
             call_type=call_type,
             status=status,
@@ -734,6 +737,7 @@ class CallAuditRepository:
             self._db.engine,
             run_id=member_token.run_id,
             worker_id=member_token.worker_id,
+            leader_epoch=None,
             verb="record_call",
             fence=fence,
             refused_call=refused_call,
@@ -841,6 +845,17 @@ class CallAuditRepository:
             operation=True,
         )
         recorded_index = None
+        refused_call = _refused_call_record(
+            call_id=call_id,
+            state_id=None,
+            operation_id=operation_id,
+            call_index=call_index,
+            call_type=call_type,
+            status=status,
+            prepared=prepared,
+            token_usage=token_usage,
+            latency_ms=latency_ms,
+        )
         try:
             with fenced_leader_transaction(
                 self._db.engine,
@@ -864,6 +879,21 @@ class CallAuditRepository:
                 raise FrameworkBugError("inserted operation call returned a non-integer call_index")
             recorded_index = recorded_value
             call_index = recorded_index
+        except RunLeadershipLostError:
+            # The call already happened; with its row refused, the refusal
+            # event is its only durable record.
+            record_refused_call(
+                self._db.engine,
+                run_id=coordination_token.run_id,
+                worker_id=coordination_token.worker_id,
+                leader_epoch=coordination_token.leader_epoch,
+                verb="record_operation_call",
+                fence="leader",
+                refused_call=refused_call,
+                work_item_id=None,
+                attempt=None,
+            )
+            raise
         finally:
             self._finish_allocation(
                 parent_id=operation_id,
