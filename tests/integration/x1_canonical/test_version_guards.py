@@ -84,7 +84,10 @@ def test_replay_checks_version_before_settings_hash(monkeypatch: pytest.MonkeyPa
     factory = Mock(spec=RecorderFactory)
     factory.run_lifecycle.get_run.return_value = source
     config = SimpleNamespace(config=source_settings)
-    with pytest.raises(AuditIntegrityError, match="canonical version differs"):
+    with pytest.raises(
+        AuditIntegrityError,
+        match="Replay source canonical version changed from 'sha256-rfc8785-v1' to 'sha256-rfc8785-test'",
+    ):
         admit_source_configuration(factory, source_run_id="source", config=config, canonical_version=hashing.CANONICAL_VERSION)
 
 

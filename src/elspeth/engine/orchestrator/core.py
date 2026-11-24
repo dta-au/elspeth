@@ -415,8 +415,9 @@ class Orchestrator:
         """§B.1: atomic follower admission — public entry point (ADR-030).
 
         Delegates to :class:`JoinAdmissionService`, which owns the follower
-        attach path (filesystem preflight + atomic admission) extracted from
-        this class. The public signature is the stable contract; the
+        attach path (filesystem preflight, canonical-version and complete-graph
+        readiness checks, plugin implementation check, then atomic admission)
+        extracted from this class. The public signature is the stable contract; the
         implementation lives in join_admission.py.
         """
         return self._join_admission.join_run(

@@ -50,7 +50,7 @@ def admit_source_configuration(
     except json.JSONDecodeError as exc:
         raise AuditIntegrityError("Replay source settings are malformed") from exc
     if source.canonical_version != canonical_version:
-        raise AuditIntegrityError("Replay source canonical version differs")
+        raise AuditIntegrityError(f"Replay source canonical version changed from {source.canonical_version!r} to {canonical_version!r}")
     if type(source_settings) is not dict or stable_hash(source_settings) != source.config_hash:
         raise AuditIntegrityError("Replay source settings hash is invalid")
     current_settings: dict[str, Any] = dict(config.config)

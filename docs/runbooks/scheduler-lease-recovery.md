@@ -706,8 +706,15 @@ The `--settings` file is **required**: the joiner must reproduce the same
 different pipeline would disagree about the graph and barrier keys, so a
 mismatch is refused.
 
-Admission is one atomic `BEGIN IMMEDIATE` transaction (ADR-030 D3, §B.1) that
-checks **all three** preconditions or refuses:
+After the filesystem preflight, join admission checks the run's canonical
+version, graph readiness, and plugin implementation. The recorded edge count
+must equal the follower graph's edge count. Fewer edges return retryable
+`join_not_ready`; if the leader seat is no longer live, the admission
+transaction instead returns its "no live leader" refusal. More recorded edges
+or different plugin implementation evidence are refused.
+
+The atomic `BEGIN IMMEDIATE` admission transaction (ADR-030 D3, §B.1) checks
+the authoritative preconditions and registers the follower only when all hold:
 
 1. `runs.status = 'RUNNING'` (else `JoinRefusedError` — terminal runs use
    `elspeth resume`);
@@ -717,6 +724,10 @@ checks **all three** preconditions or refuses:
    `elspeth resume`, or finalize the run with `elspeth abandon`"). A follower
    must never be the first process on an abandoned run — barrier and ingest
    state need a leader. **Join and takeover are disjoint verbs.**
+
+If the pre-read did not qualify for the early checks but admission succeeds,
+the service re-checks the canonical version and graph after registration.
+A refusal at that point records follower registration followed by departure.
 
 A **filesystem-writability preflight runs first** (before the registry is
 touched): the follower verifies write access to the DB file, its directory,

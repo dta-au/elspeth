@@ -164,7 +164,7 @@ import rfc8785
 
 # Two-phase canonicalization
 def canonical_json(obj: Any) -> str:
-    normalized = _normalize_for_canonical(obj)  # Phase 1: pandas/numpy -> primitives (ours)
+    normalized = normalize_for_canonical(obj)  # Phase 1: pandas/numpy -> primitives (ours)
     return rfc8785.dumps(normalized)            # Phase 2: RFC 8785/JCS standard serialization
 ```
 

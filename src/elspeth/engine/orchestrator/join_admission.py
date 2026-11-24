@@ -157,7 +157,13 @@ class JoinAdmissionService:
            ``LandscapeDB`` carries the PRAGMA probe + epoch check — G28
            cross-process uniformity by construction).
 
-        2. Atomic admission (one ``BEGIN IMMEDIATE`` transaction via
+        2. Read the run before admission. A matching, RUNNING run must use the
+           current canonical version, have its full graph registered, and
+           match the follower's plugin implementation evidence. Incomplete
+           registration is retryable while the leader seat is live; an absent
+           or expired seat receives the admission transaction's seat refusal.
+
+        3. Atomic admission (one ``BEGIN IMMEDIATE`` transaction via
            :meth:`RunCoordinationRepository.admit_follower`):
 
            - ``SELECT runs.status, runs.config_hash`` — status must be
@@ -170,6 +176,10 @@ class JoinAdmissionService:
              ADR-047), else refused ("no live leader — use ``elspeth resume``");
            - ``INSERT run_workers`` (role='follower', status='active') +
              ``worker_register`` event.  COMMIT.
+
+        A run that becomes eligible between the pre-read and admission is
+        re-checked afterward. A refusal then records registration and
+        departure for that follower.
 
         Args:
             run_id: Landscape run ID to join.
@@ -188,8 +198,10 @@ class JoinAdmissionService:
             is never constructed outside the repository.
 
         Raises:
-            JoinRefusedError: Filesystem preflight failed, run is not RUNNING,
-                config hash mismatch, or no live leader seat.
+            JoinRefusedError: Filesystem preflight failed, version, graph edge
+                count or plugin implementation differs, run is not RUNNING,
+                config hash mismatches, or no live leader seat.
+            JoinNotReadyError: The leader is live but graph registration is incomplete.
         """
 
         _window = window_seconds if window_seconds is not None else DEFAULT_RUN_LIVENESS_WINDOW_SECONDS
