@@ -741,6 +741,22 @@ def _canonical_json_refusal(context: _RefusedCallEventContext) -> str | None:
     return None
 
 
+# Canonical JSON's integer range (RFC 8785 refuses any int beyond it).
+_CANONICAL_INTEGER_MAX = 2**53 - 1
+
+
+def _last_resort_log_value(value: str | int | float | None) -> str:
+    """Format one refused-call field for the last-resort log; never raises.
+
+    An integer beyond the canonical range, which is how it reached this log, is
+    written in hex: Python refuses decimal conversion of an integer longer than
+    its digit limit, and hex has no such limit. Every other value is its repr.
+    """
+    if type(value) is int and not -_CANONICAL_INTEGER_MAX <= value <= _CANONICAL_INTEGER_MAX:
+        return hex(value)
+    return repr(value)
+
+
 def _log_unrecorded_refused_call(
     *, run_id: str, worker_id: str, verb: str, fence: str, refused_call: RefusedCallRecord, cause: str
 ) -> None:
@@ -751,7 +767,7 @@ def _log_unrecorded_refused_call(
         verb,
         fence,
         cause,
-        ", ".join(f"{key}={value!r}" for key, value in refused_call.event_context().items()),
+        ", ".join(f"{key}={_last_resort_log_value(value)}" for key, value in refused_call.event_context().items()),
     )
 
 

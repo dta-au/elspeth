@@ -316,8 +316,14 @@ def test_refused_call_record_lost_to_a_db_fault_is_logged_with_its_identity(
         pytest.param(
             12.5,
             TokenUsage(prompt_tokens=2**53, completion_tokens=45),
-            ("latency_ms=12.5", f"prompt_tokens={2**53}"),
+            ("latency_ms=12.5", f"prompt_tokens={hex(2**53)}"),
             id="token_count_beyond_canonical_integer_range",
+        ),
+        pytest.param(
+            12.5,
+            TokenUsage(prompt_tokens=10**5000, completion_tokens=45),
+            ("latency_ms=12.5", f"prompt_tokens={hex(10**5000)}"),
+            id="token_count_beyond_the_decimal_conversion_limit",
         ),
     ],
 )
