@@ -642,8 +642,9 @@ class CallAuditRepository:
             Call indices should be allocated via allocate_call_index() for coordination.
         """
         # The caller may hold a reservation for this (state, index) from
-        # allocate_call_index: release it on every exit, entry refusals included,
-        # always by the exact key the allocator stored.
+        # allocate_call_index: release it when the call ends, whether it is
+        # recorded, refused by a fence or refused at entry, by the exact key the
+        # allocator stored.
         reservation_parent = _exact_parent_key(state_id)
         reservation_index = _exact_index_key(call_index)
         recorded_index: int | None = None
@@ -854,8 +855,9 @@ class CallAuditRepository:
             The recorded Call model
         """
         # A caller's reservation from allocate_operation_call_index, or the one
-        # this call takes, is released on every exit, entry refusals included,
-        # always by the exact key the allocator stored.
+        # this call takes, is released when the call ends, whether it is
+        # recorded, refused by a fence or refused at entry, by the exact key the
+        # allocator stored.
         reservation_parent = _exact_parent_key(operation_id)
         reservation_index = None if call_index is None else _exact_index_key(call_index)
         recorded_index: int | None = None

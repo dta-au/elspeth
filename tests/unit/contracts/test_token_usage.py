@@ -233,7 +233,7 @@ class _ProviderIntSubclass(int):
 
 
 class TestTokenUsageFromDictExactIntegers:
-    """The Tier 3 boundary stores exact ints and never runs a provider subclass's own methods."""
+    """Token counts handed over as an int subclass are stored as exact ints; the count's own comparisons are never called."""
 
     def test_int_subclass_counts_are_stored_as_exact_ints(self) -> None:
         usage = TokenUsage.from_dict(
