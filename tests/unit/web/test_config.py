@@ -2649,8 +2649,10 @@ class TestComposerContextBudgetSettings:
     }
 
     def test_token_cap_is_required_and_named_in_the_error(self) -> None:
-        with pytest.raises(ValidationError, match="composer_context_max_prompt_tokens"):
+        with pytest.raises(ValidationError, match="composer_context_max_prompt_tokens") as refused:
             WebSettings(**self._BASE)
+        # The byte maximum is derived from it, so its absence is not reported as a second error.
+        assert {error["loc"] for error in refused.value.errors()} == {("composer_context_max_prompt_tokens",)}
 
     @pytest.mark.parametrize("bad", [0, -1, 1.5, "200000"])
     def test_token_cap_must_be_a_positive_strict_int(self, bad: object) -> None:
@@ -2663,7 +2665,37 @@ class TestComposerContextBudgetSettings:
         assert settings.composer_context_max_prompt_tokens == 200_000
         assert settings.composer_context_shed_above == 0.85
         assert settings.composer_context_shed_to == 0.60
-        assert settings.composer_planner_max_request_bytes == 983040
+        # Derived: 8 bytes per token of the cap. Pin history: a fixed 983040 (960 KiB) until 0.8.18.
+        assert settings.composer_planner_max_request_bytes == 1_600_000
+
+    def test_the_byte_maximum_multiplier_is_the_budgets_sparsest_plausible_density(self) -> None:
+        from elspeth.web.composer.context_budget import CONTEXT_BUDGET_MAX_MEASURED_BYTES_PER_TOKEN
+
+        assert web_config.COMPOSER_REQUEST_BYTES_PER_PROMPT_TOKEN == CONTEXT_BUDGET_MAX_MEASURED_BYTES_PER_TOKEN
+
+    @pytest.mark.parametrize("explicit", [1, 983040, 5_000_000])
+    def test_an_explicit_byte_maximum_is_kept(self, explicit: int) -> None:
+        settings = WebSettings(**self._BASE, composer_context_max_prompt_tokens=200_000, composer_planner_max_request_bytes=explicit)
+        assert settings.composer_planner_max_request_bytes == explicit
+
+    @pytest.mark.parametrize("bad", [0, 1.5, "200000", True])
+    def test_a_bad_token_cap_is_refused_on_its_own_field(self, bad: object) -> None:
+        with pytest.raises(ValidationError, match="composer_context_max_prompt_tokens") as refused:
+            WebSettings(**self._BASE, composer_context_max_prompt_tokens=bad)
+        assert {error["loc"] for error in refused.value.errors()} == {("composer_context_max_prompt_tokens",)}
+
+    @pytest.mark.usefixtures("required_web_env")
+    @pytest.mark.parametrize(("explicit", "expected"), [(None, 123456 * 8), ("2000000", 2_000_000)])
+    def test_env_loader_derives_or_keeps_the_byte_maximum(
+        self, monkeypatch: pytest.MonkeyPatch, explicit: str | None, expected: int
+    ) -> None:
+        monkeypatch.setenv("ELSPETH_WEB__COMPOSER_CONTEXT_MAX_PROMPT_TOKENS", "123456")
+        if explicit is None:
+            monkeypatch.delenv("ELSPETH_WEB__COMPOSER_PLANNER_MAX_REQUEST_BYTES", raising=False)
+        else:
+            monkeypatch.setenv("ELSPETH_WEB__COMPOSER_PLANNER_MAX_REQUEST_BYTES", explicit)
+
+        assert web_config.settings_from_env().composer_planner_max_request_bytes == expected
 
     @pytest.mark.parametrize(
         ("above", "to"),
