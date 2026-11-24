@@ -61,6 +61,7 @@ from elspeth.contracts.scheduler import GroupLossSpec, SchedulerEventType, Token
 from elspeth.core.landscape.factory import RecorderFactory, RunLifecycleReadRepository
 from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 from elspeth.core.landscape.schema import (
+    RunSourceLifecycleState,
     group_losses_table,
     nodes_table,
     run_coordination_table,
@@ -94,6 +95,7 @@ from tests.e2e.recovery.harness import (
 from tests.e2e.recovery.test_suspended_winner_fences import (
     _work_item,
 )
+from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import (
     expire_leader_seat,
     leader_token_for,
@@ -191,6 +193,26 @@ def _seed_ready_row(crashed: Any, *, ingest_sequence: int) -> tuple[str, str]:
             )
         )
     return token_id, work_item_id
+
+
+def _record_sources(
+    factory: RecorderFactory,
+    config: Any,
+    source_id_map: Any,
+    leader_token: CoordinationToken,
+    state: RunSourceLifecycleState,
+) -> None:
+    """Record every declared source in ``state`` through the leader's real writer."""
+    for source_name, source_node_id in source_id_map.items():
+        source = config.sources[source_name]
+        factory.run_lifecycle.record_run_source(
+            source_node_id=source_node_id,
+            source_name=source_name,
+            plugin_name=source.name,
+            config_hash=fake_sha256(f"source-config-{source_name}"),
+            lifecycle_state=state,
+            coordination_token=leader_token,
+        )
 
 
 def _assert_no_follower_mutation(crashed: Any, *, run_id: str, seat_before: dict[str, Any]) -> None:
@@ -297,8 +319,9 @@ class TestJoinRunAdmissionRefusals:
         )
         settings = cast(Any, types.SimpleNamespace())
         with patch("elspeth.engine.orchestrator.join_admission.resolve_config", return_value={}):
-            with pytest.raises(JoinRefusedError, match="not finished registering its graph"):
+            with pytest.raises(JoinNotReadyError, match="not finished registering its graph"):
                 Orchestrator(db).join_run(run_id=run_id, settings=settings, config=config, graph=graph)
+            _record_sources(factory, config, source_id_map, leader_token, RunSourceLifecycleState.READY)
             edges = graph.get_edges()
             assert len(edges) > 1
             for edge in edges[:1]:
@@ -319,6 +342,12 @@ class TestJoinRunAdmissionRefusals:
                     label="different-label" if different_edge and edge is edges[-1] else edge.label,
                     mode=edge.mode,
                 )
+            if not different_edge:
+                # Every edge is registered but every source is still READY: the
+                # leader has not started loading, so equal sets are not yet ready.
+                with pytest.raises(JoinNotReadyError, match="not finished registering its graph"):
+                    Orchestrator(db).join_run(run_id=run_id, settings=settings, config=config, graph=graph)
+            _record_sources(factory, config, source_id_map, leader_token, RunSourceLifecycleState.LOADING)
             if different_edge:
                 with pytest.raises(JoinRefusedError, match="recorded graph edges do not match follower graph"):
                     Orchestrator(db).join_run(run_id=run_id, settings=settings, config=config, graph=graph)
@@ -351,6 +380,67 @@ class TestJoinRunAdmissionRefusals:
                 )
             ).all()
         assert [(row.worker_id, row.status) for row in rows] == [(member.worker_id, "active")]
+        db.close()
+
+    def test_join_refuses_missing_edges_once_leader_has_started_loading(self) -> None:
+        """After a source leaves READY, registration is finished: a proper subset is a mismatch, not a wait."""
+        config, graph, _sink, _source = _build_pipeline(_SOURCE_ROWS)
+        db = make_landscape_db()
+        factory = RecorderFactory(db)
+        run_id = "run-join-loading-missing-edge"
+        factory.run_lifecycle.begin_run(
+            config={},
+            canonical_version=CANONICAL_VERSION,
+            run_id=run_id,
+            leader_worker_id=f"worker:{run_id}:leader",
+            openrouter_catalog_sha256="0" * 64,
+            openrouter_catalog_source="bundled",
+        )
+        leader_token = leader_token_for(db, run_id)
+        source_id_map = build_source_id_map(graph)
+        metadata = resolve_node_audit_metadata(
+            config,
+            graph,
+            source_id_map=source_id_map,
+            transform_id_map=graph.get_transform_id_map(),
+            sink_id_map=graph.get_sink_id_map(),
+            config_gate_node_ids=set(graph.get_config_gate_id_map().values()),
+            aggregation_node_ids=set(graph.get_aggregation_id_map().values()),
+            coalesce_node_ids=set(graph.get_coalesce_id_map().values()),
+            collector_id_map=graph.get_collector_id_map(),
+            collector_transforms=graph.get_collector_transform_map(),
+        )
+        register_nodes_with_landscape(
+            factory,
+            graph,
+            graph.topological_order(),
+            metadata,
+            resolve_source_contracts_by_node_id(config, source_id_map),
+            coordination_token=leader_token,
+        )
+        _record_sources(factory, config, source_id_map, leader_token, RunSourceLifecycleState.READY)
+        edges = graph.get_edges()
+        assert len(edges) > 1
+        first = edges[0]
+        factory.data_flow.register_edge(
+            coordination_token=leader_token,
+            from_node_id=first.from_node,
+            to_node_id=first.to_node,
+            label=first.label,
+            mode=first.mode,
+        )
+        _record_sources(factory, config, source_id_map, leader_token, RunSourceLifecycleState.LOADING)
+        with (
+            patch("elspeth.engine.orchestrator.join_admission.resolve_config", return_value={}),
+            pytest.raises(JoinRefusedError) as exc_info,
+        ):
+            Orchestrator(db).join_run(run_id=run_id, settings=cast(Any, types.SimpleNamespace()), config=config, graph=graph)
+        assert type(exc_info.value) is JoinRefusedError
+        with db.engine.connect() as conn:
+            followers = conn.execute(
+                select(run_workers_table.c.worker_id).where(run_workers_table.c.run_id == run_id, run_workers_table.c.role == "follower")
+            ).all()
+        assert followers == []
         db.close()
 
     @pytest.mark.parametrize("compatible", [False, True])
@@ -615,6 +705,7 @@ class TestJoinRunAdmissionRefusals:
             resolve_source_contracts_by_node_id(config, source_id_map),
             coordination_token=leader_token,
         )
+        _record_sources(factory, config, source_id_map, leader_token, RunSourceLifecycleState.READY)
         edges = graph.get_edges()
         assert len(edges) > 1
         factory.data_flow.register_edge(
@@ -646,6 +737,9 @@ class TestJoinRunAdmissionRefusals:
                         label=edge.label,
                         mode=edge.mode,
                     )
+                # The revived leader finishes registration and starts loading, so the
+                # post-admission check sees a registered graph and reaches the plugin check.
+                _record_sources(factory, config, source_id_map, leader_token, RunSourceLifecycleState.LOADING)
                 with db.engine.begin() as conn:
                     conn.execute(
                         update(nodes_table).where(nodes_table.c.run_id == run_id).values(source_file_hash="sha256:0000000000000000")

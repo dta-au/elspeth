@@ -707,15 +707,16 @@ different pipeline would disagree about the graph and barrier keys, so a
 mismatch is refused.
 
 After the filesystem preflight, join admission checks the run's canonical
-version, graph readiness, and plugin implementation. The recorded edge set
-must match the follower graph's edges by endpoints, label, and mode. A proper
-subset returns retryable `join_not_ready`; if the leader seat remains expired
-through admission, the transaction returns its "no live leader" refusal. If
-the leader heartbeats before admission, the post-admission check still tests
-graph readiness and departs the follower on refusal. Other
-edge differences or different plugin implementation evidence are refused.
-A follower whose graph has edges the run never registers keeps receiving
-`join_not_ready`, so callers must bound their retries.
+version, graph readiness, and plugin implementation. The graph is ready once
+some source of the run has left the `ready` lifecycle state: the leader seeds
+every source as `ready`, registers every edge, and only then starts loading.
+Before that point the join returns retryable `join_not_ready`; if the leader
+seat remains expired through admission, the transaction returns its "no live
+leader" refusal. If the leader heartbeats before admission, the
+post-admission check still tests graph readiness and departs the follower on
+refusal. Once the graph is ready, the recorded edge set must equal the
+follower graph's edges by endpoints, label, and mode; any difference, or
+different plugin implementation evidence, is refused.
 
 The atomic `BEGIN IMMEDIATE` admission transaction (ADR-030 D3, §B.1) checks
 the authoritative preconditions and registers the follower only when all hold:

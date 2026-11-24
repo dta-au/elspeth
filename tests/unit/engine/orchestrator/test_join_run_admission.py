@@ -42,7 +42,8 @@ from elspeth.contracts.types import NodeID
 from elspeth.core.landscape import run_coordination_repository as coordination_module
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.database_clock import read_landscape_decision_time, read_landscape_transaction_time
-from elspeth.core.landscape.factory import DataFlowReadRepository
+from elspeth.core.landscape.factory import DataFlowReadRepository, RunLifecycleReadRepository
+from elspeth.core.landscape.run_lifecycle_repository import RunSourceLifecycleRecord
 from elspeth.core.landscape.schema import (
     run_coordination_events_table,
     run_coordination_table,
@@ -80,12 +81,15 @@ _RECORDED_EDGE = Edge(
     default_mode=RoutingMode.MOVE,
     created_at=NOW,
 )
+# The leader has started loading its source, so graph registration is complete.
+_LOADING_SOURCE = RunSourceLifecycleRecord(source_node_id="source", source_name="primary", lifecycle_state="loading")
 _JOIN_INPUTS = {"config": types.SimpleNamespace(), "graph": types.SimpleNamespace(get_edges=lambda: [_GRAPH_EDGE])}
 
 
 @pytest.fixture
 def _registered_graph_baseline() -> object:
     with (
+        patch.object(RunLifecycleReadRepository, "get_run_source_lifecycle_records", return_value={"source": _LOADING_SOURCE}),
         patch.object(DataFlowReadRepository, "get_edges", return_value=[_RECORDED_EDGE]),
         patch("elspeth.engine.orchestrator.join_admission.check_implementation_compatibility", return_value=ResumeCheck(can_resume=True)),
     ):

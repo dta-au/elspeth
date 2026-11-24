@@ -31,6 +31,7 @@ from elspeth.core.canonical import stable_hash
 from elspeth.core.config import resolve_config
 from elspeth.core.landscape.factory import LandscapeReadRepositories, RecorderFactory
 from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
+from elspeth.core.landscape.schema import RunSourceLifecycleState
 from elspeth.engine.orchestrator.implementation_compatibility import check_implementation_compatibility
 
 if TYPE_CHECKING:
@@ -68,16 +69,25 @@ class JoinAdmissionService:
                 run_id,
                 f"canonical version changed from {run.canonical_version!r} to {hashing.CANONICAL_VERSION!r}",
             )
-        recorded_edges = {
-            (edge.from_node_id, edge.to_node_id, edge.label, edge.default_mode) for edge in read_factory.data_flow.get_edges(run_id)
-        }
-        expected_edges = {(edge.from_node, edge.to_node, edge.label, edge.mode) for edge in graph.get_edges()}
-        if recorded_edges < expected_edges:
+        # The leader seeds every source READY before it registers any edge, and
+        # moves a source past READY only in the source loop, after the last edge
+        # commits. A source past READY therefore marks graph registration
+        # complete. Read it before the edges so the edge read sees every edge
+        # committed before the marker.
+        graph_registered = any(
+            RunSourceLifecycleState(record.lifecycle_state) is not RunSourceLifecycleState.READY
+            for record in read_factory.run_lifecycle.get_run_source_lifecycle_records(run_id).values()
+        )
+        if not graph_registered:
             if defer_to_admission_on_dead_leader:
                 leader = RunCoordinationRepository(self._db.engine).live_leader(run_id=run_id)
                 if leader is None or not leader.seat_live:
                     return
             raise JoinNotReadyError(run_id, "the run's leader has not finished registering its graph; retry the join")
+        recorded_edges = {
+            (edge.from_node_id, edge.to_node_id, edge.label, edge.default_mode) for edge in read_factory.data_flow.get_edges(run_id)
+        }
+        expected_edges = {(edge.from_node, edge.to_node, edge.label, edge.mode) for edge in graph.get_edges()}
         if recorded_edges != expected_edges:
             raise JoinRefusedError(run_id, "recorded graph edges do not match follower graph")
         implementation_check = check_implementation_compatibility(read_factory, run_id, config, graph)
@@ -165,10 +175,14 @@ class JoinAdmissionService:
            cross-process uniformity by construction).
 
         2. Read the run before admission. A matching, RUNNING run must use the
-           current canonical version, have its full graph registered, and
-           match the follower's plugin implementation evidence. Incomplete
-           registration is retryable while the leader seat is live; an absent
-           or still-expired seat receives the admission transaction's seat refusal.
+           current canonical version, have finished registering its graph
+           (some source has left ``ready``, which the leader does only after
+           its last edge commits), record exactly the follower graph's edges,
+           and match the follower's plugin implementation evidence.
+           Unfinished registration is retryable while the leader seat is live;
+           an absent or still-expired seat receives the admission
+           transaction's seat refusal. After registration, any edge difference
+           is a refusal.
 
         3. Atomic admission (one ``BEGIN IMMEDIATE`` transaction via
            :meth:`RunCoordinationRepository.admit_follower`):
@@ -208,7 +222,7 @@ class JoinAdmissionService:
             JoinRefusedError: Filesystem preflight failed, version, graph edge
                 identity or plugin implementation differs, run is not RUNNING,
                 config hash mismatches, or no live leader seat.
-            JoinNotReadyError: The leader is live but graph registration is incomplete.
+            JoinNotReadyError: The leader is live but has not finished registering the graph.
         """
 
         _window = window_seconds if window_seconds is not None else DEFAULT_RUN_LIVENESS_WINDOW_SECONDS
