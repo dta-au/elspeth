@@ -21,7 +21,7 @@ from typing import Any, Final, Never, TypedDict, TypeVar, cast
 from uuid import UUID, uuid4, uuid5
 
 from opentelemetry import metrics
-from sqlalchemy import Engine, func, select
+from sqlalchemy import Engine, select
 from sqlalchemy.engine import Connection, Row
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
@@ -505,7 +505,7 @@ def _require_live_fork_write_fence(conn: Connection, fence: BlobForkWriteFence) 
             session_operation_receipts_table.c.result_session_id == str(fence.target_session_id),
             session_operation_receipts_table.c.lease_token == fence.lease_token,
             session_operation_receipts_table.c.attempt == fence.attempt,
-            session_operation_receipts_table.c.lease_expires_at > func.current_timestamp(),
+            session_operation_receipts_table.c.lease_expires_at > database_now(conn),
         )
     ).one_or_none()
     if row is None:
