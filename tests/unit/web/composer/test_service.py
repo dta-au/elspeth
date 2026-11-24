@@ -6283,6 +6283,54 @@ class TestComposerAvailabilityAndBadRequest:
         mock_sleep.assert_awaited_once_with(1.0)
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("headers", "outcome", "calls", "delays"),
+        [
+            ({"retry-after": "3"}, "success", 2, [3.0]),
+            ({"retry-after-ms": "1500", "retry-after": "3"}, "success", 2, [1.5]),
+            ({"retry-after-ms": "bad", "retry-after": "3"}, "success", 2, [3.0]),
+            ({"retry-after": "bad"}, "success", 2, [1.0]),
+            ({}, "exhausted", 3, [1.0, 2.0]),
+            ({"retry-after": "31"}, "too-long", 1, []),
+            ({"retry-after": "6"}, "deadline", 1, []),
+            ({}, "budget", 1, []),
+        ],
+        ids=("seconds", "ms-wins", "malformed-ms", "malformed-seconds", "exhausted", "ceiling", "deadline", "budget"),
+    )
+    async def test_real_rate_limit_uses_bounded_retry_and_audits_each_call(
+        self, headers: dict[str, str], outcome: str, calls: int, delays: list[float]
+    ) -> None:
+        from litellm.exceptions import RateLimitError, RateLimitType
+
+        from elspeth.web.composer.provider_config import LLM_API_MAX_ATTEMPTS
+
+        service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
+        failure = RateLimitError(
+            message="private rate limit",
+            model="openrouter/openai/gpt-5.5",
+            llm_provider="openrouter",
+            response=Response(429, request=Request("POST", "https://example.invalid"), headers=headers),
+            rate_limit_type=RateLimitType.BUDGET if outcome == "budget" else None,
+        )
+        responses: list[object] = [failure] * (LLM_API_MAX_ATTEMPTS if outcome == "exhausted" else 1)
+        if outcome == "success":
+            responses.append(_make_raw_llm_response(content="Recovered."))
+        with (
+            patch("litellm.acompletion", new_callable=AsyncMock, side_effect=responses) as mock_llm,
+            _mock_composer_retry_sleep() as mock_sleep,
+        ):
+            compose_kwargs = {"budget_seconds": 10.0} if outcome == "deadline" else {}
+            if outcome == "success":
+                result = await service.compose("Hello", [], _empty_state(), session_id=session_id, **compose_kwargs)
+                _assert_checkpoint_reply(result, "Recovered.", count=0)
+                assert len(result.llm_calls) == calls
+            else:
+                with pytest.raises(RateLimitError):
+                    await service.compose("Hello", [], _empty_state(), session_id=session_id, **compose_kwargs)
+        assert mock_llm.call_count == calls
+        assert [call.args[0] for call in mock_sleep.await_args_list] == delays
+
+    @pytest.mark.asyncio
     async def test_real_service_unavailable_is_eligible_for_bounded_retry(self) -> None:
         from litellm.exceptions import ServiceUnavailableError
 
@@ -6300,6 +6348,39 @@ class TestComposerAvailabilityAndBadRequest:
         assert mock_llm.call_count == 2
         mock_sleep.assert_awaited_once()
         mock_sleep.assert_awaited_once_with(1.0)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("failure_kind", ("internal_server", "connection"))
+    @pytest.mark.parametrize("outcome", ("success", "exhausted"))
+    async def test_500_and_connection_use_bounded_compose_retry(self, failure_kind: str, outcome: str) -> None:
+        from litellm.exceptions import APIConnectionError, InternalServerError
+
+        from elspeth.web.composer.provider_config import LLM_API_MAX_ATTEMPTS
+
+        service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
+        failure = (
+            InternalServerError(message="private failure", llm_provider="openrouter", model="openrouter/openai/gpt-5.5")
+            if failure_kind == "internal_server"
+            else APIConnectionError(message="private failure", llm_provider="openrouter", model="openrouter/openai/gpt-5.5")
+        )
+        responses: list[object] = [failure] * (LLM_API_MAX_ATTEMPTS if outcome == "exhausted" else 1)
+        if outcome == "success":
+            responses.append(_make_raw_llm_response(content="Recovered."))
+        with (
+            patch("litellm.acompletion", new_callable=AsyncMock, side_effect=responses) as mock_llm,
+            _mock_composer_retry_sleep() as mock_sleep,
+        ):
+            if outcome == "success":
+                result = await service.compose("Hello", [], _empty_state(), session_id=session_id)
+                _assert_checkpoint_reply(result, "Recovered.", count=0)
+                assert len(result.llm_calls) == 2
+            else:
+                with pytest.raises(type(failure)):
+                    await service.compose("Hello", [], _empty_state(), session_id=session_id)
+        expected = 2 if outcome == "success" else LLM_API_MAX_ATTEMPTS
+        assert mock_llm.call_count == expected
+        expected_delays = [1.0] if outcome == "success" else [1.0, 2.0]
+        assert [call.args[0] for call in mock_sleep.await_args_list] == expected_delays
 
     @pytest.mark.asyncio
     async def test_real_bad_gateway_is_not_retried(self) -> None:

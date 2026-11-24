@@ -18,7 +18,7 @@ import httpx
 import pytest
 import pytest_asyncio
 import structlog
-from litellm.exceptions import APIError, ServiceUnavailableError
+from litellm.exceptions import APIConnectionError, APIError, InternalServerError, ServiceUnavailableError
 from litellm.litellm_core_utils import logging_worker
 from litellm.llms.openai.openai import OpenAIChatCompletion
 from sqlalchemy import select
@@ -268,10 +268,14 @@ async def _run_quota_planner(
 
 
 @pytest.mark.asyncio
-async def test_second_planning_call_503_settles_before_quota_refuses_retry(
+@pytest.mark.parametrize(
+    "failure_type", (ServiceUnavailableError, InternalServerError, APIConnectionError), ids=("503", "500", "connection")
+)
+async def test_second_planning_call_settles_before_quota_refuses_retry(
     quota_service,
     tmp_path: Path,
     tool_context,
+    failure_type: type[ServiceUnavailableError] | type[InternalServerError] | type[APIConnectionError],
 ) -> None:
     engine, service, _ = quota_service
     session = await service.create_session(user_id="alice", title="Planner quota", auth_provider_type="local")
@@ -279,7 +283,7 @@ async def test_second_planning_call_503_settles_before_quota_refuses_retry(
 
     script = _ScriptedCompletion(
         _response(("list_sources", {})),
-        ServiceUnavailableError(message=secret, llm_provider="test-provider", model="test/planner"),
+        failure_type(message=secret, llm_provider="test-provider", model="test/planner"),
     )
 
     recorder = BufferingRecorder()
@@ -314,7 +318,7 @@ async def test_second_planning_call_503_settles_before_quota_refuses_retry(
     assert len(script.requests) == 2
     assert [call.status for call in recorder.llm_calls] == [ComposerLLMCallStatus.SUCCESS, ComposerLLMCallStatus.API_ERROR]
     assert [call.planner_call_ordinal for call in recorder.llm_calls] == [1, 2]
-    assert recorder.llm_calls[1].error_class == "ServiceUnavailableError"
+    assert recorder.llm_calls[1].error_class == failure_type.__name__
     assert secret not in repr(recorder.llm_calls)
     with engine.connect() as connection:
         attempts = connection.execute(select(quota_provider_attempts_table)).all()

@@ -2761,14 +2761,22 @@ async def test_checkpoint_sdk_failure_requires_response_evidence_for_malformed(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure_kind", ["auth", "bad_request", "rate_limit", "unavailable", "connection"])
-async def test_advisor_respects_existing_provider_retryability(make_service, simple_state, failure_kind):
-    from litellm.exceptions import AuthenticationError, BadRequestError, RateLimitError, ServiceUnavailableError
+@pytest.mark.parametrize("failure_kind", ["auth", "bad_request", "rate_limit", "rate_limit_budget", "unavailable", "connection"])
+async def test_advisor_respects_existing_provider_retryability(make_service, simple_state, failure_kind, monkeypatch):
+    from litellm.exceptions import AuthenticationError, BadRequestError, RateLimitError, RateLimitType, ServiceUnavailableError
+
+    from elspeth.web.composer import advisor_checkpoint
+
+    retry_sleep = AsyncMock(spec=asyncio.sleep)
+    monkeypatch.setattr(advisor_checkpoint, "asyncio", SimpleNamespace(**(vars(asyncio) | {"sleep": retry_sleep})))
 
     failures = {
         "auth": AuthenticationError("private provider detail", model="advisor", llm_provider="openai"),
         "bad_request": BadRequestError("private provider detail", model="advisor", llm_provider="openai"),
         "rate_limit": RateLimitError("private provider detail", model="advisor", llm_provider="openai"),
+        "rate_limit_budget": RateLimitError(
+            "private provider detail", model="advisor", llm_provider="openai", rate_limit_type=RateLimitType.BUDGET
+        ),
         "unavailable": ServiceUnavailableError("private provider detail", model="advisor", llm_provider="openai"),
         "connection": ConnectionError("private provider detail"),
     }
@@ -2779,8 +2787,10 @@ async def test_advisor_respects_existing_provider_retryability(make_service, sim
         phase="end", state=simple_state, **_fenced_session(service), recorder=make_recorder()
     )
     assert not verdict.ok
-    assert call.await_count == (2 if failure_kind in {"unavailable", "connection"} else 1)
-    assert verdict.retryable is (failure_kind in {"unavailable", "connection"})
+    expected_calls = 2 if failure_kind in {"rate_limit", "unavailable", "connection"} else 1
+    assert call.await_count == expected_calls
+    assert retry_sleep.await_count == expected_calls - 1
+    assert verdict.retryable is (failure_kind in {"rate_limit", "unavailable", "connection"})
     assert "private provider detail" not in verdict.findings_text
 
 
@@ -6930,11 +6940,126 @@ def _install_budget_advisor_transport(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("headers", "scenario", "expected_calls", "delays"),
+    [
+        ({"retry-after": "3"}, "success", 2, [3.0]),
+        ({"retry-after-ms": "1500", "retry-after": "3"}, "success", 2, [1.5]),
+        ({"retry-after-ms": "bad", "retry-after": "3"}, "success", 2, [3.0]),
+        ({"retry-after": "bad"}, "success", 2, [1.0]),
+        ({}, "exhausted", 2, [1.0]),
+        ({"retry-after": "31"}, "too-long", 1, []),
+        ({"retry-after": "6"}, "deadline", 1, []),
+        ({}, "budget", 1, []),
+    ],
+    ids=("seconds", "ms-wins", "malformed-ms", "malformed-seconds", "exhausted", "ceiling", "deadline", "budget"),
+)
+async def test_physical_advisor_rate_limit_counts_audit_and_quota_attempts(
+    make_service,
+    simple_state,
+    monkeypatch,
+    physical_advisor,
+    headers: dict[str, str],
+    scenario: str,
+    expected_calls: int,
+    delays: list[float],
+) -> None:
+    import httpx
+    from litellm.exceptions import RateLimitError, RateLimitType
+
+    from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
+    from elspeth.web.composer import advisor_checkpoint
+
+    limited = RateLimitError(
+        "private rate limit",
+        model="advisor",
+        llm_provider="openai",
+        response=httpx.Response(429, request=httpx.Request("POST", "https://example.invalid"), headers=headers),
+        rate_limit_type=RateLimitType.BUDGET if scenario == "budget" else None,
+    )
+    responses: list[str | Exception] = [limited] * (2 if scenario == "exhausted" else 1)
+    if scenario == "success":
+        responses.append(_checkpoint_reply(publication_verdict="ADMIT"))
+    service = make_service()
+    calls = _install_budget_advisor_transport(monkeypatch, responses, provider_cost=0.01)
+    retry_sleep = AsyncMock(spec=asyncio.sleep)
+    monkeypatch.setattr(advisor_checkpoint, "asyncio", SimpleNamespace(**(vars(asyncio) | {"sleep": retry_sleep})))
+    recorder = make_recorder()
+    deadline = asyncio.get_running_loop().time() + 10.0 if scenario == "deadline" else None
+    with prompt_guard_user_scope(""):
+        verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
+            phase="end",
+            state=simple_state,
+            recorder=recorder,
+            deadline=deadline,
+            **physical_advisor.bind(service, review_state=simple_state),
+        )
+    assert verdict.ok is (scenario == "success")
+    assert len(calls) == len(recorder.llm_calls) == expected_calls
+    assert [call.args[0] for call in retry_sleep.await_args_list] == delays
+    expected_statuses = [ComposerLLMCallStatus.API_ERROR] * expected_calls
+    if scenario == "success":
+        expected_statuses[-1] = ComposerLLMCallStatus.SUCCESS
+    assert [call.status for call in recorder.llm_calls] == expected_statuses
+    with physical_advisor.engine.connect() as connection:
+        attempts = connection.execute(select(quota_provider_attempts_table)).all()
+    assert len(attempts) == expected_calls
+    assert {attempt.attempt_id for attempt in attempts} == {call.call_id for call in recorder.llm_calls}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_kind", ("internal_server", "connection"))
+@pytest.mark.parametrize("outcome", ("success", "exhausted"))
+async def test_physical_advisor_500_and_connection_retry_with_audit_and_quota(
+    make_service, simple_state, monkeypatch, physical_advisor, failure_kind: str, outcome: str
+) -> None:
+    from litellm.exceptions import APIConnectionError, InternalServerError
+
+    from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
+    from elspeth.web.composer import advisor_checkpoint
+
+    failure = (
+        InternalServerError("private failure", model="advisor", llm_provider="openai")
+        if failure_kind == "internal_server"
+        else APIConnectionError("private failure", model="advisor", llm_provider="openai")
+    )
+    responses: list[str | Exception] = [failure] * (2 if outcome == "exhausted" else 1)
+    if outcome == "success":
+        responses.append(_checkpoint_reply(publication_verdict="ADMIT"))
+    service = make_service()
+    calls = _install_budget_advisor_transport(monkeypatch, responses, provider_cost=0.01)
+    retry_sleep = AsyncMock(spec=asyncio.sleep)
+    monkeypatch.setattr(advisor_checkpoint, "asyncio", SimpleNamespace(**(vars(asyncio) | {"sleep": retry_sleep})))
+    recorder = make_recorder()
+    with prompt_guard_user_scope(""):
+        verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
+            phase="end",
+            state=simple_state,
+            recorder=recorder,
+            **physical_advisor.bind(service, review_state=simple_state),
+        )
+    assert verdict.ok is (outcome == "success")
+    assert len(calls) == len(recorder.llm_calls) == 2
+    retry_sleep.assert_awaited_once_with(1.0)
+    statuses = [ComposerLLMCallStatus.API_ERROR, ComposerLLMCallStatus.SUCCESS if outcome == "success" else ComposerLLMCallStatus.API_ERROR]
+    assert [call.status for call in recorder.llm_calls] == statuses
+    with physical_advisor.engine.connect() as connection:
+        attempts = connection.execute(select(quota_provider_attempts_table)).all()
+    assert len(attempts) == 2
+    assert {attempt.attempt_id for attempt in attempts} == {call.call_id for call in recorder.llm_calls}
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("phase", ["early", "end"])
-@pytest.mark.parametrize("first", ["clean", "transport", "schema", "contract"])
+@pytest.mark.parametrize("first", ["clean", "transport", "rate_limit", "schema", "contract"])
 async def test_actual_checkpoint_dispatch_and_retry_fit_optional_summary(
     make_service, simple_state, monkeypatch, physical_advisor, phase, first
 ):
+    import httpx
+    from litellm.exceptions import RateLimitError
+
+    from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
+    from elspeth.web.composer import advisor_checkpoint
     from elspeth.web.composer.advisor_context import (
         build_advisor_user_message,
         summarize_pipeline_for_advisor,
@@ -6948,8 +7073,16 @@ async def test_actual_checkpoint_dispatch_and_retry_fit_optional_summary(
         publication_verdict="WITHHOLD" if phase == "end" else None,
     )
     bad = _checkpoint_reply(steps=("rate",), publication_verdict="ADMIT" if phase == "end" else None)
-    initial = {"clean": good, "transport": TimeoutError(), "schema": "not JSON", "contract": bad}[first]
+    limited = RateLimitError(
+        "private provider rate limit",
+        model="advisor",
+        llm_provider="openai",
+        response=httpx.Response(429, request=httpx.Request("POST", "https://example.invalid"), headers={"retry-after": "3"}),
+    )
+    initial = {"clean": good, "transport": TimeoutError(), "rate_limit": limited, "schema": "not JSON", "contract": bad}[first]
     calls = _install_budget_advisor_transport(monkeypatch, [initial, good])
+    retry_sleep = AsyncMock(spec=asyncio.sleep)
+    monkeypatch.setattr(advisor_checkpoint, "asyncio", SimpleNamespace(**(vars(asyncio) | {"sleep": retry_sleep})))
     recorder = make_recorder()
     full = summarize_pipeline_for_advisor(state)
     fenced = physical_advisor.bind(service, review_state=state if phase == "end" else None)
@@ -6975,6 +7108,9 @@ async def test_actual_checkpoint_dispatch_and_retry_fit_optional_summary(
     assert 0 <= _optional_summary_chars(arguments, state) <= cap
     assert calls[0]["messages"][1]["content"] == build_advisor_user_message(arguments)
     assert len(recorder.llm_calls) == len(calls)
+    if first == "rate_limit":
+        retry_sleep.assert_awaited_once_with(3.0)
+        assert [call.status for call in recorder.llm_calls] == [ComposerLLMCallStatus.API_ERROR, ComposerLLMCallStatus.SUCCESS]
     record = service._sessions_service.add_message.await_args_list[0].kwargs["tool_calls"][0]["pass"]
     assert record["provider_attempts"] == len(calls)
     assert record["format_reprompt_sent"] is (first in {"schema", "contract"})

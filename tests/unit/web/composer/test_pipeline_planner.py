@@ -19,16 +19,18 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 from uuid import UUID, uuid4
 
+import httpx
 import litellm
 import pytest
 import structlog
 from litellm import ModelResponse, Usage
 from litellm.exceptions import APIError as LiteLLMAPIError
-from litellm.exceptions import BadGatewayError, ServiceUnavailableError
+from litellm.exceptions import BadGatewayError, RateLimitError, RateLimitType, ServiceUnavailableError
 from litellm.exceptions import Timeout as LiteLLMTimeout
 from sqlalchemy import func, select
 from sqlalchemy.pool import StaticPool
@@ -5259,6 +5261,115 @@ async def test_each_transient_api_retry_consumes_and_audits_a_wire_attempt(
     assert raw_canary not in canonical_json([call.to_dict() for call in recorder.llm_calls])
     assert [attempt.ordinal for attempt in recorder.planner_attempts] == [1]
     assert [attempt.planner_call_ordinal for attempt in recorder.planner_attempts] == [2]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("headers", "scenario", "calls", "delays"),
+    [
+        ({"retry-after": "3"}, "success", 2, [3.0]),
+        ({"retry-after-ms": "1500", "retry-after": "3"}, "success", 2, [1.5]),
+        ({"retry-after-ms": "bad", "retry-after": "3"}, "success", 2, [3.0]),
+        ({"retry-after": "bad"}, "success", 2, [1.0]),
+        ({}, "exhausted", 2, [1.0]),
+        ({"retry-after": "31"}, "too-long", 1, []),
+        ({"retry-after": "6"}, "deadline", 1, []),
+        ({}, "budget", 1, []),
+    ],
+    ids=("seconds", "ms-wins", "malformed-ms", "malformed-seconds", "exhausted", "ceiling", "deadline", "budget"),
+)
+async def test_planner_rate_limit_retries_after_header_and_records_both_physical_calls(
+    tmp_path: Path, tool_context: ToolContext, headers: dict[str, str], scenario: str, calls: int, delays: list[float]
+) -> None:
+    rate_limit = RateLimitError(
+        message="private rate limit",
+        llm_provider="test-provider",
+        model="anthropic/claude-planner",
+        response=httpx.Response(429, request=httpx.Request("POST", "https://example.invalid"), headers=headers),
+        rate_limit_type=RateLimitType.BUDGET if scenario == "budget" else None,
+    )
+    responses: list[Exception | _Response] = [rate_limit] * (2 if scenario == "exhausted" else 1)
+    if scenario == "success":
+        responses.append(_response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})))
+    completion = _ScriptedCompletion(*responses)
+    recorder = BufferingRecorder()
+    retry_sleep = AsyncMock(spec=asyncio.sleep)
+    retry_asyncio = SimpleNamespace(**(vars(asyncio) | {"sleep": retry_sleep}))
+    model_overrides = {"max_api_attempts": 2, "api_retry_base_seconds": 1.0}
+    if scenario == "deadline":
+        model_overrides["timeout_seconds"] = 10.0
+    with patch.object(pipeline_planner, "asyncio", retry_asyncio):
+        if scenario == "success":
+            proposal = await _plan(
+                tmp_path=tmp_path,
+                tool_context=tool_context,
+                completion=completion,
+                recorder=recorder,
+                model_overrides=model_overrides,
+            )
+            assert deep_thaw(proposal.proposal.pipeline) == _pipeline(tmp_path)
+        else:
+            with pytest.raises(PipelinePlannerError) as caught:
+                await _plan(
+                    tmp_path=tmp_path,
+                    tool_context=tool_context,
+                    completion=completion,
+                    recorder=recorder,
+                    model_overrides=model_overrides,
+                )
+            assert caught.value.code == "PROVIDER_ERROR"
+    assert len(completion.requests) == calls
+    assert [call.args[0] for call in retry_sleep.await_args_list] == delays
+    expected_statuses = [ComposerLLMCallStatus.API_ERROR] * calls
+    if scenario == "success":
+        expected_statuses[-1] = ComposerLLMCallStatus.SUCCESS
+    assert [call.status for call in recorder.llm_calls] == expected_statuses
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_kind", ("internal_server", "connection"))
+@pytest.mark.parametrize("outcome", ("success", "exhausted"))
+async def test_planner_500_and_connection_use_bounded_retry(
+    tmp_path: Path, tool_context: ToolContext, failure_kind: str, outcome: str
+) -> None:
+    from litellm.exceptions import APIConnectionError, InternalServerError
+
+    failure = (
+        InternalServerError(message="private failure", llm_provider="test-provider", model="anthropic/claude-planner")
+        if failure_kind == "internal_server"
+        else APIConnectionError(message="private failure", llm_provider="test-provider", model="anthropic/claude-planner")
+    )
+    responses: list[Exception | _Response] = [failure] * (2 if outcome == "exhausted" else 1)
+    if outcome == "success":
+        responses.append(_response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})))
+    completion = _ScriptedCompletion(*responses)
+    recorder = BufferingRecorder()
+    retry_sleep = AsyncMock(spec=asyncio.sleep)
+    retry_asyncio = SimpleNamespace(**(vars(asyncio) | {"sleep": retry_sleep}))
+    with patch.object(pipeline_planner, "asyncio", retry_asyncio):
+        if outcome == "success":
+            proposal = await _plan(
+                tmp_path=tmp_path,
+                tool_context=tool_context,
+                completion=completion,
+                recorder=recorder,
+                model_overrides={"max_api_attempts": 2, "api_retry_base_seconds": 1.0},
+            )
+            assert deep_thaw(proposal.proposal.pipeline) == _pipeline(tmp_path)
+        else:
+            with pytest.raises(PipelinePlannerError) as caught:
+                await _plan(
+                    tmp_path=tmp_path,
+                    tool_context=tool_context,
+                    completion=completion,
+                    recorder=recorder,
+                    model_overrides={"max_api_attempts": 2, "api_retry_base_seconds": 1.0},
+                )
+            assert caught.value.code == "PROVIDER_ERROR"
+    assert len(completion.requests) == len(recorder.llm_calls) == 2
+    assert [call.args[0] for call in retry_sleep.await_args_list] == [1.0]
+    statuses = [ComposerLLMCallStatus.API_ERROR, ComposerLLMCallStatus.SUCCESS if outcome == "success" else ComposerLLMCallStatus.API_ERROR]
+    assert [call.status for call in recorder.llm_calls] == statuses
 
 
 @pytest.mark.asyncio
