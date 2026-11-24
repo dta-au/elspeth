@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from typing import Any
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import Mock, create_autospec
 from uuid import UUID, uuid4
 
 import pytest
@@ -28,14 +28,12 @@ from tests.helpers.worker_probe import WorkerProbe, run_with_probe
 _LANDSCAPE_URL = "sqlite:///unused-landscape.db"
 
 
-def _session_service(candidates: list[Any]) -> Mock:
-    service = Mock(spec=SessionServiceImpl)
-    service.list_pending_landscape_reconciliations = AsyncMock(
-        spec=SessionServiceImpl.list_pending_landscape_reconciliations, return_value=candidates
-    )
-    service.mark_landscape_reconciliation_outcomes = AsyncMock(
-        spec=SessionServiceImpl.mark_landscape_reconciliation_outcomes, return_value=None
-    )
+def _session_service(candidates: list[Any]) -> Any:
+    # An instance autospec binds ``self``, so awaited-call assertions match
+    # the keyword arguments the caller passes.
+    service = create_autospec(SessionServiceImpl, instance=True)
+    service.list_pending_landscape_reconciliations.return_value = candidates
+    service.mark_landscape_reconciliation_outcomes.return_value = None
     return service
 
 
