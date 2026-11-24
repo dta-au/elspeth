@@ -2776,6 +2776,7 @@ async def test_advisor_respects_existing_provider_retryability(make_service, sim
         "auth": AuthenticationError("private provider detail", model="advisor", llm_provider="openai"),
         "bad_request": BadRequestError("private provider detail", model="advisor", llm_provider="openai"),
         "rate_limit": RateLimitError("private provider detail", model="advisor", llm_provider="openai"),
+        # A directly typed 429, as the SDK or a proxy raises it; LiteLLM's mapper strips this type.
         "rate_limit_budget": RateLimitError(
             "private provider detail", model="advisor", llm_provider="openai", rate_limit_type=RateLimitType.BUDGET
         ),
@@ -2931,6 +2932,53 @@ async def test_end_gate_compose_deadline_keeps_the_completed_reply_recoverable(m
             initial_version=0,
         )
 
+    (row,) = service._sessions_service.add_message.calls
+    assert row.args[1:3] == ("audit", _ASSISTANT_CONTENT)
+    (envelope,) = row.kwargs["tool_calls"]
+    assert envelope["_kind"] == "composer_withheld_reply"
+    assert envelope["origin"] == "compose_deadline_expired"
+
+
+@pytest.mark.asyncio
+async def test_end_gate_503_without_retry_room_ends_through_the_compose_deadline_handler(make_service, simple_state, monkeypatch):
+    """No room for a retry is a time fact, not an advisor outage.
+
+    The 503 arrives inside the retry delay plus call margin of the deadline. The
+    pass refuses the retry without relabelling the provider disposition, so the
+    next pass reaches the compose-deadline handler, which keeps the finished
+    reply, instead of publishing "advisor model was unavailable".
+    """
+    from litellm.exceptions import ServiceUnavailableError
+
+    service = make_service()
+    deadline = asyncio.get_running_loop().time() + 3.0
+    now = [deadline - 3.0]
+    monkeypatch.setattr("elspeth.web.composer.advisor_checkpoint._compose_deadline_time", lambda: now[0])
+
+    async def unavailable_as_the_deadline_arrives(*_args: object, **_kwargs: object) -> object:
+        now[0] = deadline
+        raise ServiceUnavailableError("private provider detail", model="advisor", llm_provider="openai")
+
+    service._advisor_checkpoint._call_advisor_with_audit = AsyncMock(
+        spec=service._advisor_checkpoint._call_advisor_with_audit,
+        side_effect=unavailable_as_the_deadline_arrives,
+    )
+    monkeypatch.setattr(
+        "elspeth.web.composer.advisor_checkpoint.persist_advisor_checkpoint_pass", AsyncMock(spec=persist_advisor_checkpoint_pass)
+    )
+
+    with pytest.raises(ComposerConvergenceError) as exc_info:
+        await drive_try_terminate(
+            service,
+            simple_state,
+            advisor_checkpoint_passes_used=0,
+            deadline=deadline,
+            initial_version=0,
+        )
+
+    assert service._advisor_checkpoint._call_advisor_with_audit.await_count == 1
+    assert exc_info.value.budget_exhausted == "timeout"
+    assert "advisor model was unavailable" not in str(exc_info.value).lower()
     (row,) = service._sessions_service.add_message.calls
     assert row.args[1:3] == ("audit", _ASSISTANT_CONTENT)
     (envelope,) = row.kwargs["tool_calls"]
@@ -7014,21 +7062,16 @@ async def test_physical_advisor_rate_limit_counts_audit_and_quota_attempts(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure_kind", ("internal_server", "connection"))
 @pytest.mark.parametrize("outcome", ("success", "exhausted"))
-async def test_physical_advisor_500_and_connection_retry_with_audit_and_quota(
-    make_service, simple_state, monkeypatch, physical_advisor, failure_kind: str, outcome: str
+async def test_physical_advisor_500_retry_with_audit_and_quota(
+    make_service, simple_state, monkeypatch, physical_advisor, outcome: str
 ) -> None:
-    from litellm.exceptions import APIConnectionError, InternalServerError
+    from litellm.exceptions import InternalServerError
 
     from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
     from elspeth.web.composer import advisor_checkpoint
 
-    failure = (
-        InternalServerError("private failure", model="advisor", llm_provider="openai")
-        if failure_kind == "internal_server"
-        else APIConnectionError("private failure", model="advisor", llm_provider="openai")
-    )
+    failure = InternalServerError("private failure", model="advisor", llm_provider="openai")
     responses: list[str | Exception] = [failure] * (2 if outcome == "exhausted" else 1)
     if outcome == "success":
         responses.append(_checkpoint_reply(publication_verdict="ADMIT"))

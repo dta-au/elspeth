@@ -77,6 +77,13 @@ def observe_rate_limit(exc: OpenAIRateLimitError, *, now: datetime | None = None
     The SDK classes declare ``response``, ``code`` and (on LiteLLM's subclass)
     ``rate_limit_type``, so they are read as typed fields. Their values are
     still foreign and are checked below before anything is retained.
+
+    The budget evidence is honoured only when an error arrives typed: raised
+    directly by the SDK or typed by a proxy. LiteLLM's exception mapper, which
+    every ``acompletion`` failure passes through, rebuilds a provider 429
+    without its body, code or rate-limit type, so a quota or credit refusal
+    from that path is indistinguishable from a transient 429 and is retried
+    within the same bound.
     """
     from litellm.exceptions import RateLimitError as LiteLLMRateLimitError
     from litellm.exceptions import RateLimitType
@@ -131,7 +138,10 @@ def _provider_error_arms() -> tuple[tuple[type[BaseException], _Disposition], ..
         (le.MidStreamFallbackError, "retry"),
         (le.ServiceUnavailableError, "retry"),
         (openai.InternalServerError, "retry"),
-        (openai.APIConnectionError, "retry"),
+        # LiteLLM wraps every exception it cannot map, including a failure to
+        # read a response the provider already billed, as APIConnectionError.
+        # The class carries no typed transport evidence, so it is not retried.
+        (openai.APIConnectionError, "generic"),
         (openai.PermissionDeniedError, "auth"),
         (openai.NotFoundError, "generic"),
         (openai.UnprocessableEntityError, "generic"),

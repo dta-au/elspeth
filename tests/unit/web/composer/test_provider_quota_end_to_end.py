@@ -18,7 +18,7 @@ import httpx
 import pytest
 import pytest_asyncio
 import structlog
-from litellm.exceptions import APIConnectionError, APIError, InternalServerError, ServiceUnavailableError
+from litellm.exceptions import APIError, InternalServerError, ServiceUnavailableError
 from litellm.litellm_core_utils import logging_worker
 from litellm.llms.openai.openai import OpenAIChatCompletion
 from sqlalchemy import select
@@ -268,14 +268,12 @@ async def _run_quota_planner(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "failure_type", (ServiceUnavailableError, InternalServerError, APIConnectionError), ids=("503", "500", "connection")
-)
+@pytest.mark.parametrize("failure_type", (ServiceUnavailableError, InternalServerError), ids=("503", "500"))
 async def test_second_planning_call_settles_before_quota_refuses_retry(
     quota_service,
     tmp_path: Path,
     tool_context,
-    failure_type: type[ServiceUnavailableError] | type[InternalServerError] | type[APIConnectionError],
+    failure_type: type[ServiceUnavailableError] | type[InternalServerError],
 ) -> None:
     engine, service, _ = quota_service
     session = await service.create_session(user_id="alice", title="Planner quota", auth_provider_type="local")

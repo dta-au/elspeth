@@ -142,6 +142,7 @@ _BUDGET_DETAIL = "The reply was withheld because the completion review could not
         pytest.param(False, 0, 60.0, "0", "prior_call_cost_unknown", id="cost_unknown"),
         pytest.param(False, 1, 60.0, "0", "budget_exhausted", id="cost_unknown_and_call_count_reached"),
         pytest.param(False, 0, -1.0, "0", "budget_exhausted", id="cost_unknown_and_deadline_passed"),
+        pytest.param(False, 0, 60.0, "1", "budget_exhausted", id="cost_unknown_and_cost_at_cap"),
         pytest.param(True, 0, 60.0, "2", "budget_exhausted", id="known_cost_over_cap"),
     ],
 )

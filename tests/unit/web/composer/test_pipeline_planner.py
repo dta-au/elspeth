@@ -32,6 +32,7 @@ from litellm import ModelResponse, Usage
 from litellm.exceptions import APIError as LiteLLMAPIError
 from litellm.exceptions import BadGatewayError, RateLimitError, RateLimitType, ServiceUnavailableError
 from litellm.exceptions import Timeout as LiteLLMTimeout
+from openai import RateLimitError as OpenAIRateLimitError
 from sqlalchemy import func, select
 from sqlalchemy.pool import StaticPool
 
@@ -154,6 +155,7 @@ from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from elspeth.web.validation import _redact_sensitive_content
 from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
+from tests.helpers.litellm_mapping import through_litellm_mapper
 from tests.helpers.prompt_guard_audit import (
     PROMPT_GUARD_AUDIT_SCHEMA_VERSION,
     assert_prompt_guard_check_shape,
@@ -5281,6 +5283,7 @@ async def test_each_transient_api_retry_consumes_and_audits_a_wire_attempt(
 async def test_planner_rate_limit_retries_after_header_and_records_both_physical_calls(
     tmp_path: Path, tool_context: ToolContext, headers: dict[str, str], scenario: str, calls: int, delays: list[float]
 ) -> None:
+    # A directly typed 429, as the SDK or a proxy raises it; LiteLLM's mapper strips this type (see the mapper-built quota test).
     rate_limit = RateLimitError(
         message="private rate limit",
         llm_provider="test-provider",
@@ -5327,18 +5330,11 @@ async def test_planner_rate_limit_retries_after_header_and_records_both_physical
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure_kind", ("internal_server", "connection"))
 @pytest.mark.parametrize("outcome", ("success", "exhausted"))
-async def test_planner_500_and_connection_use_bounded_retry(
-    tmp_path: Path, tool_context: ToolContext, failure_kind: str, outcome: str
-) -> None:
-    from litellm.exceptions import APIConnectionError, InternalServerError
+async def test_planner_500_uses_bounded_retry(tmp_path: Path, tool_context: ToolContext, outcome: str) -> None:
+    from litellm.exceptions import InternalServerError
 
-    failure = (
-        InternalServerError(message="private failure", llm_provider="test-provider", model="anthropic/claude-planner")
-        if failure_kind == "internal_server"
-        else APIConnectionError(message="private failure", llm_provider="test-provider", model="anthropic/claude-planner")
-    )
+    failure = InternalServerError(message="private failure", llm_provider="test-provider", model="anthropic/claude-planner")
     responses: list[Exception | _Response] = [failure] * (2 if outcome == "exhausted" else 1)
     if outcome == "success":
         responses.append(_response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})))
@@ -5370,6 +5366,62 @@ async def test_planner_500_and_connection_use_bounded_retry(
     assert [call.args[0] for call in retry_sleep.await_args_list] == [1.0]
     statuses = [ComposerLLMCallStatus.API_ERROR, ComposerLLMCallStatus.SUCCESS if outcome == "success" else ComposerLLMCallStatus.API_ERROR]
     assert [call.status for call in recorder.llm_calls] == statuses
+
+
+@pytest.mark.asyncio
+async def test_planner_failure_arriving_as_a_connection_error_is_not_retried(tmp_path: Path, tool_context: ToolContext) -> None:
+    """LiteLLM wraps unmapped failures, including a billed response it could not read, as APIConnectionError."""
+    from litellm.exceptions import APIConnectionError
+
+    failure = through_litellm_mapper(KeyError("choices"), provider="anthropic", model="anthropic/claude-planner")
+    assert type(failure) is APIConnectionError
+    completion = _ScriptedCompletion(failure)
+    recorder = BufferingRecorder()
+    retry_sleep = AsyncMock(spec=asyncio.sleep)
+    retry_asyncio = SimpleNamespace(**(vars(asyncio) | {"sleep": retry_sleep}))
+    with patch.object(pipeline_planner, "asyncio", retry_asyncio), pytest.raises(PipelinePlannerError) as caught:
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            recorder=recorder,
+            model_overrides={"max_api_attempts": 2, "api_retry_base_seconds": 1.0},
+        )
+    assert caught.value.code == "PROVIDER_ERROR"
+    assert len(completion.requests) == len(recorder.llm_calls) == 1
+    retry_sleep.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_planner_does_not_wait_out_a_retry_delay_before_a_certain_call_budget_refusal(
+    tmp_path: Path, tool_context: ToolContext
+) -> None:
+    """The failed call used the last provider call, so the retry is refused at once, not after the Retry-After."""
+    rate_limit = through_litellm_mapper(
+        OpenAIRateLimitError(
+            "slow down",
+            response=httpx.Response(429, request=httpx.Request("POST", "https://example.invalid"), headers={"retry-after": "20"}),
+            body=None,
+        ),
+        provider="anthropic",
+        model="anthropic/claude-planner",
+    )
+    completion = _ScriptedCompletion(rate_limit)
+    recorder = BufferingRecorder()
+    retry_sleep = AsyncMock(spec=asyncio.sleep)
+    retry_asyncio = SimpleNamespace(**(vars(asyncio) | {"sleep": retry_sleep}))
+    with patch.object(pipeline_planner, "asyncio", retry_asyncio), pytest.raises(PipelinePlannerError) as caught:
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            recorder=recorder,
+            budget=_budget(max_total_provider_calls=1),
+            model_overrides={"max_api_attempts": 2, "api_retry_base_seconds": 1.0},
+        )
+    assert caught.value.code == "PROVIDER_CALLS_EXHAUSTED"
+    assert len(completion.requests) == len(recorder.llm_calls) == 1
+    retry_sleep.assert_not_awaited()
 
 
 @pytest.mark.asyncio

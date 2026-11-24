@@ -1708,7 +1708,9 @@ class AdvisorCheckpointOwner:
                     base_delay_seconds=LLM_API_RETRY_BASE_DELAY_SECONDS,
                 )
                 if retry_delay is None:
-                    last_failure_retryable = False
+                    # No room for another call in this pass is a time fact, not
+                    # a provider disposition. The next pass makes its own
+                    # deadline decision.
                     break
                 if retry_delay > 0:
                     await asyncio.sleep(retry_delay)

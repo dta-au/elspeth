@@ -12,7 +12,7 @@ import litellm
 import pytest
 from httpx import ASGITransport, AsyncClient, MockTransport, Request, Response
 from jsonschema import Draft202012Validator
-from litellm.exceptions import APIConnectionError, InternalServerError, RateLimitError, ServiceUnavailableError
+from litellm.exceptions import InternalServerError, RateLimitError, ServiceUnavailableError
 from sqlalchemy import select
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus, ToolContractDialect
@@ -225,12 +225,10 @@ async def test_each_real_composer_transition_has_its_own_settled_provider_eviden
                     raise InternalServerError("private failure", llm_provider="test", model=model)
                 if first_primary_failure == "service_unavailable":
                     raise ServiceUnavailableError("private failure", llm_provider="test", model=model)
-                if first_primary_failure == "rate_limit":
-                    request = Request("POST", "https://provider.example.test")
-                    limited = Response(429, request=request, headers={"retry-after": "1"})
-                    raise RateLimitError("private failure", llm_provider="test", model=model, response=limited)
-                assert first_primary_failure == "connection"
-                raise APIConnectionError("private failure", llm_provider="test", model=model)
+                assert first_primary_failure == "rate_limit"
+                request = Request("POST", "https://provider.example.test")
+                limited = Response(429, request=request, headers={"retry-after": "1"})
+                raise RateLimitError("private failure", llm_provider="test", model=model, response=limited)
             assert primary_replies, "Unexpected extra primary provider dispatch"
             content = primary_replies.pop(0)
             primary_ordinal = sum(call.model == model and call.attempt_id not in failed_attempt_ids for call in dispatches)
@@ -583,7 +581,7 @@ async def test_each_real_composer_transition_has_its_own_settled_provider_eviden
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("quota", ("quota_off", "quota_on"))
-@pytest.mark.parametrize("failure_kind", ("internal_server", "connection", "rate_limit", "service_unavailable"))
+@pytest.mark.parametrize("failure_kind", ("internal_server", "rate_limit", "service_unavailable"))
 @pytest.mark.parametrize("transition", ("initial", "source_missing", "proposal"))
 async def test_rootless_and_first_turn_retry_a_transient_failure_inside_the_transition(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, transition: str, failure_kind: str, quota: str

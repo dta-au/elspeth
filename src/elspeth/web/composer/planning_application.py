@@ -982,6 +982,7 @@ class PlanningApplication:
                 budget.bind_publication(review)
                 cost_unknown_before_review = (
                     not budget.cost_known
+                    and budget.validated_cost < budget.policy.max_cumulative_provider_cost
                     and self._settings.composer_advisor_checkpoint_max_passes > 0
                     and asyncio.get_running_loop().time() < budget.deadline
                     and budget.reserved_calls < budget.policy.max_total_provider_calls

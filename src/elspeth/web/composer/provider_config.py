@@ -5,8 +5,8 @@ from __future__ import annotations
 # One retry policy for Composer convergence and every planner surface.
 LLM_API_MAX_ATTEMPTS = 3
 LLM_API_RETRY_BASE_DELAY_SECONDS = 1.0
-# The next call needs its own deadline headroom. See CDA-20 handoff for the
-# measured compose budget and call-latency evidence behind this proposed cap.
+# A configured policy bound on any one retry delay, including a provider's
+# Retry-After; the next call also needs its own deadline headroom (the margin).
 LLM_API_RETRY_DELAY_CEILING_SECONDS = 30.0
 LLM_API_RETRY_CALL_MARGIN_SECONDS = 5.0
 
