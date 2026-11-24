@@ -27,7 +27,7 @@ from litellm.types.utils import ModelResponse, Usage
 
 from elspeth.contracts.composer_llm_audit import ComposerContextBudgetRecord, ComposerLLMCall, ComposerLLMCallStatus
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.web.composer import advisor_context, provider_gateway
+from elspeth.web.composer import advisor_context, advisor_policy, provider_gateway
 from elspeth.web.composer import advisor_transcript as transcript_module
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
 from elspeth.web.composer.advisor_transcript import AdvisorTranscriptHistory, AdvisorTranscriptOwner, AdvisorVisibleTranscript
@@ -950,6 +950,63 @@ def _scripted_advisor(monkeypatch: pytest.MonkeyPatch, script: list[str]) -> lis
 
     monkeypatch.setattr(provider_gateway, "_litellm_acompletion", scripted)
     return sent
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("steps", "failure_class", "retryable", "provider_attempts", "detail"),
+    [
+        pytest.param(
+            ["junk", "predispatch_timeout"], "malformed", True, 1, advisor_policy.ADVISOR_MALFORMED_USER_DETAIL, id="unparseable-reply"
+        ),
+        pytest.param(
+            ["empty", "predispatch_timeout"], "malformed", True, 1, advisor_policy.ADVISOR_MALFORMED_USER_DETAIL, id="malformed-reply"
+        ),
+        pytest.param(["junk", "timeout"], "unavailable", True, 2, advisor_policy.ADVISOR_UNAVAILABLE_USER_DETAIL, id="dispatched-failure"),
+        pytest.param(
+            ["predispatch_timeout", "predispatch_timeout"],
+            "unavailable",
+            True,
+            0,
+            advisor_policy.ADVISOR_UNAVAILABLE_USER_DETAIL,
+            id="no-dispatched-request",
+        ),
+    ],
+)
+async def test_checkpoint_reports_the_last_dispatched_request_after_an_unsent_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    steps: list[str],
+    failure_class: str,
+    retryable: bool,
+    provider_attempts: int,
+    detail: str,
+) -> None:
+    from elspeth.web.composer import advisor_checkpoint
+    from tests.unit.web.composer._helpers import _empty_state
+
+    records: list[Any] = []
+
+    async def capture(**kwargs: Any) -> None:
+        records.append(kwargs["record"])
+
+    monkeypatch.setattr(advisor_checkpoint, "persist_advisor_checkpoint_pass", capture)
+    sent = _scripted_advisor(monkeypatch, steps)
+    recorder = BufferingRecorder()
+    verdict = await _owner(tmp_path)._run_advisor_checkpoint(
+        phase="end",
+        state=_empty_state(),
+        session_id=None,
+        recorder=recorder,
+        publication_review=_review(_probe(8)),
+    )
+
+    assert len(sent) == 2
+    assert len(recorder.llm_calls) == 2
+    assert (verdict.failure_class, verdict.retryable, verdict.findings_text) == (failure_class, retryable, detail)
+    assert verdict.provider_failure is None
+    (record,) = records
+    assert (record.verdict, record.provider_attempts) == (failure_class, provider_attempts)
 
 
 @pytest.mark.asyncio
