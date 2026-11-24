@@ -19,10 +19,11 @@ from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.coordination.repository import SessionOperationConflictError
 from elspeth.web.required_executor import RequiredGenerationUnavailable
 from elspeth.web.sessions.composer_operations import CONTEXT_BUDGET_FAILURE_CODE, ComposerOperationError, ComposerRequiredRecoveryFailure
-from elspeth.web.sessions.protocol import StaleComposeStateError
+from elspeth.web.sessions.protocol import PromptFileTooLargeError, StaleComposeStateError
 
 _JSON: TypeAdapter[JsonValue] = TypeAdapter(JsonValue)
 _RETRYABLE_STORAGE_ERRNOS = frozenset((errno.EIO, errno.ENOSPC, errno.EROFS))
+_PENDING_PROPOSAL_WAY_ON = "The proposal is still pending: reject it, shorten the file, and ask for the change again."
 
 
 def _http_error(status: int, body: dict[str, JsonValue], error_type: str | None = None) -> ComposerOperationError:
@@ -237,6 +238,13 @@ def project_composer_operation_error(
             },
             "stale_compose_state",
         )
+    if isinstance(leaf, PromptFileTooLargeError):
+        # The review-card writer refuses a prompt file over an inline cap when a pipeline proposal is
+        # accepted. Answer 413 with the YAML import's body shape: the error code and a message naming only
+        # the node and the cap, plus what the user can do from here (the file is not yet bound, so it
+        # cannot be edited in place).
+        message = f"{leaf} {_PENDING_PROPOSAL_WAY_ON}"
+        return _http_error(413, {"detail": {"error_code": leaf.error_code, "message": message, "request_id": request_id}})
     if isinstance(leaf, FingerprintKeyMissingError):
         return _http_error(
             503,
