@@ -538,9 +538,13 @@ class ComposerLLMCall:
 
     ``rejection_reason_source`` says what recognised a size rejection (an
     ``error_message`` of ``context_length_exceeded`` or ``request_too_large``):
-    a structured SDK or HTTP field, the SDK's exception class, the HTTP status,
-    or a fixed-wording match on the provider's message. ``None`` on every other
-    call, and on records written before it was kept.
+    a structured SDK or HTTP field (``sdk_body``, ``http_response``), litellm's
+    context-window exception class (``sdk_class``), the HTTP status
+    (``http_status``), or ELSPETH's fixed-wording match on the provider's
+    message (``message_pattern``). ``sdk_class`` is not typed evidence: on some
+    routes (Anthropic, Bedrock, OpenAI-compatible) litellm itself assigns that
+    class by matching the provider's wording. ``None`` on every other call, and
+    on records written before it was kept.
     """
 
     model_requested: str

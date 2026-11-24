@@ -146,8 +146,10 @@ def _admit_context_length_evidence(
 
     Any retained specific code takes precedence over class or message evidence;
     absent, unavailable, foreign and generic codes remain eligible, even when
-    observations conflict. The SDK's own class is nominal evidence. The message
-    is foreign text, so it is matched against fixed wordings and then discarded.
+    observations conflict. litellm's ``ContextWindowExceededError`` is recorded
+    as ``sdk_class``; it is not typed evidence, since on some routes litellm
+    assigns that class by matching the provider's wording. The message is
+    foreign text, so it is matched against fixed wordings and then discarded.
     """
     if specific_code_seen:
         return admitted
