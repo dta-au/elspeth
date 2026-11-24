@@ -366,8 +366,9 @@ def _exact_builtin(value: object) -> str | int | float | None:
 
     Record construction runs this before the fence, so nothing downstream of
     it inside a refusal's unwind (canonical JSON, its refusal message, the
-    last-resort log) reaches a method of a subclass of a built-in type. Each
-    base-class conversion returns an exact-type copy for a subclass. ``bool`` is kept as
+    last-resort log) reaches a method of a subclass of a built-in type.
+    Each base-class conversion returns an exact-type copy for a
+    subclass. ``bool`` is kept as
     itself: through ``int`` it would become ``1`` and change the event's
     meaning. Any other type is a programming error and is refused.
 
@@ -840,8 +841,9 @@ def _last_resort_log_value(value: str | int | float | None) -> str:
     """Format one refused-call field for the last-resort log; never raises.
 
     Formatting goes through the built-in base class's own methods, so a subclass
-    of a built-in type cannot reach its own ``__repr__``, ``__format__`` or
-    comparisons. An integer beyond the canonical range, which
+    of a built-in type (``int``, ``float`` or ``str``) cannot reach its own
+    ``__repr__``,
+    ``__format__`` or comparisons. An integer beyond the canonical range, which
     is how it reached this log, is written in hex: Python refuses decimal
     conversion of an integer longer than its digit limit, and hex has no such
     limit. ``bool`` is formatted as itself, not as the integer it subclasses.
