@@ -33,6 +33,7 @@ class SQLiteLocalSessionOperationAuthority(_SessionOperationAuthorityRepository)
         *,
         quota_exceeded_recorder: Callable[[QuotaExceeded], None] = refuse_unrecorded_quota_exceeded,
         approval_supersession_recorder: Callable[[ApprovalSupersession], None] = refuse_unrecorded_approval_supersession,
+        lease_upkeep_authority: SQLiteLocalSessionOperationAuthority | None = None,
     ) -> None:
         if engine.dialect.name != "sqlite":
             raise ValueError("SQLiteLocalSessionOperationAuthority requires SQLite")
@@ -40,6 +41,7 @@ class SQLiteLocalSessionOperationAuthority(_SessionOperationAuthorityRepository)
             engine,
             quota_exceeded_recorder=quota_exceeded_recorder,
             approval_supersession_recorder=approval_supersession_recorder,
+            lease_upkeep_authority=lease_upkeep_authority,
         )
 
     @contextmanager

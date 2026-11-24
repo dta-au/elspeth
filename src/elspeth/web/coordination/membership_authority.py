@@ -34,6 +34,7 @@ from elspeth.web.coordination.contracts import (
     CompatibilityKey,
     InstanceState,
 )
+from elspeth.web.coordination.upkeep_engine import LeaseUpkeepSiblingRefusal, LeaseUpkeepSiblingRefused
 from elspeth.web.deployment_profiles import deployment_startup_profile
 from elspeth.web.sessions.models import SESSION_SCHEMA_EPOCH, web_instances_table
 from elspeth.web.sessions.protocol import WebInstanceRecord
@@ -188,13 +189,33 @@ class RepositoryWebInstanceMembershipAuthority:
     impostor using the same id cannot both succeed.
     """
 
-    __slots__ = ("_clock_sql", "_engine")
+    __slots__ = ("_clock_sql", "_engine", "_lease_upkeep_authority")
 
-    def __init__(self, engine: Engine) -> None:
+    def __init__(
+        self,
+        engine: Engine,
+        *,
+        lease_upkeep_authority: RepositoryWebInstanceMembershipAuthority | None = None,
+    ) -> None:
         if engine.dialect.name not in _DATABASE_CLOCK_SQL:
             raise NotImplementedError(f"web instance membership authority not implemented for {engine.dialect.name}")
+        if lease_upkeep_authority is not None:
+            if type(lease_upkeep_authority) is not RepositoryWebInstanceMembershipAuthority:
+                raise LeaseUpkeepSiblingRefused(LeaseUpkeepSiblingRefusal.WRONG_CLASS)
+            if lease_upkeep_authority.lease_upkeep_authority is not None:
+                raise LeaseUpkeepSiblingRefused(LeaseUpkeepSiblingRefusal.NESTED)
         self._engine = engine
         self._clock_sql = _DATABASE_CLOCK_SQL[engine.dialect.name]
+        self._lease_upkeep_authority = lease_upkeep_authority
+
+    @property
+    def lease_upkeep_authority(self) -> RepositoryWebInstanceMembershipAuthority | None:
+        """The same authority bound to the dedicated lease-upkeep pool, when wired.
+
+        ``create_app`` always wires it. Only the heartbeat uses it; register,
+        drain and stop stay on this authority.
+        """
+        return self._lease_upkeep_authority
 
     def register(self, identity: WebInstanceIdentity, *, lease_seconds: int) -> WebInstanceRecord:
         """Join the deployment as ``active`` with a lease from the database clock.

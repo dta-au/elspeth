@@ -126,6 +126,7 @@ from elspeth.web.coordination.rate_limit_authority import RepositoryRateLimitAut
 from elspeth.web.coordination.repository import PostgresSessionOperationRepository
 from elspeth.web.coordination.review_authority import RepositoryReviewAuthority
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
+from elspeth.web.coordination.upkeep_engine import create_lease_upkeep_engine
 from elspeth.web.coordination.websocket_ticket_authority import RepositorySessionWebsocketTicketAuthority
 from elspeth.web.coordination.workflow_scope_reader import RepositoryWorkflowScopeReader
 from elspeth.web.credential_guard import CredentialMaterialRefused
@@ -267,9 +268,33 @@ _RETRYABLE_STORAGE_ERRNOS: frozenset[int] = frozenset(
 )
 
 
-def _dispose_session_engine(engine: Engine) -> None:
-    """Dispose the sessions DB pool for app instances that never run lifespan."""
-    engine.dispose()
+def _dispose_session_engine(engine: Engine, lease_upkeep_engine: Engine | None) -> None:
+    """Dispose the sessions DB pools: the lease-upkeep pool, then the main pool.
+
+    The main pool is disposed even when disposing the upkeep pool raises; if
+    both fail, the main failure carries the upkeep failure as its context.
+    """
+    try:
+        if lease_upkeep_engine is not None:
+            lease_upkeep_engine.dispose()
+    finally:
+        engine.dispose()
+
+
+def _create_lease_upkeep_engine(session_engine: Engine, *, connect_timeout_seconds: int | None = None) -> Engine | None:
+    """Build the dedicated lease-upkeep pool on the database ``session_engine`` targets.
+
+    Returns ``None`` for an in-memory SQLite database, which a second engine
+    cannot share; upkeep then uses the main engine. On failure the already
+    built main engine is disposed before the error propagates.
+    """
+    try:
+        return create_lease_upkeep_engine(
+            session_engine.url.render_as_string(hide_password=False), connect_timeout_seconds=connect_timeout_seconds
+        )
+    except BaseException:
+        session_engine.dispose()
+        raise
 
 
 def _run_session_engine_finalizer(
@@ -1971,6 +1996,7 @@ def _create_app(
     app.state.platform_identity = platform_identity
 
     external_session_engine: Engine | None = None
+    lease_upkeep_engine: Engine | None = None
     if settings.auth_provider == "local" and external_state:
         from elspeth.web.auth.local import validate_existing_local_auth_store
 
@@ -1987,9 +2013,10 @@ def _create_app(
                 connect_args={"connect_timeout": _CONNECT_TIMEOUT_SECONDS},
                 **postgres_engine_kwargs(raw_session_url),
             )
+            lease_upkeep_engine = _create_lease_upkeep_engine(external_session_engine, connect_timeout_seconds=_CONNECT_TIMEOUT_SECONDS)
         except (SQLAlchemyError, ImportError):
             raise profile.session_engine_not_ready_error() from None
-        session_engine_finalizer = weakref.finalize(app, _dispose_session_engine, external_session_engine)
+        session_engine_finalizer = weakref.finalize(app, _dispose_session_engine, external_session_engine, lease_upkeep_engine)
         register_session_engine_finalizer(session_engine_finalizer)
         app.state._session_engine_finalizer = session_engine_finalizer
         profile.validate_only_schema_or_raise(settings, external_session_engine)
@@ -2043,13 +2070,20 @@ def _create_app(
     else:
         session_db_url = settings.get_session_db_url()
         session_engine = create_session_engine(session_db_url, **postgres_engine_kwargs(session_db_url))
-        session_engine_finalizer = weakref.finalize(app, _dispose_session_engine, session_engine)
+        lease_upkeep_engine = _create_lease_upkeep_engine(session_engine)
+        session_engine_finalizer = weakref.finalize(app, _dispose_session_engine, session_engine, lease_upkeep_engine)
         register_session_engine_finalizer(session_engine_finalizer)
         app.state._session_engine_finalizer = session_engine_finalizer
         initialize_session_schema(session_engine)
         session_db_path = session_engine.url.database
         if session_engine.dialect.name == "sqlite" and session_db_path not in (None, ":memory:"):
             session_engine.dispose()
+            if lease_upkeep_engine is not None:
+                lease_upkeep_engine.dispose()
+    # Lease renewal, plain release and the heartbeat check out from this pool,
+    # never from the main one; in-memory SQLite shares the main engine.
+    lease_upkeep_bind = session_engine if lease_upkeep_engine is None else lease_upkeep_engine
+    app.state.lease_upkeep_engine = lease_upkeep_engine
 
     # Build the sessions-telemetry container ONCE per process and share it
     # across every consumer (SessionServiceImpl, ExecutionServiceImpl, and
@@ -2141,12 +2175,22 @@ def _create_app(
             session_engine,
             quota_exceeded_recorder=audit_recorder.record_quota_exceeded,
             approval_supersession_recorder=audit_recorder.record_approval_superseded,
+            lease_upkeep_authority=SQLiteLocalSessionOperationAuthority(
+                lease_upkeep_bind,
+                quota_exceeded_recorder=audit_recorder.record_quota_exceeded,
+                approval_supersession_recorder=audit_recorder.record_approval_superseded,
+            ),
         )
     elif session_engine.dialect.name == "postgresql":
         session_operation_authority = PostgresSessionOperationRepository(
             session_engine,
             quota_exceeded_recorder=audit_recorder.record_quota_exceeded,
             approval_supersession_recorder=audit_recorder.record_approval_superseded,
+            lease_upkeep_authority=PostgresSessionOperationRepository(
+                lease_upkeep_bind,
+                quota_exceeded_recorder=audit_recorder.record_quota_exceeded,
+                approval_supersession_recorder=audit_recorder.record_approval_superseded,
+            ),
         )
     else:
         raise NotImplementedError(f"Session operation authority is not implemented for dialect {session_engine.dialect.name}")
@@ -2285,7 +2329,10 @@ def _create_app(
     web_instance_membership: WebInstanceMembership
     if session_engine.dialect.name == "postgresql":
         web_instance_membership = RegisteredWebInstanceMembership(
-            RepositoryWebInstanceMembershipAuthority(session_engine),
+            RepositoryWebInstanceMembershipAuthority(
+                session_engine,
+                lease_upkeep_authority=RepositoryWebInstanceMembershipAuthority(lease_upkeep_bind),
+            ),
             web_instance_identity_from_settings(settings, instance_id=session_service.session_operation_owner_instance_id),
             lease_seconds=session_service.session_operation_lease_seconds,
             process_recovery=process_recovery,
