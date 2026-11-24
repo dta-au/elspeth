@@ -15,6 +15,12 @@ changes land and is not a release.
 
 ### Upgrade notes
 
+- **Changed:** `elspeth join` exits 0 when the leader finishes the run while
+  the follower is still working. Before this release it could exit 4 although
+  the run completed. A follower that loses its run membership while the run is
+  still running now exits 3, the eviction code in the exit-code table, where it
+  previously exited 4. A script that read exit 4 from `elspeth join` as an
+  eviction should check for 3.
 - **Changed (design change):** a pipeline that previously passed composer
   validation with only a "Contract check skipped" warning, but then failed
   when the run started, now fails composer validation. No pipeline that could
