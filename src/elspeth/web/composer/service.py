@@ -3703,6 +3703,28 @@ class ComposerServiceImpl:
                 # compose is refused before the loop when there is no session
                 # to persist to. Reaching this line means neither happened.
                 raise InvariantError("plugin crash on a tool turn that was neither persisted nor rolled back") from crash.cause
+            if dispatch.credential_refusal is not None:
+                # The dispatcher's credential scan refused a call. P3 recorded
+                # it as a value-free ARG_ERROR and stopped the batch; P4 has now
+                # published the turn, so the earlier calls' rows and state are
+                # durable. The refusal leaves with this request's LLM calls,
+                # as the wire scan's refusal does. A failed unwind publication
+                # is a Tier-1 integrity fault and takes primacy.
+                refusal = dispatch.credential_refusal
+                if persist.unwind_audit_failed:
+                    raise AuditIntegrityError(
+                        "Credential refusal audit row could not be persisted",
+                        failed_turn=failed_turn,
+                    ) from refusal
+                if not persisted_tool_call_turn:
+                    raise InvariantError("credential refusal on a tool turn that was neither persisted nor rolled back") from refusal
+                attach_llm_calls(refusal, recorder)
+                if pending_checkpoint_failures:
+                    raise refusal from BaseExceptionGroup(
+                        "Credential refusal retained checkpoint failures",
+                        pending_checkpoint_failures,
+                    )
+                raise refusal
             if dispatch.advisor_failure is not None:
                 # The advisor boundary deliberately preserves unclassified
                 # controlled-code faults instead of laundering them into a

@@ -60,6 +60,7 @@ from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
 from elspeth.web.composer.advisor_request import advisor_feedback_payload
 from elspeth.web.composer.anti_anchor import AntiAnchorTracker
 from elspeth.web.composer.audit import (
+    CREDENTIAL_REFUSAL_ERROR_MESSAGE,
     BufferingRecorder,
     DispatchAudit,
     begin_dispatch,
@@ -1209,6 +1210,7 @@ async def run_tool_batch(
     tool_outcomes: list[_ToolOutcome] = []
     plugin_crash: _PluginCrash | None = None
     advisor_failure: Exception | None = None
+    credential_refusal: CredentialMaterialRefused | None = None
     advisor_compose_timeout: Literal["pre_call", "in_flight"] | None = None
     pre_state_id: str | None = current_state_id
     decoded_args_by_call_id: dict[str, dict[str, Any]] = {}
@@ -3562,11 +3564,23 @@ async def run_tool_batch(
             # Tier-1 audit invariant. Do not let the plugin-bug
             # catch-all below launder it into ComposerPluginCrashError.
             raise
-        except CredentialMaterialRefused:
+        except CredentialMaterialRefused as refused:
             # The dispatch-time argument scan refused the model's tool
-            # arguments. That is a credential refusal, not a plugin bug, so it
-            # leaves the turn the way the wire scan's refusal does.
-            raise
+            # arguments: a credential refusal, not a plugin bug.
+            # ``dispatch_with_audit`` has recorded the call as a value-free
+            # ARG_ERROR. Stop the batch like a plugin crash, so P4 persists the
+            # turn (earlier calls' rows and state) before the driver raises the
+            # refusal. The turn ends here, so the anti-anchor window, which
+            # serves the model's next attempt, does not record it.
+            _append_tool_outcome(
+                response=None,
+                error_class=type(refused).__name__,
+                error_category=ToolArgumentErrorCategory.CREDENTIAL_MATERIAL,
+                error_message=CREDENTIAL_REFUSAL_ERROR_MESSAGE,
+                post_version=state.version,
+            )
+            credential_refusal = refused
+            break
         except Exception as tool_exc:
             # Plugin-bug path: any exception class OTHER than
             # ToolArgumentError escaping execute_tool() is a plugin
@@ -3799,6 +3813,7 @@ async def run_tool_batch(
         all_cache_hits=all_cache_hits,
         plugin_crash=plugin_crash,
         advisor_failure=advisor_failure,
+        credential_refusal=credential_refusal,
         advisor_compose_timeout=advisor_compose_timeout,
         assistant_message=assistant_message,
         raw_assistant_content=raw_assistant_content,

@@ -11,6 +11,7 @@ permanent for the retry. ``ComposerAdmissionRefused`` subclasses
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,6 +19,7 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from sqlalchemy import select
 
 from elspeth.contracts.composer_progress import ComposerProgressEvent
 from elspeth.contracts.credential_material import find_credential_material
@@ -29,8 +31,9 @@ from elspeth.web.credential_guard import (
     MODEL_OUTPUT_CREDENTIAL_REFUSAL_NEXT_STEP,
     CredentialMaterialRefused,
 )
+from elspeth.web.sessions.models import chat_messages_table
 from tests.helpers.composer_operations import settle_sync, strip_request_id
-from tests.unit.web.sessions.test_routes import TestClient, _make_app
+from tests.unit.web.sessions.test_routes import TestClient, _llm_call, _make_app
 
 _REFUSAL_TEXT = "Composer admission refused: identity_disabled."
 
@@ -161,3 +164,37 @@ def test_a_non_credential_admission_refusal_keeps_the_access_and_quota_step(tmp_
 
     assert progress["headline"] == "This request was refused by the admission policy."
     assert progress["likely_next"] == "Ask an administrator to review your access and quota configuration."
+
+
+def test_a_dispatch_refusal_s_llm_calls_are_durable_after_the_route_refuses(tmp_path: Path) -> None:
+    # The compose loop attaches its LLM calls to a dispatch-time refusal, as it
+    # does to the wire scan's; the route's admission arm must make them durable.
+    refusal = _credential_refusal("composer_tool_arguments")
+    refusal.llm_calls = (_llm_call(provider_request_id="chatcmpl-dispatch-refusal"),)
+    app, service = _make_app(tmp_path)
+    composer = SimpleNamespace()
+    composer.compose = AsyncMock(spec=ComposerService.compose, side_effect=refusal)
+    app.state.composer_service = composer
+    client = TestClient(app, raise_server_exceptions=False)
+    session_id = client.post("/api/sessions", json={"title": "Dispatch refusal"}).json()["id"]
+    settled = settle_sync(
+        client,
+        app,
+        path=f"/api/sessions/{session_id}/messages",
+        body={"content": "Build a pipeline", "operation_id": str(uuid.uuid4()), "state_id": None},
+    )
+    status, _body = settled.error()
+    assert status == 422
+
+    with service._engine.connect() as conn:
+        envelopes = [
+            entry
+            for (tool_calls,) in conn.execute(
+                select(chat_messages_table.c.tool_calls).where(
+                    chat_messages_table.c.session_id == session_id, chat_messages_table.c.tool_calls.is_not(None)
+                )
+            )
+            for entry in (json.loads(tool_calls) if isinstance(tool_calls, str) else tool_calls) or ()
+        ]
+    stored = [entry for entry in envelopes if entry["_kind"] == "llm_call_audit"]
+    assert [entry["call"]["provider_request_id"] for entry in stored] == ["chatcmpl-dispatch-refusal"]

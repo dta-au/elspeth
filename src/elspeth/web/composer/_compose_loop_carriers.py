@@ -50,6 +50,7 @@ from elspeth.web.composer.protocol import ComposerPluginCrashError, ComposerResu
 from elspeth.web.composer.provider_errors import ProviderRequestFailure
 from elspeth.web.composer.state import CompositionState, ValidationSummary
 from elspeth.web.composer.tools._common import ToolResult
+from elspeth.web.credential_guard import CredentialMaterialRefused
 from elspeth.web.sessions._persist_payload import AuditOutcome, RedactedToolRow
 
 if TYPE_CHECKING:
@@ -371,6 +372,12 @@ class _DispatchOutcome:
     # original exception type, but follows the same persist-before-propagate
     # discipline so the request_advisor_hint row is never left OPEN.
     advisor_failure: Exception | None
+
+    # The dispatcher's credential scan refused a call's arguments. The call's
+    # value-free ARG_ERROR row is already recorded; like plugin_crash, the
+    # driver raises this only after P4 has persisted the turn, so earlier
+    # calls' rows and state stay durable.
+    credential_refusal: CredentialMaterialRefused | None
 
     # Advisor-tool compose timeout — the tool envelope is already closed in
     # P3, but P4 must persist/redact the current assistant+tool turn before the
