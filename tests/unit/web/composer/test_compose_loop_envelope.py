@@ -124,10 +124,13 @@ ENVELOPE_MAX_PROMPT_TOKENS_TRIVIAL_PROMPT = 50_000
 # whether prompt caching is wired.
 #
 # Rebaselined 2026-11-24 by the measured growth of the largest turn (+374 B,
-# 299,998 → 300,372): the explicit-approval passage now names the
-# set_pipeline and splice_transform exceptions, and the splice_transform
-# description states the whole-pipeline condition.
-ENVELOPE_MAX_PRODUCTION_BYTES_TRIVIAL_PROMPT = 300_374
+# 299,998 → 300,372): the explicit-approval teaching (its narrow-change rule
+# and the set_pipeline and splice_transform conditions) and the
+# splice_transform description's whole-pipeline condition.
+# Rebaselined 2026-11-24 by the measured growth of the largest turn (+88 B,
+# 300,372 → 300,460): the approval passage says the condition is not a
+# closed list (other changes refuse an invalid node configuration).
+ENVELOPE_MAX_PRODUCTION_BYTES_TRIVIAL_PROMPT = 300_462
 
 # Keep the existing two-payload allowance for catalog discovery followed by a
 # concrete clarification. The scenario has two legitimate provider transitions;
