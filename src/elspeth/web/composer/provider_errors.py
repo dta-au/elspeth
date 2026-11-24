@@ -216,12 +216,14 @@ def classify_provider_failure(exc: BaseException) -> ProviderFailure | None:
     if isinstance(exc, OpenAIBadRequestError):
         admitted, specific_code_seen = _admit_request_rejection(exc)
         rejection = _admit_context_length_evidence(exc, admitted, specific_code_seen=specific_code_seen)
-        # Context-limit evidence is the more specific; otherwise an HTTP 413 says
-        # the request is too large for the provider or a proxy in front of it.
-        # The SDK annotates this status as 400; litellm sets the provider's own
-        # (413 for a Bedrock request-size rejection), so it is read as a value.
+        # A retained specific code takes precedence, as it does over context-limit
+        # evidence; then context-limit evidence, the more specific; otherwise an
+        # HTTP 413 says the request is too large for the provider or a proxy in
+        # front of it. The SDK annotates this status as 400; litellm sets the
+        # provider's own (413 for a Bedrock request-size rejection), so it is
+        # read as a value.
         status: object = exc.status_code
-        if rejection.reason_code != "context_length_exceeded" and status == 413:
+        if not specific_code_seen and rejection.reason_code != "context_length_exceeded" and status == 413:
             rejection = _REQUEST_TOO_LARGE
         return ProviderFailure(ComposerLLMCallStatus.BAD_REQUEST_ERROR, "bad_request", False, rejection)
     if isinstance(exc, APITimeoutError):

@@ -17,6 +17,9 @@ context-limit rejection is.
 
 from __future__ import annotations
 
+import json
+
+import httpx
 import litellm
 import pytest
 from litellm.litellm_core_utils.exception_mapping_utils import exception_type
@@ -31,6 +34,7 @@ from elspeth.web.composer import audit as composer_audit
 from elspeth.web.composer.audit import llm_call_audit_envelope
 from elspeth.web.composer.protocol import ComposerConvergenceError
 from elspeth.web.composer.provider_errors import classify_provider_failure, request_size_rejection
+from elspeth.web.composer.provider_gateway import _BadRequestLLMError
 from tests.unit.web.composer.test_compose_loop_llm_audit import _make_llm_response
 from tests.unit.web.composer.test_gateway_capacity_rejection import _GENEROUS_SETTING, _compose, _ScriptedProvider, _service
 from tests.unit.web.composer.test_gateway_capacity_rejection import (
@@ -160,3 +164,53 @@ async def test_the_persisted_call_audit_names_what_recognised_the_rejection(monk
     dropped = llm_call_audit_envelope(call)["call"]
     assert isinstance(dropped, dict)
     assert "rejection_reason_source" not in dropped
+
+
+def _bedrock_413(body: dict[str, object]) -> BaseException:
+    """A Bedrock HTTP 413 whose JSON body is ``body``, as the installed litellm raises it (``BadRequestError``, status 413)."""
+    litellm.suppress_debug_info = True
+    request = httpx.Request("POST", "https://bedrock-runtime.invalid/model/invoke")
+    content = json.dumps(body)
+    try:
+        exception_type(
+            model="bedrock/anthropic.claude-opus-4-8",
+            original_exception=BedrockError(
+                status_code=413, message=content, request=request, response=httpx.Response(413, request=request, content=content.encode())
+            ),
+            custom_llm_provider="bedrock",
+        )
+    except Exception as mapped:
+        return mapped
+    raise AssertionError("litellm did not map the provider error")
+
+
+_SPECIFIC_CODE_BODY: dict[str, object] = {"error": {"code": "unsupported_parameter", "message": _PROXY_BODY}}
+
+
+def test_a_413_with_a_specific_retained_code_keeps_the_code_and_is_not_a_size_rejection() -> None:
+    # A specific structured code takes precedence over the status, as it does over context-limit evidence.
+    exc = _bedrock_413(_SPECIFIC_CODE_BODY)
+    failure = classify_provider_failure(exc)
+
+    assert failure is not None
+    assert (failure.audit_status, failure.kind, failure.retryable) == (ComposerLLMCallStatus.BAD_REQUEST_ERROR, "bad_request", False)
+    assert failure.request_rejection is not None
+    assert (failure.request_rejection.reason_code, failure.request_rejection.reason_source) == ("unsupported_parameter", "http_response")
+    assert request_size_rejection(exc) is None
+
+
+def test_control_a_413_without_a_specific_code_is_request_too_large() -> None:
+    # The same Bedrock 413 with no code in its body: the status decides.
+    assert request_size_rejection(_bedrock_413({"message": "Request Entity Too Large"})) == _TOO_LARGE
+
+
+@pytest.mark.asyncio
+async def test_a_413_with_a_specific_retained_code_is_not_resent_with_earlier_turns_left_out() -> None:
+    service, session_id = _service(_GENEROUS_SETTING)
+    provider = _ScriptedProvider(_bedrock_413(_SPECIFIC_CODE_BODY), _make_llm_response(content="Pipeline built."))
+
+    with pytest.raises(_BadRequestLLMError):
+        await _compose(service, session_id, provider, _history())
+
+    assert len(provider.requests) == 1
+    assert _history_in(provider.requests[0]) == list(_HISTORY_TEXTS)
