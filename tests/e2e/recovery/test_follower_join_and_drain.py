@@ -547,6 +547,11 @@ class TestJoinRunAdmissionRefusals:
             elif post_kind == "refusal" and departure_kind == "sqlalchemy":
                 assert isinstance(post_error, JoinRefusedError)
                 assert post_error.departure_failure == "SQLAlchemyError"
+            elif post_kind == "refusal" and departure_kind == "ordinary":
+                # The CLI renders departure_failure, not notes: an unexpected
+                # departure error on a refusal must reach that field.
+                assert isinstance(post_error, JoinRefusedError)
+                assert post_error.departure_failure == "ValueError: departure unavailable"
             else:
                 notes = post_error.__notes__
                 assert any(rows[0].worker_id in note and type(departure_error).__name__ in note for note in notes)

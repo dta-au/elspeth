@@ -43,9 +43,17 @@ if TYPE_CHECKING:
 
 
 def _departure_summary(error: Exception) -> str:
+    """One line naming a departure failure, from typed attributes only.
+
+    A DBAPI error carries the driver's message in ``orig``; any other SQLAlchemy
+    error's text can echo the SQL statement, so only its class is kept. Errors
+    outside the database layer keep their message.
+    """
     if isinstance(error, DBAPIError):
         return f"{type(error).__name__}: {error.orig}"
-    return type(error).__name__
+    if isinstance(error, SQLAlchemyError):
+        return type(error).__name__
+    return f"{type(error).__name__}: {error}"
 
 
 class JoinAdmissionService:
@@ -269,18 +277,14 @@ class JoinAdmissionService:
                 factory.run_coordination.depart_worker(member_token=token)
             except contract_errors.TIER_1_ERRORS as departure_error:
                 raise departure_error from refusal
-            except SQLAlchemyError as departure_error:
-                refusal.departure_failure = _departure_summary(departure_error)
             except Exception as departure_error:
-                refusal.add_note(f"follower {token.worker_id} departure failed: {_departure_summary(departure_error)}")
+                refusal.departure_failure = _departure_summary(departure_error)
             raise
         except Exception as error:
             try:
                 factory.run_coordination.depart_worker(member_token=token)
             except contract_errors.TIER_1_ERRORS as departure_error:
                 raise departure_error from error
-            except SQLAlchemyError as departure_error:
-                error.add_note(f"follower {token.worker_id} departure failed: {_departure_summary(departure_error)}")
             except Exception as departure_error:
                 error.add_note(f"follower {token.worker_id} departure failed: {_departure_summary(departure_error)}")
             raise
