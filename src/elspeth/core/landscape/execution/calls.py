@@ -196,7 +196,7 @@ class CallAuditRepository:
         The reservation stands only if the fenced transaction completes: a failure
         after it was taken releases it before the error propagates.
         """
-        reserved: int | None = None
+        reservation: list[tuple[str, int]] = []
         try:
             with fenced_item_transaction(
                 self._db.engine,
@@ -205,16 +205,13 @@ class CallAuditRepository:
                 verb="allocate_call_index",
             ) as conn:
                 self._verify_state_parent(conn, state_id=state_id, run_id=member_token.run_id, token_id=work_item.token_id)
-                reserved = self._allocate_call_index_on(conn, state_id)
-                return reserved
+                return self._allocate_call_index_on(conn, state_id, reservation=reservation)
         except BaseException:
-            if reserved is not None:
-                self._finish_allocation(
-                    parent_id=_exact_parent_key(state_id), proposed_index=reserved, recorded_index=None, operation=False
-                )
+            for parent_id, index in reservation:
+                self._finish_allocation(parent_id=parent_id, proposed_index=index, recorded_index=None, operation=False)
             raise
 
-    def _allocate_call_index_on(self, conn: Connection, state_id: str) -> int:
+    def _allocate_call_index_on(self, conn: Connection, state_id: str, *, reservation: list[tuple[str, int]]) -> int:
         """Allocate next call index for a state_id (thread-safe).
 
         Provides centralized call index allocation ensuring UNIQUE(state_id, call_index)
@@ -237,6 +234,8 @@ class CallAuditRepository:
 
         Args:
             state_id: Node state ID to allocate index for
+            reservation: Receives the reserved (state_id, index) before it is
+                marked pending, for the caller to release if its transaction fails
 
         Returns:
             Sequential call index (0-based), unique within this state_id
@@ -267,6 +266,9 @@ class CallAuditRepository:
             # Fast path: allocate from in-memory counter (no DB access)
             idx = self._call_indices[state_id]
             self._call_indices[state_id] += 1
+            # Recorded for the caller before the reservation exists, so whatever
+            # interrupts from here on, the caller can release it.
+            reservation.append((state_id, idx))
             self._pending_call_indices.add((state_id, idx))
             return idx
 
@@ -277,7 +279,7 @@ class CallAuditRepository:
         the leader deadline renewal that follows the body: a failure after it was
         taken releases it before the error propagates.
         """
-        reserved: int | None = None
+        reservation: list[tuple[str, int]] = []
         try:
             with fenced_leader_transaction(
                 self._db.engine,
@@ -286,16 +288,13 @@ class CallAuditRepository:
                 verb="allocate_operation_call_index",
             ) as conn:
                 self._verify_operation_parent(conn, operation_id=operation_id, run_id=coordination_token.run_id)
-                reserved = self._allocate_operation_call_index_on(conn, operation_id)
-                return reserved
+                return self._allocate_operation_call_index_on(conn, operation_id, reservation=reservation)
         except BaseException:
-            if reserved is not None:
-                self._finish_allocation(
-                    parent_id=_exact_parent_key(operation_id), proposed_index=reserved, recorded_index=None, operation=True
-                )
+            for parent_id, index in reservation:
+                self._finish_allocation(parent_id=parent_id, proposed_index=index, recorded_index=None, operation=True)
             raise
 
-    def _allocate_operation_call_index_on(self, conn: Connection, operation_id: str) -> int:
+    def _allocate_operation_call_index_on(self, conn: Connection, operation_id: str, *, reservation: list[tuple[str, int]]) -> int:
         """Allocate next call index for an operation_id (thread-safe).
 
         Provides process-local call index proposals within each operation.
@@ -305,6 +304,8 @@ class CallAuditRepository:
 
         Args:
             operation_id: Operation ID to allocate index for
+            reservation: Receives the reserved (operation_id, index) before it is
+                marked pending, for the caller to release if its transaction fails
 
         Returns:
             Sequential call index (0-based), unique within this operation_id
@@ -322,6 +323,7 @@ class CallAuditRepository:
             # Fast path: allocate from in-memory counter (no DB access)
             idx = self._operation_call_indices[operation_id]
             self._operation_call_indices[operation_id] += 1
+            reservation.append((operation_id, idx))
             self._pending_operation_call_indices.add((operation_id, idx))
             return idx
 

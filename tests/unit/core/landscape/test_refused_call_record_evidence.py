@@ -28,6 +28,7 @@ from elspeth.contracts.token_usage import TokenUsage
 from elspeth.core.canonical import stable_hash
 from elspeth.core.landscape import run_coordination_repository
 from elspeth.core.landscape.database import begin_write
+from elspeth.core.landscape.execution.calls import CallAuditRepository
 from elspeth.core.landscape.lease_deadlines import DeadlineKey
 from elspeth.core.landscape.scheduler.payload_codec import serialize_row_payload
 from elspeth.core.landscape.schema import calls_table, run_coordination_events_table, token_work_items_table
@@ -1103,14 +1104,14 @@ def test_item_fence_refusal_is_built_from_the_exact_work_item_id() -> None:
     _assert_refused_call(refusals[0]["refused_call"], call_id="attempt-late-1", state_id=setup.state_id, operation_id=None)
 
 
-def _fail_the_fenced_commit(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Every fenced transaction runs its body, then fails to commit (an ordinary database fault)."""
+def _fail_the_fenced_commit(monkeypatch: pytest.MonkeyPatch, failure: BaseException | None = None) -> None:
+    """Every fenced transaction runs its body, then fails to commit (by default, an ordinary database fault)."""
 
     @contextmanager
     def body_then_commit_failure(engine: Engine) -> Iterator[Connection]:
         with begin_write(engine) as conn:
             yield conn
-            raise OperationalError("COMMIT", {}, Exception("disk I/O error"))
+            raise OperationalError("COMMIT", {}, Exception("disk I/O error")) if failure is None else failure
 
     monkeypatch.setattr(run_coordination_repository, "begin_write", body_then_commit_failure)
 
@@ -1134,6 +1135,29 @@ def test_operation_index_allocation_whose_transaction_fails_releases_its_reserva
     with pytest.raises(OperationalError):
         setup.recorder.execution.allocate_operation_call_index(operation_id, coordination_token=setup.recorder.coordination_token)
 
+    assert _pending_reservations(setup) == (set(), set())
+
+
+class _Interrupted(BaseException):
+    """Not an ``Exception``: an interrupt or cancellation arriving while the transaction completes."""
+
+
+@pytest.mark.parametrize("parent", ["state", "operation"])
+def test_index_allocation_interrupted_after_its_body_releases_its_reservation(monkeypatch: pytest.MonkeyPatch, parent: str) -> None:
+    """The release covers every exception, not only ``Exception``; the interrupt itself propagates unchanged."""
+    setup = _setup()
+    repo = setup.recorder.execution
+    operation_id = _begin_operation(setup)
+    interrupt = _Interrupted()
+    _fail_the_fenced_commit(monkeypatch, interrupt)
+
+    with pytest.raises(_Interrupted) as excinfo:
+        if parent == "state":
+            repo.allocate_call_index(setup.state_id, member_token=setup.member, work_item=setup.item)
+        else:
+            repo.allocate_operation_call_index(operation_id, coordination_token=setup.recorder.coordination_token)
+
+    assert excinfo.value is interrupt
     assert _pending_reservations(setup) == (set(), set())
 
 
@@ -1216,3 +1240,39 @@ def test_item_fence_uses_the_work_item_as_given(on_second_construction: str) -> 
     assert recorded.call_index == index
     assert _call_count(setup) == 1
     assert len(constructions) == 1
+
+
+@pytest.mark.parametrize("parent", ["state", "operation"])
+def test_index_allocation_interrupted_before_it_returns_releases_its_reservation(monkeypatch: pytest.MonkeyPatch, parent: str) -> None:
+    """An interrupt after the index is reserved, before the allocator hands it back, still releases it."""
+    setup = _setup()
+    repo = setup.recorder.execution
+    operation_id = _begin_operation(setup)
+    interrupt = _Interrupted()
+
+    if parent == "state":
+        reserve_state = CallAuditRepository._allocate_call_index_on
+
+        def reserve_state_then_interrupt(
+            self: CallAuditRepository, conn: Connection, state_id: str, *, reservation: list[tuple[str, int]]
+        ) -> int:
+            reserve_state(self, conn, state_id, reservation=reservation)
+            raise interrupt
+
+        monkeypatch.setattr(CallAuditRepository, "_allocate_call_index_on", reserve_state_then_interrupt)
+        with pytest.raises(_Interrupted):
+            repo.allocate_call_index(setup.state_id, member_token=setup.member, work_item=setup.item)
+    else:
+        reserve_operation = CallAuditRepository._allocate_operation_call_index_on
+
+        def reserve_operation_then_interrupt(
+            self: CallAuditRepository, conn: Connection, operation_id: str, *, reservation: list[tuple[str, int]]
+        ) -> int:
+            reserve_operation(self, conn, operation_id, reservation=reservation)
+            raise interrupt
+
+        monkeypatch.setattr(CallAuditRepository, "_allocate_operation_call_index_on", reserve_operation_then_interrupt)
+        with pytest.raises(_Interrupted):
+            repo.allocate_operation_call_index(operation_id, coordination_token=setup.recorder.coordination_token)
+
+    assert _pending_reservations(setup) == (set(), set())
