@@ -72,7 +72,7 @@ examples:
     class: NETWORK
     table: "not in AGENTS.md; examples/README.md lists it (requires AZURE_SEARCH_ENDPOINT)"
     configs:
-      settings.yaml: {class: NETWORK, note: "Azure AI Search retrieval; absent from the AGENTS.md table"}
+      settings.yaml: {class: NETWORK, note: "Azure AI Search retrieval (AGENTS.md L251)"}
   batch_aggregation:
     class: NON-NETWORK
     table: "AGENTS.md L28"
@@ -318,7 +318,7 @@ examples:
     class: NETWORK
     table: "not in AGENTS.md; examples/README.md L133"
     configs:
-      settings.yaml: {class: NETWORK, note: "Power Automate HTTP trigger source and sink; absent from the AGENTS.md table"}
+      settings.yaml: {class: NETWORK, note: "Power Automate HTTP trigger source and sink (AGENTS.md L257)"}
   rate_limited_llm:
     class: NON-NETWORK
     table: "AGENTS.md L160 (shared ChaosLLM on 8199)"
