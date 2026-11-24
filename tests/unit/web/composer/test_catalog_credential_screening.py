@@ -34,7 +34,7 @@ def llm_schema_text() -> str:
 
 
 def test_registered_llm_schema_passes_credential_screening(llm_schema_text: str) -> None:
-    assert find_credential_material(llm_schema_text) is None
+    assert find_credential_material(llm_schema_text, purpose="admission") is None
 
 
 @pytest.mark.parametrize("config_name", ["AzureOpenAIConfig", "OpenRouterConfig"])
@@ -42,19 +42,30 @@ def test_registered_llm_schema_passes_credential_screening(llm_schema_text: str)
     "credential_text",
     [
         pytest.param("sk-ant-" + "A" * 40, id="recognized-key-shape"),
-        pytest.param("api_key=" + "synthetic-catalog-control", id="credential-assignment"),
+        pytest.param("Server=db;Pwd=" + "synthetic-catalog-control;", id="connection-string-password"),
     ],
 )
 def test_credentials_in_registered_schema_descriptions_remain_rejected(
     llm_schema_text: str, config_name: str, credential_text: str
 ) -> None:
-    assert find_credential_material(llm_schema_text) is None
+    assert find_credential_material(llm_schema_text, purpose="admission") is None
     payload = json.loads(llm_schema_text)
     config = payload["data"]["json_schema"]["$defs"][config_name]
     config["description"] += "\n- " + credential_text
 
-    finding = find_credential_material(json.dumps(payload))
+    finding = find_credential_material(json.dumps(payload), purpose="admission")
 
     assert finding is not None
     assert finding.category == "token_shape"
     assert finding.location == "root"
+
+
+@pytest.mark.parametrize("config_name", ["AzureOpenAIConfig", "OpenRouterConfig"])
+def test_a_keyword_assignment_in_a_schema_description_is_admitted_but_hidden_conservatively(llm_schema_text: str, config_name: str) -> None:
+    payload = json.loads(llm_schema_text)
+    config = payload["data"]["json_schema"]["$defs"][config_name]
+    config["description"] += "\n- api_key=" + "synthetic-catalog-control"
+    text = json.dumps(payload)
+
+    assert find_credential_material(text, purpose="admission") is None
+    assert find_credential_material(text, purpose="conservative") is not None

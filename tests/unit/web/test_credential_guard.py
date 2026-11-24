@@ -321,7 +321,7 @@ def test_structured_refusal_contains_only_closed_evidence() -> None:
         ),
         "category": "token_shape",
         "surface": "test_surface",
-        "detector_version": "1",
+        "detector_version": "2",
     }
     assert candidate not in repr(caught.value)
     assert candidate not in repr(payload)
@@ -357,7 +357,7 @@ def test_model_output_refusal_identifies_model_and_keeps_evidence_closed(surface
         "detail": detail,
         "category": "token_shape",
         "surface": surface,
-        "detector_version": "1",
+        "detector_version": "2",
     }
     assert candidate not in repr(caught.value)
     assert candidate not in repr(caught.value.to_payload())
@@ -633,7 +633,7 @@ async def test_serialized_state_credential_is_refused_before_provider_transport(
             prompt_guard_mount=None,
             prompt_guard_mode="required",
             prompt_guard_role="composer",
-            messages=[{"role": "user", "content": '{"password":"low-entropy-secret"}'}],
+            messages=[{"role": "user", "content": json.dumps({"password": "sk-" + "s" * 30})}],
         )
 
     assert transport_calls == []

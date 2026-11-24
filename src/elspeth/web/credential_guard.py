@@ -106,7 +106,12 @@ def require_no_credential_material_in_native_thinking(blocks: Sequence[Mapping[s
         if block["type"] == "redacted_thinking":
             continue
         text = block["thinking"]
-        finding = find_credential_material(text, CredentialTraversalPolicy(max_string_bytes=len(text.encode("utf-8"))))
+        # Conservative: the same finding either withholds the block or, when
+        # replay needs it whole, refuses the turn; withholding stays as broad as
+        # the other reasoning withholds.
+        finding = find_credential_material(
+            text, CredentialTraversalPolicy(max_string_bytes=len(text.encode("utf-8"))), purpose="conservative"
+        )
         if finding is not None:
             raise CurrentToolLoopThinkingRefused(finding=finding)
 
@@ -127,6 +132,7 @@ def require_no_credential_material(
             additional_credential_fields=additional_credential_fields,
             max_string_bytes=max_string_bytes,
         ),
+        purpose="admission",
     )
     if finding is not None:
         raise CredentialMaterialRefused(surface=surface, finding=finding)
@@ -205,11 +211,11 @@ def require_no_credential_material_in_llm_metadata(
         },
         surface=surface,
     )
-    content_finding = find_credential_material(reasoning_content)
+    content_finding = find_credential_material(reasoning_content, purpose="conservative")
     if content_finding is not None:
         reasoning_content = None
         withholds.append(ReasoningWithhold(surface, content_finding.category, content_finding.detector_version, "reasoning_content"))
-    details_finding = find_credential_material(_readable_reasoning_details(reasoning_details))
+    details_finding = find_credential_material(_readable_reasoning_details(reasoning_details), purpose="conservative")
     if details_finding is not None:
         reasoning_details = None
         withholds.append(ReasoningWithhold(surface, details_finding.category, details_finding.detector_version, "reasoning_details"))
@@ -238,7 +244,7 @@ def field_mapper_credential_options_projection(options: Any) -> Any:
     if any(type(key) is not str or type(value) is not str for key, value in mapping.items()):
         return options
     projected = dict(options) | {"mapping": [[key, value] for key, value in mapping.items()]}
-    if find_credential_material(projected) is not None:
+    if find_credential_material(projected, purpose="admission") is not None:
         return options
     from elspeth.plugins.transforms.field_mapper import FieldMapperConfig
     from elspeth.web.interpretation_state import strip_authoring_options

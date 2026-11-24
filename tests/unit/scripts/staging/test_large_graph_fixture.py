@@ -442,7 +442,7 @@ def test_251_file_held_queries_keep_the_stored_state_within_the_scan_bound(tmp_p
     summary = setup_fixture(client, session, loaded, emit=Events())
     assert summary["valid"] is True
     state = _stored_state(server, session)
-    assert find_credential_material(state.to_dict()) is None
+    assert find_credential_material(state.to_dict(), purpose="admission") is None
     require_no_credential_material_in_state(state, surface="fixture_test")
 
 

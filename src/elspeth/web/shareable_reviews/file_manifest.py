@@ -315,7 +315,7 @@ def collect_sink_paths(state: CompositionState, *, data_dir: str | Path, session
             # The import binds this value after the recipient's YAML
             # credential guard has run, and refuses a credential-shaped one;
             # recording it would make every import of the link fail.
-            if find_credential_material(relative_path) is not None:
+            if find_credential_material(relative_path, purpose="admission") is not None:
                 continue
             found.append(SinkPathEntry(output.name, cast(SinkPathOption, option), folder, relative_path))
     return tuple(sorted(found, key=lambda entry: (entry.output, entry.option)))

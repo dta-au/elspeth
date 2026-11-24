@@ -82,7 +82,7 @@ def _object(value: JsonValue) -> dict[str, JsonValue]:
 def _text(value: JsonValue) -> str:
     if type(value) is not str:
         raise _UnavailableContext("unsupported")
-    if find_credential_material(value, _POLICY) is not None:
+    if find_credential_material(value, _POLICY, purpose="conservative") is not None:
         raise _UnavailableContext("recognized_credential")
     return value
 

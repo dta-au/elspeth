@@ -48,7 +48,7 @@ from elspeth.contracts.composer_llm_audit import (
     is_provider_served_name,
 )
 from elspeth.contracts.composer_provider_context import PrivateProviderContext
-from elspeth.contracts.credential_material import CREDENTIAL_PATTERN_SPECS, find_credential_material
+from elspeth.contracts.credential_material import CONSERVATIVE_PATTERN_SPECS, find_credential_material
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.provider_rejection import ReasonSource
 from elspeth.contracts.token_usage import TokenUsage
@@ -740,9 +740,9 @@ def _safe_llm_error_message(error_message: str | None) -> str | None:
     if not raw_message:
         return error_message
 
-    raw_finding = find_credential_material(raw_message)
+    raw_finding = find_credential_material(raw_message, purpose="conservative")
     redacted_message = raw_message
-    for name, pattern in CREDENTIAL_PATTERN_SPECS:
+    for name, pattern in CONSERVATIVE_PATTERN_SPECS:
         redacted_message = pattern.sub(f"<redacted-sensitive:{name}>", redacted_message)
     redacted_message = _LLM_ERROR_DOTTED_RE.sub(_redact_dotted_match, redacted_message)
     redacted_message = _redact_sensitive_content(redacted_message, pii_shapes="email_ssn")
@@ -756,7 +756,7 @@ def _safe_llm_error_message(error_message: str | None) -> str | None:
     # The HTTP fallback also preserves the old policy of redacting any URL.
     if (
         (raw_finding is not None and raw_finding.category != "token_shape")
-        or find_credential_material(redacted_message) is not None
+        or find_credential_material(redacted_message, purpose="conservative") is not None
         or _LLM_ERROR_URL_RE.search(raw_message) is not None
     ):
         return _append_llm_error_hash(_LLM_ERROR_REDACTED_DETAIL, raw_message=raw_message)

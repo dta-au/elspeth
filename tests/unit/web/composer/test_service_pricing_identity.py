@@ -134,7 +134,7 @@ async def test_malformed_completion_withholds_reasoning_before_audit(
         {
             "surface": "composer_advisor_response" if surface == "advisor" else "composer_provider_response",
             "category": "token_shape",
-            "detector_version": "1",
+            "detector_version": "2",
             "field_class": "reasoning_content",
         }
     ]

@@ -709,7 +709,7 @@ def scan_values_of_state(state: CompositionState) -> int:
     tree = credential_material_tool_arguments_projection("set_pipeline", state.to_dict())
 
     def fits(limit: int) -> bool:
-        finding = find_credential_material(tree, CredentialTraversalPolicy(max_nodes=limit))
+        finding = find_credential_material(tree, CredentialTraversalPolicy(max_nodes=limit), purpose="admission")
         if finding is None:
             return True
         if finding.category == "traversal_limit" and limit < SCAN_CEILING:
