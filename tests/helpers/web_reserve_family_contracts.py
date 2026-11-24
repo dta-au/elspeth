@@ -1250,17 +1250,31 @@ def _renew_contract():
                                 "renewal_error",
                                 [
                                     aug(n("transient_failures")),
+                                    assign(n("failed_at"), call(a(n("time"), "monotonic"))),
                                     iff(
-                                        call(
-                                            s("_retries_transient_renewal_failure"),
-                                            n("renewal_error"),
-                                            renewed_at=n("renewed_at"),
-                                            consecutive_failures=n("transient_failures"),
+                                        either(
+                                            cmp(n("renewed_at"), ast.Is, c(None)),
+                                            neg(
+                                                call(
+                                                    s("_retries_transient_renewal_failure"),
+                                                    n("renewal_error"),
+                                                    renewed_at=n("renewed_at"),
+                                                    attempt_started_at=n("attempt_started_at"),
+                                                    failed_at=n("failed_at"),
+                                                    consecutive_failures=n("transient_failures"),
+                                                )
+                                            ),
                                         ),
-                                        [ast.Continue()],
+                                        [expr(call(s("_record_renewal_error"), n("renewal_error"))), ret()],
                                     ),
-                                    expr(call(s("_record_renewal_error"), n("renewal_error"))),
-                                    ret(),
+                                    expr(
+                                        call(
+                                            s("_log_renewal_retry"),
+                                            n("renewal_error"),
+                                            consecutive_failures=n("transient_failures"),
+                                            seconds_since_renewal=ast.BinOp(left=n("failed_at"), op=ast.Sub(), right=n("renewed_at")),
+                                        )
+                                    ),
                                 ],
                             ),
                         ],

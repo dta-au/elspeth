@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import replace
@@ -44,6 +45,51 @@ async def _actual_scope(tmp_path):
         RequiredWorkAuthority(RequiredAuthorityKind.SYNCHRONOUS_COMPOSE, context, invocation_id=str(uuid4()))
     )
     return service, engine, authority, context, coordinator
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("required", "expiry_known", "expected_attempts"),
+    (
+        pytest.param(False, True, 5, id="plain-lease-retries-to-the-cap"),
+        pytest.param(True, True, 1, id="required-work-never-retries"),
+        pytest.param(False, False, 1, id="adopted-lease-never-retries"),
+    ),
+)
+async def test_transient_renewal_retry_needs_a_plain_lease_that_knows_its_expiry(
+    tmp_path, monkeypatch, required: bool, expiry_known: bool, expected_attempts: int
+) -> None:
+    _service, engine, authority, context, coordinator = await _actual_scope(tmp_path)
+    transient = OperationalError("transient renewal contention", {}, RuntimeError("owned driver fault"))
+    attempts = []
+
+    def transient_renew(actual_context, *, lease_seconds):
+        attempts.append(actual_context)
+        raise transient
+
+    monkeypatch.setattr(authority, "renew", transient_renew)
+    lease = lifecycle.SessionOperationLease(
+        authority,
+        context,
+        lease_seconds=30,
+        renew_interval_seconds=0.01,
+        required_work=coordinator if required else None,
+        lease_extended_at=time.monotonic() if expiry_known else None,
+    )
+    try:
+        async with asyncio.timeout(10):
+            loss = await lease.wait_until_lost()
+        assert loss is transient and lease.renewal_error is transient
+        assert len(attempts) == expected_attempts
+        with pytest.raises(OperationalError) as closing:
+            await lease.close()
+        assert closing.value is transient
+    finally:
+        if not lease.closed:
+            with suppress(OperationalError):
+                await lease.close()
+        authority.release(context)
+        engine.dispose()
 
 
 def _read_actual_fence(engine, context):

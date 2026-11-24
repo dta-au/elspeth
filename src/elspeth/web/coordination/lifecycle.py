@@ -125,11 +125,15 @@ _SLOW_RENEWAL_LOG_SECONDS = 2.0
 _RENEWAL_FINISHED_AT: dict[tuple[str, str, int], float] = {}
 _RENEWAL_FINISHED_RETAINED = 1_024
 # A plain-branch renewal that raises ``OperationalError`` (transient database
-# contention) is retried while the next attempt still starts inside the lease,
-# and only this many times in a row: the same bound as the membership
-# heartbeat and the orphan sweeper. Every other renewal error loses the lease
-# at once.
+# contention) is retried only while an attempt as slow as the one that failed
+# would still finish inside the lease, and only this many times in a row: the
+# same bound as the membership heartbeat and the orphan sweeper. Every other
+# renewal error loses the lease at once.
 _RENEWAL_MAX_CONSECUTIVE_TRANSIENT_FAILURES = 5
+# SQLite stamps lease expiry with CURRENT_TIMESTAMP, which has whole-second
+# resolution, so its expiry can fall up to a second before the monotonic
+# reading plus the lease length. The retry window reserves that second.
+_RENEWAL_RETRY_CLOCK_SLACK_SECONDS = 1.0
 
 slog = structlog.get_logger()
 type ArchiveLifecycleCallback = Callable[[], Awaitable[None]]
@@ -586,7 +590,8 @@ class SessionOperationLease:
             )
             return await cls._acquire_execution(authority, execution_obligation, interval)
         # Read before the acquire SQL: the database stamps the expiry later,
-        # so the lease lasts at least lease_seconds from this reading.
+        # so the lease lasts lease_seconds from about this reading (up to the
+        # database clock's resolution earlier on SQLite).
         lease_extended_at = time.monotonic()
         # Held in a list so the finished task (whose repr carries its result or
         # exception) can be dropped from this frame on every path before a
@@ -1065,30 +1070,53 @@ class SessionOperationLease:
                 return
             except Exception as renewal_error:
                 transient_failures += 1
-                if self._retries_transient_renewal_failure(renewal_error, renewed_at=renewed_at, consecutive_failures=transient_failures):
-                    continue
-                self._record_renewal_error(renewal_error)
-                return
+                failed_at = time.monotonic()
+                # An adopted lease has no reading of when its expiry was last
+                # set, so it retries nothing until its first renewal succeeds.
+                if renewed_at is None or not self._retries_transient_renewal_failure(
+                    renewal_error,
+                    renewed_at=renewed_at,
+                    attempt_started_at=attempt_started_at,
+                    failed_at=failed_at,
+                    consecutive_failures=transient_failures,
+                ):
+                    self._record_renewal_error(renewal_error)
+                    return
+                self._log_renewal_retry(
+                    renewal_error, consecutive_failures=transient_failures, seconds_since_renewal=failed_at - renewed_at
+                )
             else:
                 renewed_at = attempt_started_at
                 transient_failures = 0
 
-    def _retries_transient_renewal_failure(self, error: Exception, *, renewed_at: float | None, consecutive_failures: int) -> bool:
+    def _retries_transient_renewal_failure(
+        self,
+        error: Exception,
+        *,
+        renewed_at: float,
+        attempt_started_at: float,
+        failed_at: float,
+        consecutive_failures: int,
+    ) -> bool:
         """True when a plain-branch renewal may try again after ``error``.
 
-        Only ``OperationalError`` models transient contention. The next
-        attempt must start inside the lease, measured from the reading taken
-        before the SQL that last extended it, so the lease is never held past
-        its database expiry by this loop. A required-work renewal is never
+        Only ``OperationalError`` models transient contention. The retry
+        starts one interval after ``failed_at`` and is allowed only when an
+        attempt as slow as the failed one would still finish inside the lease,
+        measured from the reading taken before the SQL that last extended it,
+        less the database clock's resolution. This bounds, but cannot remove,
+        an attempt running past expiry: the database still refuses a late
+        renewal and every fenced write. A required-work renewal is never
         retried: its failed ticket stays with the coordinator.
         """
-        if not isinstance(error, OperationalError) or self._required_work is not None or renewed_at is None:
+        if not isinstance(error, OperationalError) or self._required_work is not None:
             return False
         if consecutive_failures >= _RENEWAL_MAX_CONSECUTIVE_TRANSIENT_FAILURES:
             return False
-        seconds_since_renewal = time.monotonic() - renewed_at
-        if seconds_since_renewal + self._renew_interval_seconds >= self._lease_seconds:
-            return False
+        retry_finishes_at = failed_at + self._renew_interval_seconds + (failed_at - attempt_started_at)
+        return retry_finishes_at - renewed_at + _RENEWAL_RETRY_CLOCK_SLACK_SECONDS < self._lease_seconds
+
+    def _log_renewal_retry(self, error: Exception, *, consecutive_failures: int, seconds_since_renewal: float) -> None:
         # exc_info is deliberately omitted: SQLAlchemy cause chains carry the
         # database URL.
         slog.warning(
@@ -1101,7 +1129,6 @@ class SessionOperationLease:
             consecutive_failures=consecutive_failures,
             seconds_since_renewal=round(seconds_since_renewal, 3),
         )
-        return True
 
     async def _run_required_renewal_attempt(
         self, attempt: _RenewalAttemptObservation, ticket: RequiredWorkTicket

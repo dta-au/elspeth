@@ -1371,9 +1371,11 @@ async def _assert_renewal_error_escalates(
     """Inject ``error`` and return how many renewal attempts ran before the lease was lost.
 
     ``lease_seconds_per_attempt`` advances the lifecycle's clock by that much
-    for every renewal attempt after the injection, so lease headroom runs out
-    on a fixed attempt whatever the host load, while the database lease never
-    actually lapses and the release still succeeds.
+    inside every renewal attempt after the injection (the fixture counts the
+    attempt in its renew SQL), so on the lifecycle's clock each failed attempt
+    takes that long. Lease headroom then runs out on a fixed attempt whatever
+    the host load, while the database lease never actually lapses and the
+    release still succeeds.
     """
     service, session_service, executor = _execution_service(asyncio.get_running_loop(), execution_fixture=execution_fixture)
     session_id = session_service.get_current_state.return_value.session_id
@@ -1418,8 +1420,10 @@ async def _assert_renewal_error_escalates(
 
 @pytest.mark.asyncio
 async def test_execute_renewal_escalates_transient_errors_that_outlast_the_lease(execution_fixture: ExecutionTestCustody) -> None:
-    # Each failed attempt spends 8 s of a 30 s lease: after the fourth, the
-    # next attempt would start past the lease (32 s), one short of the cap.
+    # Each failed attempt takes 8 s of a 30 s lease. The third fails at 24 s;
+    # a retry as slow would finish at 32 s, past the lease less its 1 s clock
+    # slack, so it escalates two short of the cap. (Timing the retry's start
+    # alone would allow a fourth attempt; no window at all would reach the cap.)
     attempts = await _assert_renewal_error_escalates(
         execution_fixture,
         error=_transient_renewal_error(),
@@ -1428,7 +1432,25 @@ async def test_execute_renewal_escalates_transient_errors_that_outlast_the_lease
         renew_interval_seconds=0.01,
         lease_seconds_per_attempt=8.0,
     )
-    assert attempts == 4
+    assert attempts == 3
+
+
+@pytest.mark.asyncio
+async def test_execute_renewal_escalates_a_slow_transient_error_it_could_not_retry_in_time(
+    execution_fixture: ExecutionTestCustody,
+) -> None:
+    # One failed attempt takes 15 s of a 30 s lease. A retry would start
+    # inside the lease, but one as slow would finish at 30 s, past the lease
+    # less its 1 s clock slack, so the first failure escalates.
+    attempts = await _assert_renewal_error_escalates(
+        execution_fixture,
+        error=_transient_renewal_error(),
+        one_shot=False,
+        lease_seconds=30,
+        renew_interval_seconds=0.01,
+        lease_seconds_per_attempt=15.0,
+    )
+    assert attempts == 1
 
 
 @pytest.mark.asyncio
