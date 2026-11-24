@@ -26,7 +26,7 @@ from tests.fixtures.identities import ensure_test_identity
 from elspeth.contracts.advisory_locks import ELSPETH_BLOB_CUSTODY_LOCK_CLASSID, ELSPETH_SESSIONS_LOCK_CLASSID
 from elspeth.contracts.blobs import BlobForkWriteFence
 from elspeth.web.blobs.protocol import BlobForkFenceLostError
-from elspeth.web.blobs.service import BlobServiceImpl
+from elspeth.web.blobs.service import BlobServiceImpl, _require_live_fork_write_fence
 from elspeth.web.coordination import repository as coordination_repository
 from elspeth.web.coordination.contracts import (
     ArchiveDeleteReconciliation,
@@ -1248,6 +1248,50 @@ async def test_postgres_target_rename_paused_copy_reds_at_finalize_when_the_pare
             resume_rename.set()
         with pytest.raises(BlobForkFenceLostError):
             await asyncio.wait_for(copy_task, timeout=10)
+    assert first_engine.pool.checkedout() == 0
+    assert second_engine.pool.checkedout() == 0
+
+
+@pytest.mark.asyncio
+async def test_postgres_fork_write_fence_judges_the_lease_by_the_live_database_clock(
+    deployment,
+) -> None:
+    """A lease that expires after the fence's transaction began is lapsed at the check.
+
+    The fence reads the live database clock, as receipt takeover does.
+    """
+    first_engine, second_engine, first, second, _shared = deployment
+    _register_instance(first_engine, first.session_operation_owner_instance_id)
+    _register_instance(first_engine, second.session_operation_owner_instance_id)
+    parent = await first.create_session(_create_session_owner(first_engine, "pg-clock"), "Parent", "local")
+    message = await _add_message(first, parent.id, "user", "fork", writer_principal="route_user_message")
+    authority = await _claim(first, parent.id, str(uuid4()))
+    staged = await first.fork_session(authority, fork_message_id=message.id, new_message_content="edited")
+    fence = _fork_write_fence(staged.authority, source_session_id=parent.id, target_session_id=staged.session.id)
+    receipt = staged.authority.parent.receipt_fence
+
+    with second_engine.connect() as conn, conn.begin():
+        started = conn.exec_driver_sql("SELECT transaction_timestamp()").scalar_one()
+        # Control: inside this same transaction the fence is live before the lease expires.
+        _require_live_fork_write_fence(conn, fence)
+        with first_engine.begin() as other:
+            other.exec_driver_sql("SELECT pg_sleep(0.01)")
+            expires = other.exec_driver_sql("SELECT clock_timestamp()").scalar_one()
+            expired = other.execute(
+                update(session_operation_receipts_table)
+                .where(
+                    session_operation_receipts_table.c.session_id == str(parent.id),
+                    session_operation_receipts_table.c.operation_id == receipt.operation_id,
+                    session_operation_receipts_table.c.lease_token == receipt.lease_token,
+                    session_operation_receipts_table.c.attempt == receipt.attempt,
+                )
+                .values(lease_expires_at=expires)
+            )
+            assert expired.rowcount == 1
+        # Ordering: the lease expired after this transaction began.
+        assert started < expires
+        with pytest.raises(BlobForkFenceLostError):
+            _require_live_fork_write_fence(conn, fence)
     assert first_engine.pool.checkedout() == 0
     assert second_engine.pool.checkedout() == 0
 
