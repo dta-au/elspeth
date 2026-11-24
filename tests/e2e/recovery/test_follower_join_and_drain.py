@@ -52,11 +52,12 @@ import pytest
 from sqlalchemy import select, update
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
-from elspeth.contracts import NodeType, RunStatus
+from elspeth.contracts import NodeType, RowResult, RunStatus
 from elspeth.contracts.config import RuntimeRetryConfig
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.errors import AuditIntegrityError, FollowerSeatDeadError, JoinNotReadyError, JoinRefusedError, RunMembershipLostError
 from elspeth.contracts.hashing import CANONICAL_VERSION
+from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.scheduler import GroupLossSpec, SchedulerEventType, TokenWorkStatus
 from elspeth.core.landscape.factory import RecorderFactory, RunLifecycleReadRepository
 from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
@@ -72,7 +73,7 @@ from elspeth.core.landscape.schema import (
 )
 from elspeth.engine.clock import MockClock
 from elspeth.engine.orchestrator import Orchestrator
-from elspeth.engine.orchestrator.follower import FollowerProcessor
+from elspeth.engine.orchestrator.follower import FollowerProcessor, FollowerWorkSource
 from elspeth.engine.orchestrator.graph_wiring import build_source_id_map
 from elspeth.engine.orchestrator.landscape_registration import (
     register_nodes_with_landscape,
@@ -2155,5 +2156,165 @@ transforms:
             SchedulerEventType.LEASE_LOST.value,
         ]
         assert len(output_path.read_text(encoding="utf-8").splitlines()) == 1
+    finally:
+        db.close()
+
+
+class _FinalizeBeforeFirstDrain:
+    """Lets the leader finalize between the follower's terminal check and its claim.
+
+    The drain loop reads the run as RUNNING at the top of the pass; this work
+    source then runs the leader's real ``complete_run`` before handing the pass
+    to the real follower ``RowProcessor``, whose first act is ``claim_ready``
+    under the now-departed membership. That is the multi-worker finalize race,
+    with the interleaving forced instead of left to timing.
+    """
+
+    def __init__(self, inner: FollowerWorkSource, finalize: Callable[[], None]) -> None:
+        self._inner = inner
+        self._finalize = finalize
+        self.drain_calls = 0
+
+    def drain_follower_ready_work(self, ctx: PluginContext, *, before_claim: Callable[[], None] | None = None) -> list[RowResult]:
+        self.drain_calls += 1
+        if self.drain_calls == 1:
+            self._finalize()
+        return self._inner.drain_follower_ready_work(ctx, before_claim=before_claim)
+
+
+@pytest.mark.timeout(120)
+def test_real_follower_claiming_after_finalize_departed_it_exits_cleanly(tmp_path: Path) -> None:
+    """A follower whose claim lands after the leader's finalize departs cleanly.
+
+    The leader's complete_run marks the follower departed (reason
+    run_finalized) in the transaction that stamps the run terminal. The
+    follower's next claim_ready is refused by the membership fence. The run
+    ended normally, so the follower must return (``elspeth join`` exit 0), not
+    escape with the fence's refusal (exit 4).
+    """
+    from elspeth.cli import (
+        _build_resume_graph,
+        _instantiate_plugins_for_runtime_preflight,
+        _preflight_execution_sinks,
+        _start_follower_plugin_lifecycle,
+    )
+    from elspeth.core.config import resolve_config
+    from elspeth.core.landscape import LandscapeDB
+    from elspeth.core.payload_store import FilesystemPayloadStore
+    from elspeth.engine.orchestrator.cleanup import cleanup_plugins
+    from elspeth.engine.orchestrator.follower import build_follower_processor
+    from elspeth.engine.orchestrator.preflight import (
+        SinkEffectExecutionPurpose,
+        assemble_and_validate_pipeline_config,
+    )
+
+    settings = _real_follower_settings(
+        tmp_path,
+        processing_yaml="""
+transforms:
+  - name: process_row
+    plugin: passthrough
+    input: processing
+    on_success: output
+    on_error: discard
+    options:
+      schema:
+        mode: observed
+""",
+    )
+    _plugins, graph, config = _build_runtime_graph(settings)
+    db = LandscapeDB.from_url(settings.landscape.url)
+    try:
+        payload_store = FilesystemPayloadStore(settings.payload_store.base_path)
+        run_id = Orchestrator(db).run(config, graph=graph, settings=settings, payload_store=payload_store).run_id
+        factory = RecorderFactory(db, payload_store=payload_store)
+        with db.engine.begin() as conn:
+            conn.execute(update(runs_table).where(runs_table.c.run_id == run_id).values(status=RunStatus.RUNNING.value, completed_at=None))
+        leader_token = factory.run_coordination.acquire_run_leadership(
+            run_id=run_id,
+            worker_id=f"worker:{run_id}:real-leader",
+            window_seconds=_GUARD_LIVE_SEAT_WINDOW_SECONDS,
+        )
+
+        follower_plugins = _instantiate_plugins_for_runtime_preflight(settings, purpose=SinkEffectExecutionPurpose.FOLLOWER)
+        execution_sinks, execution_modes, admission = _preflight_execution_sinks(
+            settings,
+            follower_plugins,
+            purpose=SinkEffectExecutionPurpose.FOLLOWER,
+        )
+        execution_graph = _build_resume_graph(settings, follower_plugins)
+        follower_config = assemble_and_validate_pipeline_config(
+            sources=follower_plugins.sources,
+            transforms=follower_plugins.transforms,
+            sinks=execution_sinks,
+            aggregations=follower_plugins.aggregations,
+            settings=settings,
+            graph=execution_graph,
+            sink_effect_modes=execution_modes,
+            sink_effect_admission=admission,
+        )
+        member_token = Orchestrator(db).join_run(
+            run_id,
+            settings,
+            config=follower_config,
+            graph=execution_graph,
+            window_seconds=_GUARD_LIVE_SEAT_WINDOW_SECONDS,
+        )
+        follower = build_follower_processor(
+            factory=factory,
+            member_token=member_token,
+            graph=execution_graph,
+            config=follower_config,
+            payload_store=payload_store,
+            retry_config=RuntimeRetryConfig.from_settings(settings.retry),
+        )
+        forced = _FinalizeBeforeFirstDrain(
+            follower._processor,
+            lambda: factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_token),
+        )
+        follower._processor = forced
+
+        def _no_idle_pass(_seconds: float) -> None:
+            raise AssertionError("the follower idled instead of leaving the finalized run")
+
+        follower._wait_fn = _no_idle_pass
+        ctx = PluginContext(
+            run_id=run_id,
+            config=resolve_config(settings),
+            landscape=factory.plugin_audit_writer(),
+            payload_store=payload_store,
+            member_token=member_token,
+        )
+        pending_exc: BaseException | None = None
+        try:
+            _start_follower_plugin_lifecycle(
+                transforms=follower_config.transforms,
+                sinks=execution_sinks,
+                configured_modes=execution_modes,
+                admission=admission,
+                ctx=ctx,
+            )
+            follower.run(ctx)
+        except BaseException as exc:
+            pending_exc = exc
+            raise
+        finally:
+            cleanup_plugins(follower_config, ctx, include_source=False, pending_exc=pending_exc)
+
+        assert forced.drain_calls == 1
+        with db.engine.connect() as conn:
+            assert conn.execute(select(runs_table.c.status).where(runs_table.c.run_id == run_id)).scalar_one() == RunStatus.COMPLETED.value
+        follower_row = {w["worker_id"]: w for w in _run_workers(db, run_id)}[member_token.worker_id]
+        assert follower_row["status"] == "departed"
+        assert follower_row["evicted_at"] is None
+        follower_events = [
+            (event["event_type"], json.loads(event["context_json"]))
+            for event in _coordination_events(db, run_id)
+            if event["worker_id"] == member_token.worker_id
+        ]
+        # The forced interleaving went through the real fence: finalize departed
+        # the follower, then its claim_ready was refused.
+        assert ("worker_depart", {"reason": "run_finalized"}) in follower_events
+        assert ("fence_refusal", {"fence": "membership", "verb": "claim_ready"}) in follower_events
     finally:
         db.close()
