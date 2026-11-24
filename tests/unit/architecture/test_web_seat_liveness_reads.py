@@ -19,6 +19,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+from elspeth_lints.core.ast_walker import iter_python_files
+
 _ROOT = Path(__file__).resolve().parents[3]
 _WEB = _ROOT / "src" / "elspeth" / "web"
 
@@ -41,7 +43,7 @@ def _identifier_references(source: str, names: frozenset[str]) -> list[tuple[int
 
 def _web_references(names: frozenset[str]) -> dict[str, list[tuple[int, str]]]:
     found: dict[str, list[tuple[int, str]]] = {}
-    for path in sorted(_WEB.rglob("*.py")):
+    for path in iter_python_files(_WEB):
         references = _identifier_references(path.read_text(encoding="utf-8"), names)
         if references:
             found[str(path.relative_to(_ROOT))] = references
@@ -66,7 +68,7 @@ def test_web_liveness_reads_are_the_reviewed_live_leader_calls() -> None:
     # FAILED/INTERRUPTED) and the recovery-refusal handler. A new web liveness
     # read is a reviewed addition here.
     calls: dict[str, int] = {}
-    for path in sorted(_WEB.rglob("*.py")):
+    for path in iter_python_files(_WEB):
         count = _live_leader_calls(path.read_text(encoding="utf-8"))
         if count:
             calls[str(path.relative_to(_ROOT))] = count
