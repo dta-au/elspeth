@@ -468,7 +468,9 @@ def context_budget_refusal_progress_event() -> ComposerProgressEvent:
     return ComposerProgressEvent(
         phase="failed",
         headline="This conversation is too large for the composer to continue.",
-        evidence=("The request does not fit the composer's context budget, even with earlier conversation left out.",),
+        # One line for every size reason: the composer's own budget, the
+        # provider's context limit, or a proxy's request size limit.
+        evidence=("The request is too large to send, even with earlier conversation left out.",),
         likely_next="Start a new session, or shorten your request.",
         reason="context_budget_exceeded",
     )
