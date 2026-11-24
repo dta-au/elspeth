@@ -275,7 +275,7 @@ UNKNOWN_TOKEN_USAGE = TokenUsage()
         "reasoning_tokens) — provider data ELSPETH does not own"
     ),
     source_param="value",
-    suppresses=("R5",),
+    suppresses=(),
     invariant=(
         "returns an exact int only when the value is a non-negative, non-bool int; every other shape "
         "(str, float, bool, None, absent key, negative int) returns None so an unreported count "
