@@ -1060,8 +1060,12 @@ _EXPECTED_SUBORDINATE_EDGE_SHA256 = "99e14aae3b82aca256018fc9c4c58da2db08a76ccc8
 # X1 join admission records departure after a post-admission refusal:
 # JoinAdmissionService.join_run -> depart_worker joins the existing admit_follower call.
 # Measured against a02f25747: 43/0ff714e7… -> 44/a980dd0f…; one arrival.
-_EXPECTED_COORDINATION_CALL_COUNT = 44
-_EXPECTED_COORDINATION_CALL_SHA256 = "a980dd0f9617eed8bd9f1f9d16cf371856ca4309b46c18c48bea19adff32c78f"
+# The post-admission handler has separate Tier-1, refusal and ordinary-error arms,
+# each departing the follower: depart_worker ordinals 2 and 3 in join_run arrive.
+# Measured by scripts/fencing_inventory.py --baseline against a git archive of
+# 398655945: 44/a980dd0f… -> 46/d7f7be08…; arrived 2, departed 0, moved 0.
+_EXPECTED_COORDINATION_CALL_COUNT = 46
+_EXPECTED_COORDINATION_CALL_SHA256 = "d7f7be08c9f2c7b6460235c5d9268d5203df0beb93f25afb3b2c852a4508bd20"
 _EXPECTED_INTERNAL_EDGE_COUNT = 93
 # QR (lane 5887): d1af3e66… -> the value below, 92 -> 93: the internal
 # insert_row_with_token_on edge moves from DataFlowRepository.create_quarantine_row_with_token
