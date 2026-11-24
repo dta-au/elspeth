@@ -3798,7 +3798,9 @@ class TestCopyBlobsForFork:
             )
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("fork_status", ["in_progress", "in_progress_expired", "completed", "failed"])
+    @pytest.mark.parametrize(
+        "fork_status", ["in_progress", "in_progress_expired", "in_progress_expires_at_the_decision_instant", "completed", "failed"]
+    )
     async def test_delete_enforces_session_fork_retention_lifecycle(
         self,
         blob_service: BlobServiceImpl,
@@ -3807,6 +3809,7 @@ class TestCopyBlobsForFork:
         target_session_id: UUID,
         fork_status: str,
         compose_context,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         source = await blob_service.create_blob(session_id, "source.csv", b"source", "text/csv", session_operation_context=compose_context)
         now = datetime.now(UTC)
@@ -3815,7 +3818,7 @@ class TestCopyBlobsForFork:
             "session_id": str(session_id),
             "operation_id": operation_id,
             "kind": "session_fork",
-            "status": "in_progress" if fork_status == "in_progress_expired" else fork_status,
+            "status": "in_progress" if fork_status.startswith("in_progress") else fork_status,
             "request_hash": "a" * 64,
             "attempt": 1,
             "created_at": now,
@@ -3829,6 +3832,21 @@ class TestCopyBlobsForFork:
             with db_engine.connect() as conn:
                 database_time = database_now(conn)
             values.update(lease_token="lease", lease_expires_at=database_time - timedelta(hours=1))
+        elif fork_status == "in_progress_expires_at_the_decision_instant":
+            # The takeover's boundary: a lease expiring AT the decision instant
+            # is abandoned. Both database clocks the deletion reads are frozen
+            # there (just past now, inside the compose fence's own lease), so a
+            # retention reader comparing ``>=`` would refuse.
+            from elspeth.web.blobs import service as blob_service_module
+            from elspeth.web.coordination import repository as coordination_repository
+
+            with db_engine.connect() as conn:
+                instant = database_now(conn) + timedelta(seconds=1)
+            values.update(lease_token="lease", lease_expires_at=instant)
+            monkeypatch.setattr(
+                coordination_repository._SessionOperationAuthorityRepository, "_database_now", staticmethod(lambda _conn: instant)
+            )
+            monkeypatch.setattr(blob_service_module, "database_now", lambda _conn: instant)
         elif fork_status == "completed":
             values.update(
                 settled_at=now,
