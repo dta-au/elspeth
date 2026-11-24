@@ -460,7 +460,7 @@ def test_concurrent_export_reservation_reuses_one_effect_and_association(
     # BOTH seats are read BEFORE any task starts, and that ordering is required.
     # `pool.submit` starts task 1 immediately, so evaluating the second token as a
     # submit ARGUMENT reads the seat while task 1 is inside its fenced write
-    # transaction. `live_leader` opens its own connection for that read, and under
+    # transaction. `seat_holder` opens its own connection for that read, and under
     # SQLite's StaticPool the "new" connection is the SAME DBAPI connection, so the
     # read autobegins inside an open transaction: "cannot start a transaction within
     # a transaction". A real pool hands out a distinct connection, so this is a

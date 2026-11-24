@@ -4178,6 +4178,69 @@ def test_durable_recovery_refusal_preserves_reason_without_terminalizing(
     finalize.assert_not_called()
 
 
+@pytest.mark.parametrize(("seat", "marked"), [("lapsed", True), ("live", False)])
+def test_durable_recovery_refusal_defers_only_to_a_live_leader_seat(
+    service: ExecutionServiceImpl, mock_session_service: MagicMock, mock_settings: _WebSettingsStub, tmp_path: Path, seat: str, marked: bool
+) -> None:
+    """A lapsed seat's incumbent is not a live owner: the refusal is recorded as recovery-required."""
+    from elspeth.contracts.hashing import CANONICAL_VERSION
+    from elspeth.core.landscape.database import LandscapeDB
+    from elspeth.core.landscape.factory import RecorderFactory
+    from elspeth.web.coordination.contracts import RecoveryRequiredReason
+    from elspeth.web.execution.service import _RunRecoveryRequired
+    from elspeth.web.sessions.protocol import SessionOperationMutationTransaction, SessionOperationRunMutations
+    from tests.fixtures.landscape import expire_leader_seat
+
+    run_id = uuid4()
+    mock_settings.landscape_url = f"sqlite:///{tmp_path / 'audit.db'}"
+    with LandscapeDB.from_url(mock_settings.landscape_url, create_tables=True) as db:
+        RecorderFactory(db).run_lifecycle.begin_run(
+            config={},
+            canonical_version=CANONICAL_VERSION,
+            run_id=str(run_id),
+            openrouter_catalog_sha256="0" * 64,
+            openrouter_catalog_source="bundled",
+        )
+        if seat == "lapsed":
+            expire_leader_seat(db, str(run_id))
+    transaction = MagicMock(spec=SessionOperationMutationTransaction)
+    transaction.runs = MagicMock(spec=SessionOperationRunMutations)
+    mock_session_service.session_operation_authority.mutate.side_effect = lambda _context, action: action(transaction)
+    mock_session_service.assess_run_start_admission.return_value = SimpleNamespace(state=StartPermitState.PENDING, execution_refusal=None)
+    mock_session_service.issue_run_start_permit.return_value = SimpleNamespace(
+        state=StartPermitState.START_PERMITTED,
+        execution_refusal=None,
+        admission_decision=None,
+        permit_id=uuid4(),
+        permit_epoch=1,
+        subject_hash="a" * 64,
+    )
+    # The refusal is raised after the Landscape database is open, where the
+    # handler reads the run's leader seat before recording recovery-required.
+    with (
+        patch(
+            "elspeth.core.landscape.run_start_admission.RunStartAdmissionRepository.observe",
+            side_effect=_RunRecoveryRequired(RecoveryRequiredReason.MISSING_BASELINE),
+        ) as observe,
+        patch.object(service, "_finalize_output_blobs") as finalize,
+    ):
+        service._run_pipeline(
+            str(run_id),
+            _TEST_PIPELINE_YAML,
+            threading.Event(),
+            session_operation_lease=_execute_lease(),
+            durable_admission=True,
+            restored_envelope=cast(Any, SimpleNamespace(settings=None)),
+        )
+    observe.assert_called_once()
+    if marked:
+        transaction.runs.mark_recovery_required.assert_called_once_with(run_id=run_id, reason=RecoveryRequiredReason.MISSING_BASELINE)
+    else:
+        transaction.runs.mark_recovery_required.assert_not_called()
+    mock_session_service.update_run_status.assert_not_called()
+    finalize.assert_not_called()
+
+
 class TestP2aCleanupCatchNarrowing:
     """Preserve redaction and programmer-error visibility before transfer.
 

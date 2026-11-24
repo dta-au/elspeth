@@ -503,7 +503,7 @@ def leader_token_for(db: LandscapeDB, run_id: str) -> CoordinationToken:
     passes its own leader's fence.
     """
 
-    leader = RunCoordinationRepository(db.engine).live_leader(run_id=run_id)
+    leader = RunCoordinationRepository(db.engine).seat_holder(run_id=run_id)
     if leader is None:
         raise AssertionError(f"run {run_id!r} has no run_coordination seat; begin_run mints one — was the run created via raw SQL?")
     return CoordinationToken(run_id=run_id, worker_id=leader.leader_worker_id, leader_epoch=leader.leader_epoch)
@@ -541,7 +541,7 @@ def leader_coordination_token(factory: RecorderFactory, run_id: str) -> Coordina
     token.
     """
 
-    leader = factory.run_coordination.live_leader(run_id=run_id)
+    leader = factory.run_coordination.seat_holder(run_id=run_id)
     if leader is None:
         raise AssertionError(f"run {run_id!r} has no run_coordination seat; begin_run mints one — was the run created via raw SQL?")
     return CoordinationToken(run_id=run_id, worker_id=leader.leader_worker_id, leader_epoch=leader.leader_epoch)
