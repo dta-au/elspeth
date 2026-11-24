@@ -72,8 +72,7 @@ CONTEXT_BUDGET_PROVIDER_REFUSAL_DETAIL: Final[str] = (
 # context limit. ELSPETH's own byte maximum let it through; the limit that
 # refused it is the provider's or the proxy's.
 CONTEXT_BUDGET_REQUEST_TOO_LARGE_DETAIL: Final[str] = (
-    "The model gateway, or a proxy in front of it, refused this request as too large. "
-    "An administrator can raise that request size limit, or set the Composer's request byte maximum below it."
+    "The model gateway, or a proxy in front of it, refused this request as too large. An administrator can raise that request size limit."
 )
 
 # The typed reason a sent request was refused as too large by the provider:
