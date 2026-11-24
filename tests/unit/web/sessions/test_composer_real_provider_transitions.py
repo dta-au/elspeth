@@ -12,7 +12,7 @@ import litellm
 import pytest
 from httpx import ASGITransport, AsyncClient, MockTransport, Request, Response
 from jsonschema import Draft202012Validator
-from litellm.exceptions import InternalServerError, RateLimitError, ServiceUnavailableError
+from litellm.exceptions import RateLimitError, ServiceUnavailableError
 from sqlalchemy import select
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus, ToolContractDialect
@@ -221,8 +221,6 @@ async def test_each_real_composer_transition_has_its_own_settled_provider_eviden
                 # One transient failure on the first primary dispatch. Its
                 # retry must stay inside this transition, on the common path.
                 failed_attempt_ids.append(pending["attempt_id"])
-                if first_primary_failure == "internal_server":
-                    raise InternalServerError("private failure", llm_provider="test", model=model)
                 if first_primary_failure == "service_unavailable":
                     raise ServiceUnavailableError("private failure", llm_provider="test", model=model)
                 assert first_primary_failure == "rate_limit"
@@ -581,7 +579,7 @@ async def test_each_real_composer_transition_has_its_own_settled_provider_eviden
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("quota", ("quota_off", "quota_on"))
-@pytest.mark.parametrize("failure_kind", ("internal_server", "rate_limit", "service_unavailable"))
+@pytest.mark.parametrize("failure_kind", ("rate_limit", "service_unavailable"))
 @pytest.mark.parametrize("transition", ("initial", "source_missing", "proposal"))
 async def test_rootless_and_first_turn_retry_a_transient_failure_inside_the_transition(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, transition: str, failure_kind: str, quota: str

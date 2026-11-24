@@ -21,7 +21,7 @@ from uuid import UUID, uuid4
 import litellm
 import pytest
 import structlog
-from httpx import ConnectError, MockTransport, Request, Response
+from httpx import MockTransport, Request, Response
 from litellm.exceptions import APIError as LiteLLMAPIError
 from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
@@ -128,7 +128,7 @@ from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
 from tests.fixtures.required_executor import assert_owned_executor_fixture_settled
 from tests.helpers.advisor_review import parse_advisor_publication_review
-from tests.helpers.litellm_mapping import insufficient_quota_429, through_litellm_mapper
+from tests.helpers.litellm_dispatch import Failure, Route, provider_failure
 from tests.helpers.session_fences import fenced_operation_context
 from tests.unit.web.composer._helpers import (
     FakeChoice,
@@ -6354,43 +6354,15 @@ class TestComposerAvailabilityAndBadRequest:
         mock_sleep.assert_awaited_once_with(1.0)
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("outcome", ("success", "exhausted"))
-    async def test_500_uses_bounded_compose_retry(self, outcome: str) -> None:
-        from litellm.exceptions import InternalServerError
-
-        from elspeth.web.composer.provider_config import LLM_API_MAX_ATTEMPTS
-
-        service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
-        failure = InternalServerError(message="private failure", llm_provider="openrouter", model="openrouter/openai/gpt-5.5")
-        responses: list[object] = [failure] * (LLM_API_MAX_ATTEMPTS if outcome == "exhausted" else 1)
-        if outcome == "success":
-            responses.append(_make_raw_llm_response(content="Recovered."))
-        with (
-            patch("litellm.acompletion", new_callable=AsyncMock, side_effect=responses) as mock_llm,
-            _mock_composer_retry_sleep() as mock_sleep,
-        ):
-            if outcome == "success":
-                result = await service.compose("Hello", [], _empty_state(), session_id=session_id)
-                _assert_checkpoint_reply(result, "Recovered.", count=0)
-                assert len(result.llm_calls) == 2
-            else:
-                with pytest.raises(type(failure)):
-                    await service.compose("Hello", [], _empty_state(), session_id=session_id)
-        expected = 2 if outcome == "success" else LLM_API_MAX_ATTEMPTS
-        assert mock_llm.call_count == expected
-        expected_delays = [1.0] if outcome == "success" else [1.0, 2.0]
-        assert [call.args[0] for call in mock_sleep.await_args_list] == expected_delays
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("provider", ("openai", "bedrock"))
-    async def test_mapper_built_quota_429_is_retried_and_stops_at_the_bound(self, provider: str) -> None:
-        """A quota 429 reaches the compose loop stripped of its quota code, so it is retried within the bound."""
+    @pytest.mark.parametrize("route", ("openai", "bedrock"))
+    async def test_real_quota_429_is_retried_and_stops_at_the_bound(self, route: Route) -> None:
+        """A quota 429 reaches the compose loop as an ordinary 429, so it is retried within the bound."""
         from litellm.exceptions import RateLimitError
 
         from elspeth.web.composer.provider_config import LLM_API_MAX_ATTEMPTS
 
         service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
-        failures = [through_litellm_mapper(insufficient_quota_429(), provider=provider) for _ in range(LLM_API_MAX_ATTEMPTS)]
+        failures = [await provider_failure(route, "429_quota") for _ in range(LLM_API_MAX_ATTEMPTS)]
         with (
             patch("litellm.acompletion", new_callable=AsyncMock, side_effect=failures) as mock_llm,
             _mock_composer_retry_sleep() as mock_sleep,
@@ -6401,24 +6373,41 @@ class TestComposerAvailabilityAndBadRequest:
         assert [call.args[0] for call in mock_sleep.await_args_list] == [1.0, 2.0]
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(("route", "delays"), [("bedrock", [7.0]), ("openai", [1.0])])
+    async def test_real_429_waits_for_retry_after_only_where_the_header_survives(self, route: Route, delays: list[float]) -> None:
+        """Both 429s carry retry-after: 7. Only Bedrock's reaches the Composer; the OpenAI route waits the base delay."""
+        service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
+        failure = await provider_failure(route, "429_retry_after")
+        with (
+            patch(
+                "litellm.acompletion", new_callable=AsyncMock, side_effect=[failure, _make_raw_llm_response(content="Recovered.")]
+            ) as mock_llm,
+            _mock_composer_retry_sleep() as mock_sleep,
+        ):
+            result = await service.compose("Hello", [], _empty_state(), session_id=session_id)
+        _assert_checkpoint_reply(result, "Recovered.", count=0)
+        assert mock_llm.call_count == 2
+        assert [call.args[0] for call in mock_sleep.await_args_list] == delays
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "original",
+        ("route", "failure"),
         [
-            pytest.param(KeyError("choices"), id="response-key"),
-            pytest.param(ConnectError("refused", request=Request("POST", "https://example.invalid")), id="transport"),
+            pytest.param("openai", "500", id="openai-500"),
+            pytest.param("openai", "connect", id="openai-connect"),
+            pytest.param("openai", "malformed_200", id="openai-unreadable-billed-200"),
+            pytest.param("anthropic", "read", id="anthropic-read"),
+            pytest.param("anthropic", "malformed_200", id="anthropic-unreadable-billed-200"),
         ],
     )
-    async def test_failure_arriving_as_a_connection_error_is_not_retried(self, original: Exception) -> None:
-        """LiteLLM wraps unmapped failures, including a billed response it could not read, as APIConnectionError."""
-        from litellm.exceptions import APIConnectionError
-
-        failure = through_litellm_mapper(original, provider="openrouter")
-        assert type(failure) is APIConnectionError
+    async def test_real_failure_that_may_follow_a_billed_response_is_not_retried(self, route: Route, failure: Failure) -> None:
+        """LiteLLM reports a transport failure or an unreadable billed response like a provider 500; none is re-sent."""
+        raised = await provider_failure(route, failure)
         service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
         with (
-            patch("litellm.acompletion", new_callable=AsyncMock, side_effect=failure) as mock_llm,
+            patch("litellm.acompletion", new_callable=AsyncMock, side_effect=raised) as mock_llm,
             _mock_composer_retry_sleep() as mock_sleep,
-            pytest.raises(APIConnectionError),
+            pytest.raises(type(raised)),
         ):
             await service.compose("Hello", [], _empty_state(), session_id=session_id)
         assert mock_llm.call_count == 1

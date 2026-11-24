@@ -117,6 +117,7 @@ from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from elspeth_lints.core.ast_walker import iter_python_files
 from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
+from tests.helpers.litellm_dispatch import Failure, Route, provider_failure
 
 
 @pytest.mark.asyncio
@@ -2763,23 +2764,14 @@ async def test_checkpoint_sdk_failure_requires_response_evidence_for_malformed(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure_kind", ["auth", "bad_request", "rate_limit", "rate_limit_budget", "unavailable", "connection"])
-async def test_advisor_respects_existing_provider_retryability(make_service, simple_state, failure_kind, monkeypatch):
-    from litellm.exceptions import AuthenticationError, BadRequestError, RateLimitError, RateLimitType, ServiceUnavailableError
-
-    from elspeth.web.composer import advisor_checkpoint
-
-    retry_sleep = AsyncMock(spec=asyncio.sleep)
-    monkeypatch.setattr(advisor_checkpoint, "asyncio", SimpleNamespace(**(vars(asyncio) | {"sleep": retry_sleep})))
+@pytest.mark.parametrize("failure_kind", ["auth", "bad_request", "rate_limit", "unavailable", "connection"])
+async def test_advisor_respects_existing_provider_retryability(make_service, simple_state, failure_kind):
+    from litellm.exceptions import AuthenticationError, BadRequestError, RateLimitError, ServiceUnavailableError
 
     failures = {
         "auth": AuthenticationError("private provider detail", model="advisor", llm_provider="openai"),
         "bad_request": BadRequestError("private provider detail", model="advisor", llm_provider="openai"),
         "rate_limit": RateLimitError("private provider detail", model="advisor", llm_provider="openai"),
-        # A directly typed 429, as the SDK or a proxy raises it; LiteLLM's mapper strips this type.
-        "rate_limit_budget": RateLimitError(
-            "private provider detail", model="advisor", llm_provider="openai", rate_limit_type=RateLimitType.BUDGET
-        ),
         "unavailable": ServiceUnavailableError("private provider detail", model="advisor", llm_provider="openai"),
         "connection": ConnectionError("private provider detail"),
     }
@@ -2790,10 +2782,8 @@ async def test_advisor_respects_existing_provider_retryability(make_service, sim
         phase="end", state=simple_state, **_fenced_session(service), recorder=make_recorder()
     )
     assert not verdict.ok
-    expected_calls = 2 if failure_kind in {"rate_limit", "unavailable", "connection"} else 1
-    assert call.await_count == expected_calls
-    assert retry_sleep.await_count == expected_calls - 1
-    assert verdict.retryable is (failure_kind in {"rate_limit", "unavailable", "connection"})
+    assert call.await_count == (2 if failure_kind in {"unavailable", "connection"} else 1)
+    assert verdict.retryable is (failure_kind in {"unavailable", "connection"})
     assert "private provider detail" not in verdict.findings_text
 
 
@@ -2940,28 +2930,42 @@ async def test_end_gate_compose_deadline_keeps_the_completed_reply_recoverable(m
 
 
 @pytest.mark.asyncio
-async def test_end_gate_503_without_retry_room_ends_through_the_compose_deadline_handler(make_service, simple_state, monkeypatch):
-    """No room for a retry is a time fact, not an advisor outage.
+@pytest.mark.parametrize(
+    ("time_left", "base_calls"),
+    [
+        pytest.param(0.0, 1, id="at-deadline"),
+        pytest.param(2.0, 2, id="inside-margin"),
+        pytest.param(5.5, 2, id="inside-delay-plus-margin"),
+        pytest.param(7.0, 2, id="retry-fits"),
+    ],
+)
+async def test_end_gate_503_near_the_deadline_ends_through_the_compose_deadline_handler(
+    make_service, simple_state, monkeypatch, time_left: float, base_calls: int
+):
+    """Running out of time near the deadline is a time fact, not an advisor outage.
 
-    The 503 arrives inside the retry delay plus call margin of the deadline. The
-    pass refuses the retry without relabelling the provider disposition, so the
-    next pass reaches the compose-deadline handler, which keeps the finished
-    reply, instead of publishing "advisor model was unavailable".
+    The first 503 arrives ``time_left`` seconds before the deadline; any later
+    call runs until the deadline and also fails. Whatever the time left, the
+    user gets the compose-deadline outcome, which keeps the finished reply, and
+    never "advisor model was unavailable". Review retries stay immediate, so
+    the provider call count matches: one call at the deadline, otherwise two.
     """
     from litellm.exceptions import ServiceUnavailableError
 
     service = make_service()
-    deadline = asyncio.get_running_loop().time() + 3.0
-    now = [deadline - 3.0]
+    deadline = asyncio.get_running_loop().time() + 30.0
+    now = [deadline - 30.0]
     monkeypatch.setattr("elspeth.web.composer.advisor_checkpoint._compose_deadline_time", lambda: now[0])
+    calls = [0]
 
-    async def unavailable_as_the_deadline_arrives(*_args: object, **_kwargs: object) -> object:
-        now[0] = deadline
+    async def unavailable_near_the_deadline(*_args: object, **_kwargs: object) -> object:
+        calls[0] += 1
+        now[0] = deadline - time_left if calls[0] == 1 else deadline
         raise ServiceUnavailableError("private provider detail", model="advisor", llm_provider="openai")
 
     service._advisor_checkpoint._call_advisor_with_audit = AsyncMock(
         spec=service._advisor_checkpoint._call_advisor_with_audit,
-        side_effect=unavailable_as_the_deadline_arrives,
+        side_effect=unavailable_near_the_deadline,
     )
     monkeypatch.setattr(
         "elspeth.web.composer.advisor_checkpoint.persist_advisor_checkpoint_pass", AsyncMock(spec=persist_advisor_checkpoint_pass)
@@ -2976,7 +2980,7 @@ async def test_end_gate_503_without_retry_room_ends_through_the_compose_deadline
             initial_version=0,
         )
 
-    assert service._advisor_checkpoint._call_advisor_with_audit.await_count == 1
+    assert calls[0] == base_calls
     assert exc_info.value.budget_exhausted == "timeout"
     assert "advisor model was unavailable" not in str(exc_info.value).lower()
     (row,) = service._sessions_service.add_message.calls
@@ -6995,90 +6999,26 @@ def _install_budget_advisor_transport(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("headers", "scenario", "expected_calls", "delays"),
+    ("route", "failure"),
     [
-        ({"retry-after": "3"}, "success", 2, [3.0]),
-        ({"retry-after-ms": "1500", "retry-after": "3"}, "success", 2, [1.5]),
-        ({"retry-after-ms": "bad", "retry-after": "3"}, "success", 2, [3.0]),
-        ({"retry-after": "bad"}, "success", 2, [1.0]),
-        ({}, "exhausted", 2, [1.0]),
-        ({"retry-after": "31"}, "too-long", 1, []),
-        ({"retry-after": "6"}, "deadline", 1, []),
-        ({}, "budget", 1, []),
+        pytest.param("openai", "429_retry_after", id="openai-429"),
+        pytest.param("bedrock", "429_retry_after", id="bedrock-429-with-retry-after"),
+        pytest.param("openai", "500", id="openai-500"),
+        pytest.param("openai", "connect", id="openai-connect"),
+        pytest.param("openai", "malformed_200", id="openai-unreadable-billed-200"),
+        pytest.param("anthropic", "malformed_200", id="anthropic-unreadable-billed-200"),
     ],
-    ids=("seconds", "ms-wins", "malformed-ms", "malformed-seconds", "exhausted", "ceiling", "deadline", "budget"),
 )
-async def test_physical_advisor_rate_limit_counts_audit_and_quota_attempts(
-    make_service,
-    simple_state,
-    monkeypatch,
-    physical_advisor,
-    headers: dict[str, str],
-    scenario: str,
-    expected_calls: int,
-    delays: list[float],
+async def test_physical_advisor_does_not_resend_a_429_or_an_unreadable_response(
+    make_service, simple_state, monkeypatch, physical_advisor, route: Route, failure: Failure
 ) -> None:
-    import httpx
-    from litellm.exceptions import RateLimitError, RateLimitType
-
+    """Review retries are immediate, so a 429 is never re-sent, and nothing a
+    billed response can turn into is re-sent either: one call, one audit row."""
     from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
-    from elspeth.web.composer import advisor_checkpoint
 
-    limited = RateLimitError(
-        "private rate limit",
-        model="advisor",
-        llm_provider="openai",
-        response=httpx.Response(429, request=httpx.Request("POST", "https://example.invalid"), headers=headers),
-        rate_limit_type=RateLimitType.BUDGET if scenario == "budget" else None,
-    )
-    responses: list[str | Exception] = [limited] * (2 if scenario == "exhausted" else 1)
-    if scenario == "success":
-        responses.append(_checkpoint_reply(publication_verdict="ADMIT"))
+    raised = await provider_failure(route, failure)
     service = make_service()
-    calls = _install_budget_advisor_transport(monkeypatch, responses, provider_cost=0.01)
-    retry_sleep = AsyncMock(spec=asyncio.sleep)
-    monkeypatch.setattr(advisor_checkpoint, "asyncio", SimpleNamespace(**(vars(asyncio) | {"sleep": retry_sleep})))
-    recorder = make_recorder()
-    deadline = asyncio.get_running_loop().time() + 10.0 if scenario == "deadline" else None
-    with prompt_guard_user_scope(""):
-        verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
-            phase="end",
-            state=simple_state,
-            recorder=recorder,
-            deadline=deadline,
-            **physical_advisor.bind(service, review_state=simple_state),
-        )
-    assert verdict.ok is (scenario == "success")
-    assert len(calls) == len(recorder.llm_calls) == expected_calls
-    assert [call.args[0] for call in retry_sleep.await_args_list] == delays
-    expected_statuses = [ComposerLLMCallStatus.API_ERROR] * expected_calls
-    if scenario == "success":
-        expected_statuses[-1] = ComposerLLMCallStatus.SUCCESS
-    assert [call.status for call in recorder.llm_calls] == expected_statuses
-    with physical_advisor.engine.connect() as connection:
-        attempts = connection.execute(select(quota_provider_attempts_table)).all()
-    assert len(attempts) == expected_calls
-    assert {attempt.attempt_id for attempt in attempts} == {call.call_id for call in recorder.llm_calls}
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("outcome", ("success", "exhausted"))
-async def test_physical_advisor_500_retry_with_audit_and_quota(
-    make_service, simple_state, monkeypatch, physical_advisor, outcome: str
-) -> None:
-    from litellm.exceptions import InternalServerError
-
-    from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
-    from elspeth.web.composer import advisor_checkpoint
-
-    failure = InternalServerError("private failure", model="advisor", llm_provider="openai")
-    responses: list[str | Exception] = [failure] * (2 if outcome == "exhausted" else 1)
-    if outcome == "success":
-        responses.append(_checkpoint_reply(publication_verdict="ADMIT"))
-    service = make_service()
-    calls = _install_budget_advisor_transport(monkeypatch, responses, provider_cost=0.01)
-    retry_sleep = AsyncMock(spec=asyncio.sleep)
-    monkeypatch.setattr(advisor_checkpoint, "asyncio", SimpleNamespace(**(vars(asyncio) | {"sleep": retry_sleep})))
+    calls = _install_budget_advisor_transport(monkeypatch, [raised, _checkpoint_reply(publication_verdict="ADMIT")], provider_cost=0.01)
     recorder = make_recorder()
     with prompt_guard_user_scope(""):
         verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
@@ -7087,28 +7027,20 @@ async def test_physical_advisor_500_retry_with_audit_and_quota(
             recorder=recorder,
             **physical_advisor.bind(service, review_state=simple_state),
         )
-    assert verdict.ok is (outcome == "success")
-    assert len(calls) == len(recorder.llm_calls) == 2
-    retry_sleep.assert_awaited_once_with(1.0)
-    statuses = [ComposerLLMCallStatus.API_ERROR, ComposerLLMCallStatus.SUCCESS if outcome == "success" else ComposerLLMCallStatus.API_ERROR]
-    assert [call.status for call in recorder.llm_calls] == statuses
+    assert not verdict.ok and not verdict.retryable
+    assert len(calls) == len(recorder.llm_calls) == 1
+    assert [call.status for call in recorder.llm_calls] == [ComposerLLMCallStatus.API_ERROR]
     with physical_advisor.engine.connect() as connection:
         attempts = connection.execute(select(quota_provider_attempts_table)).all()
-    assert len(attempts) == 2
-    assert {attempt.attempt_id for attempt in attempts} == {call.call_id for call in recorder.llm_calls}
+    assert len(attempts) == 1
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("phase", ["early", "end"])
-@pytest.mark.parametrize("first", ["clean", "transport", "rate_limit", "schema", "contract"])
+@pytest.mark.parametrize("first", ["clean", "transport", "schema", "contract"])
 async def test_actual_checkpoint_dispatch_and_retry_fit_optional_summary(
     make_service, simple_state, monkeypatch, physical_advisor, phase, first
 ):
-    import httpx
-    from litellm.exceptions import RateLimitError
-
-    from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
-    from elspeth.web.composer import advisor_checkpoint
     from elspeth.web.composer.advisor_context import (
         build_advisor_user_message,
         summarize_pipeline_for_advisor,
@@ -7122,16 +7054,8 @@ async def test_actual_checkpoint_dispatch_and_retry_fit_optional_summary(
         publication_verdict="WITHHOLD" if phase == "end" else None,
     )
     bad = _checkpoint_reply(steps=("rate",), publication_verdict="ADMIT" if phase == "end" else None)
-    limited = RateLimitError(
-        "private provider rate limit",
-        model="advisor",
-        llm_provider="openai",
-        response=httpx.Response(429, request=httpx.Request("POST", "https://example.invalid"), headers={"retry-after": "3"}),
-    )
-    initial = {"clean": good, "transport": TimeoutError(), "rate_limit": limited, "schema": "not JSON", "contract": bad}[first]
+    initial = {"clean": good, "transport": TimeoutError(), "schema": "not JSON", "contract": bad}[first]
     calls = _install_budget_advisor_transport(monkeypatch, [initial, good])
-    retry_sleep = AsyncMock(spec=asyncio.sleep)
-    monkeypatch.setattr(advisor_checkpoint, "asyncio", SimpleNamespace(**(vars(asyncio) | {"sleep": retry_sleep})))
     recorder = make_recorder()
     full = summarize_pipeline_for_advisor(state)
     fenced = physical_advisor.bind(service, review_state=state if phase == "end" else None)
@@ -7157,9 +7081,6 @@ async def test_actual_checkpoint_dispatch_and_retry_fit_optional_summary(
     assert 0 <= _optional_summary_chars(arguments, state) <= cap
     assert calls[0]["messages"][1]["content"] == build_advisor_user_message(arguments)
     assert len(recorder.llm_calls) == len(calls)
-    if first == "rate_limit":
-        retry_sleep.assert_awaited_once_with(3.0)
-        assert [call.status for call in recorder.llm_calls] == [ComposerLLMCallStatus.API_ERROR, ComposerLLMCallStatus.SUCCESS]
     record = service._sessions_service.add_message.await_args_list[0].kwargs["tool_calls"][0]["pass"]
     assert record["provider_attempts"] == len(calls)
     assert record["format_reprompt_sent"] is (first in {"schema", "contract"})

@@ -32,7 +32,6 @@ from elspeth.web.composer.provider_errors import (
     observe_rate_limit,
 )
 from elspeth.web.composer.provider_retry import retry_delay_seconds
-from tests.helpers.litellm_mapping import insufficient_quota_429, through_litellm_mapper
 
 _SECRET = "UPSTREAM-RESPONSE-BODY-SECRET"
 _PROVIDER = "test-provider"
@@ -48,9 +47,11 @@ def test_real_rate_limit_and_non_429_status_have_distinct_dispositions() -> None
     limited = classify_provider_failure(_rate_limit())
     assert limited is not None
     assert (limited.audit_status, limited.kind, limited.retryable) == (ComposerLLMCallStatus.API_ERROR, "unavailable", True)
+    assert limited.rate_limited is True
     response = httpx.Response(409, request=httpx.Request("POST", "https://example.invalid"))
     other = classify_provider_failure(APIStatusError(_SECRET, response=response, body=None))
     assert other is not None and not other.retryable and other.kind == "unavailable"
+    assert other.rate_limited is False
 
 
 def test_rate_limit_budget_uses_exact_typed_evidence() -> None:
@@ -73,38 +74,6 @@ def test_structured_insufficient_quota_code_stops_retry_without_message_matching
     near_miss = classify_provider_failure(OpenAIRateLimitError(_SECRET, response=response, body={"code": "quota_nearly_full"}))
     assert exhausted is not None and not exhausted.retryable
     assert near_miss is not None and near_miss.retryable
-
-
-@pytest.mark.parametrize("provider", ["openai", "bedrock"])
-def test_mapper_built_quota_429_is_retryable_because_the_mapper_strips_its_structure(provider: str) -> None:
-    """The quota code survives only on the directly raised error, not on what acompletion raises."""
-    original = insufficient_quota_429()
-    direct = classify_provider_failure(original)
-    assert direct is not None and not direct.retryable
-    mapped = through_litellm_mapper(original, provider=provider)
-    assert type(mapped) is LiteLLMRateLimitError
-    assert mapped.rate_limit_type is None and mapped.body is None
-    failure = classify_provider_failure(mapped)
-    assert failure is not None
-    assert (failure.audit_status, failure.kind, failure.retryable) == (ComposerLLMCallStatus.API_ERROR, "unavailable", True)
-
-
-@pytest.mark.parametrize(
-    "original",
-    [
-        pytest.param(KeyError("choices"), id="response-key"),
-        pytest.param(ValueError("response transformation"), id="response-value"),
-        pytest.param(httpx.ConnectError("refused", request=httpx.Request("POST", "https://example.invalid")), id="transport"),
-    ],
-)
-def test_mapper_wrapped_failure_arriving_as_a_connection_error_is_not_retried(original: Exception) -> None:
-    from litellm.exceptions import APIConnectionError as LiteLLMAPIConnectionError
-
-    mapped = through_litellm_mapper(original, provider="openai")
-    assert type(mapped) is LiteLLMAPIConnectionError
-    failure = classify_provider_failure(mapped)
-    assert failure is not None
-    assert (failure.audit_status, failure.kind, failure.retryable) == (ComposerLLMCallStatus.API_ERROR, "unavailable", False)
 
 
 @pytest.mark.parametrize(
@@ -187,10 +156,9 @@ def test_addendum_sdk_policy_and_timeout_order() -> None:
     from litellm.exceptions import Timeout as LiteLLMTimeout
     from openai import APIConnectionError, APITimeoutError, InternalServerError, PermissionDeniedError
 
-    for retried in (InternalServerError, LiteLLMInternalServerError):
-        assert _provider_error_disposition(retried) == "retry"
-    # LiteLLM wraps unmapped failures as APIConnectionError; without typed transport evidence it is not retried.
-    for unmapped in (APIConnectionError, LiteLLMAPIConnectionError):
+    # LiteLLM reports transport failures and unreadable billed responses as a 500
+    # or as APIConnectionError; without typed transport evidence neither is retried.
+    for unmapped in (InternalServerError, LiteLLMInternalServerError, APIConnectionError, LiteLLMAPIConnectionError):
         assert _provider_error_disposition(unmapped) == "generic"
     for timed_out in (APITimeoutError, LiteLLMTimeout):
         assert _provider_error_disposition(timed_out) == "timeout"
@@ -211,7 +179,7 @@ def test_addendum_concrete_sdk_failures_keep_value_free_dispositions() -> None:
     request = httpx.Request("POST", "https://example.invalid")
     response = httpx.Response(403, request=request)
     cases = (
-        (InternalServerError(_SECRET, llm_provider=_PROVIDER, model=_MODEL), "unavailable", True),
+        (InternalServerError(_SECRET, llm_provider=_PROVIDER, model=_MODEL), "unavailable", False),
         (LiteLLMAPIConnectionError(_SECRET, llm_provider=_PROVIDER, model=_MODEL, request=request), "unavailable", False),
         (PermissionDeniedError(_SECRET, llm_provider=_PROVIDER, model=_MODEL, response=response), "auth", False),
         (APIResponseValidationError(_SECRET, llm_provider=_PROVIDER, model=_MODEL), "unavailable", False),

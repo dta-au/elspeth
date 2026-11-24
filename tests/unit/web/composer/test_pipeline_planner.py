@@ -32,7 +32,6 @@ from litellm import ModelResponse, Usage
 from litellm.exceptions import APIError as LiteLLMAPIError
 from litellm.exceptions import BadGatewayError, RateLimitError, RateLimitType, ServiceUnavailableError
 from litellm.exceptions import Timeout as LiteLLMTimeout
-from openai import RateLimitError as OpenAIRateLimitError
 from sqlalchemy import func, select
 from sqlalchemy.pool import StaticPool
 
@@ -155,7 +154,7 @@ from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from elspeth.web.validation import _redact_sensitive_content
 from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
-from tests.helpers.litellm_mapping import through_litellm_mapper
+from tests.helpers.litellm_dispatch import Failure, Route, provider_failure
 from tests.helpers.prompt_guard_audit import (
     PROMPT_GUARD_AUDIT_SCHEMA_VERSION,
     assert_prompt_guard_check_shape,
@@ -5330,52 +5329,20 @@ async def test_planner_rate_limit_retries_after_header_and_records_both_physical
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("outcome", ("success", "exhausted"))
-async def test_planner_500_uses_bounded_retry(tmp_path: Path, tool_context: ToolContext, outcome: str) -> None:
-    from litellm.exceptions import InternalServerError
-
-    failure = InternalServerError(message="private failure", llm_provider="test-provider", model="anthropic/claude-planner")
-    responses: list[Exception | _Response] = [failure] * (2 if outcome == "exhausted" else 1)
-    if outcome == "success":
-        responses.append(_response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})))
-    completion = _ScriptedCompletion(*responses)
-    recorder = BufferingRecorder()
-    retry_sleep = AsyncMock(spec=asyncio.sleep)
-    retry_asyncio = SimpleNamespace(**(vars(asyncio) | {"sleep": retry_sleep}))
-    with patch.object(pipeline_planner, "asyncio", retry_asyncio):
-        if outcome == "success":
-            proposal = await _plan(
-                tmp_path=tmp_path,
-                tool_context=tool_context,
-                completion=completion,
-                recorder=recorder,
-                model_overrides={"max_api_attempts": 2, "api_retry_base_seconds": 1.0},
-            )
-            assert deep_thaw(proposal.proposal.pipeline) == _pipeline(tmp_path)
-        else:
-            with pytest.raises(PipelinePlannerError) as caught:
-                await _plan(
-                    tmp_path=tmp_path,
-                    tool_context=tool_context,
-                    completion=completion,
-                    recorder=recorder,
-                    model_overrides={"max_api_attempts": 2, "api_retry_base_seconds": 1.0},
-                )
-            assert caught.value.code == "PROVIDER_ERROR"
-    assert len(completion.requests) == len(recorder.llm_calls) == 2
-    assert [call.args[0] for call in retry_sleep.await_args_list] == [1.0]
-    statuses = [ComposerLLMCallStatus.API_ERROR, ComposerLLMCallStatus.SUCCESS if outcome == "success" else ComposerLLMCallStatus.API_ERROR]
-    assert [call.status for call in recorder.llm_calls] == statuses
-
-
-@pytest.mark.asyncio
-async def test_planner_failure_arriving_as_a_connection_error_is_not_retried(tmp_path: Path, tool_context: ToolContext) -> None:
-    """LiteLLM wraps unmapped failures, including a billed response it could not read, as APIConnectionError."""
-    from litellm.exceptions import APIConnectionError
-
-    failure = through_litellm_mapper(KeyError("choices"), provider="anthropic", model="anthropic/claude-planner")
-    assert type(failure) is APIConnectionError
-    completion = _ScriptedCompletion(failure)
+@pytest.mark.parametrize(
+    ("route", "failure"),
+    [
+        pytest.param("openai", "500", id="openai-500"),
+        pytest.param("openai", "connect", id="openai-connect"),
+        pytest.param("openai", "malformed_200", id="openai-unreadable-billed-200"),
+        pytest.param("anthropic", "malformed_200", id="anthropic-unreadable-billed-200"),
+    ],
+)
+async def test_planner_failure_that_may_follow_a_billed_response_is_not_retried(
+    tmp_path: Path, tool_context: ToolContext, route: Route, failure: Failure
+) -> None:
+    """LiteLLM reports a transport failure or an unreadable billed response like a provider 500; none is re-sent."""
+    completion = _ScriptedCompletion(await provider_failure(route, failure))
     recorder = BufferingRecorder()
     retry_sleep = AsyncMock(spec=asyncio.sleep)
     retry_asyncio = SimpleNamespace(**(vars(asyncio) | {"sleep": retry_sleep}))
@@ -5393,20 +5360,23 @@ async def test_planner_failure_arriving_as_a_connection_error_is_not_retried(tmp
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("timeout_seconds", "code"),
+    [
+        pytest.param(60.0, "PROVIDER_CALLS_EXHAUSTED", id="delay-fits"),
+        pytest.param(10.0, "PROVIDER_ERROR", id="delay-does-not-fit"),
+    ],
+)
 async def test_planner_does_not_wait_out_a_retry_delay_before_a_certain_call_budget_refusal(
-    tmp_path: Path, tool_context: ToolContext
+    tmp_path: Path, tool_context: ToolContext, timeout_seconds: float, code: str
 ) -> None:
-    """The failed call used the last provider call, so the retry is refused at once, not after the Retry-After."""
-    rate_limit = through_litellm_mapper(
-        OpenAIRateLimitError(
-            "slow down",
-            response=httpx.Response(429, request=httpx.Request("POST", "https://example.invalid"), headers={"retry-after": "20"}),
-            body=None,
-        ),
-        provider="anthropic",
-        model="anthropic/claude-planner",
-    )
-    completion = _ScriptedCompletion(rate_limit)
+    """The failed call used the last provider call, so no retry delay is waited out.
+
+    The Bedrock 429 carries retry-after: 7. When that delay fits the deadline the
+    refusal is the call budget, raised at once; when it does not fit, the failure
+    is reported as the provider error it was, as before.
+    """
+    completion = _ScriptedCompletion(await provider_failure("bedrock", "429_retry_after"))
     recorder = BufferingRecorder()
     retry_sleep = AsyncMock(spec=asyncio.sleep)
     retry_asyncio = SimpleNamespace(**(vars(asyncio) | {"sleep": retry_sleep}))
@@ -5417,9 +5387,9 @@ async def test_planner_does_not_wait_out_a_retry_delay_before_a_certain_call_bud
             completion=completion,
             recorder=recorder,
             budget=_budget(max_total_provider_calls=1),
-            model_overrides={"max_api_attempts": 2, "api_retry_base_seconds": 1.0},
+            model_overrides={"max_api_attempts": 2, "api_retry_base_seconds": 1.0, "timeout_seconds": timeout_seconds},
         )
-    assert caught.value.code == "PROVIDER_CALLS_EXHAUSTED"
+    assert caught.value.code == code
     assert len(completion.requests) == len(recorder.llm_calls) == 1
     retry_sleep.assert_not_awaited()
 

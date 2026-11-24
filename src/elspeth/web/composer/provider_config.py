@@ -6,7 +6,8 @@ from __future__ import annotations
 LLM_API_MAX_ATTEMPTS = 3
 LLM_API_RETRY_BASE_DELAY_SECONDS = 1.0
 # A configured policy bound on any one retry delay, including a provider's
-# Retry-After; the next call also needs its own deadline headroom (the margin).
+# Retry-After where LiteLLM keeps that header (Bedrock; the other supported
+# routes drop it). The next call also needs its own deadline headroom (the margin).
 LLM_API_RETRY_DELAY_CEILING_SECONDS = 30.0
 LLM_API_RETRY_CALL_MARGIN_SECONDS = 5.0
 

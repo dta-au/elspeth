@@ -112,7 +112,6 @@ from elspeth.web.composer.prompt_guard import (
     prompt_guard_enforces_character_limits,
 )
 from elspeth.web.composer.protocol import ComposerResult, ComposerSettings, ToolArgumentError
-from elspeth.web.composer.provider_config import LLM_API_RETRY_BASE_DELAY_SECONDS
 from elspeth.web.composer.provider_context import capture_provider_context
 from elspeth.web.composer.provider_errors import ProviderRequestFailure, classify_provider_failure, is_context_length_rejection
 from elspeth.web.composer.provider_gateway import (
@@ -130,7 +129,6 @@ from elspeth.web.composer.provider_quota import (
     quota_provider_calls,
     required_provider_audit_scope,
 )
-from elspeth.web.composer.provider_retry import retry_delay_seconds
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools import ADVISOR_TRIGGER_DETERMINISTIC_EARLY, ADVISOR_TRIGGER_DETERMINISTIC_END
 from elspeth.web.composer.tools._dispatch import require_schema_valid_arguments
@@ -1593,7 +1591,7 @@ class AdvisorCheckpointOwner:
             provider_attempts += 1
             format_reprompt_sent = format_reprompt_sent or format_reprompt_pending
 
-        for attempt in range(1, attempts + 1):
+        for _ in range(attempts):
             if format_reprompt_pending:
                 # The format instruction can change rendered budget overhead.
                 # Refit the same complete saved graph, never a fitted prefix.
@@ -1684,36 +1682,13 @@ class AdvisorCheckpointOwner:
                     )
                 if continuation_budget is not None and not continuation_budget.has_cost_headroom():
                     return continuation_withheld(provider_failure=last_request_failure)
-                last_failure_retryable = failure is None or failure.retryable
+                # Review retries are immediate, so a provider 429 is never re-sent
+                # here: it would land inside the provider's own wait.
+                last_failure_retryable = failure is None or (failure.retryable and not failure.rate_limited)
                 if not last_failure_retryable:
                     # The primary path uses this same value-free policy.
                     # Repeating an unchanged rejected request cannot repair it.
                     break
-                if attempt >= attempts:
-                    break
-                if (
-                    continuation_budget is not None
-                    and continuation_budget.reserved_calls >= continuation_budget.policy.max_total_provider_calls
-                ):
-                    return continuation_withheld(provider_failure=last_request_failure)
-                now = _compose_deadline_time()
-                retry_deadline = deadline if deadline is not None else float("inf")
-                if continuation_budget is not None:
-                    retry_deadline = min(retry_deadline, continuation_budget.deadline)
-                retry_delay = retry_delay_seconds(
-                    attempt=attempt,
-                    retry_after=failure.retry_after if failure is not None else None,
-                    deadline=retry_deadline,
-                    now=now,
-                    base_delay_seconds=LLM_API_RETRY_BASE_DELAY_SECONDS,
-                )
-                if retry_delay is None:
-                    # No room for another call in this pass is a time fact, not
-                    # a provider disposition. The next pass makes its own
-                    # deadline decision.
-                    break
-                if retry_delay > 0:
-                    await asyncio.sleep(retry_delay)
                 continue
             if continuation_budget is not None and not continuation_budget.within_cost_cap():
                 return continuation_withheld()

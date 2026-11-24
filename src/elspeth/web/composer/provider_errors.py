@@ -42,6 +42,8 @@ class ProviderFailure:
     retryable: bool
     request_rejection: SafeRequestRejection | None = None
     retry_after: RetryAfter | None = None
+    # A provider 429. Callers whose retries are immediate must not re-send it.
+    rate_limited: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,7 +85,9 @@ def observe_rate_limit(exc: OpenAIRateLimitError, *, now: datetime | None = None
     every ``acompletion`` failure passes through, rebuilds a provider 429
     without its body, code or rate-limit type, so a quota or credit refusal
     from that path is indistinguishable from a transient 429 and is retried
-    within the same bound.
+    within the same bound. The same rebuild drops the response headers on the
+    OpenAI, Anthropic and OpenRouter routes, so a Retry-After is seen only
+    where LiteLLM keeps them (Bedrock).
     """
     from litellm.exceptions import RateLimitError as LiteLLMRateLimitError
     from litellm.exceptions import RateLimitType
@@ -137,7 +141,10 @@ def _provider_error_arms() -> tuple[tuple[type[BaseException], _Disposition], ..
         (le.BadGatewayError, "bad_gateway"),
         (le.MidStreamFallbackError, "retry"),
         (le.ServiceUnavailableError, "retry"),
-        (openai.InternalServerError, "retry"),
+        # LiteLLM's OpenAI and Anthropic handlers rewrap a transport failure, or
+        # a billed response they could not read, as a status-500 error. A class
+        # policy cannot tell that from a provider 500, so it is not retried.
+        (openai.InternalServerError, "generic"),
         # LiteLLM wraps every exception it cannot map, including a failure to
         # read a response the provider already billed, as APIConnectionError.
         # The class carries no typed transport evidence, so it is not retried.
@@ -158,6 +165,7 @@ def _deliberately_generic() -> dict[type[BaseException], str]:
     import openai
     from litellm import exceptions as le
     from openai._exceptions import SubjectTokenProviderError
+    from openai._extras._common import MissingDependencyError
     from openai._response import StreamAlreadyConsumed
     from openai.lib._old_api import APIRemovedInV1
     from openai.lib.azure import MutuallyExclusiveAuthError
@@ -175,6 +183,7 @@ def _deliberately_generic() -> dict[type[BaseException], str]:
         openai.WebSocketQueueFullError: "stream queue has no replay policy",
         openai._AmbiguousModuleClientUsageError: "client configuration defect",
         SubjectTokenProviderError: "identity provider configuration defect",
+        MissingDependencyError: "missing optional SDK dependency is a client installation defect",
         StreamAlreadyConsumed: "stream lifecycle defect",
         APIRemovedInV1: "removed API use is a client defect",
         MutuallyExclusiveAuthError: "conflicting authentication configuration",
@@ -367,6 +376,10 @@ def classify_provider_failure(exc: BaseException) -> ProviderFailure | None:
         assert isinstance(exc, OpenAIRateLimitError)
         observed = observe_rate_limit(exc)
         return ProviderFailure(
-            ComposerLLMCallStatus.API_ERROR, "unavailable", not observed.budget_exhausted, retry_after=observed.retry_after
+            ComposerLLMCallStatus.API_ERROR,
+            "unavailable",
+            not observed.budget_exhausted,
+            retry_after=observed.retry_after,
+            rate_limited=True,
         )
     return ProviderFailure(ComposerLLMCallStatus.API_ERROR, "unavailable", False)

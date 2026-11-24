@@ -4409,9 +4409,6 @@ async def _plan_pipeline_inner(
                 if provider_failure.kind == "timeout":
                     raise PipelinePlannerError("planner provider call timed out", code="TIMEOUT") from None
                 if provider_failure.retryable and attempt < model_config.max_api_attempts:
-                    if total_calls >= budget_policy.max_total_provider_calls:
-                        # Do not wait out a delay before a refusal that is already certain.
-                        raise PipelinePlannerError("planner provider call budget exhausted", code="PROVIDER_CALLS_EXHAUSTED") from None
                     retry_delay = retry_delay_seconds(
                         attempt=attempt,
                         retry_after=provider_failure.retry_after,
@@ -4420,6 +4417,9 @@ async def _plan_pipeline_inner(
                         base_delay_seconds=model_config.api_retry_base_seconds,
                     )
                     if retry_delay is not None:
+                        if total_calls >= budget_policy.max_total_provider_calls:
+                            # Do not wait out a delay before a refusal that is already certain.
+                            raise PipelinePlannerError("planner provider call budget exhausted", code="PROVIDER_CALLS_EXHAUSTED") from None
                         if retry_delay > 0:
                             await asyncio.sleep(retry_delay)
                         continue
