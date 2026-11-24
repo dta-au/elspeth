@@ -11,7 +11,8 @@ hunter2")` returns `token_shape`) and a control (`in str(exc)` finds
 ## Headline
 
 No live code classifies the model's prose by its wording (refusal, apology,
-completion claim, tool JSON in prose). Provider error handling is typed. What
+completion claim, tool JSON in prose). Provider error handling is typed, apart
+from one later addition (#19, registered after the survey). What
 remains falls into five groups: drifted copies of the credential detector and
 name-suffix rules; ELSPETH's own messages re-parsed into codes; a few keyword
 rules over user or model text; one durable flag stored as a suffix of a prose
@@ -43,6 +44,7 @@ planner; L is cosmetic.
 | 16 | frontend `SecretsPanel.tsx:96-115` | Substrings of the backend 422 detail choose the `aria-invalid` field | L-M | run |
 | 17 | frontend `ComposingIndicator.tsx:108`, `validationHumaniser.ts:290-420`, `ExecuteButton.tsx:94`, `approvalRows.ts:12` | Keyword and id-token guessing for display | L | by reading |
 | 18 | `wire_projection.py:260`, `titles.py:44`, `source_inspection.py:371`, `tutorial_service.py:598` | Omission-phrase lint, default-title regex, file kind by name, artifact format by suffix | L | by reading |
+| 19 | `web/composer/provider_errors.py` `_CONTEXT_LENGTH_MESSAGE_PATTERNS`, `_admit_context_length_evidence` | Six lower-cased substrings of a provider's HTTP 400 message decide that a request was over the model's context limit; the size resend and the size refusal act on it (see below). Registered 2026-11-24, after the survey | M | run |
 
 ## The six that matter most
 
@@ -127,8 +129,9 @@ must be calibrated to flag #2 and #5 and stay quiet on identifier shapes.
 
 ## Excluded, with reasons
 
-`provider_errors.py` (typed by SDK exception and closed code; the model to
-copy); the producers in `no_tool_policy.py` (ELSPETH literals);
+`provider_errors.py` (typed by SDK exception, closed code and HTTP status;
+the model to copy), except its context-length message patterns, which are
+#19; the producers in `no_tool_policy.py` (ELSPETH literals);
 `capability_skill.py:62` (ELSPETH's own table, fails loudly); prompt comment
 stripping; the auto-title character allowlist; the registered pipeline
 decision terms (closed registry, exact match); JSON-Schema keyword sets; hash,
@@ -136,6 +139,37 @@ id, version and schema-name shape checks; the exporter marker parsed at
 `routes/composer/state.py:376`; source literal sniffing; the minted `source:`,
 `node:`, `output:` and `blob:` id prefixes; self-coded `csv_…` warnings;
 closed alias sets; the `web/auth` regexes; tutorial detection (flag-based).
+
+## #19: context-length message patterns (registered 2026-11-24)
+
+Added by `5eaa31b53` (0.8.17), so that a gateway's context-limit rejection
+reaches the user as a size refusal. The classifier tries six fixed phrases
+against the lower-cased message of an HTTP 400 only when no specific typed
+code was retained; a generic `invalid_request` code does not stop it. A hit
+records `rejection_reason_source = "message_pattern"` on the call, so every
+decision made this way is visible in the audit.
+
+Since 0.8.18 five behaviours act on it: the compose loop's and the reply
+stage's resend with every earlier turn left out, the advisor's, and the
+planner's and escape hatch's, plus the size refusal when nothing is left to
+leave out.
+
+An independent review (2026-11-24) ruled on each phrase:
+
+| Phrase | Exact, documented response? | Typed evidence takes precedence? | Last resort, visible in the audit? |
+|---|---|---|---|
+| `prompt is too long` | No: a case-folded substring | No: a generic `invalid_request` does not block it | Visible as `message_pattern`; not after every typed source |
+| `maximum context length` | No | No | As above |
+| `context_length_exceeded` | No: a structured code, searched for in prose | No | As above |
+| `context length exceeded` | No | No | As above |
+| `exceeds the context window` | No | No | As above |
+| `input is too long for requested model` | No | No | As above |
+
+Kept for 0.8.18: making a typed code block the fallback, or removing it,
+would regress the 0.8.17 gateway fix. Target: recognise a context-limit
+rejection from typed evidence only (an SDK class, a structured code or an
+HTTP status) once the gateway's typed context-limit code reaches ELSPETH, or
+a typed gateway route flag exists, and then remove the phrases.
 
 ## Not checked
 
