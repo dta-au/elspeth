@@ -907,7 +907,7 @@ async def test_advisor_size_resend_is_available_after_the_last_ordinary_attempt(
 
 
 def _scripted_advisor(monkeypatch: pytest.MonkeyPatch, script: list[str]) -> list[dict[str, Any]]:
-    """Each call takes the next step: ``size`` (rejected as over the context limit), ``junk`` (text that is no verdict) or ``ok``."""
+    """Each call takes the next step: ``size`` (rejected as over the context limit), ``timeout``, ``junk`` (text that is no verdict) or ``ok``."""
     from litellm.exceptions import BadRequestError
 
     _transport(monkeypatch)
@@ -926,6 +926,8 @@ def _scripted_advisor(monkeypatch: pytest.MonkeyPatch, script: list[str]) -> lis
             raise BadRequestError(
                 "PRIVATE_PROVIDER_BODY", model=kwargs["model"], llm_provider="openai", body={"code": "context_length_exceeded"}
             )
+        if step == "timeout":
+            raise TimeoutError("advisor provider timed out")
         return ModelResponse(
             id="advisor-junk",
             model=kwargs["model"],
@@ -1029,6 +1031,32 @@ async def test_a_size_resend_rejected_again_is_recorded_as_a_rejected_request(tm
     (record,) = records
     assert record.verdict == "request_rejected"
     assert record.provider_attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_a_size_resend_that_then_times_out_is_recorded_as_unavailable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The rejection described the first, larger request. The smaller resend
+    # and the last attempt were never rejected; they timed out, so the pass
+    # reports the advisor unavailable, not the first request's rejection.
+    from elspeth.web.composer import advisor_checkpoint
+    from tests.unit.web.composer._helpers import _empty_state
+
+    records: list[Any] = []
+
+    async def capture(**kwargs: Any) -> None:
+        records.append(kwargs["record"])
+
+    monkeypatch.setattr(advisor_checkpoint, "persist_advisor_checkpoint_pass", capture)
+    sent = _scripted_advisor(monkeypatch, ["size", "timeout", "timeout"])
+    verdict = await _owner(tmp_path)._run_advisor_checkpoint(
+        phase="end", state=_empty_state(), session_id=None, recorder=BufferingRecorder(), publication_review=_review(_probe(8))
+    )
+
+    assert len(sent) == 3
+    assert (verdict.ok, verdict.failure_class) == (False, "unavailable")
+    (record,) = records
+    assert record.verdict == "unavailable"
+    assert record.provider_attempts == 3
 
 
 @pytest.mark.asyncio

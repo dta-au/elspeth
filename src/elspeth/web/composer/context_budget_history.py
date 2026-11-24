@@ -264,8 +264,8 @@ def _budgeted_call(call: Mapping[str, Any]) -> _BudgetedCall | None:
     model, status, prompt_tokens = call["model_requested"], call["status"], call["prompt_tokens"]
     if type(model) is not str or not model:
         raise AuditIntegrityError("Stored composer call audit has no requested model")
-    if type(status) is not str:
-        raise AuditIntegrityError("Stored composer call audit has a non-string status")
+    if type(status) is not str or status not in {member.value for member in ComposerLLMCallStatus}:
+        raise AuditIntegrityError("Stored composer call audit status is not a known call status")
     if prompt_tokens is not None and (type(prompt_tokens) is not int or prompt_tokens < 0):
         raise AuditIntegrityError("Stored composer call prompt_tokens is not a non-negative integer")
     if "shed_history_indices" not in budget:

@@ -1693,10 +1693,14 @@ class AdvisorCheckpointOwner:
                 call_arguments = arguments
                 format_reprompt_pending = False
                 failure = classify_provider_failure(exc)
-                if failure is not None and failure.request_rejection is not None:
-                    last_request_failure = self._retain_request_failure(
-                        exc, failure.request_rejection, recorder=recorder, attempt_call_offset=attempt_call_offset
-                    )
+                # The final verdict describes the last attempt. A rejection of
+                # an earlier, different request (a size resend sheds history)
+                # must not be reported for a later attempt that failed otherwise.
+                last_request_failure = (
+                    self._retain_request_failure(exc, failure.request_rejection, recorder=recorder, attempt_call_offset=attempt_call_offset)
+                    if failure is not None and failure.request_rejection is not None
+                    else None
+                )
                 if continuation_budget is not None and not continuation_budget.has_cost_headroom():
                     return continuation_withheld(provider_failure=last_request_failure)
                 if is_context_length_rejection(exc) and sent_earlier_turn and not leave_out_all_earlier:

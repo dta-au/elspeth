@@ -2673,6 +2673,24 @@ class TestComposerContextBudgetSettings:
 
         assert web_config.COMPOSER_REQUEST_BYTES_PER_PROMPT_TOKEN == CONTEXT_BUDGET_MAX_MEASURED_BYTES_PER_TOKEN
 
+    def test_an_integer_subtype_cap_the_field_accepts_also_derives_the_byte_maximum(self) -> None:
+        # The strict int field accepts any int subclass but bool (an IntEnum
+        # member, for one) and stores a plain int, so the derivation must
+        # accept the same values rather than leave the placeholder in place.
+        import enum
+
+        class TokenCap(enum.IntEnum):
+            WINDOW = 200_000
+
+        class Tokens(int):
+            pass
+
+        for cap in (TokenCap.WINDOW, Tokens(200_000)):
+            settings = WebSettings(**self._BASE, composer_context_max_prompt_tokens=cap)
+            assert type(settings.composer_context_max_prompt_tokens) is int
+            assert type(settings.composer_planner_max_request_bytes) is int
+            assert settings.composer_planner_max_request_bytes == 1_600_000
+
     @pytest.mark.parametrize("explicit", [1, 983040, 5_000_000])
     def test_an_explicit_byte_maximum_is_kept(self, explicit: int) -> None:
         settings = WebSettings(**self._BASE, composer_context_max_prompt_tokens=200_000, composer_planner_max_request_bytes=explicit)

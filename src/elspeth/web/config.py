@@ -1338,16 +1338,18 @@ class WebSettings(BaseModel):
         many bytes per token of the cap cannot fit it. A smaller fixed default
         refused requests the model could take. An explicit value is kept.
 
-        A missing or invalid cap fails on its own field (the check below is the
-        field's own: an exact int of at least 1). The byte maximum then gets a
-        placeholder that never reaches a model, so the error does not also ask
-        for a byte maximum the operator need not set.
+        A missing or invalid cap fails on its own field. The check below
+        accepts what the strict field accepts (an int or int subclass other
+        than bool, at least 1), so every cap that validates gets a derived
+        maximum. Otherwise the byte maximum gets a placeholder that never
+        reaches a model, and the error does not also ask for a byte maximum
+        the operator need not set.
         """
         if not isinstance(data, Mapping) or "composer_planner_max_request_bytes" in data:
             return data
         tokens = data["composer_context_max_prompt_tokens"] if "composer_context_max_prompt_tokens" in data else None
-        if type(tokens) is int and tokens >= 1:
-            return {**data, "composer_planner_max_request_bytes": tokens * COMPOSER_REQUEST_BYTES_PER_PROMPT_TOKEN}
+        if isinstance(tokens, int) and not isinstance(tokens, bool) and tokens >= 1:
+            return {**data, "composer_planner_max_request_bytes": int(tokens) * COMPOSER_REQUEST_BYTES_PER_PROMPT_TOKEN}
         return {**data, "composer_planner_max_request_bytes": 1}
 
     @model_validator(mode="after")
