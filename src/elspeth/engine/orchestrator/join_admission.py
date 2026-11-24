@@ -162,7 +162,7 @@ class JoinAdmissionService:
            current canonical version, have its full graph registered, and
            match the follower's plugin implementation evidence. Incomplete
            registration is retryable while the leader seat is live; an absent
-           or expired seat receives the admission transaction's seat refusal.
+           or still-expired seat receives the admission transaction's seat refusal.
 
         3. Atomic admission (one ``BEGIN IMMEDIATE`` transaction via
            :meth:`RunCoordinationRepository.admit_follower`):

@@ -709,8 +709,10 @@ mismatch is refused.
 After the filesystem preflight, join admission checks the run's canonical
 version, graph readiness, and plugin implementation. The recorded edge set
 must match the follower graph's edges by endpoints, label, and mode. A proper
-subset returns retryable `join_not_ready`; if the leader seat is no longer live,
-the admission transaction instead returns its "no live leader" refusal. Other
+subset returns retryable `join_not_ready`; if the leader seat remains expired
+through admission, the transaction returns its "no live leader" refusal. If
+the leader heartbeats before admission, the post-admission check still tests
+graph readiness and departs the follower on refusal. Other
 edge differences or different plugin implementation evidence are refused.
 A follower whose graph has edges the run never registers keeps receiving
 `join_not_ready`, so callers must bound their retries.
