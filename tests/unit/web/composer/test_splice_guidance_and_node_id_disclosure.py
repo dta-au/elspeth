@@ -32,16 +32,17 @@ def test_splice_validation_failed_resolves_to_direct_guidance() -> None:
     explanation, suggested_fix = explain_validation_code("splice_validation_failed")
     assert explanation == (
         "The inserted transform passed its own option checks, but the pipeline that results from inserting it fails "
-        "context-aware validation, and splice_transform requires that whole result to validate. The rejected_mutation "
-        "entries that follow this one name each error the insertion added, attributed to the component it concerns in "
-        "rejected_component. When none follows, the insertion added no error: the pipeline already failed validation "
-        "before the splice. Nothing was mutated."
+        "context-aware validation, and splice_transform requires that whole result to validate. Each rejected_mutation "
+        "entry that follows this one names an error the insertion added, attributed to the component it concerns in "
+        "rejected_component. When no rejected_mutation entry follows, the insertion added no error: the errors were "
+        "there before the splice. Nothing was mutated."
     )
     assert suggested_fix == (
-        "Repair the inserted node's options against the entries that follow (for a schema_contract_violation, remove "
-        "or satisfy the fields it names), or splice at a position whose producer supplies them. Errors the pipeline "
-        "already had also refuse the splice, and the same splice is refused again until they are repaired: repair "
-        "them first, or add the step with upsert_node and re-point the successor's input with upsert_node."
+        "For each rejected_mutation entry that follows, repair the inserted node's options (for a "
+        "schema_contract_violation, remove or satisfy the fields it names) or splice at a position whose producer "
+        "supplies those fields. Errors that were there before the splice also refuse it, and the same splice is "
+        "refused again until they are repaired: repair them first, or add the step with upsert_node and use "
+        "upsert_node with routing_only=true to re-point the successor's input."
     )
     # A splice refused only for errors the pipeline already had forwards no
     # entry of its own, so an unconditional "retry splice_transform" would
@@ -56,8 +57,8 @@ def test_splice_description_discloses_the_whole_pipeline_validity_requirement() 
     definitions = {definition["name"]: definition for definition in get_tool_definitions()}
     description = " ".join(definitions["splice_transform"]["description"].split())
     assert (
-        "The whole resulting pipeline must validate, including errors that were there before the splice, or the "
-        "splice is refused and nothing changes." in description
+        "The whole resulting pipeline must validate, or the splice is refused and nothing changes. "
+        "Errors that were there before the splice also refuse it." in description
     )
 
 

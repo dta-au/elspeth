@@ -1678,10 +1678,10 @@ class TestSkillFollowsCurrentToolBehaviour:
         # (SetPipelineCandidate.acceptable) and a splice_transform whose whole
         # result does not validate are refused with no proposal.
         assert (
-            "Two changes must leave the whole pipeline valid, or they are refused with no proposal: a `set_pipeline`, "
-            "which replaces the whole pipeline, and a `splice_transform`, which is refused even for errors that were "
-            "there before it" in flattened
+            "The exceptions are `set_pipeline` and `splice_transform`: each must leave the whole pipeline valid, or it "
+            "is refused with no proposal. A `splice_transform` is refused even for errors that were there before it" in flattened
         )
+        assert "Two changes must leave the whole pipeline valid" not in flattened
         assert "A `set_pipeline` replaces the whole pipeline and must validate on its own" not in flattened
         assert "a change that leaves errors is still recorded as a proposal" not in flattened
         assert "Use one `set_pipeline` carrying the whole result" not in flattened

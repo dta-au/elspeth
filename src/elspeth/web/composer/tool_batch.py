@@ -464,9 +464,8 @@ async def _approval_containment_refusal(
             "time. Send the first change alone, then tell the user what follows; send each next change after the one "
             "before it is accepted. A pipeline between narrow changes does not have to validate: a narrow change "
             "that leaves errors is still recorded as a proposal, and the errors clear with the last change. "
-            "Two changes must leave the whole pipeline valid, or they are refused with no proposal: a set_pipeline, "
-            "which replaces the whole pipeline, and a splice_transform, which is refused even for errors that were "
-            "there before it. "
+            "The exceptions are set_pipeline and splice_transform: each must leave the whole pipeline valid, or it "
+            "is refused with no proposal. A splice_transform is refused even for errors that were there before it. "
             "create_blob is not a pipeline change: in an earlier response, create the file "
             "for the prompt; then send the one call carrying its marker.",
         )

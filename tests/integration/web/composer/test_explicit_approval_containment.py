@@ -146,8 +146,8 @@ async def test_batch_with_two_staged_edits_is_refused_before_effects_then_one_co
         assert "carried 2 pipeline-change calls" in message
         assert "None of them was applied and no proposal was recorded" in message
         # By design: under approval, narrow edits go one at a time and a
-        # pipeline between narrow changes does not have to validate. Two
-        # changes are the exception: an invalid set_pipeline is refused
+        # pipeline between narrow changes does not have to validate. The
+        # exceptions are set_pipeline and splice_transform: an invalid set_pipeline is refused
         # PREVALIDATION_REJECTED, and a splice_transform whose whole result
         # does not validate is refused, each with no proposal. The text must
         # not promise otherwise or the planner loops on refused changes.
@@ -159,10 +159,10 @@ async def test_batch_with_two_staged_edits_is_refused_before_effects_then_one_co
             "recorded as a proposal, and the errors clear with the last change" in message
         )
         assert (
-            "Two changes must leave the whole pipeline valid, or they are refused with no proposal: a set_pipeline, "
-            "which replaces the whole pipeline, and a splice_transform, which is refused even for errors that were "
-            "there before it" in message
+            "The exceptions are set_pipeline and splice_transform: each must leave the whole pipeline valid, or it "
+            "is refused with no proposal. A splice_transform is refused even for errors that were there before it" in message
         )
+        assert "Two changes must leave the whole pipeline valid" not in message
         assert "A set_pipeline replaces the whole pipeline and must validate on its own" not in message
         assert "a change that leaves errors is still recorded as a proposal" not in message
         assert "Use one `set_pipeline` carrying the whole result" not in message
