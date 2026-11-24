@@ -164,7 +164,7 @@ from elspeth.web.composer.provider_context import capture_provider_context
 from elspeth.web.composer.provider_discovery_response import (
     argument_error_response,
 )
-from elspeth.web.composer.provider_errors import classify_provider_failure, is_context_length_rejection
+from elspeth.web.composer.provider_errors import classify_provider_failure, request_size_rejection, size_rejection_code
 from elspeth.web.composer.provider_gateway import _litellm_acompletion
 from elspeth.web.composer.provider_quota import (
     ProviderCallCustody,
@@ -4180,7 +4180,7 @@ async def _plan_pipeline_inner(
                 seed=model_config.seed,
                 error_class=type(exc).__name__,
                 # A recognised context-limit rejection is recorded by its closed reason, never by provider text.
-                error_message="context_length_exceeded" if is_context_length_rejection(exc) else type(exc).__name__,
+                error_message=size_rejection_code(exc) or type(exc).__name__,
                 failure=exc,
                 private_request=private_request,
                 max_completion_tokens_requested=budget_policy.max_completion_tokens,
@@ -4402,7 +4402,7 @@ async def _plan_pipeline_inner(
                     # An admitted dispatch still needs terminal evidence, but
                     # a first-party fault must retain its original type.
                     raise
-                if is_context_length_rejection(exc):
+                if request_size_rejection(exc) is not None:
                     unshed_history = request_conversation_context is not None and (
                         any(
                             request.history_index not in context_budget.shed_history_indices

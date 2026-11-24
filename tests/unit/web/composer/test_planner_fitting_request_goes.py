@@ -238,6 +238,26 @@ async def test_a_gateway_length_rejection_on_the_planner_path_is_the_size_refusa
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["openai", "bedrock", "bedrock_mantle"])
+async def test_a_413_on_the_planner_path_is_the_size_refusal_naming_the_provider(
+    tmp_path: Path, tool_context: ToolContext, route: str
+) -> None:
+    from tests.unit.web.composer.test_request_too_large import mapped_provider_error
+
+    completion = _ScriptedCompletion(mapped_provider_error(route, 413), mapped_provider_error(route, 413))
+    recorder = BufferingRecorder()
+
+    refusal = await _plan_once(tmp_path, tool_context, completion, recorder)
+
+    assert refusal.code == ComposerPlannerCode.CONTEXT_BUDGET_EXHAUSTED.value
+    assert refusal.detail_codes[0] == "context_ceiling_provider"
+    assert len(completion.requests) == 2
+    assert all(row.status is ComposerLLMCallStatus.BAD_REQUEST_ERROR for row in recorder.llm_calls)
+    assert recorder.llm_calls[-1].error_message == "request_too_large"
+    assert _freeform_planner_failure_code(refusal) == "context_budget_exceeded"
+
+
+@pytest.mark.asyncio
 async def test_planner_resends_size_rejection_with_all_earlier_turns_left_out(tmp_path: Path, tool_context: ToolContext) -> None:
     rejection = ContextWindowExceededError(message="prompt is too long", model="test-model", llm_provider="anthropic")
     completion = _ScriptedCompletion(rejection, _text_response("Which output format do you want?"))

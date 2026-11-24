@@ -48,7 +48,7 @@ from elspeth.web.composer.private_diagnostic_facts import bind_received_response
 from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused, build_prompt_guard_mount, enforce_prompt_guard
 from elspeth.web.composer.protocol import ComposerServiceError, ComposerSettings
 from elspeth.web.composer.provider_context import capture_provider_context
-from elspeth.web.composer.provider_errors import classify_provider_failure, is_context_length_rejection
+from elspeth.web.composer.provider_errors import classify_provider_failure, size_rejection_code
 from elspeth.web.composer.provider_quota import (
     ProviderCallCustody,
     provider_call_scope,
@@ -621,6 +621,7 @@ class ProviderGateway:
         prompt_guard_thinking_parts: tuple[PromptGuardThinkingParts | None, ...] | None = None,
     ) -> _AdmittedLLMCompletion:
         """Call LiteLLM and return only the admitted, owned completion."""
+        from litellm.exceptions import APIError as LiteLLMAPIError
         from litellm.exceptions import BadRequestError as LiteLLMBadRequestError
 
         try:
@@ -644,6 +645,16 @@ class ProviderGateway:
                 **kwargs,
             )
         except LiteLLMBadRequestError as exc:
+            raise _BadRequestLLMError(
+                f"LLM request rejected ({type(exc).__name__})",
+                provider_detail=str(exc) or None,
+                provider_status_code=exc.status_code,
+            ) from exc
+        except LiteLLMAPIError as exc:
+            # A request too large for the provider or a proxy in front of it
+            # (HTTP 413) is a rejected request, not an outage.
+            if size_rejection_code(exc) != "request_too_large":
+                raise
             raise _BadRequestLLMError(
                 f"LLM request rejected ({type(exc).__name__})",
                 provider_detail=str(exc) or None,
@@ -678,6 +689,7 @@ class ProviderGateway:
         prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
     ) -> Any:
         """Call the LLM for non-tool text generation."""
+        from litellm.exceptions import APIError as LiteLLMAPIError
         from litellm.exceptions import BadRequestError as LiteLLMBadRequestError
 
         try:
@@ -700,6 +712,16 @@ class ProviderGateway:
                 **kwargs,
             )
         except LiteLLMBadRequestError as exc:
+            raise _BadRequestLLMError(
+                f"LLM request rejected ({type(exc).__name__})",
+                provider_detail=str(exc) or None,
+                provider_status_code=exc.status_code,
+            ) from exc
+        except LiteLLMAPIError as exc:
+            # A request too large for the provider or a proxy in front of it
+            # (HTTP 413) is a rejected request, not an outage.
+            if size_rejection_code(exc) != "request_too_large":
+                raise
             raise _BadRequestLLMError(
                 f"LLM request rejected ({type(exc).__name__})",
                 provider_detail=str(exc) or None,
@@ -891,8 +913,8 @@ class ProviderGateway:
             cause = exc.__cause__
             status = ComposerLLMCallStatus.BAD_REQUEST_ERROR
             error_class = type(cause).__name__ if cause is not None else type(exc).__name__
-            # A recognised context-limit rejection is recorded by its closed reason, never by provider text.
-            error_message = "context_length_exceeded" if is_context_length_rejection(cause) else error_class
+            # A recognised size rejection is recorded by its closed reason, never by provider text.
+            error_message = size_rejection_code(cause) or error_class
             attach_llm_calls(exc, recorder)
             raise
         except CredentialMaterialRefused as exc:
@@ -1078,8 +1100,8 @@ class ProviderGateway:
             cause = exc.__cause__
             status = ComposerLLMCallStatus.BAD_REQUEST_ERROR
             error_class = type(cause).__name__ if cause is not None else type(exc).__name__
-            # A recognised context-limit rejection is recorded by its closed reason, never by provider text.
-            error_message = "context_length_exceeded" if is_context_length_rejection(cause) else error_class
+            # A recognised size rejection is recorded by its closed reason, never by provider text.
+            error_message = size_rejection_code(cause) or error_class
             attach_llm_calls(exc, recorder)
             raise
         except CredentialMaterialRefused as exc:

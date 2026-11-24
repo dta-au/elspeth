@@ -20,6 +20,16 @@ changes land and is not a release.
   when the run started, now fails composer validation. No pipeline that could
   run before is refused. Only pipelines the runtime was already refusing at
   run start are now refused earlier, at validation.
+- **Changed:** when `ELSPETH_WEB__COMPOSER_PLANNER_MAX_REQUEST_BYTES` is not
+  set, the Composer's request byte maximum is now derived from
+  `ELSPETH_WEB__COMPOSER_CONTEXT_MAX_PROMPT_TOKENS` (8 bytes per token:
+  1,600,000 bytes for a 200,000-token limit) instead of the fixed 983,040.
+  If a proxy in front of your model gateway limits request bodies (nginx's
+  default is 1 MiB), set the byte maximum below that limit. A request a
+  provider or proxy refuses with HTTP 413 is now treated as too large: it is
+  sent once more with earlier turns left out, then refused as too large,
+  instead of being retried unchanged. On the direct Anthropic route a 413 is
+  reported as an ordinary rejected request.
 
 ### Fixed
 

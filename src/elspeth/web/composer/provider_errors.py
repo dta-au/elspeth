@@ -170,14 +170,30 @@ def _admit_context_length_evidence(
     return SafeRequestRejection(reason_code="context_length_exceeded", reason_disposition="retained", reason_source=source)
 
 
-def is_context_length_rejection(exc: BaseException | None) -> bool:
-    """Whether a provider failure is a recognised rejection of the request for exceeding the model's context limit."""
+_REQUEST_TOO_LARGE = SafeRequestRejection(reason_code="request_too_large", reason_disposition="retained", reason_source="http_status")
+
+
+def request_size_rejection(exc: BaseException | None) -> SafeRequestRejection | None:
+    """The rejection, when a provider failure is a recognised refusal of the request as too large.
+
+    Too large for the model's context limit (``context_length_exceeded``), or
+    for the provider's or a proxy's request size limit (``request_too_large``).
+    Either way the request must shrink; it is never resent unchanged.
+    """
     if exc is None:
-        return False
+        return None
     failure = classify_provider_failure(exc)
-    return (
-        failure is not None and failure.request_rejection is not None and failure.request_rejection.reason_code == "context_length_exceeded"
-    )
+    if failure is None or failure.request_rejection is None:
+        return None
+    if failure.request_rejection.reason_code in ("context_length_exceeded", "request_too_large"):
+        return failure.request_rejection
+    return None
+
+
+def size_rejection_code(exc: BaseException | None) -> RequestRejectionReason | None:
+    """The closed reason a size rejection is recorded by on its call; ``None`` for any other failure."""
+    rejection = request_size_rejection(exc)
+    return None if rejection is None else rejection.reason_code
 
 
 def classify_provider_failure(exc: BaseException) -> ProviderFailure | None:
@@ -199,12 +215,15 @@ def classify_provider_failure(exc: BaseException) -> ProviderFailure | None:
         return ProviderFailure(ComposerLLMCallStatus.AUTH_ERROR, "auth", False)
     if isinstance(exc, OpenAIBadRequestError):
         admitted, specific_code_seen = _admit_request_rejection(exc)
-        return ProviderFailure(
-            ComposerLLMCallStatus.BAD_REQUEST_ERROR,
-            "bad_request",
-            False,
-            _admit_context_length_evidence(exc, admitted, specific_code_seen=specific_code_seen),
-        )
+        rejection = _admit_context_length_evidence(exc, admitted, specific_code_seen=specific_code_seen)
+        # Context-limit evidence is the more specific; otherwise an HTTP 413 says
+        # the request is too large for the provider or a proxy in front of it.
+        # The SDK annotates this status as 400; litellm sets the provider's own
+        # (413 for a Bedrock request-size rejection), so it is read as a value.
+        status: object = exc.status_code
+        if rejection.reason_code != "context_length_exceeded" and status == 413:
+            rejection = _REQUEST_TOO_LARGE
+        return ProviderFailure(ComposerLLMCallStatus.BAD_REQUEST_ERROR, "bad_request", False, rejection)
     if isinstance(exc, APITimeoutError):
         return ProviderFailure(ComposerLLMCallStatus.TIMEOUT, "timeout", False)
     if isinstance(exc, BadGatewayError):
@@ -212,5 +231,12 @@ def classify_provider_failure(exc: BaseException) -> ProviderFailure | None:
     if isinstance(exc, ServiceUnavailableError):
         return ProviderFailure(ComposerLLMCallStatus.API_ERROR, "unavailable", True)
     if isinstance(exc, LiteLLMAPIError):
+        if exc.status_code == 413:
+            # Too large for the provider or a proxy in front of it. Only the
+            # status is read. An unchanged resend is refused the same way: a
+            # rejected request, not an outage. (The installed litellm keeps
+            # 413 as the status for OpenAI-compatible routes and Bedrock; its
+            # Anthropic mapping reports 400, an ordinary rejected request.)
+            return ProviderFailure(ComposerLLMCallStatus.BAD_REQUEST_ERROR, "bad_request", False, _REQUEST_TOO_LARGE)
         return ProviderFailure(ComposerLLMCallStatus.API_ERROR, "unavailable", True)
     return ProviderFailure(ComposerLLMCallStatus.API_ERROR, "unavailable", False)

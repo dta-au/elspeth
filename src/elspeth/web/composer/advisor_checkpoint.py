@@ -112,7 +112,12 @@ from elspeth.web.composer.prompt_guard import (
 )
 from elspeth.web.composer.protocol import ComposerResult, ComposerSettings, ToolArgumentError
 from elspeth.web.composer.provider_context import capture_provider_context
-from elspeth.web.composer.provider_errors import ProviderRequestFailure, classify_provider_failure, is_context_length_rejection
+from elspeth.web.composer.provider_errors import (
+    ProviderRequestFailure,
+    classify_provider_failure,
+    request_size_rejection,
+    size_rejection_code,
+)
 from elspeth.web.composer.provider_gateway import (
     _capture_composer_llm_completion_fields,
     _MalformedLLMResponseError,
@@ -727,7 +732,7 @@ class AdvisorCheckpointOwner:
             status = failure.audit_status if failure is not None else ComposerLLMCallStatus.API_ERROR
             error_class = type(exc).__name__
             # As the provider gateway records it: a context-length rejection is named.
-            error_message = "context_length_exceeded" if is_context_length_rejection(exc) else error_class
+            error_message = size_rejection_code(exc) or error_class
             raise
         except _MalformedLLMResponseError as exc:
             status = ComposerLLMCallStatus.MALFORMED_RESPONSE
@@ -1703,7 +1708,7 @@ class AdvisorCheckpointOwner:
                     )
                 if continuation_budget is not None and not continuation_budget.has_cost_headroom():
                     return continuation_withheld(provider_failure=last_request_failure)
-                if is_context_length_rejection(exc) and sent_earlier_turn and not leave_out_all_earlier:
+                if request_size_rejection(exc) is not None and sent_earlier_turn and not leave_out_all_earlier:
                     leave_out_all_earlier = True
                     size_resend_pending = True
                     call_arguments, format_reprompt_pending = sent_arguments, sent_format_reprompt

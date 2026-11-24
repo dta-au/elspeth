@@ -168,7 +168,7 @@ from elspeth.web.composer.provider_config import (
     infer_provider_from_model_name,
     infer_provider_from_unprefixed_model_name,
 )
-from elspeth.web.composer.provider_errors import classify_provider_failure, is_context_length_rejection
+from elspeth.web.composer.provider_errors import classify_provider_failure, request_size_rejection
 from elspeth.web.composer.provider_gateway import (
     ProviderGateway,
     _BadRequestLLMError,
@@ -2033,7 +2033,7 @@ class ComposerServiceImpl:
                     context_budget=budget_record,
                 )
             except _BadRequestLLMError as rejection:
-                if not is_context_length_rejection(rejection.__cause__):
+                if request_size_rejection(rejection.__cause__) is None:
                     # Not recognised as a size rejection, so not called one. That the
                     # request went out above the estimate is carried for the user.
                     rejection.sent_over_estimate = budget_record.over_estimate is True
@@ -2641,7 +2641,7 @@ class ComposerServiceImpl:
                                 if (
                                     reply_resent
                                     or not unshed_history
-                                    or not is_context_length_rejection(rejection.__cause__)
+                                    or request_size_rejection(rejection.__cause__) is None
                                     or reply_timeout <= 0
                                 ):
                                     # The call audit retains the failure; a trusted

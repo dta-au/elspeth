@@ -908,7 +908,8 @@ async def test_advisor_size_resend_is_available_after_the_last_ordinary_attempt(
 
 def _scripted_advisor(monkeypatch: pytest.MonkeyPatch, script: list[str]) -> list[dict[str, Any]]:
     """Each call takes the next step: ``size`` (rejected as over the context limit), ``timeout``,
-    ``junk`` (text that is no verdict), ``empty`` (whitespace text, a malformed reply) or ``ok``."""
+    ``413`` (refused as too large by the provider or a proxy in front of it), ``junk`` (text that is
+    no verdict), ``empty`` (whitespace text, a malformed reply) or ``ok``."""
     from litellm.exceptions import BadRequestError
 
     _transport(monkeypatch)
@@ -929,6 +930,10 @@ def _scripted_advisor(monkeypatch: pytest.MonkeyPatch, script: list[str]) -> lis
             )
         if step == "timeout":
             raise TimeoutError("advisor provider timed out")
+        if step == "413":
+            from tests.unit.web.composer.test_request_too_large import mapped_provider_error
+
+            raise mapped_provider_error("openai", 413)
         return ModelResponse(
             id=f"advisor-{step}",
             model=kwargs["model"],
@@ -1091,6 +1096,23 @@ async def test_a_size_resend_that_then_gets_malformed_replies_is_recorded_as_mal
     (record,) = records
     assert record.verdict == "malformed"
     assert record.provider_attempts == 3
+
+
+@pytest.mark.asyncio
+async def test_a_413_gets_the_size_resend_with_every_earlier_turn_left_out(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from tests.unit.web.composer._helpers import _empty_state
+
+    sent = _scripted_advisor(monkeypatch, ["413", "ok"])
+    recorder = BufferingRecorder()
+    verdict = await _owner(tmp_path)._run_advisor_checkpoint(
+        phase="end", state=_empty_state(), session_id=None, recorder=recorder, publication_review=_review(_probe(8))
+    )
+
+    assert verdict.ok is True
+    assert len(sent) == 2
+    assert _labels(_sent_transcript(sent[0]["messages"][1]["content"])) != _NOW
+    assert _labels(_sent_transcript(sent[1]["messages"][1]["content"])) == _NOW
+    assert recorder.llm_calls[0].error_message == "request_too_large"
 
 
 @pytest.mark.asyncio

@@ -529,14 +529,15 @@ def advisor_signoff_blocked_wording(
             if request_rejection is not None
             else SafeRequestRejection(reason_code=None, reason_disposition="unavailable", reason_source="unavailable")
         )
-        # A request too large for the model's context: the recourse is the
-        # context budget's own (a new session or a shorter request). The
+        # A request too large for the model's context, or for the provider's
+        # or a proxy's size limit: the recourse is the context budget's own
+        # (a new session or a shorter request). The
         # suggestion is stored on the blocker but never matched against stored
         # text; only its length is bounded (advisor_audit).
         return (
             rejection.public_detail,
             CONTEXT_BUDGET_REFUSAL_DETAIL
-            if rejection.reason_code == "context_length_exceeded"
+            if rejection.reason_code in ("context_length_exceeded", "request_too_large")
             else "An unchanged rejected request will not be retried automatically. Review the rejection reason before sending another message.",
         )
     if reason == "unavailable":
