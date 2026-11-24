@@ -5,11 +5,11 @@
   },
   "src/elspeth/web/coordination/composer_operation_authority.py": {
     "protected_exports": [],
-    "sha256": "a4aada5c6e8f2cc2e930d9ac0e9847e97a07b1cf69993906568deda7767e0e9d"
+    "sha256": "9affdd6de78816a61392d9ff30f85e4496d672000c5cbcd006ec83959efc6997"
   },
   "src/elspeth/web/coordination/lifecycle.py": {
     "protected_exports": [],
-    "sha256": "88d7bf8784a4e58893fae8a79008ca0b8b7f1f8f092665383f9291a687828823"
+    "sha256": "cf439f271bc14325faf7b9e286892f72c345035bd48912e01f0e0c1b5baf38c0"
   },
   "src/elspeth/web/execution_lease_cleanup.py": {
     "protected_exports": [],
@@ -62,6 +62,6 @@
   },
   "src/elspeth/web/sessions/service.py": {
     "protected_exports": [],
-    "sha256": "09207511082462942d23cd69c934d5a5dd0ddef898f4ad3c8678b68e6d593881"
+    "sha256": "24150b30288e073c920c61cd4882efe21ec4b79d9b2ffbc4d276c480a75dc301"
   }
 }

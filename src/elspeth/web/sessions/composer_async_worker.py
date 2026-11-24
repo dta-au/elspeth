@@ -1543,18 +1543,21 @@ class ComposerAsyncWorker:
             except SessionOperationConflictError:
                 if record.claim_owner_instance_id == self._owner_instance_id:
                     try:
-                        await _owned(
+                        settled = await _owned(
                             run_sync_in_worker(
                                 self._authority.settle_own_lapsed,
                                 session_id=record.session_id,
                                 operation_id=record.operation_id,
                                 owner_instance_id=self._owner_instance_id,
                                 failure=failure,
+                                release_lapsed_fence=True,
                             )
                         )
-                        count += 1
                     except ComposerOperationFenceLost:
                         pass
+                    else:
+                        self._discharge_reaped_failure_projection((record.session_id, record.operation_id), settled)
+                        count += 1
             except SessionOperationFenceLost as exc:
                 if exc.reason is FenceLossReason.OWNER_INACTIVE:
                     await _owned(
@@ -1573,6 +1576,43 @@ class ComposerAsyncWorker:
             if count > settled_before:
                 self._unsettled_owners.pop((record.session_id, record.operation_id), None)
         return count
+
+    def _discharge_reaped_failure_projection(self, key: tuple[UUID, str], settled: ComposerOperationRecord) -> None:
+        """Complete a retained owner's failure projection from the reaper's own settlement.
+
+        The owner's failed-terminal write was refused before it wrote, so its
+        projection stayed open. The reaper's settle_own_lapsed transaction wrote
+        that job's failed terminal and released its fence; adoption recovery
+        discharges the same projection from the same kind of settlement.
+        """
+        coordinator = self._required_coordinators.get(key)
+        if coordinator is None:
+            return
+        if type(settled) is not ComposerOperationRecord:
+            raise AuditIntegrityError("Reaped settlement returned no nominal operation record")
+        if settled.settled_by != "settle_own_lapsed":
+            # Another settler finished this job first; its custody, not ours.
+            return
+        authority = coordinator.authority
+        fence = authority.context.fence
+        if (
+            (settled.session_id, settled.operation_id) != key
+            or authority.durable_operation_id != settled.operation_id
+            or authority.claim_attempt != settled.attempt
+            or fence.operation_id != settled.session_operation_id
+            or fence.operation_epoch != settled.session_operation_epoch
+            or settled.status != "failed"
+        ):
+            raise AuditIntegrityError("Reaped settlement does not match the retained owner's exact authority")
+        open_tickets = [ticket for ticket in coordinator.tickets if not ticket.complete]
+        if len(open_tickets) != 1 or open_tickets[0].key.source is not RequiredWorkSource.TERMINAL_FAILURE_PROJECTION:
+            raise AuditIntegrityError("Reaped settlement found retained work beyond its failure projection")
+        projection = open_tickets[0]
+        coordinator.validate_terminal_failure_work(projection_ticket=projection)
+        projection.begin_projection()
+        self._complete_reconciled_projection(projection, ())
+        coordinator.assert_completed()
+        del self._required_coordinators[key]
 
     def _reaped_failure(self, record: ComposerOperationRecord) -> ComposerOperationError:
         """A lost worker unless this live process saw the owner end unsettled."""

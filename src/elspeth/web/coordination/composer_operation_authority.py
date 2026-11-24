@@ -13,7 +13,7 @@ from typing import Any, Literal, NotRequired, TypedDict, cast, final
 from uuid import UUID
 
 from pydantic import JsonValue, ValidationError
-from sqlalchemy import Connection, Engine, Row, and_, func, insert, or_, select, update
+from sqlalchemy import Connection, Engine, Row, and_, case, func, insert, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from elspeth.contracts.errors import AuditIntegrityError
@@ -746,9 +746,18 @@ class ComposerAsyncOperationAuthority:
         owner_instance_id: str,
         failure: ComposerOperationError,
         authoritative_failure: bool = False,
+        release_lapsed_fence: bool = False,
     ) -> ComposerOperationRecord:
+        """Settle this instance's own job whose session fence has lapsed.
+
+        With ``release_lapsed_fence`` the same transaction also releases that
+        lapsed fence. Only the reaper passes it: by then no task of this
+        process still holds the job's lease.
+        """
         if owner_instance_id != self._owner_instance_id:
             raise ValueError("lapsed settlement must belong to this worker instance")
+        if type(release_lapsed_fence) is not bool:
+            raise TypeError("release_lapsed_fence must be an exact bool")
         return self._settle_recovery(
             session_id=session_id,
             operation_id=operation_id,
@@ -756,6 +765,7 @@ class ComposerAsyncOperationAuthority:
             settled_by="settle_own_lapsed",
             authoritative_failure=authoritative_failure,
             recovery_context=None,
+            release_lapsed_fence=release_lapsed_fence,
         )
 
     def settle_lost_inactive_session(
@@ -784,8 +794,11 @@ class ComposerAsyncOperationAuthority:
         settled_by: ComposerOperationSettledBy,
         recovery_context: SessionOperationContext | None,
         authoritative_failure: bool,
+        release_lapsed_fence: bool = False,
     ) -> ComposerOperationRecord:
         _identity(session_id, operation_id)
+        if release_lapsed_fence and settled_by != "settle_own_lapsed":
+            raise AuditIntegrityError("only an own lapsed settlement may release its fence")
         if type(failure) is not ComposerOperationError or type(authoritative_failure) is not bool:
             raise TypeError("recovery settlement requires owned failure and nominal evidence classification")
         if recovery_context is not None and type(recovery_context) is not SessionOperationContext:
@@ -838,6 +851,26 @@ class ComposerAsyncOperationAuthority:
                 .where(*_key(session_id, operation_id), jobs.c.status == "running")
                 .values(**_terminal_values(failure, now=now, settled_by=settled_by))
             )
+            if release_lapsed_fence:
+                # The arm above proved this exact lapsed, unreleased fence belongs
+                # to the job just settled; release it in the same transaction.
+                if fence is None:
+                    raise AuditIntegrityError("own lapsed settlement lost its fence row")
+                expiry = fences.c.lease_expires_at
+                released = conn.execute(
+                    update(fences)
+                    .where(
+                        fences.c.session_id == fence.session_id,
+                        fences.c.operation_id == fence.operation_id,
+                        fences.c.lease_token == fence.lease_token,
+                        fences.c.operation_epoch == fence.operation_epoch,
+                        fences.c.operation_kind == fence.operation_kind,
+                        fences.c.released_at.is_(None),
+                    )
+                    .values(lease_expires_at=case((expiry > now, now), else_=expiry), released_at=now)
+                )
+                if released.rowcount != 1:
+                    raise AuditIntegrityError("own lapsed settlement could not release its locked fence")
             settled = _read(conn, session_id, operation_id)
             if settled is None:
                 raise AuditIntegrityError("recovery settlement missing")

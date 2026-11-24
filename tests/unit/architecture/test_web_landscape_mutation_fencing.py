@@ -5856,7 +5856,7 @@ _reserve_CANCEL_ROUTE_SHA256 = "084791796bc88481d879d0a09b7ab43e8f483c378d56cff6
 _reserve_CANCEL_CONSUMERS = {
     "src/elspeth/web/composer_watch_reads.py": "099b7e92f3617d5d9f39b479c1f21f229375e24e20208d294c822d7099cf6e3f",
     "src/elspeth/web/sessions/composer_turn.py": "06da1fb618ac26fc7f46d3c83cf65bcb6ac295379d43e4910159349e3cfa201c",
-    "src/elspeth/web/sessions/composer_async_worker.py": "d7dba5e6b9f8ff9101f9b70aaad33f634625593d66f4233d8470bb092732c98f",
+    "src/elspeth/web/sessions/composer_async_worker.py": "2f5c8eaaad1ba7eda734f5508b6ce9eab135c28b3ce79d83cf7665152b10621b",
 }
 
 
@@ -10341,7 +10341,7 @@ def _reserve_sink_effect_disjoint_receipts(units):
         (
             "src/elspeth/web/coordination/lifecycle.py",
             "SessionOperationLease",
-            "8f0fa66fbe863609537e720af36c08489271007314ba9053122ee4fddfc3cc01",
+            "7f1105410a64f38ba5ab3950a78de39e0645744bcde6e93aa0e4ec07f883b47a",
         ),
         (
             "src/elspeth/web/coordination/lifecycle.py",

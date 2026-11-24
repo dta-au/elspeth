@@ -294,9 +294,21 @@ async def test_known_outcome_renewal_failure_is_surfaced_and_the_close_releases_
 
 @pytest.mark.parametrize("reason", tuple(FenceLossReason), ids=lambda reason: reason.value)
 def test_only_the_owned_fence_loss_reasons_leave_a_fence_to_release_at_close(reason: FenceLossReason) -> None:
-    admitted = CLOSE_RELEASE_AFTER_RENEWAL_FAILURE.admits(SessionOperationFenceLost(reason))
+    admitted = CLOSE_RELEASE_AFTER_RENEWAL_FAILURE.admits(SessionOperationFenceLost(reason), operation_kind=SessionOperationKind.COMPOSE)
 
     assert admitted is (reason in CLOSE_RELEASE_AFTER_RENEWAL_FAILURE.fence_loss_reasons)
+
+
+@pytest.mark.parametrize("kind", tuple(SessionOperationKind), ids=lambda kind: kind.value)
+def test_an_excluded_kind_never_releases_after_a_failed_renewal(kind: SessionOperationKind) -> None:
+    """Every admitted renewal outcome is refused for an excluded kind, and only for it."""
+    outcomes: list[BaseException] = [SessionOperationFenceLost(reason) for reason in CLOSE_RELEASE_AFTER_RENEWAL_FAILURE.fence_loss_reasons]
+    outcomes.extend(error_type.__new__(error_type) for error_type in CLOSE_RELEASE_AFTER_RENEWAL_FAILURE.error_types)
+    excluded = kind in CLOSE_RELEASE_AFTER_RENEWAL_FAILURE.excluded_operation_kinds
+
+    assert CLOSE_RELEASE_AFTER_RENEWAL_FAILURE.admits(None, operation_kind=kind) is True
+    for outcome in outcomes:
+        assert CLOSE_RELEASE_AFTER_RENEWAL_FAILURE.admits(outcome, operation_kind=kind) is not excluded
 
 
 @pytest.mark.asyncio
