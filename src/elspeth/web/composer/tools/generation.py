@@ -1713,11 +1713,14 @@ _DIRECT_VALIDATION_GUIDANCE: Final = (
     DirectValidationGuidance(
         "splice_validation_failed",
         "The inserted transform passed its own option checks, but the pipeline that results from inserting it fails "
-        "context-aware validation. The rejected_mutation entries that follow this one name each new error, attributed "
-        "to the component it concerns in rejected_component. Nothing was mutated.",
+        "context-aware validation, and splice_transform requires that whole result to validate. The rejected_mutation "
+        "entries that follow this one name each error the insertion added, attributed to the component it concerns in "
+        "rejected_component. When none follows, the insertion added no error: the pipeline already failed validation "
+        "before the splice. Nothing was mutated.",
         "Repair the inserted node's options against the entries that follow (for a schema_contract_violation, remove "
-        "or satisfy the fields it names), or splice at a position whose producer supplies them, then retry "
-        "splice_transform.",
+        "or satisfy the fields it names), or splice at a position whose producer supplies them. Errors the pipeline "
+        "already had also refuse the splice, and the same splice is refused again until they are repaired: repair "
+        "them first, or add the step with upsert_node and re-point the successor's input with upsert_node.",
     ),
     DirectValidationGuidance(
         "batch_dependency_refused",

@@ -29,14 +29,24 @@ def _splice_node_id_schema() -> dict[str, Any]:
 
 
 def test_splice_validation_failed_resolves_to_direct_guidance() -> None:
-    assert explain_validation_code("splice_validation_failed") == (
+    explanation, suggested_fix = explain_validation_code("splice_validation_failed")
+    assert explanation == (
         "The inserted transform passed its own option checks, but the pipeline that results from inserting it fails "
-        "context-aware validation. The rejected_mutation entries that follow this one name each new error, attributed "
-        "to the component it concerns in rejected_component. Nothing was mutated.",
-        "Repair the inserted node's options against the entries that follow (for a schema_contract_violation, remove "
-        "or satisfy the fields it names), or splice at a position whose producer supplies them, then retry "
-        "splice_transform.",
+        "context-aware validation, and splice_transform requires that whole result to validate. The rejected_mutation "
+        "entries that follow this one name each error the insertion added, attributed to the component it concerns in "
+        "rejected_component. When none follows, the insertion added no error: the pipeline already failed validation "
+        "before the splice. Nothing was mutated."
     )
+    assert suggested_fix == (
+        "Repair the inserted node's options against the entries that follow (for a schema_contract_violation, remove "
+        "or satisfy the fields it names), or splice at a position whose producer supplies them. Errors the pipeline "
+        "already had also refuse the splice, and the same splice is refused again until they are repaired: repair "
+        "them first, or add the step with upsert_node and re-point the successor's input with upsert_node."
+    )
+    # A splice refused only for errors the pipeline already had forwards no
+    # entry of its own, so an unconditional "retry splice_transform" would
+    # send the planner back into the same refusal.
+    assert "then retry splice_transform" not in suggested_fix
 
 
 def test_splice_node_id_declares_the_reserved_labels_like_set_pipeline_node_id() -> None:

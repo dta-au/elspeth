@@ -529,8 +529,10 @@ takes several changes, make them one proposal at a time: send the first change
 alone, then tell the user what follows; send each next change after the one
 before it is accepted. A pipeline between narrow changes does not have to
 validate: a narrow change that leaves errors is still recorded as a proposal,
-and the errors clear with the last change. A `set_pipeline` replaces the whole
-pipeline and must validate on its own, or it is refused with no proposal. The
+and the errors clear with the last change. Two changes must leave the whole
+pipeline valid, or they are refused with no proposal: a `set_pipeline`, which
+replaces the whole pipeline, and a `splice_transform`, which is refused even
+for errors that were there before it. The
 rule to continue from each saved batch within the
 same request applies only where changes apply directly. `create_blob` is not a
 composition change and is not refused for this reason: create a prompt file

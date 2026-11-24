@@ -1674,9 +1674,15 @@ class TestSkillFollowsCurrentToolBehaviour:
             "A pipeline between narrow changes does not have to validate: a narrow change that leaves errors is still "
             "recorded as a proposal, and the errors clear with the last change" in flattened
         )
-        # The exception the code enforces (SetPipelineCandidate.acceptable):
-        # an invalid set_pipeline is refused with no proposal.
-        assert "A `set_pipeline` replaces the whole pipeline and must validate on its own, or it is refused with no proposal" in flattened
+        # The exceptions the code enforces: an invalid set_pipeline
+        # (SetPipelineCandidate.acceptable) and a splice_transform whose whole
+        # result does not validate are refused with no proposal.
+        assert (
+            "Two changes must leave the whole pipeline valid, or they are refused with no proposal: a `set_pipeline`, "
+            "which replaces the whole pipeline, and a `splice_transform`, which is refused even for errors that were "
+            "there before it" in flattened
+        )
+        assert "A `set_pipeline` replaces the whole pipeline and must validate on its own" not in flattened
         assert "a change that leaves errors is still recorded as a proposal" not in flattened
         assert "Use one `set_pipeline` carrying the whole result" not in flattened
         assert "`approval_batch_not_atomic`" in flattened

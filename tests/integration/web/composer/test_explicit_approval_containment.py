@@ -146,10 +146,11 @@ async def test_batch_with_two_staged_edits_is_refused_before_effects_then_one_co
         assert "carried 2 pipeline-change calls" in message
         assert "None of them was applied and no proposal was recorded" in message
         # By design: under approval, narrow edits go one at a time and a
-        # pipeline between narrow changes does not have to validate. A
-        # set_pipeline is the exception: an invalid candidate is refused
-        # PREVALIDATION_REJECTED with no proposal, so the text must not
-        # promise otherwise or the planner loops on partial rebuilds.
+        # pipeline between narrow changes does not have to validate. Two
+        # changes are the exception: an invalid set_pipeline is refused
+        # PREVALIDATION_REJECTED, and a splice_transform whose whole result
+        # does not validate is refused, each with no proposal. The text must
+        # not promise otherwise or the planner loops on refused changes.
         assert "only one proposal can await the user at a time" in message
         assert "Send the first change alone, then tell the user what follows" in message
         assert "send each next change after the one before it is accepted" in message
@@ -157,7 +158,12 @@ async def test_batch_with_two_staged_edits_is_refused_before_effects_then_one_co
             "A pipeline between narrow changes does not have to validate: a narrow change that leaves errors is still "
             "recorded as a proposal, and the errors clear with the last change" in message
         )
-        assert "A set_pipeline replaces the whole pipeline and must validate on its own, or it is refused with no proposal" in message
+        assert (
+            "Two changes must leave the whole pipeline valid, or they are refused with no proposal: a set_pipeline, "
+            "which replaces the whole pipeline, and a splice_transform, which is refused even for errors that were "
+            "there before it" in message
+        )
+        assert "A set_pipeline replaces the whole pipeline and must validate on its own" not in message
         assert "a change that leaves errors is still recorded as a proposal" not in message
         assert "Use one `set_pipeline` carrying the whole result" not in message
         assert "containing every edit" not in message
@@ -360,6 +366,92 @@ async def test_set_pipeline_that_does_not_validate_is_refused_with_no_proposal(t
     assert [entry["error_code"] for entry in payload["validation"]["errors"]] == ["source_on_success_dangling"]
     assert result.state is state
     assert _count_rows(harness.engine, composition_states_table) == 0
+
+
+def _linear_state(tmp_path: Path, *, standing_error: bool) -> CompositionState:
+    """source -> t1 -> main, optionally with an orphan transform nothing feeds.
+
+    The orphan's ``node_input_not_reachable`` is an error away from the splice
+    site, standing before the splice is sent.
+    """
+    arguments = _valid_pipeline_args(tmp_path)
+    arguments["source"]["on_success"] = "mid"
+    nodes: list[dict[str, Any]] = [
+        {
+            "id": "t1",
+            "node_type": "transform",
+            "plugin": "passthrough",
+            "input": "mid",
+            "on_success": "main",
+            "on_error": "discard",
+            "options": {"schema": {"mode": "observed"}},
+        }
+    ]
+    if standing_error:
+        nodes.append(
+            {
+                "id": "orphan",
+                "node_type": "transform",
+                "plugin": "passthrough",
+                "input": "nowhere",
+                "on_success": "main",
+                "on_error": "discard",
+                "options": {"schema": {"mode": "observed"}},
+            }
+        )
+    return CompositionState.from_dict(
+        {
+            **arguments,
+            "nodes": nodes,
+            "version": 7,
+            "metadata": {"description": "", **arguments["metadata"]},
+            "outputs": [{"name": output["sink_name"], **output} for output in arguments["outputs"]],
+        }
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("standing_error", [False, True], ids=["valid_pipeline", "standing_error"])
+async def test_splice_is_proposed_only_when_the_whole_result_validates(tmp_path: Path, standing_error: bool) -> None:
+    harness = _harness(tmp_path)
+    state = _linear_state(tmp_path, standing_error=standing_error)
+    standing = {entry.error_code for entry in _composer_validation(harness, state).errors}
+    assert standing == ({"node_input_not_reachable"} if standing_error else set())
+    # The same valid insertion in both arms; only the pipeline it lands in differs.
+    llm = _ScriptedLLM(
+        _tool_turn(
+            "call_splice",
+            "splice_transform",
+            {
+                "predecessor_id": "source",
+                "successor_id": "t1",
+                "node": {"id": "ins", "plugin": "passthrough", "options": {"schema": {"mode": "observed"}}, "on_error": "discard"},
+            },
+        ),
+        _fake_llm_response(content="Done."),
+    )
+    result = await _compose(harness, llm, state)
+
+    proposals = await harness.sessions.list_composition_proposals(UUID(harness.session_id))
+    payload = _tool_feedback(llm, 1, "call_splice")
+    assert result.state is state
+    if not standing_error:
+        assert [(proposal.tool_call_id, proposal.tool_name, proposal.status) for proposal in proposals] == [
+            ("call_splice", "splice_transform", "pending")
+        ]
+        assert payload["success"] is True
+        assert payload["data"]["status"] == "APPROVAL_REQUIRED"
+        return
+    # Refused for an error the splice did not add: no proposal, and no
+    # rejected_mutation entry after the leading one, which is what the
+    # splice_validation_failed guidance tells the planner to read.
+    assert proposals == []
+    assert payload["success"] is False
+    assert payload["version"] == state.version
+    errors = [(entry["component"], entry["error_code"]) for entry in payload["validation"]["errors"]]
+    assert errors[0] == ("rejected_mutation", "splice_validation_failed")
+    assert [code for component, code in errors[1:] if component == "rejected_mutation"] == []
+    assert ("node:orphan", "node_input_not_reachable") in errors[1:]
 
 
 @pytest.mark.asyncio
