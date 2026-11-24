@@ -20,13 +20,17 @@ changes land and is not a release.
   when the run started, now fails composer validation. No pipeline that could
   run before is refused. Only pipelines the runtime was already refusing at
   run start are now refused earlier, at validation.
-- **Changed:** the composer's main loop and planner start a provider retry only
-  when its wait plus 5 s still fits before the job deadline. This also applies
-  to their existing retries after a provider 503. When it does not fit, the main
-  loop reports the provider failure at once. After a 503 the planner waits
-  until the deadline and reports a time-out instead of making one last call,
-  or reports a call-budget refusal at once if the failed call used the last one;
-  after a 429 it reports the provider failure at once. The completion review keeps
+- **Changed:** when a provider call fails, the composer's main loop and planner
+  decide whether a retry's wait plus 5 s still fits before the job deadline,
+  and retry only if it does. This also applies to their existing retries after
+  a provider 503. When the retry does not fit, the main loop reports the
+  provider failure at once. The planner, after a 503 whose retry does not fit,
+  waits until the deadline and reports a time-out instead of making one last
+  call; after a 429 whose retry does not fit, it reports the provider failure
+  at once. When the failed call used the last call the budget allows and
+  another attempt remains, the planner reports a call-budget refusal at once,
+  after a 503 or after a 429 whose retry would fit; on an escape-hatch turn it
+  reports the hatch's original exhaustion instead. The completion review keeps
   its existing immediate retry and does not retry a 429.
 - **Do not enable a composer token quota yet.** With one configured, a failed
   provider call's usage is recorded as unknown, and that refuses the user's
