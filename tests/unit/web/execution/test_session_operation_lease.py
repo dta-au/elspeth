@@ -33,7 +33,7 @@ import time
 import traceback
 from asyncio.tasks import run_coroutine_threadsafe
 from asyncio.threads import to_thread
-from collections.abc import Coroutine, Iterator
+from collections.abc import Callable, Coroutine, Iterator
 from concurrent.futures import Future
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -50,6 +50,7 @@ import structlog
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import Engine, event, func, select
+from sqlalchemy.exc import OperationalError
 from starlette.requests import Request
 
 from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
@@ -354,6 +355,7 @@ async def _canonical_execute_lease(
     *,
     session_id: UUID,
     renew_interval_seconds: float = 10.0,
+    lease_seconds: int = 30,
 ) -> tuple[SessionOperationLease, CanonicalExecutionAuthorityObservation]:
     observed = execution_fixture.observe_authority(session_id)
     observed.release_allowed.clear()
@@ -362,7 +364,7 @@ async def _canonical_execute_lease(
         observed.authority,
         session_id=session_id,
         owner_instance_id="execution-lease-test",
-        lease_seconds=30,
+        lease_seconds=lease_seconds,
         renew_interval_seconds=renew_interval_seconds,
     )
     return lease, observed
@@ -1297,6 +1299,204 @@ async def test_execute_wires_real_renewal_loss_to_exact_worker_shutdown_and_reta
         await asyncio.wait_for(execution_fixture.shutdown_service(service), timeout=2)
     assert cleanup_failure.value is loss
     execution_fixture.witness_cleanup_original(loss)
+
+
+def _transient_renewal_error() -> OperationalError:
+    return OperationalError("UPDATE session_operation_fences", {}, Exception("database is locked"))
+
+
+async def _submit_canonical_execute(
+    service: ExecutionServiceImpl, session_service: Any, executor: ActualPrivatePipelineExecutorControl, lease: SessionOperationLease
+) -> threading.Event:
+    session_id = session_service.get_current_state.return_value.session_id
+    validation = ValidationResult(
+        is_valid=True,
+        checks=[],
+        errors=[],
+        readiness=ValidationReadiness(authoring_valid=True, execution_ready=True, completion_ready=True, blockers=[]),
+    )
+    with patch("elspeth.web.execution.validation.validate_pipeline", return_value=validation):
+        await service.execute(session_id, session_operation_lease=lease)
+    worker_shutdown_event = executor.submit_calls[0][1][2]
+    assert isinstance(worker_shutdown_event, threading.Event)
+    assert not worker_shutdown_event.is_set()
+    return worker_shutdown_event
+
+
+async def _eventually(predicate: Callable[[], bool], *, seconds: float = 5.0) -> bool:
+    deadline = time.monotonic() + seconds
+    while not predicate():
+        if time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(0.01)
+    return True
+
+
+async def _finish_execute_run(
+    lease: SessionOperationLease, authority: CanonicalExecutionAuthorityObservation, executor: ActualPrivatePipelineExecutorControl
+) -> None:
+    authority.release_allowed.set()
+    executor.future.set_result(None)
+    assert await _eventually(lambda: lease.closed)
+
+
+@pytest.mark.asyncio
+async def test_execute_renewal_survives_one_transient_database_error(execution_fixture: ExecutionTestCustody) -> None:
+    service, session_service, executor = _execution_service(asyncio.get_running_loop(), execution_fixture=execution_fixture)
+    session_id = session_service.get_current_state.return_value.session_id
+    lease, authority = await _canonical_execute_lease(service, execution_fixture, session_id=session_id, renew_interval_seconds=0.01)
+    worker_shutdown_event = await _submit_canonical_execute(service, session_service, executor, lease)
+    registry = service.execution_lease_release_registry
+    watchdog = execution_fixture.recovery.watchdog
+    reasons_before, signals_before = list(watchdog.reasons), list(watchdog.signals)
+    attempts_before = authority.renew_attempts
+    authority.renew_errors_once.append(_transient_renewal_error())
+
+    # The failed attempt and two later successful ones.
+    assert await _eventually(lambda: authority.renew_attempts >= attempts_before + 3), "renewal stopped after one transient error"
+    assert authority.renew_errors_once == []
+    assert not worker_shutdown_event.is_set(), "one transient renewal error must not cancel the run"
+    lease.raise_if_lost()
+    assert registry._failures == [] and not registry._recovery_requested
+
+    await _finish_execute_run(lease, authority, executor)
+    obligation = lease.execution_obligation
+    assert obligation is not None and obligation.release_succeeded and not obligation.release_lost
+    assert registry._failures == [] and not registry._recovery_requested, "a tolerated error must not reach process recovery"
+    assert (watchdog.reasons, watchdog.signals) == (reasons_before, signals_before)
+    await asyncio.wait_for(execution_fixture.shutdown_service(service), timeout=2)
+
+
+async def _assert_renewal_error_escalates(
+    execution_fixture: ExecutionTestCustody,
+    *,
+    error: BaseException,
+    one_shot: bool,
+    lease_seconds: int,
+    renew_interval_seconds: float,
+    lease_seconds_per_attempt: float = 0.0,
+) -> int:
+    """Inject ``error`` and return how many renewal attempts ran before the lease was lost.
+
+    ``lease_seconds_per_attempt`` advances the lifecycle's clock by that much
+    inside every renewal attempt that raises the injected error (the fixture
+    counts each one in its renew SQL; a renewal that succeeds around the
+    injection is not counted), so on the lifecycle's clock each failed attempt
+    takes that long. Lease headroom then runs out on a fixed attempt whatever
+    the host load, while the database lease never actually lapses and the
+    release still succeeds.
+    """
+    service, session_service, executor = _execution_service(asyncio.get_running_loop(), execution_fixture=execution_fixture)
+    session_id = session_service.get_current_state.return_value.session_id
+    lease, authority = await _canonical_execute_lease(
+        service, execution_fixture, session_id=session_id, renew_interval_seconds=renew_interval_seconds, lease_seconds=lease_seconds
+    )
+    worker_shutdown_event = await _submit_canonical_execute(service, session_service, executor, lease)
+    failures_before = authority.renew_failures_injected
+    real_monotonic = time.monotonic
+
+    def lifecycle_clock() -> float:
+        return real_monotonic() + lease_seconds_per_attempt * (authority.renew_failures_injected - failures_before)
+
+    with patch.object(lifecycle_module, "time", SimpleNamespace(monotonic=lifecycle_clock)):
+        if one_shot:
+            authority.renew_errors_once.append(error)
+        else:
+            authority.renew_error = error
+        # The lease's own loss signal, not the run's shutdown event: the run
+        # watcher can also set that event in this harness.
+        lost = await asyncio.wait_for(lease.wait_until_lost(), timeout=5)
+    assert lost is error
+    with pytest.raises(type(error)) as raised:
+        lease.raise_if_lost()
+    assert raised.value is error
+    assert await asyncio.wait_for(run_sync_in_worker(worker_shutdown_event.wait, 5), timeout=6), "a lost lease must cancel the run"
+    attempts = authority.renew_failures_injected - failures_before
+    attempts_at_loss = authority.renew_attempts
+    await asyncio.sleep(10 * renew_interval_seconds)
+    assert authority.renew_attempts == attempts_at_loss, "renewal must stop once the lease is lost"
+
+    authority.renew_error = None
+    await _finish_execute_run(lease, authority, executor)
+    registry = service.execution_lease_release_registry
+    assert registry._recovery_requested, "a lost EXECUTE lease must request process recovery"
+    assert any(original is error for original in registry._failures)
+    with pytest.raises(type(error)) as cleanup_failure:
+        await asyncio.wait_for(execution_fixture.shutdown_service(service), timeout=2)
+    assert cleanup_failure.value is error
+    execution_fixture.witness_cleanup_original(error)
+    return attempts
+
+
+@pytest.mark.asyncio
+async def test_execute_renewal_escalates_transient_errors_that_outlast_the_lease(execution_fixture: ExecutionTestCustody) -> None:
+    # Each failed attempt takes 8 s of a 30 s lease. The third fails at 24 s;
+    # a retry as slow would finish at 32 s, past the lease, so it escalates two
+    # short of the cap. (Timing the retry's start
+    # alone would allow a fourth attempt; no window at all would reach the cap.)
+    attempts = await _assert_renewal_error_escalates(
+        execution_fixture,
+        error=_transient_renewal_error(),
+        one_shot=False,
+        lease_seconds=30,
+        renew_interval_seconds=0.01,
+        lease_seconds_per_attempt=8.0,
+    )
+    assert attempts == 3
+
+
+@pytest.mark.asyncio
+async def test_execute_renewal_reserves_one_second_of_clock_slack(execution_fixture: ExecutionTestCustody) -> None:
+    # Each failed attempt takes 9.7 s of a 30 s lease. After the second, a
+    # retry as slow would finish at 29.1 s: inside the lease, but not inside
+    # it less the 1 s slack for the database clock's resolution, so the second
+    # failure escalates (without the slack a third attempt would run).
+    attempts = await _assert_renewal_error_escalates(
+        execution_fixture,
+        error=_transient_renewal_error(),
+        one_shot=False,
+        lease_seconds=30,
+        renew_interval_seconds=0.01,
+        lease_seconds_per_attempt=9.7,
+    )
+    assert attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_execute_renewal_escalates_a_slow_transient_error_it_could_not_retry_in_time(
+    execution_fixture: ExecutionTestCustody,
+) -> None:
+    # One failed attempt takes 15 s of a 30 s lease. A retry would start
+    # inside the lease, but one as slow would finish at 30 s, at the lease's
+    # end, so the first failure escalates.
+    attempts = await _assert_renewal_error_escalates(
+        execution_fixture,
+        error=_transient_renewal_error(),
+        one_shot=False,
+        lease_seconds=30,
+        renew_interval_seconds=0.01,
+        lease_seconds_per_attempt=15.0,
+    )
+    assert attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_execute_renewal_escalates_at_the_consecutive_transient_cap(execution_fixture: ExecutionTestCustody) -> None:
+    # A 30 s lease leaves room for many 0.01 s intervals; the cap of 5
+    # consecutive transient failures (the membership and orphan-sweeper bound)
+    # ends it.
+    attempts = await _assert_renewal_error_escalates(
+        execution_fixture, error=_transient_renewal_error(), one_shot=False, lease_seconds=30, renew_interval_seconds=0.01
+    )
+    assert attempts == 5
+
+
+@pytest.mark.asyncio
+async def test_execute_renewal_loses_the_lease_on_one_non_transient_error(execution_fixture: ExecutionTestCustody) -> None:
+    attempts = await _assert_renewal_error_escalates(
+        execution_fixture, error=RuntimeError("renewal defect"), one_shot=True, lease_seconds=30, renew_interval_seconds=0.01
+    )
+    assert attempts == 1
 
 
 @pytest.mark.asyncio

@@ -14,7 +14,7 @@ from functools import partial
 from uuid import UUID
 
 import structlog
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from starlette.applications import Starlette
 
 from elspeth.contracts.errors import AuditIntegrityError, ComposerOwnedSettlementFailure
@@ -87,10 +87,25 @@ _OWNER_UNSETTLED_LOGGED_LEAVES = 8
 # Unsettled owners remembered for the reaper; the oldest is forgotten first.
 # One that is forgotten is settled as a lost worker, as before.
 _UNSETTLED_OWNERS_RETAINED = 1_024
+# A poll whose custody-free reap or claim statement raises OperationalError
+# (transient database contention) is retried after a full scan interval, at
+# most this many times in a row: the same bound as session-lease renewal, the
+# membership heartbeat and the orphan sweeper. Past it, on any other error, or
+# on an OperationalError inside a reap's session lease or its own-lapsed
+# settlement, the loop ends and the process is restarted.
+_POLL_MAX_CONSECUTIVE_TRANSIENT_FAILURES = 5
 # A probe Task sleeps this long, repeatedly; waking this much later than asked
 # means some callback held the event loop, and is logged.
 _EVENT_LOOP_PROBE_SECONDS = 0.5
 _EVENT_LOOP_LAG_LOG_SECONDS = 1.0
+
+
+class ComposerReapCustodyUnknown(RuntimeError):
+    """A reap step's custody outcome is unknown after a database error.
+
+    The caller ends the worker; the poll loop never retries it. The original
+    error is the cause.
+    """
 
 
 @dataclass(slots=True)
@@ -341,19 +356,57 @@ class ComposerAsyncWorker:
             return
         # Consume the exception without logging provider/request content.
         failure = None if task.cancelled() else task.exception()
-        slog.error("composer_operation.worker_loop_lost", exc_class=type(failure).__name__)
+        cause = None if failure is None else failure.__cause__
+        slog.error(
+            "composer_operation.worker_loop_lost",
+            exc_class=type(failure).__name__,
+            cause_class=None if cause is None else type(cause).__name__,
+        )
         self._process_recovery.request_shutdown()
 
     async def _loop(self) -> None:
         # Logging only; it holds no custody and ends with this loop.
         probe = asyncio.create_task(_probe_event_loop_lag(), name="composer-event-loop-probe")
+        consecutive_failures = 0
         try:
             while not self._stopping and not self._instance_draining.is_set():
                 self._wake.clear()
-                await self.reap_once()
-                await self._claim_once()
-                with suppress(TimeoutError):
-                    await asyncio.wait_for(self._wake.wait(), timeout=self._scan_interval)
+                try:
+                    await self.reap_once()
+                    await self._claim_once()
+                except OperationalError as exc:
+                    # Only custody-free statements reach here: each is its own
+                    # transaction and holds no lease or fence when it raises
+                    # (a reap's session lease and its own-lapsed settlement
+                    # raise ComposerReapCustodyUnknown instead). claim_next
+                    # commits each candidate separately: a claim whose commit
+                    # is unknown, and any committed before the failing one, are
+                    # never run here, stay queued, and are taken again with a
+                    # new token once their claim lease lapses. exc_info is
+                    # deliberately omitted: SQLAlchemy cause chains carry the
+                    # database URL.
+                    consecutive_failures += 1
+                    if consecutive_failures >= _POLL_MAX_CONSECUTIVE_TRANSIENT_FAILURES:
+                        slog.error(
+                            "composer_operation.worker_poll_escalating",
+                            exc_class=type(exc).__name__,
+                            consecutive_failures=consecutive_failures,
+                        )
+                        raise
+                    slog.warning(
+                        "composer_operation.worker_poll_retrying",
+                        exc_class=type(exc).__name__,
+                        consecutive_failures=consecutive_failures,
+                    )
+                else:
+                    consecutive_failures = 0
+                if consecutive_failures:
+                    # A failed scan waits its whole interval: new submissions
+                    # set the wake, which must not spend the bound in a burst.
+                    await asyncio.sleep(self._scan_interval)
+                else:
+                    with suppress(TimeoutError):
+                        await asyncio.wait_for(self._wake.wait(), timeout=self._scan_interval)
         finally:
             probe.cancel()
 
@@ -1540,6 +1593,10 @@ class ComposerAsyncWorker:
                         )
                     )
                 count += 1
+            except OperationalError as exc:
+                # Acquire, settle or release may have committed: the fence's
+                # custody is unknown, so this is never a transient poll error.
+                raise ComposerReapCustodyUnknown("Reap session lease outcome is unknown") from exc
             except SessionOperationConflictError:
                 if record.claim_owner_instance_id == self._owner_instance_id:
                     try:
@@ -1555,6 +1612,9 @@ class ComposerAsyncWorker:
                         )
                     except ComposerOperationFenceLost:
                         pass
+                    except OperationalError as exc:
+                        # The settlement's custody outcome is unknown: end the worker.
+                        raise ComposerReapCustodyUnknown("Reap settlement outcome is unknown") from exc
                     else:
                         self._discharge_reaped_failure_projection((record.session_id, record.operation_id), settled)
                         count += 1

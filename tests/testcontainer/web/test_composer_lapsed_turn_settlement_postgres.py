@@ -29,6 +29,7 @@ from httpx import ASGITransport, AsyncClient
 from litellm.types.utils import Choices, Message, ModelResponse, Usage
 from psycopg import sql
 from sqlalchemy import Connection, Engine, create_engine, func, select, update
+from sqlalchemy.exc import OperationalError
 from tests.fixtures.identities import grant_test_pipeline_user
 from tests.helpers.composer_operations import message_body
 from tests.testcontainer.web.test_external_deployment_postgres import _DatabasePair, _identifier
@@ -40,6 +41,7 @@ from elspeth.web.composer import prompt_guard_clients
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.coordination.repository import SessionOperationConflictError
+from elspeth.web.process_watchdog_codec import RecoveryReason
 from elspeth.web.prompt_guard_config import PromptGuardSettings
 from elspeth.web.required_work import RequiredWorkIncomplete, RequiredWorkSource
 from elspeth.web.schema_probe import postgres_engine_kwargs
@@ -212,7 +214,7 @@ def _run(
     observer: Engine,
     *,
     hold_pool: bool,
-    probe: Literal["none", "foreign_owner", "flagless_own", "peer_settles"] = "none",
+    probe: Literal["none", "foreign_owner", "flagless_own", "peer_settles", "commit_then_error"] = "none",
 ) -> dict[str, Any]:
     _prepare(databases, tmp_path, monkeypatch)
     monkeypatch.setattr(prompt_guard_clients, "build_prompt_guard_client", _guard_client)
@@ -365,6 +367,19 @@ def _run(
 
                     monkeypatch.setattr(composer_authority, "list_expired_running", listed_before_the_peer_committed)
                     record["peer"] = {"settled_by": peer_settled.settled_by, "fence_after_peer": _fence(observer, session_id)}
+                elif probe == "commit_then_error":
+                    # The reaper's own-lapsed settlement commits on PostgreSQL,
+                    # then its caller sees an OperationalError.
+                    composer_authority = app.state.composer_async_operation_authority
+                    actual_settle_own_lapsed = composer_authority.settle_own_lapsed
+                    record["committed_then_failed"] = []
+
+                    def settle_then_fail(**kwargs: Any) -> ComposerOperationRecord:
+                        settled_here = actual_settle_own_lapsed(**kwargs)
+                        record["committed_then_failed"].append(settled_here.settled_by)
+                        raise OperationalError("settle_own_lapsed", {}, RuntimeError("connection lost after commit"))
+
+                    monkeypatch.setattr(composer_authority, "settle_own_lapsed", settle_then_fail)
 
             task.add_done_callback(at_turn_end)
 
@@ -399,12 +414,27 @@ def _run(
                     "disposition": lease.disposition,
                     "renewal_error": _leaves(lease.renewal_error),
                 }
-            # Drive the recovery sweep directly; the worker's own loop is also
-            # woken when the turn ends and may settle the job first.
-            try:
-                record["reap_once"] = await asyncio.wait_for(worker.reap_once(), timeout=30)
-            except Exception as reap_error:
-                record["reap_once"] = _leaves(reap_error)
+            if probe == "commit_then_error":
+                # Only the worker's own loop reaps here, so it is the caller
+                # that meets the error.
+                loop_task = worker._loop_task
+                record["loop_ended"] = await _wait_for(loop_task.done, seconds=30)
+                loop_failure = loop_task.exception() if record["loop_ended"] and not loop_task.cancelled() else None
+                record["loop_failure"] = (
+                    None
+                    if loop_failure is None
+                    else (type(loop_failure).__name__, None if loop_failure.__cause__ is None else type(loop_failure.__cause__).__name__)
+                )
+                watchdog = app.state.process_recovery.watchdog
+                await _wait_for(lambda: bool(watchdog.reasons), seconds=10)
+                record["recovery_reasons"] = list(watchdog.reasons)
+            else:
+                # Drive the recovery sweep directly; the worker's own loop is also
+                # woken when the turn ends and may settle the job first.
+                try:
+                    record["reap_once"] = await asyncio.wait_for(worker.reap_once(), timeout=30)
+                except Exception as reap_error:
+                    record["reap_once"] = _leaves(reap_error)
             if probe == "peer_settles":
                 peer.pop("stale")
                 record["peer"]["fence_after_reap"] = _fence(observer, session_id)
@@ -582,3 +612,21 @@ def test_a_peer_that_settles_first_releases_its_own_fence_and_the_reaper_leaves_
     assert record["instance_draining_at_end"] is False, record
     # The owner's projection was not this reaper's to discharge: shutdown fails closed, as on base.
     assert RequiredWorkIncomplete in record["lifespan_exit_error"], record
+
+
+@pytest.mark.timeout(240, method="thread")
+def test_a_reap_settlement_that_commits_before_an_operational_error_ends_the_worker(
+    databases: _DatabasePair, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, observer: Engine
+) -> None:
+    record = _run(databases, tmp_path, monkeypatch, observer, hold_pool=True, probe="commit_then_error")
+    _lapsed_preconditions(record)
+    assert record["committed_then_failed"] == ["settle_own_lapsed"], record
+    assert record["loop_ended"] is True, record
+    assert record["loop_failure"] == ("ComposerReapCustodyUnknown", "OperationalError"), record
+    assert record["recovery_reasons"] == [RecoveryReason.REQUIRED_WORKER_LOST], record
+    # The settlement committed on PostgreSQL: the job is failed and its fence released.
+    assert record["first_job"] is not None and record["first_job"]["status"] == "failed", record
+    assert record["first_job"]["settled_by"] == "settle_own_lapsed", record
+    assert record["fence_after_settle"]["released"] is True, record
+    # The worker ended before discharging the owner's projection.
+    assert record["coordinator_retained_after_settle"] is True, record
