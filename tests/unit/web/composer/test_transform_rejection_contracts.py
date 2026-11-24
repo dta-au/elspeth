@@ -19,7 +19,7 @@ from elspeth.web.composer.protocol import ComposerPluginCrashError
 from elspeth.web.composer.redaction import redact_tool_call_response
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.composer.service import ComposerAvailability
-from elspeth.web.composer.state import CompositionState, EdgeSpec, ValidationSummary
+from elspeth.web.composer.state import CompositionState, EdgeSpec, SchemaContractDetail, ValidationEntry, ValidationSummary
 from elspeth.web.composer.tools import execute_tool, transforms
 from elspeth.web.composer.tools._common import ToolContext, ToolResult, normalize_tool_result_validation
 from elspeth.web.composer.tools._dispatch import finalize_tool_result
@@ -551,7 +551,11 @@ def test_splice_codeless_boundary_is_preserved_and_planner_refuses_to_invent_cod
     # producer currently emits this codeless finding. Keep its real attribution.
     codeless = replace(actual, component="node:inserted", error_code=None, rejected_component=None)
     result = transforms._splice_validation_rejection(
-        state, candidate_errors=(codeless,), prior_errors=context.catalog.validate_composition_state(state).validation.errors
+        state,
+        candidate_errors=(codeless,),
+        prior_errors=context.catalog.validate_composition_state(state).validation.errors,
+        predecessor_id="before",
+        inserted_node_id="inserted",
     )
     forwarded = result.validation.errors[1]
     assert forwarded.component == "rejected_mutation" and forwarded.rejected_component == "node:inserted"
@@ -561,6 +565,113 @@ def test_splice_codeless_boundary_is_preserved_and_planner_refuses_to_invent_cod
     assert normalized.validation.errors[1].error_code is None
     with pytest.raises(AuditIntegrityError, match="producer-owned error code"):
         _allowlisted_candidate_feedback(normalized)
+
+
+def _successor_requiring(field: str) -> CompositionState:
+    """The linear splice fixture whose successor already requires a field nothing supplies."""
+    state = replace(splice_fixtures._state(), version=17)
+    options = {"schema": {"mode": "observed"}, "required_input_fields": [field]}
+    return replace(state, nodes=tuple(replace(node, options=options) if node.id == "after" else node for node in state.nodes))
+
+
+def _splice_args(options: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "predecessor_id": "before",
+        "successor_id": "after",
+        "node": {"id": "inserted", "plugin": "passthrough", "options": options, "on_error": "discard"},
+    }
+
+
+@pytest.mark.parametrize("surface", ["handler", "dispatch"])
+def test_splice_standing_successor_contract_error_is_not_reported_as_added(surface: Surface) -> None:
+    state = _successor_requiring("ghost_field")
+    context = _context()
+    prior = context.catalog.validate_composition_state(state).validation
+    standing_contracts = [entry.contract for entry in prior.errors if entry.contract is not None]
+    # Control: the successor already lacks the field against the predecessor.
+    assert SchemaContractDetail(producer="before", consumer="after", missing_fields=("ghost_field",)) in standing_contracts
+    result = _invoke(surface, "splice_transform", _splice_args({"schema": {"mode": "observed"}}), state, context)
+    assert not result.success and result.updated_state is state
+    leading, *following = result.validation.errors
+    assert leading.error_code == "splice_validation_failed"
+    # After the insertion the same error names the inserted node as producer
+    # (another message, possibly another component); it was there before.
+    assert [entry for entry in following if entry.component == "rejected_mutation"] == []
+
+
+@pytest.mark.parametrize("surface", ["handler", "dispatch"])
+def test_splice_forwards_the_error_it_adds_beside_a_standing_one(surface: Surface) -> None:
+    state = _successor_requiring("ghost_field")
+    context = _context()
+    options = {"schema": {"mode": "observed"}, "required_input_fields": ["other_field"]}
+    result = _invoke(surface, "splice_transform", _splice_args(options), state, context)
+    assert not result.success and result.updated_state is state
+    forwarded = [entry for entry in result.validation.errors[1:] if entry.component == "rejected_mutation"]
+    assert [(entry.error_code, entry.rejected_component, entry.contract) for entry in forwarded] == [
+        (
+            "schema_contract_violation",
+            "node:inserted",
+            SchemaContractDetail(producer="before", consumer="inserted", missing_fields=("other_field",)),
+        )
+    ]
+
+
+def _contract_entry(code: str, component: str, message: str, contract: SchemaContractDetail) -> ValidationEntry:
+    return ValidationEntry(component, message, "high", code, contract=contract)
+
+
+def test_splice_identity_keeps_another_producers_error_into_the_same_consumer_distinct() -> None:
+    # Explicit boundary injection: two producers feed one sink, as a fan-in
+    # does. The other arm's standing error must not hide the one the splice
+    # adds on this arm, though code, consumer and fields are the same.
+    other_arm = _contract_entry(
+        "sink_contract_violation", "output:result", "standing", SchemaContractDetail("arm_a", "output:result", missing_fields=("x",))
+    )
+    this_arm = _contract_entry(
+        "sink_contract_violation", "output:result", "added", SchemaContractDetail("after", "output:result", missing_fields=("x",))
+    )
+    result = transforms._splice_validation_rejection(
+        splice_fixtures._state(),
+        candidate_errors=(other_arm, this_arm),
+        prior_errors=(other_arm,),
+        predecessor_id="before",
+        inserted_node_id="inserted",
+    )
+    forwarded = [entry for entry in result.validation.errors[1:] if entry.component == "rejected_mutation"]
+    assert [(entry.message, entry.rejected_component) for entry in forwarded] == [("added", "output:result")]
+
+
+def test_splice_identity_maps_only_the_inserted_producer_to_the_predecessor() -> None:
+    before = _contract_entry(
+        "schema_contract_violation", "source", "'before' -> 'after'", SchemaContractDetail("before", "after", missing_fields=("x",))
+    )
+    moved = _contract_entry(
+        "schema_contract_violation", "node:after", "'inserted' -> 'after'", SchemaContractDetail("inserted", "after", missing_fields=("x",))
+    )
+    result = transforms._splice_validation_rejection(
+        splice_fixtures._state(),
+        candidate_errors=(moved,),
+        prior_errors=(before,),
+        predecessor_id="before",
+        inserted_node_id="inserted",
+    )
+    assert [entry for entry in result.validation.errors[1:] if entry.component == "rejected_mutation"] == []
+
+
+def test_splice_identity_of_a_contract_detail_without_fields_stays_on_the_message() -> None:
+    # A semantic contract detail names producer and consumer but no field, so
+    # two different findings on one consumer must not collapse into one.
+    standing = _contract_entry("semantic_contract_violation", "node:after", "field a", SchemaContractDetail("before", "after"))
+    added = _contract_entry("semantic_contract_violation", "node:after", "field b", SchemaContractDetail("before", "after"))
+    result = transforms._splice_validation_rejection(
+        splice_fixtures._state(),
+        candidate_errors=(standing, added),
+        prior_errors=(standing,),
+        predecessor_id="before",
+        inserted_node_id="inserted",
+    )
+    forwarded = [entry for entry in result.validation.errors[1:] if entry.component == "rejected_mutation"]
+    assert [entry.message for entry in forwarded] == ["field b"]
 
 
 @pytest.mark.asyncio

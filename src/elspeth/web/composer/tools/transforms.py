@@ -1814,6 +1814,8 @@ def _execute_splice_transform(
             state,
             candidate_errors=profile_validation.validation.errors,
             prior_errors=context.catalog.validate_composition_state(state).validation.errors,
+            predecessor_id=predecessor_id,
+            inserted_node_id=prepared_node.id,
         )
     new_state = replace(reconciled, version=state.version + 1)
     return _mutation_result(
@@ -1845,11 +1847,51 @@ def _rejection_subject_ref(component: str) -> str | None:
     return None
 
 
+def _splice_error_identity(
+    entry: ValidationEntry,
+    *,
+    predecessor_id: str,
+    inserted_node_id: str | None,
+) -> tuple[object, ...]:
+    """The identity a splice compares an error by, before and after the insertion.
+
+    A splice turns the edge ``predecessor -> successor`` into
+    ``predecessor -> inserted -> successor``. An error the successor already
+    had against the predecessor comes back naming the inserted node as its
+    producer, with a reworded message and possibly another component. An
+    entry whose typed contract detail names fields is therefore identified by
+    its code, its producer (the inserted node counted as the predecessor it
+    stands in for), its consumer and those fields; component and message are
+    ignored. Errors from any other producer stay distinct, so an error the
+    insertion causes on another edge into the same consumer is still new.
+
+    Every other entry, including a contract detail that names no fields, is
+    identified by its component, code and message.
+
+    ``inserted_node_id`` is ``None`` before the insertion: the pre-splice
+    state has no inserted node to map.
+    """
+    contract = entry.contract
+    if contract is not None and (contract.missing_fields or contract.extra_fields):
+        producer = predecessor_id if contract.producer == inserted_node_id else contract.producer
+        return (
+            "contract",
+            entry.error_code,
+            producer,
+            contract.consumer,
+            contract.missing_fields,
+            contract.extra_fields,
+        )
+    return ("entry", entry.component, entry.error_code, entry.message)
+
+
 def _splice_validation_rejection(
     state: CompositionState,
     *,
     candidate_errors: Sequence[ValidationEntry],
     prior_errors: Sequence[ValidationEntry],
+    predecessor_id: str,
+    inserted_node_id: str,
 ) -> ToolResult:
     """Reject a splice whose candidate fails context-aware validation, naming why.
 
@@ -1867,8 +1909,10 @@ def _splice_validation_rejection(
     ``plugin_identity`` is cleared: the entry was not produced from a name
     this handler resolved through the policy view, and absence is the safe
     value.
+
+    Whether an error was already there is decided by :func:`_splice_error_identity`.
     """
-    prior_keys = {(entry.component, entry.error_code, entry.message) for entry in prior_errors}
+    prior_keys = {_splice_error_identity(entry, predecessor_id=predecessor_id, inserted_node_id=None) for entry in prior_errors}
     forwarded = tuple(
         replace(
             entry,
@@ -1877,7 +1921,7 @@ def _splice_validation_rejection(
             rejected_component=_rejection_subject_ref(entry.component),
         )
         for entry in candidate_errors
-        if (entry.component, entry.error_code, entry.message) not in prior_keys
+        if _splice_error_identity(entry, predecessor_id=predecessor_id, inserted_node_id=inserted_node_id) not in prior_keys
     )
     rejection = _saved_graph_rejection_result(
         state, _SPLICE_VALIDATION_FAILED_MESSAGE, error_code="splice_validation_failed", rejected_component=None
