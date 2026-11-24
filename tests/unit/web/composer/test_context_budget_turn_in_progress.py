@@ -626,8 +626,11 @@ async def test_a_turns_first_call_is_priced_at_the_sessions_stored_density() -> 
 
     assert record.anchor_status == "no_previous_call"
     assert record.bytes_per_token == repr(4.4 * 0.9)
+    # The record says the density came from the session's stored call, as measured.
+    assert (record.surface, record.density_source, record.measured_bytes_per_token) == ("compose_loop", "stored_call", repr(4.4))
     # Control: with no stored call the same request is priced at the policy's fallback rate.
     _selected, fallback = await _fit_two_round_turn(
         service, llm_messages, recorder=BufferingRecorder(), history=ContextBudgetHistory.empty(), reply_stage=False
     )
     assert fallback.bytes_per_token == repr(service._context_budget_policy.fallback_bytes_per_token)
+    assert (fallback.density_source, fallback.measured_bytes_per_token) == ("fallback", None)

@@ -1598,10 +1598,6 @@ class AdvisorCheckpointOwner:
                 size_resend_pending = False
             else:
                 normal_attempts_used += 1
-            # The final verdict describes the last attempt. A rejection of an
-            # earlier, different request (a size resend sheds history) must not
-            # be reported for a later attempt that timed out or answered badly.
-            last_request_failure = None
             if format_reprompt_pending:
                 # The format instruction can change rendered budget overhead.
                 # Refit the same complete saved graph, never a fitted prefix.
@@ -1615,7 +1611,8 @@ class AdvisorCheckpointOwner:
                     "_elspeth_advisor_summary_parts": summary_parts,
                 }
             if continuation_budget is not None and not continuation_budget.reserve_attempt(now=_compose_deadline_time()):
-                return continuation_withheld()
+                # Withheld before this attempt went: the last call that did go keeps its rejection.
+                return continuation_withheld(provider_failure=last_request_failure)
             remaining: float | None = None
             if deadline is not None:
                 remaining = deadline - _compose_deadline_time()
@@ -1630,6 +1627,12 @@ class AdvisorCheckpointOwner:
                     if last_exc is None and not last_response_unparseable:
                         raise _AdvisorCheckpointComposeDeadlineExpired
                     break
+            # The final verdict describes the last attempt that went. A rejection
+            # of an earlier, different request (a size resend sheds history) must
+            # not be reported for a later attempt that timed out or answered
+            # badly; until this attempt goes, the last call's outcome stands.
+            last_request_failure = None
+            last_failure_retryable = True
             attempt_call_offset = len(recorder.llm_calls) if recorder is not None else 0
             # A size resend repeats this request, format instruction included, with the earlier turns left out.
             sent_arguments, sent_format_reprompt = call_arguments, format_reprompt_pending
@@ -1711,12 +1714,12 @@ class AdvisorCheckpointOwner:
                     )
                 if continuation_budget is not None and not continuation_budget.has_cost_headroom():
                     return continuation_withheld(provider_failure=last_request_failure)
+                last_failure_retryable = failure is None or failure.retryable
                 if request_size_rejection(exc) is not None and sent_earlier_turn and not leave_out_all_earlier:
                     leave_out_all_earlier = True
                     size_resend_pending = True
                     call_arguments, format_reprompt_pending = sent_arguments, sent_format_reprompt
                     continue
-                last_failure_retryable = failure is None or failure.retryable
                 if not last_failure_retryable:
                     # The primary path uses this same value-free policy.
                     # Repeating an unchanged rejected request cannot repair it.

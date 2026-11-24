@@ -1066,6 +1066,42 @@ async def test_a_size_resend_that_then_times_out_is_recorded_as_unavailable(tmp_
 
 
 @pytest.mark.asyncio
+async def test_a_size_resend_the_deadline_stops_before_dispatch_keeps_the_rejection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Only the first request reached the provider, and it was rejected for size.
+    # The resend never went, so the pass describes that rejection: not the
+    # advisor unavailable, and not worth repeating unchanged.
+    from elspeth.web.composer import advisor_checkpoint
+    from tests.unit.web.composer._helpers import _empty_state
+
+    records: list[Any] = []
+
+    async def capture(**kwargs: Any) -> None:
+        records.append(kwargs["record"])
+
+    monkeypatch.setattr(advisor_checkpoint, "persist_advisor_checkpoint_pass", capture)
+    sent = _scripted_advisor(monkeypatch, ["size", "ok"])
+    # The shared compose deadline passes once the first call has been made.
+    monkeypatch.setattr(advisor_checkpoint, "_compose_deadline_time", lambda: 0.0 if not sent else 1_000.0)
+    verdict = await _owner(tmp_path)._run_advisor_checkpoint(
+        phase="end",
+        state=_empty_state(),
+        session_id=None,
+        recorder=BufferingRecorder(),
+        publication_review=_review(_probe(8)),
+        deadline=100.0,
+    )
+
+    assert len(sent) == 1
+    assert (verdict.ok, verdict.failure_class, verdict.retryable) == (False, "request_rejected", False)
+    assert verdict.provider_failure is not None
+    assert verdict.provider_failure.details.reason_code == "context_length_exceeded"
+    (record,) = records
+    assert record.provider_attempts == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "script",
     [["size", "empty", "empty"], ["size", "junk", "empty"]],

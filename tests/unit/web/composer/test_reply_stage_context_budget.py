@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -365,9 +366,16 @@ async def test_control_a_provider_failure_at_the_reply_stage_keeps_its_call_reco
     assert turn.refusal_records() == []
 
 
+def _proxy_413() -> BaseException:
+    from tests.unit.web.composer.test_request_too_large import mapped_provider_error
+
+    return mapped_provider_error("openai", 413)
+
+
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cause", [_too_long, _proxy_413], ids=["context-limit", "http-413"])
 async def test_reply_stage_resends_size_rejection_without_earlier_turns(
-    tmp_path: Path, sessions: SessionServiceImpl, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, sessions: SessionServiceImpl, monkeypatch: pytest.MonkeyPatch, cause: Callable[[], BaseException]
 ) -> None:
     turn = _Turn(tmp_path, sessions, monkeypatch)
     turn.history = _history()
@@ -380,7 +388,7 @@ async def test_reply_stage_resends_size_rejection_without_earlier_turns(
             rejected = True
             scripted.messages.append(messages)
             scripted.tools.append(tools)
-            raise _BadRequestLLMError("LLM request rejected") from _too_long()
+            raise _BadRequestLLMError("LLM request rejected") from cause()
         return await scripted(messages, tools, **kwargs)
 
     monkeypatch.setattr(turn, "llm", _CallableLLM(_reply, scripted))
