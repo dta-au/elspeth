@@ -71,7 +71,7 @@ def _setup() -> _Setup:
     return _Setup(recorder, member, item, state_id)
 
 
-def _record_state_call(setup: _Setup, *, latency_ms: float = 12.5) -> None:
+def _record_state_call(setup: _Setup, *, latency_ms: float = 12.5, token_usage: TokenUsage = _USAGE) -> None:
     setup.recorder.execution.record_call(
         setup.state_id,
         0,
@@ -80,7 +80,7 @@ def _record_state_call(setup: _Setup, *, latency_ms: float = 12.5) -> None:
         RawCallPayload(_REQUEST),
         RawCallPayload(_RESPONSE),
         latency_ms=latency_ms,
-        token_usage=_USAGE,
+        token_usage=token_usage,
         call_id="attempt-late-1",
         member_token=setup.member,
         work_item=setup.item,
@@ -309,8 +309,22 @@ def test_refused_call_record_lost_to_a_db_fault_is_logged_with_its_identity(
     assert "completion_tokens=45" in message
 
 
-def test_refused_call_with_non_finite_latency_keeps_the_refusal_and_logs_the_call(caplog: pytest.LogCaptureFixture) -> None:
-    """A value the audit store cannot hold must not replace the fence's refusal."""
+@pytest.mark.parametrize(
+    ("latency_ms", "token_usage", "logged"),
+    [
+        pytest.param(float("nan"), _USAGE, ("latency_ms=nan", "prompt_tokens=120"), id="non_finite_latency"),
+        pytest.param(
+            12.5,
+            TokenUsage(prompt_tokens=2**53, completion_tokens=45),
+            ("latency_ms=12.5", f"prompt_tokens={2**53}"),
+            id="token_count_beyond_canonical_integer_range",
+        ),
+    ],
+)
+def test_refused_call_with_a_value_canonical_json_refuses_keeps_the_refusal_and_logs_the_call(
+    caplog: pytest.LogCaptureFixture, latency_ms: float, token_usage: TokenUsage, logged: tuple[str, str]
+) -> None:
+    """A provider value the contracts admit but the audit store cannot hold must not replace the fence's refusal."""
     from elspeth.core.landscape import run_coordination_repository
 
     setup = _setup()
@@ -322,7 +336,7 @@ def test_refused_call_with_non_finite_latency_keeps_the_refusal_and_logs_the_cal
         )
 
     with caplog.at_level("ERROR", logger=run_coordination_repository.__name__), pytest.raises(SchedulerLeaseLostError):
-        _record_state_call(setup, latency_ms=float("nan"))
+        _record_state_call(setup, latency_ms=latency_ms, token_usage=token_usage)
 
     assert _call_count(setup) == 0
     assert _fence_refusals(setup) == []
@@ -330,7 +344,7 @@ def test_refused_call_with_non_finite_latency_keeps_the_refusal_and_logs_the_cal
     assert len(lost) == 1
     assert lost[0].levelname == "ERROR"
     message = lost[0].getMessage()
-    assert "(non-finite latency_ms)" in message
+    assert "(not canonical JSON: " in message
     assert "call_id='attempt-late-1'" in message
-    assert "prompt_tokens=120" in message
-    assert "latency_ms=nan" in message
+    for fragment in logged:
+        assert fragment in message

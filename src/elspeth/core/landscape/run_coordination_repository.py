@@ -54,7 +54,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import math
 import os
 import socket
 from collections.abc import Iterator, Mapping, Sequence
@@ -683,13 +682,33 @@ def record_refused_call(
     row carrying ``refused_call`` is the call's. The item-lease fence writes no
     row of its own.
 
-    When the audit store cannot hold the event (a DB fault, or a non-finite
-    latency that canonical JSON rejects), the last-resort ERROR log carries the
-    call's identity and usage, formatted without canonical JSON.
+    When the audit store cannot hold the event, the last-resort ERROR log
+    carries the call's identity and usage, formatted without canonical JSON.
+    That covers a DB fault, and a provider-reported value the contracts admit
+    but canonical JSON refuses: a non-finite latency, or a token count beyond
+    the canonical integer range. The context is encoded here with the writer's
+    own encoder first, so no such value can raise inside the caller's unwind.
     """
-    if refused_call.latency_ms is not None and not math.isfinite(refused_call.latency_ms):
+    context = {
+        "verb": verb,
+        "fence": fence,
+        "work_item_id": work_item_id,
+        "attempt": attempt,
+        "refused_call": refused_call.event_context(),
+    }
+    try:
+        canonical_json(context)
+    except (ValueError, TypeError) as exc:
+        # canonical_json's documented refusals: ValueError for a non-finite
+        # float or an out-of-range integer (rfc8785 domain errors subclass it),
+        # TypeError for a type it cannot encode.
         _log_unrecorded_refused_call(
-            run_id=run_id, worker_id=worker_id, verb=verb, fence=fence, refused_call=refused_call, cause="non-finite latency_ms"
+            run_id=run_id,
+            worker_id=worker_id,
+            verb=verb,
+            fence=fence,
+            refused_call=refused_call,
+            cause=f"not canonical JSON: {type(exc).__name__}",
         )
         return
     outcome = _record_best_effort_event(
@@ -699,13 +718,7 @@ def record_refused_call(
         worker_id=worker_id,
         leader_epoch=leader_epoch,
         recorded_at=datetime.now(UTC),
-        context={
-            "verb": verb,
-            "fence": fence,
-            "work_item_id": work_item_id,
-            "attempt": attempt,
-            "refused_call": refused_call.event_context(),
-        },
+        context=context,
     )
     if outcome is BestEffortEventOutcome.LOST_TO_DB_FAULT:
         _log_unrecorded_refused_call(
