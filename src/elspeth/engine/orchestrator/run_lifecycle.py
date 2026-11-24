@@ -254,7 +254,7 @@ class RunLifecycleCoordinator:
                         "run has crossed its first-effect boundary; checkpoint resume is required",
                         cause=ResumeRefusalCause.FIRST_EFFECT_BOUNDARY_CROSSED,
                     )
-                leader = factory.run_coordination.live_leader(run_id=run.run_id)
+                leader = factory.run_coordination.seat_holder(run_id=run.run_id)
                 if leader is not None and leader.leader_worker_id == worker_id:
                     coordination_token = CoordinationToken(run_id=run.run_id, worker_id=worker_id, leader_epoch=leader.leader_epoch)
                 else:

@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
@@ -280,6 +282,60 @@ def test_deliberate_caddy_buffering_falls_back_to_same_job_get(tmp_path: Path) -
             harness.composer.release.set()
 
 
+# Chromium closes an open HTTP/2 stream with this net error when the client host
+# gains an address (measured: a container start on the test host). The observer
+# then completes the job through the durable GET fallback.
+CHROMIUM_NETWORK_CHANGED = "net::ERR_NETWORK_CHANGED"
+
+
+@dataclass(frozen=True, slots=True)
+class BrowserObservation:
+    """What the in-browser observer saw, parsed from the Playwright program's output."""
+
+    requests: tuple[tuple[str, str], ...]
+    request_failures: tuple[tuple[str, str, str], ...]
+    stream_events: tuple[str, ...]
+    saw_progress: bool
+    saw_heartbeat: bool
+
+    @classmethod
+    def from_evidence(cls, evidence: Mapping[str, object]) -> BrowserObservation:
+        requests = evidence["requests"]
+        failures = evidence["requestFailures"]
+        frames = evidence["frameEvents"]
+        assert isinstance(requests, list) and isinstance(failures, list) and isinstance(frames, list), evidence
+        saw_progress, saw_heartbeat = evidence["sawProgress"], evidence["sawHeartbeat"]
+        assert isinstance(saw_progress, bool) and isinstance(saw_heartbeat, bool), evidence
+        return cls(
+            requests=tuple((str(item["method"]), str(item["path"])) for item in requests),
+            request_failures=tuple((str(item["method"]), str(item["path"]), str(item["error"])) for item in failures),
+            stream_events=tuple(str(frame["event"]) for frame in frames),
+            saw_progress=saw_progress,
+            saw_heartbeat=saw_heartbeat,
+        )
+
+
+def assert_healthy_stream_delivery(observation: BrowserObservation, *, durable_path: str) -> None:
+    """Healthy proxy: one stream delivers the terminal frame and the observer never falls back.
+
+    The one exception is a stream that Chromium closed with net::ERR_NETWORK_CHANGED, matched by
+    its exact error code. That is a client-side network change, not a transport defect. There the
+    durable GET fallback must have done the work instead.
+    """
+    stream_path = f"{durable_path}/stream"
+    streams = observation.requests.count(("GET", stream_path))
+    durable_reads = observation.requests.count(("GET", durable_path))
+    stream_failures = [error for method, path, error in observation.request_failures if (method, path) == ("GET", stream_path)]
+    assert streams == 1, observation
+    if stream_failures == [CHROMIUM_NETWORK_CHANGED]:
+        assert durable_reads > 1, observation
+        return
+    assert "terminal" in observation.stream_events, observation
+    assert durable_reads == 1, observation
+    assert observation.saw_progress, observation
+    assert observation.saw_heartbeat, observation
+
+
 @pytest.mark.parametrize("proxy_mode", ["healthy", "buffered", "idle-cutoff"])
 def test_production_browser_observer_completes_same_job_over_tls(tmp_path: Path, proxy_mode: str) -> None:
     """Bundle and execute the shipped observer/custody/decoder inside Chromium."""
@@ -390,12 +446,18 @@ const browser = await chromium.launch({ headless: true });
 try {
   const context = await browser.newContext({ ignoreHTTPSErrors: true });
   const page = await context.newPage();
+  // Chromium's own net error for every failed request, so a client-side network
+  // change can be told apart from a transport defect by its exact code.
+  const requestFailures = [];
+  page.on('requestfailed', request => requestFailures.push({
+    method: request.method(), path: new URL(request.url()).pathname, error: request.failure()?.errorText ?? '',
+  }));
   await page.goto(baseUrl + '/docs');
   await page.addScriptTag({ url: baseUrl + '/__acceptance/observer.js' });
   const result = await page.evaluate(args => window.runComposerAcceptance(args), {
     token, sessionId, operationId, releaseDelay: Number(releaseDelay),
   });
-  console.log(JSON.stringify(result));
+  console.log(JSON.stringify({ ...result, requestFailures }));
   await context.close();
 } finally { await browser.close(); }
 """
@@ -436,8 +498,7 @@ try {
             assert {"method": "GET", "path": durable_path} in evidence["requests"]
             assert harness.composer.calls == 1
             if proxy_mode == "healthy":
-                assert evidence["sawProgress"], evidence
-                assert evidence["sawHeartbeat"], evidence
+                assert_healthy_stream_delivery(BrowserObservation.from_evidence(evidence), durable_path=durable_path)
             else:
                 assert not evidence["sawHeartbeat"]
         finally:

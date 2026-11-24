@@ -53,6 +53,17 @@ def _explicit_originals(error: BaseException) -> tuple[BaseException, ...]:
     return tuple(found)
 
 
+def _recording_close_release(authority, epochs):
+    """Record a lease close's release epoch alongside plain releases, then run the real close release."""
+    original = authority.release_at_close
+
+    def close_release(context):
+        epochs.append(context.fence.operation_epoch)
+        return original(context)
+
+    return close_release
+
+
 async def _wait_for(entered: threading.Event) -> None:
     for _ in range(500):
         if entered.is_set():
@@ -337,6 +348,11 @@ async def test_failed_fresh_terminal_sql_keeps_projection_pending_and_escalates(
         raise fresh_error
 
     monkeypatch.setattr(service.session_operation_authority, "release", observed_release)
+    monkeypatch.setattr(
+        service.session_operation_authority,
+        "release_at_close",
+        _recording_close_release(service.session_operation_authority, released_epochs),
+    )
     monkeypatch.setattr(authority, "settle_lost", failed_fresh_terminal)
     key = (record.session_id, record.operation_id)
     try:
@@ -384,6 +400,11 @@ async def test_failed_physical_readback_cannot_complete_fresh_projection_or_rele
 
     monkeypatch.setattr(authority, "get", failed_readback)
     monkeypatch.setattr(service.session_operation_authority, "release", observed_release)
+    monkeypatch.setattr(
+        service.session_operation_authority,
+        "release_at_close",
+        _recording_close_release(service.session_operation_authority, released_epochs),
+    )
     key = (record.session_id, record.operation_id)
     owners = tuple(worker._jobs.values())
     assert len(owners) == 1
@@ -453,6 +474,11 @@ async def test_foreign_real_database_readback_refuses_fresh_projection(tmp_path,
 
     monkeypatch.setattr(authority, "get", foreign_physical_readback)
     monkeypatch.setattr(service.session_operation_authority, "release", observed_release)
+    monkeypatch.setattr(
+        service.session_operation_authority,
+        "release_at_close",
+        _recording_close_release(service.session_operation_authority, released_epochs),
+    )
     monkeypatch.setattr(authority, "settle_lost", observed_settle)
     key = (record.session_id, record.operation_id)
     try:
@@ -505,6 +531,11 @@ async def test_same_job_returned_value_disagreement_refuses_projection_with_boun
 
     monkeypatch.setattr(authority, "settle_lost", commit_then_corrupt_return)
     monkeypatch.setattr(service.session_operation_authority, "release", observed_release)
+    monkeypatch.setattr(
+        service.session_operation_authority,
+        "release_at_close",
+        _recording_close_release(service.session_operation_authority, released_epochs),
+    )
     key = (record.session_id, record.operation_id)
     owners = tuple(worker._jobs.values())
     assert len(owners) == 1
@@ -646,7 +677,15 @@ async def test_repeated_close_waiter_cancellation_joins_physical_release_error(t
         assert fresh_release.wait(timeout=10)
         raise close_error
 
+    def failed_fresh_close_release(context):
+        # The fresh lease's close releases through release_at_close.
+        released_epochs.append(context.fence.operation_epoch)
+        fresh_entered.set()
+        assert fresh_release.wait(timeout=10)
+        raise close_error
+
     monkeypatch.setattr(service.session_operation_authority, "release", failed_fresh_release)
+    monkeypatch.setattr(service.session_operation_authority, "release_at_close", failed_fresh_close_release)
     key = (record.session_id, record.operation_id)
     owners = tuple(worker._jobs.values())
     assert len(owners) == 1
@@ -715,13 +754,22 @@ async def test_successful_fresh_close_hands_off_late_waiter_originals_before_cle
     key = (record.session_id, record.operation_id)
     observations = worker._adoption_recovery_cancellations[key]
 
+    original_close_release = service.session_operation_authority.release_at_close
+
     def hold_fresh_release(context):
         if context.fence.operation_epoch > record.session_operation_epoch:
             fresh_entered.set()
             assert fresh_release.wait(timeout=10)
         return original_release(context)
 
+    def hold_fresh_close_release(context):
+        if context.fence.operation_epoch > record.session_operation_epoch:
+            fresh_entered.set()
+            assert fresh_release.wait(timeout=10)
+        return original_close_release(context)
+
     monkeypatch.setattr(service.session_operation_authority, "release", hold_fresh_release)
+    monkeypatch.setattr(service.session_operation_authority, "release_at_close", hold_fresh_close_release)
     owners = tuple(worker._jobs.values())
     assert len(owners) == 1
     delivered = _observe_owner_shield_deliveries(monkeypatch, owners[0], fresh_entered, fresh_release, "SessionOperationLease.close")
@@ -797,6 +845,13 @@ async def test_failed_adoption_release_retains_physical_child_cancel_separately_
 
     monkeypatch.setattr(lifecycle, "_retain_cancellation", observed_retain)
     monkeypatch.setattr(service.session_operation_authority, "release", release_then_physical_cancel)
+    original_close_release = service.session_operation_authority.release_at_close
+
+    def observed_close_release(context):
+        actual_release_calls.append(context)
+        return original_close_release(context)
+
+    monkeypatch.setattr(service.session_operation_authority, "release_at_close", observed_close_release)
     owners = tuple(worker._jobs.values())
     assert len(owners) == 1
     try:
@@ -1138,6 +1193,14 @@ async def test_adoption_task_allocated_then_factory_raises_keeps_unknown_custody
 
     monkeypatch.setattr(service.session_operation_authority, "compare_and_swap", held_real_cas)
     monkeypatch.setattr(service.session_operation_authority, "release", observe_release)
+    original_close_release = service.session_operation_authority.release_at_close
+
+    def observe_close_release(context):
+        nonlocal release_calls
+        release_calls += 1
+        return original_close_release(context)
+
+    monkeypatch.setattr(service.session_operation_authority, "release_at_close", observe_close_release)
     monkeypatch.setattr(authority, "settle_lost", observe_fresh_writer)
     monkeypatch.setattr(lifecycle.asyncio, "create_task", allocate_then_raise)
     key = (record.session_id, record.operation_id)

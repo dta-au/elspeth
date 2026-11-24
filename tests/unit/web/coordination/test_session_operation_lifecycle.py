@@ -13,6 +13,7 @@ import pytest
 from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError
 from elspeth.web.coordination.contracts import (
     ArchiveDeleteReconciliation,
+    CloseReleaseOutcome,
     FenceLossReason,
     SessionOperationContext,
     SessionOperationFence,
@@ -21,7 +22,7 @@ from elspeth.web.coordination.contracts import (
     SessionOperationLeaseDisposition,
     SessionOperationTerminalOutcomeUnknown,
 )
-from elspeth.web.coordination.lifecycle import SessionOperationLease
+from elspeth.web.coordination.lifecycle import CLOSE_RELEASE_AFTER_RENEWAL_FAILURE, SessionOperationLease
 from elspeth.web.sessions.protocol import SessionOperationAuthority
 
 
@@ -148,6 +149,10 @@ class _FakeAuthority:
         finally:
             self.release_finished.set()
 
+    def release_at_close(self, context: SessionOperationContext) -> CloseReleaseOutcome:
+        self.release(context)
+        return CloseReleaseOutcome.RELEASED_LIVE
+
     def archive_delete(self, context: SessionOperationContext) -> None:
         with self._lock:
             self.archive_delete_calls.append(context)
@@ -267,14 +272,55 @@ async def test_renewal_fence_loss_is_recorded_surfaced_and_never_released() -> N
 
 
 @pytest.mark.asyncio
-async def test_non_fence_renewal_failure_is_surfaced_without_uncertain_release() -> None:
+@pytest.mark.parametrize("error_type", CLOSE_RELEASE_AFTER_RENEWAL_FAILURE.error_types, ids=lambda error_type: error_type.__name__)
+async def test_known_outcome_renewal_failure_is_surfaced_and_the_close_releases_its_own_fence(
+    error_type: type[BaseException],
+) -> None:
     authority = _FakeAuthority()
-    failure = OSError("renewal transport unavailable")
+    # Built without its constructor so the case list is exactly the owned
+    # constant: a type added to it is covered here with no second list.
+    failure = error_type.__new__(error_type)
     authority.renew_error = failure
     lease = await _acquire(authority)
 
     assert await lease.wait_until_lost() is failure
-    with pytest.raises(OSError) as close_error:
+    with pytest.raises(error_type) as close_error:
+        await lease.close()
+
+    assert close_error.value is failure
+    assert authority.release_calls == [authority.context]
+    assert lease.disposition is SessionOperationLeaseDisposition.LOST
+
+
+@pytest.mark.parametrize("reason", tuple(FenceLossReason), ids=lambda reason: reason.value)
+def test_only_the_owned_fence_loss_reasons_leave_a_fence_to_release_at_close(reason: FenceLossReason) -> None:
+    admitted = CLOSE_RELEASE_AFTER_RENEWAL_FAILURE.admits(SessionOperationFenceLost(reason), operation_kind=SessionOperationKind.COMPOSE)
+
+    assert admitted is (reason in CLOSE_RELEASE_AFTER_RENEWAL_FAILURE.fence_loss_reasons)
+
+
+@pytest.mark.parametrize("kind", tuple(SessionOperationKind), ids=lambda kind: kind.value)
+def test_an_excluded_kind_never_releases_after_a_failed_renewal(kind: SessionOperationKind) -> None:
+    """Every admitted renewal outcome is refused for an excluded kind, and only for it."""
+    outcomes: list[BaseException] = [SessionOperationFenceLost(reason) for reason in CLOSE_RELEASE_AFTER_RENEWAL_FAILURE.fence_loss_reasons]
+    outcomes.extend(error_type.__new__(error_type) for error_type in CLOSE_RELEASE_AFTER_RENEWAL_FAILURE.error_types)
+    excluded = kind in CLOSE_RELEASE_AFTER_RENEWAL_FAILURE.excluded_operation_kinds
+
+    assert CLOSE_RELEASE_AFTER_RENEWAL_FAILURE.admits(None, operation_kind=kind) is True
+    for outcome in outcomes:
+        assert CLOSE_RELEASE_AFTER_RENEWAL_FAILURE.admits(outcome, operation_kind=kind) is not excluded
+
+
+@pytest.mark.asyncio
+async def test_renewal_failure_of_unknown_kind_is_surfaced_without_a_release() -> None:
+    authority = _FakeAuthority()
+    failure = RuntimeError("renewal failed for an unclassified reason")
+    assert not isinstance(failure, CLOSE_RELEASE_AFTER_RENEWAL_FAILURE.error_types)
+    authority.renew_error = failure
+    lease = await _acquire(authority)
+
+    assert await lease.wait_until_lost() is failure
+    with pytest.raises(RuntimeError) as close_error:
         await lease.close()
 
     assert close_error.value is failure
@@ -850,7 +896,9 @@ async def test_known_loss_cancels_owned_tasks_and_leaks_no_background_renewal() 
     assert owned.cancelled()
     assert owned_cancelled.is_set()
     assert len(authority.renew_calls) == renew_count_after_close
-    assert authority.release_calls == []
+    # A passed deadline leaves the row with this lease's identity; the close
+    # releases it after the owned task is cancelled and renewal has stopped.
+    assert authority.release_calls == [authority.context]
 
 
 @pytest.mark.asyncio

@@ -197,7 +197,7 @@ def inspect_leaderless_run(db: LandscapeDB, run_id: str) -> LeaderlessRunPreflig
             refusal_cause=ResumeRefusalCause.RUN_NOT_FOUND,
         )
 
-    leader = RunCoordinationRepository(db.engine).live_leader(run_id=run_id)
+    leader = RunCoordinationRepository(db.engine).seat_holder(run_id=run_id)
     source_lifecycle = check_source_lifecycle_resumable(db, run_id).lifecycle_by_source
     resume_check = _resume_verdict(db, run_id)
 

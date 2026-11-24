@@ -778,7 +778,7 @@ def _craft_crashed_lease(
     Returns the crashed token_id.
     """
     coordination = crashed.factory.run_coordination
-    owns_fixture_seat = coordination.live_leader(run_id=crashed.run_id) is None
+    owns_fixture_seat = coordination.seat_holder(run_id=crashed.run_id) is None
     with crashed.db.engine.connect() as conn:
         run = conn.execute(select(runs_table.c.status, runs_table.c.config_hash).where(runs_table.c.run_id == crashed.run_id)).one()
     if owns_fixture_seat:
