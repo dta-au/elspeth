@@ -24,7 +24,8 @@ changes land and is not a release.
   when its wait plus 5 s still fits before the job deadline. This also applies
   to their existing retries after a provider 503. When it does not fit, the main
   loop reports the provider failure at once. After a 503 the planner waits
-  until the deadline and reports a time-out instead of making one last call;
+  until the deadline and reports a time-out instead of making one last call,
+  or reports a call-budget refusal at once if the failed call used the last one;
   after a 429 it reports the provider failure at once. The completion review keeps
   its existing immediate retry and does not retry a 429.
 - **Do not enable a composer token quota yet.** With one configured, a failed

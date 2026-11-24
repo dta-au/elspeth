@@ -5442,6 +5442,20 @@ _SUCCEEDED = [ComposerLLMCallStatus.SUCCESS]
         pytest.param(False, (None,), 1, 3, "PROVIDER_CALLS_EXHAUSTED", [], _FAILED, id="delay-fits-at-call-cap"),
         # The refusal comes from the final attempt's loop head, not past the loop.
         pytest.param(False, (0.5,), 1, 2, "PROVIDER_CALLS_EXHAUSTED", [], _FAILED, id="call-cap-before-final-attempt"),
+        # The cap is reached by the second failing call: the refusal still comes from the loop head.
+        pytest.param(
+            False, (None, None), 2, 3, "PROVIDER_CALLS_EXHAUSTED", [1.0], [*_FAILED, *_FAILED], id="attempt-2-delay-fits-at-call-cap"
+        ),
+        pytest.param(
+            False,
+            (None, 4.0),
+            2,
+            3,
+            "PROVIDER_CALLS_EXHAUSTED",
+            [1.0],
+            [*_FAILED, *_FAILED],
+            id="attempt-2-delay-past-deadline-at-call-cap",
+        ),
         # The delay fits but the 5 s call margin does not: no call is started.
         pytest.param(False, (5.99,), 4, 3, "TIMEOUT", [5.99], _FAILED, id="inside-call-margin"),
         # Exactly the delay plus the call margin: the retry is made.
@@ -5461,6 +5475,26 @@ _SUCCEEDED = [ComposerLLMCallStatus.SUCCESS]
         ),
         pytest.param(True, (0.5,), 3, 3, "DISCOVERY_EXHAUSTED", [], [*_DISCOVERY, *_FAILED], id="hatch-at-call-cap"),
         pytest.param(True, (None,), 3, 3, "DISCOVERY_EXHAUSTED", [], [*_DISCOVERY, *_FAILED], id="hatch-delay-fits-at-call-cap"),
+        pytest.param(
+            True,
+            (None, None),
+            4,
+            3,
+            "DISCOVERY_EXHAUSTED",
+            [1.0],
+            [*_DISCOVERY, *_FAILED, *_FAILED],
+            id="hatch-attempt-2-delay-fits-at-call-cap",
+        ),
+        pytest.param(
+            True,
+            (None, 4.0),
+            4,
+            3,
+            "DISCOVERY_EXHAUSTED",
+            [1.0],
+            [*_DISCOVERY, *_FAILED, *_FAILED],
+            id="hatch-attempt-2-delay-past-deadline-at-call-cap",
+        ),
     ],
 )
 async def test_planner_503_whose_retry_does_not_fit_ends_with_the_loop_head_outcome(
