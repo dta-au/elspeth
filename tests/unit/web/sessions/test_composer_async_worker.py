@@ -4,17 +4,24 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, replace
+from itertools import pairwise
 from uuid import uuid4
 
 import pytest
+from sqlalchemy.exc import OperationalError
+from structlog.testing import capture_logs
 
 from elspeth.contracts.composer_progress import ComposerProgressEvent
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.composer.progress import ComposerProgressRegistry
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 from elspeth.web.coordination.database_clock import database_now
+from elspeth.web.coordination.repository import SessionOperationConflictError
+from elspeth.web.coordination.upkeep_engine import lease_upkeep_authority
 from elspeth.web.process_recovery import ProcessRecovery
+from elspeth.web.process_watchdog_codec import RecoveryReason
 from elspeth.web.required_work import RequiredWorkSource, required_failure_leaves
 from elspeth.web.sessions import composer_async_worker as worker_module
 from elspeth.web.sessions.composer_async_worker import ComposerAsyncWorker
@@ -102,14 +109,14 @@ async def test_exact_progress_recompose_custody_and_finished_lease() -> None:
     await registry.finish_request(first)
 
 
-def _worker(app, authority) -> ComposerAsyncWorker:
+def _worker(app, authority, *, scan_interval_seconds: float = 0.01) -> ComposerAsyncWorker:
     app.state.plugin_snapshot_factory = _SnapshotFactory(app.state.plugin_snapshot_factory)
     instance_draining = threading.Event()
     return ComposerAsyncWorker(
         app=app,
         authority=authority,
         concurrency=2,
-        scan_interval_seconds=0.01,
+        scan_interval_seconds=scan_interval_seconds,
         claim_lease_seconds=30,
         drain_seconds=0.05,
         owner_instance_id=app.state.session_service.session_operation_owner_instance_id,
@@ -651,4 +658,297 @@ async def test_cancel_unclaimed_job_never_dispatches_provider(tmp_path) -> None:
         assert current is not None and current.failure_code == "request_cancelled"
         assert composer.calls == 0
     finally:
+        engine.dispose()
+
+
+def _transient_claim_error() -> OperationalError:
+    return OperationalError("UPDATE composer_operations", {}, Exception("database is locked"))
+
+
+async def _poll_loop_with_claim_failures(
+    tmp_path,
+    monkeypatch,
+    failures: list[BaseException | None],
+    *,
+    scan_interval_seconds: float = 0.01,
+    queued_reap_failures: list[BaseException] | None = None,
+):
+    """Start a worker whose first ``len(failures)`` claim scans raise, in order (``None`` scans normally).
+
+    ``queued_reap_failures`` likewise raise from the first expired-queued
+    reap reads. Returns the admitted record, the worker, its watchdog, the
+    authority and the engine, plus the monotonic start time of each claim
+    scan attempted.
+    """
+    app, service, engine, _composer = _file_app(tmp_path)
+    authority = ComposerAsyncOperationAuthority(
+        engine, owner_instance_id=service.session_operation_owner_instance_id, claim_lease_seconds=30
+    )
+    record = await _admit(app, service, authority, operation_id=str(uuid4()))
+    worker = _worker(app, authority, scan_interval_seconds=scan_interval_seconds)
+    actual_claim_next = authority.claim_next
+    scans: list[float] = []
+    pending = list(failures)
+
+    def claim_next(*, limit: int):
+        scans.append(time.monotonic())
+        failure = pending.pop(0) if pending else None
+        if failure is not None:
+            raise failure
+        return actual_claim_next(limit=limit)
+
+    monkeypatch.setattr(authority, "claim_next", claim_next)
+    if queued_reap_failures is not None:
+        actual_list_expired_queued = authority.list_expired_queued
+        pending_reap = queued_reap_failures
+
+        def list_expired_queued(*, limit: int):
+            if pending_reap:
+                raise pending_reap.pop(0)
+            return actual_list_expired_queued(limit=limit)
+
+        monkeypatch.setattr(authority, "list_expired_queued", list_expired_queued)
+    worker.start()
+    return record, worker, worker._process_recovery.watchdog, authority, engine, scans
+
+
+async def _until(predicate, *, seconds: float = 10.0) -> bool:
+    deadline = asyncio.get_running_loop().time() + seconds
+    while not predicate():
+        if asyncio.get_running_loop().time() >= deadline:
+            return False
+        await asyncio.sleep(0.01)
+    return True
+
+
+@pytest.mark.asyncio
+async def test_poll_loop_survives_one_transient_claim_error(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    record, worker, watchdog, authority, engine, scans = await _poll_loop_with_claim_failures(
+        tmp_path, monkeypatch, [_transient_claim_error()]
+    )
+    try:
+
+        def completed() -> bool:
+            current = authority.get(session_id=record.session_id, operation_id=record.operation_id)
+            return current is not None and current.status == "completed"
+
+        settled = await _until(lambda: completed() or worker._loop_task.done())
+        assert not worker._loop_task.done(), f"one transient claim error ended the poll loop; recovery reasons {watchdog.reasons}"
+        assert settled and completed(), "the admitted job must still run after the transient error"
+        assert len(scans) >= 2
+        assert watchdog.reasons == [] and watchdog.signals == []
+    finally:
+        await worker.stop()
+        engine.dispose()
+
+
+async def _assert_poll_loop_escalates(tmp_path, monkeypatch, failures: list[BaseException]) -> int:
+    _record, worker, watchdog, _authority, engine, scans = await _poll_loop_with_claim_failures(tmp_path, monkeypatch, failures)
+    try:
+        assert await _until(lambda: worker._loop_task.done()), "the poll loop must end"
+        assert type(worker._loop_task.exception()) is type(failures[-1])
+        assert await _until(lambda: bool(watchdog.signals))
+        assert watchdog.reasons == [RecoveryReason.REQUIRED_WORKER_LOST]
+        return len(scans)
+    finally:
+        await worker.stop()
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_poll_loop_escalates_at_the_consecutive_transient_cap(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Five in a row: the bound shared with session-lease renewal, membership
+    # and the orphan sweeper.
+    scans = await _assert_poll_loop_escalates(tmp_path, monkeypatch, [_transient_claim_error() for _ in range(5)])
+    assert scans == 5
+
+
+@pytest.mark.asyncio
+async def test_poll_loop_escalates_on_one_non_transient_claim_error(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    scans = await _assert_poll_loop_escalates(tmp_path, monkeypatch, [RuntimeError("claim defect")])
+    assert scans == 1
+
+
+@pytest.mark.asyncio
+async def test_poll_loop_bound_counts_only_consecutive_transient_errors(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Eight transient errors, never five in a row: one good scan between two
+    # runs of four resets the count, so the loop keeps running.
+    failures: list[BaseException | None] = [_transient_claim_error() for _ in range(4)]
+    failures += [None, *(_transient_claim_error() for _ in range(4))]
+    record, worker, watchdog, authority, engine, scans = await _poll_loop_with_claim_failures(tmp_path, monkeypatch, failures)
+    try:
+
+        def completed() -> bool:
+            current = authority.get(session_id=record.session_id, operation_id=record.operation_id)
+            return current is not None and current.status == "completed"
+
+        assert await _until(lambda: len(scans) > len(failures) or worker._loop_task.done())
+        assert not worker._loop_task.done(), f"non-consecutive transient errors ended the poll loop; recovery reasons {watchdog.reasons}"
+        assert await _until(completed), "the admitted job must still run"
+        assert watchdog.reasons == [] and watchdog.signals == []
+    finally:
+        await worker.stop()
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_poll_loop_waits_a_full_interval_after_a_failed_scan_despite_new_work(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # New submissions set the worker's wake; after a failed scan the loop must
+    # still wait its whole scan interval, or a burst of submissions would spend
+    # the consecutive bound in a moment.
+    interval = 0.25
+    _record, worker, _watchdog, _authority, engine, scans = await _poll_loop_with_claim_failures(
+        tmp_path, monkeypatch, [_transient_claim_error(), _transient_claim_error()], scan_interval_seconds=interval
+    )
+    try:
+        while len(scans) < 3 and not worker._loop_task.done():
+            worker.notify_work()
+            await asyncio.sleep(0.005)
+        assert not worker._loop_task.done()
+        gaps = [later - earlier for earlier, later in pairwise(scans[:3])]
+        assert all(gap >= 0.9 * interval for gap in gaps), gaps
+    finally:
+        await worker.stop()
+        engine.dispose()
+
+
+async def _poll_loop_reaping_one_lease(tmp_path, monkeypatch, *, fault: str):
+    """Start a worker whose first reap finds one expired running job and fails on it.
+
+    ``fault`` is ``"acquire"`` (the lease's acquire SQL raises),
+    ``"release"`` (the settle succeeds and the lease's release SQL raises),
+    ``"own_lapsed"`` (the lease is refused, the job is this instance's, and
+    settle_own_lapsed raises) or ``"own_lapsed_committed"`` (as
+    ``"own_lapsed"``, but a real terminal write for the job commits first).
+    Returns the worker, its watchdog, the engine, the raised error, the
+    composer authority and the admitted record.
+    """
+    app, service, engine, _composer = _file_app(tmp_path)
+    authority = ComposerAsyncOperationAuthority(
+        engine, owner_instance_id=service.session_operation_owner_instance_id, claim_lease_seconds=30
+    )
+    record = await _admit(app, service, authority, operation_id=str(uuid4()))
+    worker = _worker(app, authority)
+    error = _transient_claim_error()
+    own = fault in ("own_lapsed", "own_lapsed_committed")
+    listed = record
+    if own:
+        # The listing reports this instance as the job's claim owner. This is
+        # the queued claimed shape (token, owner, expiry, first attempt), not
+        # the running shape list_expired_running returns: the reap routing
+        # reads only the claim owner and request id. The committed case's
+        # real settle_unstarted write stands in for the settlement's commit;
+        # the real committed state is covered by the PostgreSQL test.
+        listed = replace(
+            record,
+            claim_token_present=True,
+            claim_owner_instance_id=worker._owner_instance_id,
+            claim_expires_at=record.created_at,
+            attempt=1,
+        )
+    expired = [listed]
+    monkeypatch.setattr(authority, "list_expired_running", lambda *, limit: [expired.pop()] if expired else [])
+    lease_authority = app.state.session_service.session_operation_authority
+    if fault == "acquire":
+
+        def failing_acquire(**_kwargs):
+            raise error
+
+        monkeypatch.setattr(lease_authority, "acquire", failing_acquire)
+    elif own:
+
+        def refused_acquire(**_kwargs):
+            raise SessionOperationConflictError()
+
+        actual_settle_unstarted = authority.settle_unstarted
+
+        def failing_settle_own_lapsed(*, session_id, operation_id, owner_instance_id, failure, release_lapsed_fence):
+            assert owner_instance_id == worker._owner_instance_id and release_lapsed_fence is True
+            if fault == "own_lapsed_committed":
+                actual_settle_unstarted(None, session_id=session_id, operation_id=operation_id, failure=failure)
+            raise error
+
+        monkeypatch.setattr(lease_authority, "acquire", refused_acquire)
+        monkeypatch.setattr(authority, "settle_own_lapsed", failing_settle_own_lapsed)
+    else:
+        settled: list[str] = []
+        monkeypatch.setattr(authority, "settle_lost", lambda **kwargs: settled.append(kwargs["operation_id"]))
+
+        def failing_release(_context):
+            assert settled == [record.operation_id], "release must follow the settle"
+            raise error
+
+        # A closing COMPOSE lease releases its fence through release_at_close.
+        monkeypatch.setattr(lease_upkeep_authority(lease_authority), "release_at_close", failing_release)
+    worker.start()
+    return worker, worker._process_recovery.watchdog, engine, error, authority, record
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ("acquire", "release"))
+async def test_poll_loop_escalates_on_a_transient_error_inside_a_reap_lease(tmp_path, monkeypatch: pytest.MonkeyPatch, fault: str) -> None:
+    # An error inside a reap's session lease leaves its custody unknown: the
+    # loop ends and the process restarts, as before.
+    with capture_logs() as logs:
+        worker, watchdog, engine, error, _authority, _record = await _poll_loop_reaping_one_lease(tmp_path, monkeypatch, fault=fault)
+        try:
+            assert await _until(lambda: worker._loop_task.done()), "an error inside a reap lease must end the poll loop"
+            failure = worker._loop_task.exception()
+            assert type(failure) is worker_module.ComposerReapCustodyUnknown
+            assert failure.__cause__ is error
+            assert await _until(lambda: bool(watchdog.signals))
+            assert watchdog.reasons == [RecoveryReason.REQUIRED_WORKER_LOST]
+        finally:
+            await worker.stop()
+            engine.dispose()
+    lost = [entry for entry in logs if entry["event"] == "composer_operation.worker_loop_lost"]
+    assert [(entry["exc_class"], entry["cause_class"]) for entry in lost] == [("ComposerReapCustodyUnknown", "OperationalError")], (
+        "the loop-lost log names the original driver class"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ("own_lapsed", "own_lapsed_committed"))
+async def test_poll_loop_escalates_on_a_transient_error_from_an_own_lapsed_reap_settlement(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    # An error from the reap's own-lapsed settlement ends the loop, whether or
+    # not the settlement committed.
+    worker, watchdog, engine, error, authority, record = await _poll_loop_reaping_one_lease(tmp_path, monkeypatch, fault=fault)
+    try:
+        assert await _until(lambda: worker._loop_task.done()), "an own-lapsed settlement error must end the poll loop"
+        failure = worker._loop_task.exception()
+        assert type(failure) is worker_module.ComposerReapCustodyUnknown
+        assert failure.__cause__ is error
+        assert await _until(lambda: bool(watchdog.signals))
+        assert watchdog.reasons == [RecoveryReason.REQUIRED_WORKER_LOST]
+        current = authority.get(session_id=record.session_id, operation_id=record.operation_id)
+        expected_status = "failed" if fault == "own_lapsed_committed" else "queued"
+        assert current is not None and current.status == expected_status, "the committed case's write landed; the other wrote nothing"
+    finally:
+        await worker.stop()
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_poll_loop_retries_a_transient_error_from_a_custody_free_reap_statement(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # list_expired_queued holds no lease or fence: its transient error is
+    # retried at the next scan like a claim error, and the job still runs.
+    reap_errors: list[BaseException] = [_transient_claim_error()]
+    record, worker, watchdog, authority, engine, scans = await _poll_loop_with_claim_failures(
+        tmp_path, monkeypatch, [], queued_reap_failures=reap_errors
+    )
+    try:
+
+        def completed() -> bool:
+            current = authority.get(session_id=record.session_id, operation_id=record.operation_id)
+            return current is not None and current.status == "completed"
+
+        assert await _until(lambda: completed() or worker._loop_task.done())
+        assert not worker._loop_task.done(), f"a custody-free reap error ended the poll loop; recovery reasons {watchdog.reasons}"
+        assert reap_errors == [] and completed(), "the failed reap must come first and the job must still run"
+        assert scans, "the job was claimed by a later scan"
+        assert watchdog.reasons == [] and watchdog.signals == []
+    finally:
+        await worker.stop()
         engine.dispose()
