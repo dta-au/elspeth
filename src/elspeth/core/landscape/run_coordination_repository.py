@@ -689,26 +689,22 @@ def record_refused_call(
     the canonical integer range. The context is encoded here with the writer's
     own encoder first, so no such value can raise inside the caller's unwind.
     """
-    context = {
+    context: _RefusedCallEventContext = {
         "verb": verb,
         "fence": fence,
         "work_item_id": work_item_id,
         "attempt": attempt,
         "refused_call": refused_call.event_context(),
     }
-    try:
-        canonical_json(context)
-    except (ValueError, TypeError) as exc:
-        # canonical_json's documented refusals: ValueError for a non-finite
-        # float or an out-of-range integer (rfc8785 domain errors subclass it),
-        # TypeError for a type it cannot encode.
+    refusal = _canonical_json_refusal(context)
+    if refusal is not None:
         _log_unrecorded_refused_call(
             run_id=run_id,
             worker_id=worker_id,
             verb=verb,
             fence=fence,
             refused_call=refused_call,
-            cause=f"not canonical JSON: {type(exc).__name__}",
+            cause=f"not canonical JSON: {refusal}",
         )
         return
     outcome = _record_best_effort_event(
@@ -724,6 +720,25 @@ def record_refused_call(
         _log_unrecorded_refused_call(
             run_id=run_id, worker_id=worker_id, verb=verb, fence=fence, refused_call=refused_call, cause="database fault"
         )
+
+
+_RefusedCallEventContext = dict[str, str | int | dict[str, str | int | float | None] | None]
+"""The ``fence_refusal`` context ``record_refused_call`` writes: the verb, fence,
+work item and attempt, and the ``refused_call`` record's own context."""
+
+
+def _canonical_json_refusal(context: _RefusedCallEventContext) -> str | None:
+    """Name the refusal ``canonical_json`` raises for ``context``, or ``None`` if it encodes.
+
+    The two documented refusals: ``ValueError`` for a non-finite float or an
+    out-of-range integer (the rfc8785 domain errors subclass it), and
+    ``TypeError`` for a type it cannot encode.
+    """
+    try:
+        canonical_json(context)
+    except (ValueError, TypeError) as exc:
+        return type(exc).__name__
+    return None
 
 
 def _log_unrecorded_refused_call(
