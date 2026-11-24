@@ -57,7 +57,7 @@ from elspeth.contracts.coordination import (
     WorkerMembershipToken,
 )
 from elspeth.contracts.enums import RunStatus
-from elspeth.contracts.errors import AuditIntegrityError, FollowerSeatDeadError, RunWorkerEvictedError
+from elspeth.contracts.errors import AuditIntegrityError, FollowerSeatDeadError, RunMembershipLostError, RunWorkerEvictedError
 from elspeth.contracts.plugin_capabilities import WebConfigAuthority
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.engine.orchestrator.follower import FollowerProcessor, _SeatDeadError
@@ -887,6 +887,86 @@ class TestFollowerEvictionFinalizeDepartureRace:
         assert exc_info.value.run_id == RUN_ID
 
         # Depart still called (best-effort).
+        assert len(coord_repo.depart_calls) == 1
+
+
+class _MidDrainFenceRefusingProcessor:
+    """Refuses the first drain pass the way a departed member's claim_ready does.
+
+    ``test_real_follower_claiming_after_finalize_departed_it_exits_cleanly`` in
+    tests/e2e/recovery/test_follower_join_and_drain.py drives the real
+    ``claim_ready`` refusal through the real follower processor; this stub
+    covers the RUNNING (true eviction) arm that the real path cannot reach
+    without a housekeeping sweep.
+    """
+
+    def __init__(self) -> None:
+        self.drain_calls = 0
+
+    def drain_follower_ready_work(self, ctx: PluginContext, *, before_claim: object = None) -> list[object]:
+        self.drain_calls += 1
+        raise RunMembershipLostError(run_id=RUN_ID, worker_id=WORKER_ID, verb="claim_ready")
+
+
+class TestFollowerMembershipFenceRefusalMidDrain:
+    """A membership-fence refusal raised inside a drain pass is discriminated like an eviction.
+
+    The membership fence of every fenced verb refuses with
+    RunMembershipLostError, not RunWorkerEvictedError. With the run terminal
+    (finalize-departure) the follower departs cleanly (CLI exit 0); with the
+    run still RUNNING it is a true eviction (CLI exit 3), never an unknown
+    framework error (CLI exit 4).
+    """
+
+    def test_fence_refusal_with_terminal_run_returns_cleanly(self) -> None:
+        processor = _MidDrainFenceRefusingProcessor()
+        coord_repo = _StubRunCoordRepo()
+        heartbeat = _StubHeartbeat(evicted=False)
+        factory = _StubFactory(running=True)
+        # Top-of-loop read: RUNNING. Recheck after the refusal: COMPLETED.
+        factory.run_lifecycle.get_run_results = [
+            _RunStatusRecord(status=RunStatus.RUNNING),
+            _RunStatusRecord(status=RunStatus.COMPLETED),
+        ]
+        follower = FollowerProcessor(
+            processor=processor,
+            member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID),
+            run_coordination=coord_repo,
+            factory=factory,
+            wait_fn=lambda _: None,
+        )
+
+        with patch("elspeth.engine.orchestrator.follower.RunHeartbeatThread", return_value=heartbeat):
+            follower.run(ctx=_ctx())
+
+        assert processor.drain_calls == 1
+        assert len(coord_repo.depart_calls) == 1
+        assert coord_repo.depart_calls[0]["worker_id"] == WORKER_ID
+        assert heartbeat.stop_called
+
+    def test_fence_refusal_with_running_run_is_reported_as_eviction(self) -> None:
+        processor = _MidDrainFenceRefusingProcessor()
+        coord_repo = _StubRunCoordRepo()
+        heartbeat = _StubHeartbeat(evicted=False)
+        follower = FollowerProcessor(
+            processor=processor,
+            member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID),
+            run_coordination=coord_repo,
+            factory=_StubFactory(running=True),
+            wait_fn=lambda _: None,
+        )
+
+        with (
+            patch("elspeth.engine.orchestrator.follower.RunHeartbeatThread", return_value=heartbeat),
+            pytest.raises(RunWorkerEvictedError) as exc_info,
+        ):
+            follower.run(ctx=_ctx())
+
+        assert exc_info.value.worker_id == WORKER_ID
+        assert exc_info.value.run_id == RUN_ID
+        cause = exc_info.value.__cause__
+        assert type(cause) is RunMembershipLostError
+        assert cause.verb == "claim_ready"
         assert len(coord_repo.depart_calls) == 1
 
 

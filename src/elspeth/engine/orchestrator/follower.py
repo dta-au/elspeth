@@ -102,7 +102,7 @@ from elspeth.contracts.coordination import (
     DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
     WorkerMembershipToken,
 )
-from elspeth.contracts.errors import AuditIntegrityError, FollowerSeatDeadError, RunWorkerEvictedError
+from elspeth.contracts.errors import AuditIntegrityError, FollowerSeatDeadError, RunMembershipLostError, RunWorkerEvictedError
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.engine.orchestrator.heartbeat import RunHeartbeatThread
 
@@ -288,22 +288,33 @@ class FollowerProcessor:
         terminal_exit = False
         try:
             self._drain_loop(ctx, heartbeat)
-        except RunWorkerEvictedError:
-            # The membership fence can raise mid-drain-pass when the leader's
+        except (RunWorkerEvictedError, RunMembershipLostError) as exc:
+            # A drain pass can lose membership mid-pass when the leader's
             # complete_run departed our run_workers row in the SAME txn that
             # stamped the run terminal (finalize-departure, design case a).
-            # The top-of-loop discrimination only covers the heartbeat-latch
-            # path; recheck run status here before reporting a true eviction.
+            # Every membership-fenced verb the drain reaches (claim_ready, the
+            # node-state and disposition writes, heartbeat_lease) refuses with
+            # RunMembershipLostError; the in-verb CAS re-probes raise
+            # RunWorkerEvictedError. The top-of-loop discrimination only covers
+            # the heartbeat-latch path; recheck run status here before
+            # reporting a true eviction.
             if self._run_is_terminal():
                 logger.info(
-                    "follower %r: eviction raised mid-drain but run %r is terminal (finalize-departure) — exiting cleanly",
+                    "follower %r: membership lost mid-drain but run %r is terminal (finalize-departure) — exiting cleanly",
                     self._token.worker_id,
                     self._token.run_id,
                 )
                 terminal_exit = True
                 return
             # True eviction: leader's housekeeping sweep evicted us while the
-            # run is still RUNNING (design case b). Propagate (CLI exit 3).
+            # run is still RUNNING (design case b). Report it as the eviction
+            # it is (CLI exit 3), whichever fence observed it.
+            if isinstance(exc, RunMembershipLostError):
+                raise RunWorkerEvictedError(
+                    worker_id=self._token.worker_id,
+                    run_id=self._token.run_id,
+                    reason=f"membership fence refused verb {exc.verb!r}",
+                ) from exc
             raise
         except KeyboardInterrupt:
             logger.info(
