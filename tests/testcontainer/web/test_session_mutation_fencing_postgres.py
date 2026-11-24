@@ -30,6 +30,7 @@ from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.coordination import repository as coordination_repository
 from elspeth.web.coordination.contracts import (
     ArchiveDeleteReconciliation,
+    CloseReleaseOutcome,
     FenceLossReason,
     SessionOperationContext,
     SessionOperationFenceLost,
@@ -1424,13 +1425,22 @@ async def test_postgres_failed_archive_restores_before_contender_can_acquire(
             delete_failed = True
             raise RuntimeError("injected archive delete failure")
 
+    original_close_release = authority.release_at_close
+
     def blocked_release(context: SessionOperationContext) -> None:
         release_entered.set()
         assert release_allowed.wait(timeout=10)
         original_release(context)
 
+    def blocked_close_release(context: SessionOperationContext) -> CloseReleaseOutcome:
+        # The archive lease's close releases through release_at_close.
+        release_entered.set()
+        assert release_allowed.wait(timeout=10)
+        return original_close_release(context)
+
     event.listen(first_engine, "before_cursor_execute", fail_first_archive_delete)
     monkeypatch.setattr(authority, "release", blocked_release)
+    monkeypatch.setattr(authority, "release_at_close", blocked_close_release)
     archive_task = asyncio.create_task(first.archive_session(session.id))
     try:
         assert await asyncio.to_thread(release_entered.wait, 10)

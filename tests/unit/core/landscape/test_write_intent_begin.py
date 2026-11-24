@@ -508,7 +508,7 @@ def _scheduler(db: LandscapeDB) -> TokenSchedulerRepository:
 # the zero-argument read. Inputs are chosen so no read returns before it
 # connects (``count_ready_in_set`` short-circuits an empty id set).
 _PLAIN_REPOSITORY_READS: tuple[tuple[str, Callable[[LandscapeDB], Callable[[], object]]], ...] = (
-    ("live_leader", lambda db: partial(RunCoordinationRepository(db.engine).live_leader, run_id=RUN_ID)),
+    ("seat_holder", lambda db: partial(RunCoordinationRepository(db.engine).seat_holder, run_id=RUN_ID)),
     (
         "dead_non_leader_workers",
         lambda db: partial(
@@ -617,7 +617,7 @@ class TestStaticPoolConnectionSerialization:
 
         A locked writer on another thread that then BEGINs fails with "cannot
         start a transaction within a transaction": a sink-effect lease heartbeat
-        died this way when a test fixture's ``live_leader`` read overlapped it.
+        died this way when a test fixture's ``seat_holder`` read overlapped it.
         Every plain read in the coordination and scheduler repositories, which
         the idle-timeout pump and lease heartbeats share with the main thread,
         must wait for the lock instead.

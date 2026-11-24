@@ -178,7 +178,7 @@ def _run_hammer(args: argparse.Namespace) -> dict[str, Any]:
         repo = TokenSchedulerRepository(engine)
         coordination = RunCoordinationRepository(engine)
         member = coordination.admit_follower(run_id=args.run_id, worker_id=args.owner, config_hash=stable_hash({}), window_seconds=80)
-        seat = coordination.live_leader(run_id=args.run_id)
+        seat = coordination.seat_holder(run_id=args.run_id)
         assert seat is not None
         # Both contention hammers hold the same real coordinator grant for
         # maintenance. Their item claims use distinct admitted memberships.

@@ -385,6 +385,7 @@ async def test_actual_parked_readback_three_original_cancellations_and_late_rele
     monkeypatch.setattr(worker_module, "run_required_sql_finish_once", retain_actual_carrier)
     if late_release_fault:
         monkeypatch.setattr(service.session_operation_authority, "release", actual_release_fault)
+        monkeypatch.setattr(service.session_operation_authority, "release_at_close", actual_release_fault)
     try:
         admitted = await _admit(app, service, authority, operation_id=str(uuid4()))
         assert await worker._claim_once() == 1

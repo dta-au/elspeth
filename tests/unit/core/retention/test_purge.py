@@ -1499,7 +1499,7 @@ class TestPurgePayloads:
         )
         result = PurgeManager(db, store).purge_payloads([ref])
         assert result.grade_update_failures == ("held",)
-        leader = coordination.live_leader(run_id="held")
+        leader = coordination.seat_holder(run_id="held")
         assert leader is not None
         assert leader.leader_worker_id == authority.worker_id
         with db.connection() as conn:

@@ -213,7 +213,7 @@ class TestAbandonLeaderlessRun:
         assert statuses[_LEADER_WORKER_ID] == "evicted"
         assert statuses[_FOLLOWER_WORKER_ID] == "departed"
         assert statuses[outcome.worker_id] == "departed"
-        assert RunCoordinationRepository(setup.db.engine).live_leader(run_id=setup.run_id) is None
+        assert RunCoordinationRepository(setup.db.engine).seat_holder(run_id=setup.run_id) is None
         with setup.db.connection() as conn:
             event_types = list(
                 conn.execute(

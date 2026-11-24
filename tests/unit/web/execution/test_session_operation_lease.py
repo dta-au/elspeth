@@ -61,6 +61,7 @@ from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.coordination import lifecycle as lifecycle_module
 from elspeth.web.coordination.contracts import (
+    CloseReleaseOutcome,
     FenceLossReason,
     SessionOperationContext,
     SessionOperationFence,
@@ -201,6 +202,10 @@ class _ControllableAuthority:
         if self.release_error is not None:
             raise self.release_error
 
+    def release_at_close(self, context: SessionOperationContext) -> CloseReleaseOutcome:
+        self.release(context)
+        return CloseReleaseOutcome.RELEASED_LIVE
+
 
 class _BlockedRenewalAuthority:
     """Real SQLite authority with a controllable in-flight renewal."""
@@ -225,6 +230,9 @@ class _BlockedRenewalAuthority:
 
     def release(self, context: SessionOperationContext) -> None:
         self._authority.release(context)
+
+    def release_at_close(self, context: SessionOperationContext) -> CloseReleaseOutcome:
+        return self._authority.release_at_close(context)
 
 
 class _ControllableExecutor:
