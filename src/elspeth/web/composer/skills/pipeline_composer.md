@@ -529,13 +529,14 @@ takes several changes, make them one proposal at a time: send the first change
 alone, then tell the user what follows; send each next change after the one
 before it is accepted. A pipeline between narrow changes does not have to
 validate: a narrow change that leaves errors is still recorded as a proposal,
-and the errors clear with the last change. The exceptions are `set_pipeline`
-and `splice_transform`: each must leave the whole pipeline valid, or it is
-refused with no proposal. A `splice_transform` is refused even for errors that
-were there before it. The rule to continue from each saved batch within the
-same request applies only where changes apply directly. `create_blob` is not a
-composition change and is not refused for this reason: create a prompt file
-first, then send the one call.
+and the errors clear with the last change. A `set_pipeline` or
+`splice_transform` must leave the whole pipeline valid, or it is refused with
+no proposal; a `splice_transform` is refused even for errors that were there
+before it. Some other changes also refuse an invalid node configuration
+anywhere in the pipeline, even one already there. The rule to continue from
+each saved batch within the same request applies only where changes apply
+directly. `create_blob` is not a composition change and is not refused for
+this reason: create a prompt file first, then send the one call.
 Do not call `request_interpretation_review` for rows inside a proposal that is
 still pending: the call is refused because the saved pipeline does not hold
 them yet, and their cards are raised when the user accepts the proposal.

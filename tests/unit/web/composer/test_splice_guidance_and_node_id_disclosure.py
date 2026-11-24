@@ -32,18 +32,23 @@ def test_splice_validation_failed_resolves_to_direct_guidance() -> None:
     explanation, suggested_fix = explain_validation_code("splice_validation_failed")
     assert explanation == (
         "The inserted transform passed its own option checks, but the pipeline that results from inserting it fails "
-        "context-aware validation, and splice_transform requires that whole result to validate. Each rejected_mutation "
-        "entry that follows this one names an error the insertion added, attributed to the component it concerns in "
-        "rejected_component. When no rejected_mutation entry follows, the insertion added no error: the errors were "
-        "there before the splice. Nothing was mutated."
+        "context-aware validation, and splice_transform requires that whole result to validate. The rejected_mutation "
+        "entries that follow this one name each error the insertion added, attributed to the component it concerns in "
+        "rejected_component. An entry that shares its error_code with an error the pipeline already had may be that "
+        "error, reworded. When no rejected_mutation entry follows, the insertion added no error: the errors were there "
+        "before the splice. Nothing was mutated."
     )
     assert suggested_fix == (
-        "For each rejected_mutation entry that follows, repair the inserted node's options (for a "
-        "schema_contract_violation, remove or satisfy the fields it names) or splice at a position whose producer "
-        "supplies those fields. Errors that were there before the splice also refuse it, and the same splice is "
-        "refused again until they are repaired: repair them first, or add the step with upsert_node and use "
-        "upsert_node with routing_only=true to re-point the successor's input."
+        "Repair each error the insertion added: fix the inserted node's options (for a schema_contract_violation, "
+        "remove or satisfy the fields it names) or splice at a position whose producer supplies those fields. Errors "
+        "that were there before the splice, reworded or not, also refuse it, and the same splice is refused again until "
+        "they are repaired: repair them first, or add the step with upsert_node and use upsert_node with "
+        "routing_only=true to re-point the successor's input."
     )
+    # The per-entry claim runs one way only: every added error is listed, not
+    # every listed entry is added (a standing error the splice rewords can be
+    # listed when it is not a field contract).
+    assert "Each rejected_mutation entry that follows this one names an error the insertion added" not in explanation
     # A splice refused only for errors the pipeline already had forwards no
     # entry of its own, so an unconditional "retry splice_transform" would
     # send the planner back into the same refusal.

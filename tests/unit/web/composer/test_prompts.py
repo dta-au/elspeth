@@ -1674,13 +1674,17 @@ class TestSkillFollowsCurrentToolBehaviour:
             "A pipeline between narrow changes does not have to validate: a narrow change that leaves errors is still "
             "recorded as a proposal, and the errors clear with the last change" in flattened
         )
-        # The exceptions the code enforces: an invalid set_pipeline
+        # What the code enforces: an invalid set_pipeline
         # (SetPipelineCandidate.acceptable) and a splice_transform whose whole
-        # result does not validate are refused with no proposal.
+        # result does not validate are refused with no proposal; the narrow
+        # tools that run _post_mutation_invariant_error also refuse a standing
+        # invalid node configuration, so the text is not a closed list.
         assert (
-            "The exceptions are `set_pipeline` and `splice_transform`: each must leave the whole pipeline valid, or it "
-            "is refused with no proposal. A `splice_transform` is refused even for errors that were there before it" in flattened
+            "A `set_pipeline` or `splice_transform` must leave the whole pipeline valid, or it is refused with no "
+            "proposal; a `splice_transform` is refused even for errors that were there before it. Some other changes "
+            "also refuse an invalid node configuration anywhere in the pipeline, even one already there." in flattened
         )
+        assert "The exceptions are `set_pipeline` and `splice_transform`" not in flattened
         assert "Two changes must leave the whole pipeline valid" not in flattened
         assert "A `set_pipeline` replaces the whole pipeline and must validate on its own" not in flattened
         assert "a change that leaves errors is still recorded as a proposal" not in flattened

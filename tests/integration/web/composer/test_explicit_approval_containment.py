@@ -159,9 +159,11 @@ async def test_batch_with_two_staged_edits_is_refused_before_effects_then_one_co
             "recorded as a proposal, and the errors clear with the last change" in message
         )
         assert (
-            "The exceptions are set_pipeline and splice_transform: each must leave the whole pipeline valid, or it "
-            "is refused with no proposal. A splice_transform is refused even for errors that were there before it" in message
+            "A set_pipeline or splice_transform must leave the whole pipeline valid, or it is refused with no "
+            "proposal; a splice_transform is refused even for errors that were there before it. Some other changes "
+            "also refuse an invalid node configuration anywhere in the pipeline, even one already there." in message
         )
+        assert "The exceptions are set_pipeline and splice_transform" not in message
         assert "Two changes must leave the whole pipeline valid" not in message
         assert "A set_pipeline replaces the whole pipeline and must validate on its own" not in message
         assert "a change that leaves errors is still recorded as a proposal" not in message
@@ -309,7 +311,8 @@ def _composer_validation(harness: _Harness, state: CompositionState) -> Validati
 
 # The two halves of the approval teaching in ``approval_batch_not_atomic`` and
 # the composer skill: a narrow change may leave the pipeline with errors and is
-# still recorded, while a set_pipeline must validate on its own.
+# still recorded, while a set_pipeline or a splice_transform must leave the
+# whole pipeline valid or is refused with no proposal.
 
 
 @pytest.mark.asyncio
@@ -376,7 +379,7 @@ def _linear_state(tmp_path: Path, *, standing_error: bool) -> CompositionState:
     """
     arguments = _valid_pipeline_args(tmp_path)
     arguments["source"]["on_success"] = "mid"
-    nodes: list[dict[str, Any]] = [
+    nodes: list[dict[str, object]] = [
         {
             "id": "t1",
             "node_type": "transform",

@@ -1713,15 +1713,16 @@ _DIRECT_VALIDATION_GUIDANCE: Final = (
     DirectValidationGuidance(
         "splice_validation_failed",
         "The inserted transform passed its own option checks, but the pipeline that results from inserting it fails "
-        "context-aware validation, and splice_transform requires that whole result to validate. Each rejected_mutation "
-        "entry that follows this one names an error the insertion added, attributed to the component it concerns in "
-        "rejected_component. When no rejected_mutation entry follows, the insertion added no error: the errors were "
-        "there before the splice. Nothing was mutated.",
-        "For each rejected_mutation entry that follows, repair the inserted node's options (for a "
-        "schema_contract_violation, remove or satisfy the fields it names) or splice at a position whose producer "
-        "supplies those fields. Errors that were there before the splice also refuse it, and the same splice is "
-        "refused again until they are repaired: repair them first, or add the step with upsert_node and use "
-        "upsert_node with routing_only=true to re-point the successor's input.",
+        "context-aware validation, and splice_transform requires that whole result to validate. The rejected_mutation "
+        "entries that follow this one name each error the insertion added, attributed to the component it concerns in "
+        "rejected_component. An entry that shares its error_code with an error the pipeline already had may be that "
+        "error, reworded. When no rejected_mutation entry follows, the insertion added no error: the errors were there "
+        "before the splice. Nothing was mutated.",
+        "Repair each error the insertion added: fix the inserted node's options (for a schema_contract_violation, "
+        "remove or satisfy the fields it names) or splice at a position whose producer supplies those fields. Errors "
+        "that were there before the splice, reworded or not, also refuse it, and the same splice is refused again until "
+        "they are repaired: repair them first, or add the step with upsert_node and use upsert_node with "
+        "routing_only=true to re-point the successor's input.",
     ),
     DirectValidationGuidance(
         "batch_dependency_refused",
