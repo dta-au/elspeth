@@ -89,7 +89,7 @@ async def test_nonretryable_provider_failure_does_not_invent_a_format_retry(make
     record = service._sessions_service.add_message.calls[0].kwargs["tool_calls"][0]["pass"]
     assert record["provider_attempts"] == 1
     assert record["format_reprompt_sent"] is False
-    detail, suggestion = advisor_signoff_blocked_wording(reason="unavailable", findings=verdict.findings_text)
+    detail, suggestion = advisor_signoff_blocked_wording(draft_has_content=True, reason="unavailable", findings=verdict.findings_text)
     assert "after a format retry" not in suggestion
     assert "private-malformed-marker" not in detail + suggestion
 

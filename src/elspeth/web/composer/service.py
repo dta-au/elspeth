@@ -176,6 +176,7 @@ from elspeth.web.composer.provider_gateway import (
     composer_loop_tool_definitions,
 )
 from elspeth.web.composer.provider_quota import ProviderCallCustody, ProviderInvocationFamily, ProviderInvocationOwner, composer_quota_scope
+from elspeth.web.composer.provider_retry import retry_delay_seconds
 from elspeth.web.composer.reasoning import warn_if_not_reasoning_capable
 from elspeth.web.composer.recovery_controls import (
     parse_recovery_tool_batch,
@@ -4096,9 +4097,14 @@ class ComposerServiceImpl:
                 attempt += 1
                 if attempt >= LLM_API_MAX_ATTEMPTS:
                     raise
-                delay_seconds = LLM_API_RETRY_BASE_DELAY_SECONDS * (2 ** (attempt - 1))
-                remaining_after_error = deadline - asyncio.get_event_loop().time()
-                if remaining_after_error <= delay_seconds:
+                delay_seconds = retry_delay_seconds(
+                    attempt=attempt,
+                    retry_after=failure.retry_after,
+                    deadline=deadline,
+                    now=asyncio.get_event_loop().time(),
+                    base_delay_seconds=LLM_API_RETRY_BASE_DELAY_SECONDS,
+                )
+                if delay_seconds is None:
                     raise
                 await asyncio.sleep(delay_seconds)
 

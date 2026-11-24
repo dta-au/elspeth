@@ -128,6 +128,7 @@ from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
 from tests.fixtures.required_executor import assert_owned_executor_fixture_settled
 from tests.helpers.advisor_review import parse_advisor_publication_review
+from tests.helpers.litellm_dispatch import Failure, Route, provider_failure
 from tests.helpers.session_fences import fenced_operation_context
 from tests.unit.web.composer._helpers import (
     FakeChoice,
@@ -3035,7 +3036,9 @@ class TestComposerMultiTurnToolCalls:
         _assert_checkpoint_reply(
             result,
             _no_tool_policy_module.compose_review_reply_withheld_message(
-                _no_tool_policy_module.compose_advisor_signoff_unrendered_unverified_message("", failure_class="unavailable"),
+                _no_tool_policy_module.compose_advisor_signoff_unrendered_unverified_message(
+                    "", failure_class="unavailable", draft_has_content=True
+                ),
                 reason="unavailable",
             ),
             raw="",
@@ -6283,6 +6286,78 @@ class TestComposerAvailabilityAndBadRequest:
         mock_sleep.assert_awaited_once_with(1.0)
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("headers", "budget_seconds", "outcome", "calls", "delays"),
+        [
+            ({"retry-after": "3"}, None, "success", 2, [3.0]),
+            ({"retry-after-ms": "1500", "retry-after": "3"}, None, "success", 2, [1.5]),
+            ({"retry-after-ms": "bad", "retry-after": "3"}, None, "success", 2, [3.0]),
+            ({"retry-after": "bad"}, None, "success", 2, [1.0]),
+            # A Retry-After shorter than the step waits the step. This row sends it in
+            # milliseconds; "retry-after: 0" or a near HTTP date are other routes.
+            ({"retry-after-ms": "500"}, None, "success", 2, [1.0]),
+            ({}, None, "exhausted", 3, [1.0, 2.0]),
+            # The 30 s ceiling admits a Retry-After of exactly 30 s and refuses 31 s.
+            ({"retry-after": "30"}, 60.0, "success", 2, [30.0]),
+            ({"retry-after": "31"}, 60.0, "too-long", 1, []),
+            ({"retry-after": "6"}, 10.0, "deadline", 1, []),
+            ({}, None, "budget", 1, []),
+        ],
+        ids=(
+            "seconds",
+            "ms-wins",
+            "malformed-ms",
+            "malformed-seconds",
+            "below-step",
+            "exhausted",
+            "at-ceiling",
+            "over-ceiling",
+            "deadline",
+            "budget",
+        ),
+    )
+    async def test_real_rate_limit_uses_bounded_retry_and_audits_each_call(
+        self, headers: dict[str, str], budget_seconds: float | None, outcome: str, calls: int, delays: list[float]
+    ) -> None:
+        from litellm.exceptions import RateLimitError, RateLimitType
+
+        from elspeth.web.composer.provider_config import LLM_API_MAX_ATTEMPTS
+
+        service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
+        failure: Exception
+        if outcome == "budget":
+            # A budget-typed 429 exists only inside the LiteLLM proxy server; it never
+            # reaches the Composer, which receives a plain 429 on every route. This row
+            # covers the classifier's handling of the typed form, hand-built.
+            failure = RateLimitError(
+                message="private rate limit",
+                model="bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0",
+                llm_provider="bedrock",
+                response=Response(429, request=Request("POST", "https://example.invalid")),
+                rate_limit_type=RateLimitType.BUDGET,
+            )
+        else:
+            # Bedrock is the route where LiteLLM keeps the provider's Retry-After headers.
+            failure = await provider_failure("bedrock", "429_retry_after", retry_after_headers=headers)
+        responses: list[object] = [failure] * (LLM_API_MAX_ATTEMPTS if outcome == "exhausted" else 1)
+        if outcome == "success":
+            responses.append(_make_raw_llm_response(content="Recovered."))
+        with (
+            patch("litellm.acompletion", new_callable=AsyncMock, side_effect=responses) as mock_llm,
+            _mock_composer_retry_sleep() as mock_sleep,
+        ):
+            compose_kwargs = {} if budget_seconds is None else {"budget_seconds": budget_seconds}
+            if outcome == "success":
+                result = await service.compose("Hello", [], _empty_state(), session_id=session_id, **compose_kwargs)
+                _assert_checkpoint_reply(result, "Recovered.", count=0)
+                assert len(result.llm_calls) == calls
+            else:
+                with pytest.raises(RateLimitError):
+                    await service.compose("Hello", [], _empty_state(), session_id=session_id, **compose_kwargs)
+        assert mock_llm.call_count == calls
+        assert [call.args[0] for call in mock_sleep.await_args_list] == delays
+
+    @pytest.mark.asyncio
     async def test_real_service_unavailable_is_eligible_for_bounded_retry(self) -> None:
         from litellm.exceptions import ServiceUnavailableError
 
@@ -6300,6 +6375,66 @@ class TestComposerAvailabilityAndBadRequest:
         assert mock_llm.call_count == 2
         mock_sleep.assert_awaited_once()
         mock_sleep.assert_awaited_once_with(1.0)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("route", ("openai", "bedrock"))
+    async def test_real_quota_429_is_retried_and_stops_at_the_bound(self, route: Route) -> None:
+        """A quota 429 reaches the compose loop as an ordinary 429, so it is retried within the bound."""
+        from litellm.exceptions import RateLimitError
+
+        from elspeth.web.composer.provider_config import LLM_API_MAX_ATTEMPTS
+
+        service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
+        failures = [await provider_failure(route, "429_quota") for _ in range(LLM_API_MAX_ATTEMPTS)]
+        with (
+            patch("litellm.acompletion", new_callable=AsyncMock, side_effect=failures) as mock_llm,
+            _mock_composer_retry_sleep() as mock_sleep,
+            pytest.raises(RateLimitError),
+        ):
+            await service.compose("Hello", [], _empty_state(), session_id=session_id)
+        assert mock_llm.call_count == LLM_API_MAX_ATTEMPTS
+        assert [call.args[0] for call in mock_sleep.await_args_list] == [1.0, 2.0]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("route", "delays"), [("bedrock", [7.0]), ("openai", [1.0])])
+    async def test_real_429_waits_for_retry_after_only_where_the_header_survives(self, route: Route, delays: list[float]) -> None:
+        """Both 429s carry retry-after: 7. Only Bedrock's reaches the Composer; the OpenAI route waits the base delay."""
+        service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
+        failure = await provider_failure(route, "429_retry_after")
+        with (
+            patch(
+                "litellm.acompletion", new_callable=AsyncMock, side_effect=[failure, _make_raw_llm_response(content="Recovered.")]
+            ) as mock_llm,
+            _mock_composer_retry_sleep() as mock_sleep,
+        ):
+            result = await service.compose("Hello", [], _empty_state(), session_id=session_id)
+        _assert_checkpoint_reply(result, "Recovered.", count=0)
+        assert mock_llm.call_count == 2
+        assert [call.args[0] for call in mock_sleep.await_args_list] == delays
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("route", "failure"),
+        [
+            pytest.param("openai", "500", id="openai-500"),
+            pytest.param("openai", "connect", id="openai-connect"),
+            pytest.param("openai", "malformed_200", id="openai-unreadable-billed-200"),
+            pytest.param("anthropic", "read", id="anthropic-read"),
+            pytest.param("anthropic", "malformed_200", id="anthropic-unreadable-billed-200"),
+        ],
+    )
+    async def test_real_failure_that_may_follow_a_billed_response_is_not_retried(self, route: Route, failure: Failure) -> None:
+        """LiteLLM reports a transport failure or an unreadable billed response like a provider 500; none is re-sent."""
+        raised = await provider_failure(route, failure)
+        service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
+        with (
+            patch("litellm.acompletion", new_callable=AsyncMock, side_effect=raised) as mock_llm,
+            _mock_composer_retry_sleep() as mock_sleep,
+            pytest.raises(type(raised)),
+        ):
+            await service.compose("Hello", [], _empty_state(), session_id=session_id)
+        assert mock_llm.call_count == 1
+        mock_sleep.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_real_bad_gateway_is_not_retried(self) -> None:

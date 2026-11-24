@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -467,6 +468,21 @@ _BARE_SUFFIX_ROUND_TRIP_CASES = [
         id="_ADVISOR_REVIEW_BUDGET_SUFFIX",
     ),
     pytest.param(
+        no_tool_policy._ADVISOR_REVIEW_BUDGET_NO_DRAFT_SUFFIX,
+        no_tool_policy._ADVISOR_REVIEW_BUDGET_NO_DRAFT_NOTICE,
+        id="_ADVISOR_REVIEW_BUDGET_NO_DRAFT_SUFFIX",
+    ),
+    pytest.param(
+        no_tool_policy._ADVISOR_REVIEW_COST_UNKNOWN_SUFFIX,
+        no_tool_policy._ADVISOR_REVIEW_COST_UNKNOWN_NOTICE,
+        id="_ADVISOR_REVIEW_COST_UNKNOWN_SUFFIX",
+    ),
+    pytest.param(
+        no_tool_policy._ADVISOR_REVIEW_COST_UNKNOWN_NO_DRAFT_SUFFIX,
+        no_tool_policy._ADVISOR_REVIEW_COST_UNKNOWN_NO_DRAFT_NOTICE,
+        id="_ADVISOR_REVIEW_COST_UNKNOWN_NO_DRAFT_SUFFIX",
+    ),
+    pytest.param(
         no_tool_policy._GRAPH_RECOVERY_REFUSAL_SUFFIX,
         no_tool_policy._GRAPH_RECOVERY_REFUSAL_NOTICE,
         id="_GRAPH_RECOVERY_REFUSAL_SUFFIX",
@@ -807,7 +823,7 @@ def test_review_reply_unavailable_is_trusted_alongside_handoff() -> None:
 def test_withheld_notice_is_canonical_and_cannot_be_spoofed() -> None:
     from elspeth.web.composer.advisor_policy import advisor_signoff_blocked_wording
 
-    detail, _suggestion = advisor_signoff_blocked_wording(reason="publication_withheld", findings="")
+    detail, _suggestion = advisor_signoff_blocked_wording(draft_has_content=True, reason="publication_withheld", findings="")
     content = no_tool_policy._bare_trusted_suffix(detail)
     assert visible_message_segments(content=content, raw_content="") == (
         TrustedSystemNoticeSegment("The completion review did not admit the reply's claims; the reply was withheld."),
@@ -819,7 +835,7 @@ def test_withheld_notice_is_canonical_and_cannot_be_spoofed() -> None:
         assert visible_message_segments(content=malformed, raw_content="") == (AssistantTextSegment(malformed),)
 
 
-@pytest.mark.parametrize("reason", ["unavailable", "malformed", "request_rejected", "budget_exhausted"])
+@pytest.mark.parametrize("reason", ["unavailable", "malformed", "request_rejected", "budget_exhausted", "prior_call_cost_unknown"])
 def test_unfinished_review_notice_is_truthful_and_cannot_be_spoofed(reason) -> None:
     notice = "The completion review could not finish, so the reply was withheld."
     assert visible_message_segments(content=no_tool_policy._bare_trusted_suffix(notice), raw_content="") == (
@@ -944,7 +960,9 @@ def test_durable_blocker_wording_promises_a_review_after_a_pipeline_change(reaso
     """
     from elspeth.web.composer.advisor_policy import advisor_signoff_blocked_wording
 
-    _detail, suggestion = advisor_signoff_blocked_wording(reason=reason, findings=findings, findings_backend_authored=authored)
+    _detail, suggestion = advisor_signoff_blocked_wording(
+        draft_has_content=True, reason=reason, findings=findings, findings_backend_authored=authored
+    )
     assert "after your next pipeline change" in suggestion
     assert "on your next message" not in suggestion
     assert "retry the request" not in suggestion.lower()
@@ -954,6 +972,29 @@ def test_durable_blocker_wording_promises_a_review_after_a_pipeline_change(reaso
 def test_transient_advisor_blocker_offers_retry_without_graph_edit(reason: str) -> None:
     from elspeth.web.composer.advisor_policy import advisor_signoff_blocked_wording
 
-    _, suggestion = advisor_signoff_blocked_wording(reason=reason, findings="No verdict.")
+    _, suggestion = advisor_signoff_blocked_wording(draft_has_content=True, reason=reason, findings="No verdict.")
     assert "on your next message" in suggestion
     assert "pipeline change" not in suggestion
+
+
+def test_every_end_block_reason_has_an_explicit_withheld_reply_notice() -> None:
+    from typing import get_args
+
+    from elspeth.web.composer.advisor_audit import AdvisorTerminalBlockReason
+
+    assert set(no_tool_policy._REVIEW_REPLY_SUFFIX_BY_REASON) == set(get_args(AdvisorTerminalBlockReason))
+
+
+def test_an_unknown_end_block_reason_is_refused_not_relabelled() -> None:
+    from elspeth.contracts.errors import AuditIntegrityError
+    from elspeth.web.composer.advisor_checkpoint import _unrendered_failure_class
+    from elspeth.web.composer.advisor_policy import advisor_signoff_blocked_wording
+
+    # A value outside the closed vocabulary, as an older or foreign caller could pass it.
+    unknown: Any = "not_a_reason"
+    with pytest.raises(AuditIntegrityError):
+        no_tool_policy.compose_review_reply_withheld_message("", reason=unknown)
+    with pytest.raises(AuditIntegrityError):
+        _unrendered_failure_class(unknown)
+    with pytest.raises(AuditIntegrityError):
+        advisor_signoff_blocked_wording(reason=unknown, findings="", draft_has_content=False)
