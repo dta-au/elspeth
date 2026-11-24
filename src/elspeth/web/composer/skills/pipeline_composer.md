@@ -443,8 +443,7 @@ When the request or attachment inventory supplies an expected hash, pass it as
 The ordinary guard still inspects all content as untrusted. Check file size with
 `list_blobs` or `get_blob_metadata` when needed. If only the complete response
 envelope cannot fit, use `get_blob_content` for selected pages instead. Both
-readers require the entire original file to pass credential inspection; paging
-does not bypass a whole-input inspection refusal.
+readers refuse a file over the same size limit; paging does not get around it.
 Use `inspect_source` for tabular structure rather than reading every data row.
 
 <!-- taught:begin tool-data read_attachment data.blob_id; tool-data read_attachment data.filename; tool-data read_attachment data.mime_type; tool-data read_attachment data.content; tool-data read_attachment data.truncated; tool-data read_attachment data.size_bytes; tool-data read_attachment data.content_hash; tool-data read_attachment data.total_chars; tool-data read_attachment data.start_char; tool-data read_attachment data.end_char; tool-data read_attachment data.next_offset_chars; tool-data read_attachment data.created_by; tool-data read_attachment data.creation_modality -->

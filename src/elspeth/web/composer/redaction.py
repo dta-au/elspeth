@@ -38,7 +38,6 @@ from pydantic.json_schema import SkipJsonSchema
 from elspeth.contracts.blobs import BLOB_CREATORS, AllowedMimeType, BlobCreator
 from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 from elspeth.contracts.composer_interpretation import InterpretationKind
-from elspeth.contracts.credential_material import DEFAULT_CREDENTIAL_TRAVERSAL_POLICY
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import freeze_fields
@@ -3453,7 +3452,11 @@ class GetBlobContentDataModel(BaseModel):
         return self
 
 
-READ_ATTACHMENT_MAX_UTF8_BYTES = min(JSON_MAX_TOTAL_UTF8_BYTES, DEFAULT_CREDENTIAL_TRAVERSAL_POLICY.max_string_bytes)
+# The largest attachment the composer returns whole to the model. A context
+# size limit of its own: the credential scan bound is separate and never
+# moves it.
+ATTACHMENT_CONTENT_MAX_BYTES: Final[int] = 262_144
+READ_ATTACHMENT_MAX_UTF8_BYTES = min(JSON_MAX_TOTAL_UTF8_BYTES, ATTACHMENT_CONTENT_MAX_BYTES)
 
 
 class ReadAttachmentArgumentsModel(BaseModel):
