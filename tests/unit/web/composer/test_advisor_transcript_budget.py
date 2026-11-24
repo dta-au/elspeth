@@ -1009,6 +1009,29 @@ async def test_an_advisor_pass_makes_at_most_three_provider_calls(
 
 
 @pytest.mark.asyncio
+async def test_a_size_resend_rejected_again_is_recorded_as_a_rejected_request(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from elspeth.web.composer import advisor_checkpoint
+    from tests.unit.web.composer._helpers import _empty_state
+
+    records: list[Any] = []
+
+    async def capture(**kwargs: Any) -> None:
+        records.append(kwargs["record"])
+
+    monkeypatch.setattr(advisor_checkpoint, "persist_advisor_checkpoint_pass", capture)
+    sent = _scripted_advisor(monkeypatch, ["size", "size", "ok"])
+    verdict = await _owner(tmp_path)._run_advisor_checkpoint(
+        phase="end", state=_empty_state(), session_id=None, recorder=BufferingRecorder(), publication_review=_review(_probe(8))
+    )
+
+    assert verdict.ok is False
+    assert len(sent) == 2
+    (record,) = records
+    assert record.verdict == "request_rejected"
+    assert record.provider_attempts == 2
+
+
+@pytest.mark.asyncio
 async def test_an_editing_turn_over_its_estimate_sends_the_review_and_publishes_the_admitted_reply(
     monkeypatch: pytest.MonkeyPatch, make_service: Any, simple_state: Any
 ) -> None:

@@ -297,6 +297,25 @@ async def test_an_over_estimate_send_is_recorded_on_its_call() -> None:
 
 
 @pytest.mark.asyncio
+async def test_must_go_content_over_960_kib_that_fits_the_setting_goes() -> None:
+    # The graph and the turn's latest tool result are must-go: nothing of them is left out. Over
+    # the former fixed 960 KiB maximum they were refused on bytes although a 1,000,000-token
+    # setting takes them at any plausible density.
+    rows = {f"rows_{part}": f"result row {part} " * 13_000 for part in "abc"}
+    service, session_id = _service(1_000_000)
+    provider = _RecordingProvider(_tool_turn("call-1"), _make_llm_response(content="Done."))
+
+    result = await _compose(service, session_id, provider, state=large_graph_state(), tool_data={"call-1": rows})
+
+    assert len(provider.requests) == len(result.llm_calls) == 2
+    second = provider.requests[1]
+    assert _wire_bytes(second) > 960 * 1024
+    latest = second["messages"][-1]
+    assert latest["role"] == "tool" and all(text in latest["content"] for text in rows.values())
+    assert len(_node_ids(_state_context(second["messages"]))) == 25
+
+
+@pytest.mark.asyncio
 async def test_a_request_over_960_kib_that_fits_the_setting_goes() -> None:
     # A 1,000,000-token setting: the request is well under it at any plausible density, but over
     # the former fixed 960 KiB maximum, under which every earlier turn was left out although the
