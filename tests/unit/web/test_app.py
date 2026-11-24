@@ -4570,6 +4570,7 @@ class TestDeploymentStateModeStartup:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         settings = _external_settings(tmp_path, "azure-container-apps", composer_boot_probe_enabled=False)
+        from elspeth.web.coordination.upkeep_engine import create_lease_upkeep_engine as real_create_lease_upkeep_engine
         from elspeth.web.sessions.engine import create_session_engine as real_create_session_engine
         from elspeth.web.sessions.schema import initialize_session_schema as real_initialize_session_schema
 
@@ -4589,8 +4590,19 @@ class TestDeploymentStateModeStartup:
 
         monkeypatch.setattr(engine, "dispose", dispose)
         monkeypatch.setattr(app_module, "create_session_engine", lambda *_args, **_kwargs: engine)
+        # The upkeep pool joins the same stand-in; the PostgreSQL-only connect
+        # timeout does not apply to it, but the external branch must pass the
+        # main engine's timeout through.
+        upkeep_connect_timeouts: list[int | None] = []
+
+        def create_upkeep_stand_in(url: str, *, connect_timeout_seconds: int | None = None) -> Engine | None:
+            upkeep_connect_timeouts.append(connect_timeout_seconds)
+            return real_create_lease_upkeep_engine(url)
+
+        monkeypatch.setattr(app_module, "create_lease_upkeep_engine", create_upkeep_stand_in)
         monkeypatch.setattr(external_state_startup_module, "validate_only_schema_or_raise", lambda *_args, **_kwargs: None)
         app = create_app(settings)
+        assert upkeep_connect_timeouts == [external_state_startup_module._CONNECT_TIMEOUT_SECONDS]
 
         # The audit engine now starts before services. Model the externally
         # provisioned Landscape alongside the provisioned Sessions stand-in;
@@ -4889,7 +4901,8 @@ class TestAwsEcsValidateOnlyStartup:
         assert len(finalizers) == 3
         assert finalizers[0][0] is app
         assert finalizers[0][1] is app_module._dispose_session_engine
-        assert finalizers[0][2] == (engine,)
+        # In-memory SQLite has no separate lease-upkeep pool.
+        assert finalizers[0][2] == (engine, None)
         assert finalizers[1][0] is app
         assert finalizers[1][1] == app.state.auth_audit_recorder.close
         assert finalizers[1][2] == ()

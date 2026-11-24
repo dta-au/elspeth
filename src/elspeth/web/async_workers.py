@@ -472,21 +472,52 @@ LEASE_UPKEEP_MAX_WORKERS: Final[int] = 2
 LEASE_UPKEEP_ADMISSION_CAPACITY: Final[int] = 32
 
 
+class _LeaseUpkeepThreadMarker(threading.local):
+    """Per-thread flag that only the lease-upkeep executor's initializer sets."""
+
+    def __init__(self) -> None:
+        self.active = False
+
+
+_LEASE_UPKEEP_THREAD = _LeaseUpkeepThreadMarker()
+
+
+def _mark_lease_upkeep_thread() -> None:
+    _LEASE_UPKEEP_THREAD.active = True
+
+
+def on_lease_upkeep_worker() -> bool:
+    """Return whether the current thread was started by the lease-upkeep executor.
+
+    The flag is set by the executor's ``initializer``, so it identifies where a
+    thread came from rather than what it is called.
+    """
+    return _LEASE_UPKEEP_THREAD.active
+
+
 class _ReservedWorkers:
     """Bounded workers reserved for lifecycle operations."""
 
-    def __init__(self, *, max_workers: int, capacity: int, name: str) -> None:
+    def __init__(
+        self,
+        *,
+        max_workers: int,
+        capacity: int,
+        name: str,
+        initializer: Callable[[], None] | None = None,
+    ) -> None:
         self.lock = threading.Lock()
         self.executor: ThreadPoolExecutor | None = None
         self.outstanding = 0
         self.max_workers = max_workers
         self.capacity = capacity
         self.name = name
+        self.initializer = initializer
 
     def get_executor(self) -> ThreadPoolExecutor:
         with self.lock:
             if self.executor is None:
-                self.executor = ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix=self.name)
+                self.executor = ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix=self.name, initializer=self.initializer)
             return self.executor
 
     def try_admit(self) -> bool:
@@ -517,7 +548,10 @@ class _AuthAuditWorkers(_ReservedWorkers):
 
 _AUTH_AUDIT_WORKERS = _AuthAuditWorkers()
 _LEASE_UPKEEP_WORKERS = _ReservedWorkers(
-    max_workers=LEASE_UPKEEP_MAX_WORKERS, capacity=LEASE_UPKEEP_ADMISSION_CAPACITY, name="lease-upkeep"
+    max_workers=LEASE_UPKEEP_MAX_WORKERS,
+    capacity=LEASE_UPKEEP_ADMISSION_CAPACITY,
+    name="lease-upkeep",
+    initializer=_mark_lease_upkeep_thread,
 )
 
 
