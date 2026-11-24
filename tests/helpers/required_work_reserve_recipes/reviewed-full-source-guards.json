@@ -9,7 +9,7 @@
   },
   "src/elspeth/web/coordination/lifecycle.py": {
     "protected_exports": [],
-    "sha256": "f9ca1b22fc4aa3ee0cfaa3304f5a420571dd6148145277ab74ddd42e7fbf7963"
+    "sha256": "88d7bf8784a4e58893fae8a79008ca0b8b7f1f8f092665383f9291a687828823"
   },
   "src/elspeth/web/execution_lease_cleanup.py": {
     "protected_exports": [],
@@ -58,7 +58,7 @@
   },
   "src/elspeth/web/sessions/protocol.py": {
     "protected_exports": [],
-    "sha256": "c9fc3c8466fff9fca5d195602576f462d4ee620e5fed797f9e73df9ee1cde848"
+    "sha256": "67fe230f4b38ce0a05070590de3e4e19076686392d50032c0e9d9e7361a48a55"
   },
   "src/elspeth/web/sessions/service.py": {
     "protected_exports": [],
