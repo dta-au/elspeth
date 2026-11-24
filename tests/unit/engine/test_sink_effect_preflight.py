@@ -856,6 +856,8 @@ def test_follower_rejection_never_calls_join_run(monkeypatch: pytest.MonkeyPatch
             orchestrator,  # type: ignore[arg-type]
             "run-1",
             settings,  # type: ignore[arg-type]
+            config=MagicMock(),
+            graph=MagicMock(),
         )
 
     orchestrator.join_run.assert_not_called()

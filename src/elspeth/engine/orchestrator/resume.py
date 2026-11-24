@@ -59,6 +59,7 @@ from elspeth.core.checkpoint.recovery import (
     NonResumableRunError,
     check_group_satisfiability_resumable,
     check_http_effects_resumable,
+    check_run_canonical_version_resumable,
     check_run_status_resumable,
     check_source_lifecycle_resumable,
     group_binding_view_from_graph,
@@ -852,6 +853,15 @@ class ResumeCoordinator:
             else:
                 refusal_reason = status_check.reason
             raise NonResumableRunError(guarded_run_id, refusal_reason, cause=status_check.cause)
+
+        version_check = check_run_canonical_version_resumable(self._db, guarded_run_id)
+        if not version_check.can_resume:
+            assert version_check.reason is not None and version_check.cause is not None
+            raise NonResumableRunError(
+                guarded_run_id,
+                version_check.reason,
+                cause=version_check.cause,
+            )
 
         # ---- resume() entry guard, part 2: checkpoint currency + topology ----
         # (elspeth-5129406607) RecoveryManager.get_resume_point() is ADVISORY

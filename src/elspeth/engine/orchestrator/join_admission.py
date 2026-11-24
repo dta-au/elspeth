@@ -17,19 +17,44 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from sqlalchemy.exc import DBAPIError, SQLAlchemyError
+
+from elspeth.contracts import RunStatus, hashing
+from elspeth.contracts import errors as contract_errors
 from elspeth.contracts.coordination import (
     DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
     WorkerMembershipToken,
     mint_worker_id,
 )
-from elspeth.contracts.errors import JoinRefusedError
+from elspeth.contracts.enums import NodeType
+from elspeth.contracts.errors import AuditIntegrityError, JoinNotReadyError, JoinRefusedError
 from elspeth.core.canonical import stable_hash
 from elspeth.core.config import resolve_config
-from elspeth.core.landscape.factory import RecorderFactory
+from elspeth.core.landscape.factory import LandscapeReadRepositories, RecorderFactory
+from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
+from elspeth.core.landscape.schema import RunSourceLifecycleState
+from elspeth.engine.orchestrator.implementation_compatibility import check_implementation_compatibility
 
 if TYPE_CHECKING:
+    from elspeth.contracts.audit import Run
     from elspeth.core.config import ElspethSettings
+    from elspeth.core.dag import ExecutionGraph
     from elspeth.core.landscape import LandscapeDB
+    from elspeth.engine.orchestrator.types import PipelineConfig
+
+
+def _departure_summary(error: Exception) -> str:
+    """One line naming a departure failure, from typed attributes only.
+
+    A DBAPI error carries the driver's message in ``orig``; any other SQLAlchemy
+    error's text can echo the SQL statement, so only its class is kept. Errors
+    outside the database layer keep their message.
+    """
+    if isinstance(error, DBAPIError):
+        return f"{type(error).__name__}: {error.orig}"
+    if isinstance(error, SQLAlchemyError):
+        return type(error).__name__
+    return f"{type(error).__name__}: {error}"
 
 
 class JoinAdmissionService:
@@ -37,6 +62,58 @@ class JoinAdmissionService:
 
     def __init__(self, *, db: LandscapeDB) -> None:
         self._db = db
+
+    def _check_join_compatibility(
+        self,
+        read_factory: LandscapeReadRepositories,
+        run: Run,
+        run_id: str,
+        config: PipelineConfig,
+        graph: ExecutionGraph,
+        *,
+        defer_to_admission_on_dead_leader: bool = True,
+    ) -> None:
+        if run.canonical_version != hashing.CANONICAL_VERSION:
+            raise JoinRefusedError(
+                run_id,
+                f"canonical version changed from {run.canonical_version!r} to {hashing.CANONICAL_VERSION!r}",
+            )
+        # The leader seeds every source READY before it registers any edge, and
+        # moves a source past READY only in the source loop, after the last edge
+        # commits. A source past READY therefore marks graph registration
+        # complete. Read it before the edges so the edge read sees every edge
+        # committed before the marker.
+        records = read_factory.run_lifecycle.get_run_source_lifecycle_records(run_id)
+        try:
+            states = {node_id: RunSourceLifecycleState(record.lifecycle_state) for node_id, record in records.items()}
+        except ValueError as exc:
+            # The column's CHECK admits only RunSourceLifecycleState values.
+            raise AuditIntegrityError(f"run {run_id!r} has a run_sources lifecycle state outside RunSourceLifecycleState") from exc
+        graph_registered = any(state is not RunSourceLifecycleState.READY for state in states.values())
+        if graph_registered:
+            # One registration wrote the source nodes and their run_sources rows
+            # from one graph, nodes first, so the two sets must agree once the
+            # marker is set. A follower-graph difference is skew, refused by the
+            # implementation check below.
+            source_node_ids = {node.node_id for node in read_factory.data_flow.get_nodes(run_id) if node.node_type is NodeType.SOURCE}
+            if set(states) != source_node_ids:
+                raise AuditIntegrityError(f"run {run_id!r} run_sources rows do not cover its recorded source nodes")
+        else:
+            if defer_to_admission_on_dead_leader:
+                leader = RunCoordinationRepository(self._db.engine).live_leader(run_id=run_id)
+                if leader is None or not leader.seat_live:
+                    return
+            raise JoinNotReadyError(run_id, "the run's leader has not finished registering its graph; retry the join")
+        recorded_edges = {
+            (edge.from_node_id, edge.to_node_id, edge.label, edge.default_mode) for edge in read_factory.data_flow.get_edges(run_id)
+        }
+        expected_edges = {(edge.from_node, edge.to_node, edge.label, edge.mode) for edge in graph.get_edges()}
+        if recorded_edges != expected_edges:
+            raise JoinRefusedError(run_id, "recorded graph edges do not match follower graph")
+        implementation_check = check_implementation_compatibility(read_factory, run_id, config, graph)
+        if not implementation_check.can_resume:
+            assert implementation_check.reason is not None
+            raise JoinRefusedError(run_id, implementation_check.reason)
 
     @staticmethod
     def _join_preflight(db: LandscapeDB, run_id: str) -> None:
@@ -97,6 +174,8 @@ class JoinAdmissionService:
         run_id: str,
         settings: ElspethSettings,
         *,
+        config: PipelineConfig,
+        graph: ExecutionGraph,
         window_seconds: float | None = None,
     ) -> WorkerMembershipToken:
         """§B.1: atomic follower admission — new public entry point (ADR-030).
@@ -115,7 +194,17 @@ class JoinAdmissionService:
            ``LandscapeDB`` carries the PRAGMA probe + epoch check — G28
            cross-process uniformity by construction).
 
-        2. Atomic admission (one ``BEGIN IMMEDIATE`` transaction via
+        2. Read the run before admission. A matching, RUNNING run must use the
+           current canonical version, have finished registering its graph
+           (some source has left ``ready``, which the leader does only after
+           its last edge commits), record exactly the follower graph's edges,
+           and match the follower's plugin implementation evidence.
+           Unfinished registration is retryable while the leader seat is live;
+           an absent or still-expired seat receives the admission
+           transaction's seat refusal. After registration, any edge difference
+           is a refusal.
+
+        3. Atomic admission (one ``BEGIN IMMEDIATE`` transaction via
            :meth:`RunCoordinationRepository.admit_follower`):
 
            - ``SELECT runs.status, runs.config_hash`` — status must be
@@ -128,6 +217,10 @@ class JoinAdmissionService:
              ADR-047), else refused ("no live leader — use ``elspeth resume``");
            - ``INSERT run_workers`` (role='follower', status='active') +
              ``worker_register`` event.  COMMIT.
+
+        After every admission, the run's version, graph, and plugin evidence
+        are checked again. A refusal then records registration and departure
+        for that follower.
 
         Args:
             run_id: Landscape run ID to join.
@@ -146,8 +239,10 @@ class JoinAdmissionService:
             is never constructed outside the repository.
 
         Raises:
-            JoinRefusedError: Filesystem preflight failed, run is not RUNNING,
-                config hash mismatch, or no live leader seat.
+            JoinRefusedError: Filesystem preflight failed, version, graph edge
+                identity or plugin implementation differs, run is not RUNNING,
+                config hash mismatches, or no live leader seat.
+            JoinNotReadyError: The leader is live but has not finished registering the graph.
         """
 
         _window = window_seconds if window_seconds is not None else DEFAULT_RUN_LIVENESS_WINDOW_SECONDS
@@ -165,10 +260,48 @@ class JoinAdmissionService:
         joiner_config_hash = stable_hash(resolve_config(settings))
         worker_id = mint_worker_id(run_id)
 
+        read_factory = RecorderFactory.read_only(self._db)
+        run = read_factory.run_lifecycle.get_run(run_id)
+        if run is not None and run.status is RunStatus.RUNNING and run.config_hash == joiner_config_hash:
+            self._check_join_compatibility(read_factory, run, run_id, config, graph)
+
         factory = RecorderFactory(self._db, payload_store=None)
-        return factory.run_coordination.admit_follower(
+        token = factory.run_coordination.admit_follower(
             run_id=run_id,
             worker_id=worker_id,
             config_hash=joiner_config_hash,
             window_seconds=_window,
         )
+        try:
+            current_factory = RecorderFactory.read_only(self._db)
+            current_run = current_factory.run_lifecycle.get_run(run_id)
+            if current_run is None:
+                raise AuditIntegrityError(f"Admitted follower's run {run_id!r} is missing from the Landscape")
+            self._check_join_compatibility(current_factory, current_run, run_id, config, graph, defer_to_admission_on_dead_leader=False)
+        except contract_errors.TIER_1_ERRORS as error:
+            try:
+                factory.run_coordination.depart_worker(member_token=token)
+            except Exception as departure_error:
+                error.add_note(f"follower {token.worker_id} departure failed: {_departure_summary(departure_error)}")
+            raise
+        except JoinRefusedError as refusal:
+            try:
+                factory.run_coordination.depart_worker(member_token=token)
+            except contract_errors.TIER_1_ERRORS as departure_error:
+                # Bare raise keeps any cause of its own; the refusal is its context,
+                # and the note keeps it visible when that cause suppresses context.
+                departure_error.add_note(f"follower {token.worker_id} departure followed join refusal: {refusal.reason}")
+                raise
+            except Exception as departure_error:
+                refusal.departure_failure = _departure_summary(departure_error)
+            raise
+        except Exception as error:
+            try:
+                factory.run_coordination.depart_worker(member_token=token)
+            except contract_errors.TIER_1_ERRORS as departure_error:
+                departure_error.add_note(f"follower {token.worker_id} departure followed post-admission error: {_departure_summary(error)}")
+                raise
+            except Exception as departure_error:
+                error.add_note(f"follower {token.worker_id} departure failed: {_departure_summary(departure_error)}")
+            raise
+        return token

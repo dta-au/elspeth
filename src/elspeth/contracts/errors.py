@@ -1209,10 +1209,16 @@ class JoinRefusedError(Exception):
     actionable filesystem-writability failure) without parsing text.
     """
 
-    def __init__(self, run_id: str, reason: str) -> None:
+    def __init__(self, run_id: str, reason: str, *, departure_failure: str | None = None) -> None:
         self.run_id = run_id
         self.reason = reason
+        self.departure_failure = departure_failure
         super().__init__(f"Cannot join run {run_id!r}: {reason}")
+
+
+# TIER-2: Retryable join refusal while the leader is registering the run graph.
+class JoinNotReadyError(JoinRefusedError):
+    """Raised when a follower must retry after graph registration completes."""
 
 
 # ADR-030 §B.1 step 5: leader seat expired while a follower was draining.

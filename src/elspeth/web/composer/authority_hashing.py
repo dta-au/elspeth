@@ -171,7 +171,7 @@ def canonical_json_and_hash(value: object) -> tuple[str, str]:
 
     ``core.canonical.stable_hash`` is SHA-256 over the UTF-8 bytes of exactly
     the text ``core.canonical.canonical_json`` returns: both apply the same
-    ``_normalize_for_canonical`` and then the ``contracts.hashing`` primitive,
+    ``normalize_for_canonical`` and then the ``contracts.hashing`` primitive,
     whose ``stable_hash`` hashes its own ``canonical_json``. A caller that
     needs both therefore serializes once; the two refuse the same inputs.
     """
