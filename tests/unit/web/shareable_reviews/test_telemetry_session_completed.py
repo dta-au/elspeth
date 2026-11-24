@@ -25,6 +25,7 @@ from uuid import UUID, uuid4
 import pytest
 from sqlalchemy import select
 from sqlalchemy.exc import InvalidRequestError, OperationalError
+from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.core.payload_store import FilesystemPayloadStore
@@ -133,7 +134,7 @@ class _UnreadBlobService:
 
 @pytest.fixture
 def engine():  # type: ignore[no-untyped-def]
-    eng = create_session_engine("sqlite:///:memory:")
+    eng = create_session_engine("sqlite:///:memory:", poolclass=StaticPool, connect_args={"check_same_thread": False})
     initialize_session_schema(eng)
     return eng
 

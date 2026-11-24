@@ -419,7 +419,8 @@ async def _reconcile_pending_landscape_runs(
     create_tables: bool,
 ) -> None:
     candidates = await session_service.list_pending_landscape_reconciliations()
-    complete_run_ids, absent_run_ids = _finalize_orphaned_landscape_runs(
+    complete_run_ids, absent_run_ids = await run_sync_in_worker(
+        _finalize_orphaned_landscape_runs,
         landscape_url,
         candidates,
         create_tables=create_tables,
