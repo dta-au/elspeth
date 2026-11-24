@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import pickle
 import threading
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -228,6 +229,13 @@ def test_sibling_must_be_the_same_class_and_must_not_nest(tmp_path: Path) -> Non
         assert membership_wrong_class.value.reason is LeaseUpkeepSiblingRefusal.WRONG_CLASS
     finally:
         engine.dispose()
+
+
+@pytest.mark.parametrize("reason", list(LeaseUpkeepSiblingRefusal))
+def test_sibling_refusal_round_trips_through_pickle(reason: LeaseUpkeepSiblingRefusal) -> None:
+    restored = pickle.loads(pickle.dumps(LeaseUpkeepSiblingRefused(reason)))
+    assert type(restored) is LeaseUpkeepSiblingRefused
+    assert restored.reason is reason
 
 
 # --- production wiring --------------------------------------------------------------

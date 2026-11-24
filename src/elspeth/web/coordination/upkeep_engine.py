@@ -64,6 +64,10 @@ class LeaseUpkeepSiblingRefused(ValueError):
         super().__init__(_SIBLING_REFUSAL_MESSAGES[reason])
         self.reason = reason
 
+    def __reduce__(self) -> tuple[type[LeaseUpkeepSiblingRefused], tuple[LeaseUpkeepSiblingRefusal]]:
+        # Rebuild from the typed reason; ``args`` holds the message text.
+        return (type(self), (self.reason,))
+
 
 def has_separate_lease_upkeep_pool(url: str) -> bool:
     """Return whether ``url`` can have a second engine on the same database.

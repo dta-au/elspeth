@@ -797,8 +797,9 @@ restore_runtime_a() {
 }
 ```
 
-From that moment `rA`'s pools (`pool_pre_ping`, 5 + 5 per engine) detect the
-dead sockets, try to reconnect and are refused: heartbeat, renew, release,
+From that moment `rA`'s pools (`pool_pre_ping`; 5 + 5 per engine, and the
+2-connection pool that heartbeat, renew and release use) detect the dead
+sockets, try to reconnect and are refused: heartbeat, renew, release,
 cancel and the `stopped` write all fail; `rB` is untouched. The secondary
 primitive is `az containerapp revision deactivate` with
 `terminationGracePeriodSeconds: 0` ("stop immediately via the kill signal";
@@ -821,7 +822,7 @@ sessions database each replica also keeps a 2-connection pool (no
 overflow) for session lease renewal, lease release and the membership
 heartbeat, so the sessions side uses up to 12 connections per replica.
 The Landscape engines and the readiness probes' connections come on top,
-as do the second replica, Jobs and the operator's `psql` (facts §4.5). `verify-connection-budget` reads
+as do the other replicas, Jobs and the operator's `psql` (facts §4.5). `verify-connection-budget` reads
 `az monitor metrics list --metric active_connections` on the server and
 passes the series through the shared validator against the SKU's
 `max_connections`.
