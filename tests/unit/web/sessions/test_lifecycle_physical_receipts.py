@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import replace
@@ -17,6 +18,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web import async_workers
 from elspeth.web.coordination import lifecycle
+from elspeth.web.coordination.contracts import SessionOperationLeaseDisposition
 from elspeth.web.required_sql_outcomes import RequiredSQLRaised, RequiredSQLReturned
 from elspeth.web.required_work import (
     RequiredAuthorityKind,
@@ -44,6 +46,93 @@ async def _actual_scope(tmp_path):
         RequiredWorkAuthority(RequiredAuthorityKind.SYNCHRONOUS_COMPOSE, context, invocation_id=str(uuid4()))
     )
     return service, engine, authority, context, coordinator
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("required", "expiry_known", "expected_attempts"),
+    (
+        pytest.param(False, True, 5, id="plain-lease-retries-to-the-cap"),
+        pytest.param(True, True, 1, id="required-work-never-retries"),
+        pytest.param(False, False, 1, id="adopted-lease-never-retries"),
+    ),
+)
+async def test_transient_renewal_retry_needs_a_plain_lease_that_knows_its_expiry(
+    tmp_path, monkeypatch, required: bool, expiry_known: bool, expected_attempts: int
+) -> None:
+    _service, engine, authority, context, coordinator = await _actual_scope(tmp_path)
+    transient = OperationalError("transient renewal contention", {}, RuntimeError("owned driver fault"))
+    attempts = []
+
+    def transient_renew(actual_context, *, lease_seconds):
+        attempts.append(actual_context)
+        raise transient
+
+    monkeypatch.setattr(authority, "renew", transient_renew)
+    lease = lifecycle.SessionOperationLease(
+        authority,
+        context,
+        lease_seconds=30,
+        renew_interval_seconds=0.01,
+        required_work=coordinator if required else None,
+        lease_extended_at=time.monotonic() if expiry_known else None,
+    )
+    try:
+        async with asyncio.timeout(10):
+            loss = await lease.wait_until_lost()
+        assert loss is transient and lease.renewal_error is transient
+        assert len(attempts) == expected_attempts
+        with pytest.raises(OperationalError) as closing:
+            await lease.close()
+        assert closing.value is transient
+        # The driver refused the renewal with a known outcome, so the close
+        # still gives up this lease's own fence.
+        assert _read_actual_fence(engine, context).released_at is not None
+    finally:
+        if not lease.closed:
+            with suppress(OperationalError):
+                await lease.close()
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_a_fault_logging_a_renewal_retry_records_the_loss_before_it_escapes(tmp_path, monkeypatch) -> None:
+    _service, engine, authority, context, _coordinator = await _actual_scope(tmp_path)
+    transient = OperationalError("transient renewal contention", {}, RuntimeError("owned driver fault"))
+    log_fault = RuntimeError("retry log fault")
+
+    def transient_renew(actual_context, *, lease_seconds):
+        raise transient
+
+    def failing_retry_log(self, error, *, consecutive_failures, seconds_since_renewal):
+        raise log_fault
+
+    monkeypatch.setattr(authority, "renew", transient_renew)
+    monkeypatch.setattr(lifecycle.SessionOperationLease, "_log_renewal_retry", failing_retry_log)
+    lease = lifecycle.SessionOperationLease(
+        authority, context, lease_seconds=30, renew_interval_seconds=0.01, lease_extended_at=time.monotonic()
+    )
+    try:
+        async with asyncio.timeout(10):
+            loss = await lease.wait_until_lost()
+            renewal = lease._renewal_task
+            assert renewal is not None
+            await asyncio.wait({renewal})
+        assert loss is transient and lease.renewal_error is transient, "the loss is recorded before the log fault escapes"
+        assert renewal.exception() is log_fault, "the log fault is not suppressed"
+        # Renewal ended on the log fault, so close does not release: the fence
+        # stays until its expiry, the renewal error is raised and the lease is lost.
+        with pytest.raises(OperationalError) as closing:
+            await lease.close()
+        assert closing.value is transient
+        assert lease.disposition is SessionOperationLeaseDisposition.LOST
+        assert _read_actual_fence(engine, context).released_at is None
+    finally:
+        if not lease.closed:
+            with suppress(Exception):
+                await lease.close()
+        authority.release(context)
+        engine.dispose()
 
 
 def _read_actual_fence(engine, context):
