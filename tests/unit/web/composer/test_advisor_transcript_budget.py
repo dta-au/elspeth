@@ -811,6 +811,9 @@ async def test_a_provider_rejection_of_a_request_over_its_estimate_is_an_ordinar
 
     async def rejected(**kwargs: Any) -> None:
         await admit_provider_attempt(model=kwargs["model"])
+        # The real transport calls the dispatch hook once the attempt is admitted, before sending.
+        if kwargs.get("on_provider_dispatch") is not None:
+            kwargs["on_provider_dispatch"]()
         sent.append(copy.deepcopy(kwargs))
         raise BadRequestError(
             "PRIVATE_PROVIDER_BODY", model=kwargs["model"], llm_provider="openai", body={"code": "context_length_exceeded"}
