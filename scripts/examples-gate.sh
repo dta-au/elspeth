@@ -527,7 +527,9 @@ for line in "${CASE_LINES[@]}"; do
     fi
 
     set +e
-    pre="$("${HELPER[@]}" preflight --cases "$CASES" --tree "$root" --case "$id" 2>&1)"
+    mkdir -p "$case_dir/ignore-check"
+    pre="$("${HELPER[@]}" preflight --cases "$CASES" --tree "$root" --case "$id" \
+        --sandbox-proof "$LOG_DIR/self-test.out" --nonce "$NONCE" --scratch "$case_dir/ignore-check" 2>&1)"
     rc=$?
     set -e
     if [ "$rc" -ne 0 ]; then

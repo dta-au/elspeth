@@ -867,6 +867,12 @@ cases:
   - id: blob_transforms
     example: blob_transforms
     command: ./examples/blob_transforms/run.sh
+    generated_inputs:
+      generator: examples/blob_transforms/run.sh
+      paths:
+        - examples/blob_transforms/input/csv_blob_manifest.csv
+        - examples/blob_transforms/input/json_blob_manifest.csv
+        - examples/blob_transforms/input/text_blob_manifest.csv
     expect_exit: [0]
     configs:
       - examples/blob_transforms/settings_expand_csv_blobs.yaml
@@ -886,6 +892,10 @@ cases:
   - id: pdf_rasterize
     example: pdf_rasterize
     command: ./examples/pdf_rasterize/run.sh
+    generated_inputs:
+      generator: examples/pdf_rasterize/run.sh
+      paths:
+        - examples/pdf_rasterize/input/pdf_manifest.csv
     expect_exit: [1]
     configs: [examples/pdf_rasterize/settings.yaml]
     expectation_source: "AGENTS.md L53, L73: 2 documents, PARTIAL/exit 1, 1 quarantined, 3 page rows"
@@ -993,7 +1003,11 @@ cases:
 
   - id: chaosllm_endurance
     example: chaosllm_endurance
-    command: CHAOSLLM_ENDURANCE_ROWS=20 ./examples/chaosllm_endurance/run.sh
+    command: CHAOSLLM_ENDURANCE_ROWS=20 CHAOSLLM_ENDURANCE_INPUT_PATH=examples/chaosllm_endurance/input.20.csv ./examples/chaosllm_endurance/run.sh
+    generated_inputs:
+      generator: examples/chaosllm_endurance/run.sh
+      paths:
+        - examples/chaosllm_endurance/input.20.csv
     expect_exit: [0, 1]
     ports: [8199]
     configs: [examples/chaosllm_endurance/settings.yaml]
@@ -1116,6 +1130,10 @@ cases:
   - id: fixed_web_search.multipart
     example: fixed_web_search
     command: ./examples/fixed_web_search/run_fixture.sh multipart
+    generated_inputs:
+      generator: examples/fixed_web_search/run_fixture.sh
+      paths:
+        - examples/fixed_web_search/runs_multipart/input.jsonl
     expect_exit: [0]
     ports: [8213]
     configs: [examples/fixed_web_search/settings_fixture_multipart.yaml]

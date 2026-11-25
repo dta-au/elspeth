@@ -23,14 +23,17 @@ Exit codes: 0 = ok/PASS, 1 = FAIL/refused, 2 = usage or data-file error.
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import re
 import shlex
 import sqlite3
 import stat
+import subprocess
 import sys
 from collections.abc import Iterator
 from pathlib import Path
@@ -89,6 +92,191 @@ def _list_of(node: Any, expected: type, label: str) -> None:
         raise DataError(f"{label}: expected a list of {expected.__name__}")
 
 
+GENERATED_INPUT_SUFFIXES = frozenset({".csv", ".jsonl", ".json"})
+_ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*", re.S)
+_PATH_VARIABLE_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
+
+
+def _command_words(command: str, label: str) -> list[str]:
+    try:
+        return shlex.split(command)
+    except ValueError as error:
+        raise DataError(f"{label}.command: invalid command: {error}") from error
+
+
+def case_environment(case: dict[str, Any]) -> dict[str, str]:
+    """The variables a case sets for its own command: its env mapping, overridden by its leading VAR=value words."""
+    environment: dict[str, str] = dict(case.get("env") or {})
+    for word in _command_words(case["command"], f"case {case['id']!r}"):
+        if not _ASSIGNMENT_RE.fullmatch(word):
+            break
+        name, value = word.split("=", 1)
+        environment[name] = value
+    return environment
+
+
+def resolve_source_path(raw: str, environment: dict[str, str]) -> str:
+    """A config's source path as the case's command sees it.
+
+    ${NAME:-default} takes the case's own value of NAME, else the default; a variable the case
+    does not set is never looked up anywhere else.
+    """
+
+    def substitute(match: re.Match[str]) -> str:
+        name, default = match.group(1), match.group(2)
+        if name in environment:
+            return environment[name]
+        return default if default is not None else match.group(0)
+
+    return _PATH_VARIABLE_RE.sub(substitute, raw)
+
+
+def _validate_generated_inputs(case: dict[str, Any], label: str) -> None:
+    block = _mapping(case["generated_inputs"], {"generator", "paths"}, f"{label}.generated_inputs")
+    _typed(block.get("generator"), str, f"{label}.generated_inputs.generator")
+    _list_of(block.get("paths"), str, f"{label}.generated_inputs.paths")
+    if not block["paths"] or len(set(block["paths"])) != len(block["paths"]):
+        raise DataError(f"{label}.generated_inputs.paths: expected distinct paths")
+    example_dir = Path("examples") / str(case.get("example"))
+    for raw in [block["generator"], *block["paths"]]:
+        path = Path(raw)
+        if raw != os.path.normpath(raw) or path.is_absolute() or re.search(r"[*?\[\]]", raw) or not path.is_relative_to(example_dir):
+            raise DataError(f"{label}.generated_inputs: {raw!r} is not an exact path inside {example_dir}")
+    for raw in block["paths"]:
+        if Path(raw).suffix not in GENERATED_INPUT_SUFFIXES:
+            raise DataError(f"{label}.generated_inputs: {raw!r} is not one of {sorted(GENERATED_INPUT_SUFFIXES)}")
+    words = [word for word in _command_words(case["command"], label) if not _ASSIGNMENT_RE.fullmatch(word)]
+    if not words or os.path.normpath(words[0]) != block["generator"]:
+        raise DataError(f"{label}.generated_inputs.generator: {block['generator']!r} is not the case's own launcher")
+
+
+def generated_inputs_of(case: dict[str, Any]) -> list[str]:
+    return list((case.get("generated_inputs") or {}).get("paths") or [])
+
+
+def sandbox_in_force(proof: str | None, nonce: str | None) -> bool:
+    """True only when this run's sandbox self-test output carries this run's nonce.
+
+    The gate refuses every case when the self-test fails; checking its output here as well keeps
+    the deferral of the offline guard tied to the sandbox, so a call without it never defers.
+    """
+    if not proof or not nonce or not re.fullmatch(r"[0-9a-f]{32}", nonce):
+        return False
+    try:
+        lines = Path(proof).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+    return f"self-test-ok {nonce}" in lines
+
+
+def gitignored(tree: Path, rel: str, scratch: Path) -> bool:
+    """Whether the tree's own .gitignore files ignore ``rel``. The tree is an export with no .git:
+    an empty repository lends git its machinery, and no user or system ignore file is read."""
+    git_dir = scratch / "ignore-check.git"
+    if not git_dir.is_dir():
+        subprocess.run(["git", "init", "-q", "--bare", "--template=", str(git_dir)], check=True, env=_GIT_ENV)
+    result = subprocess.run(
+        [
+            "git",
+            "-c",
+            "core.excludesFile=/dev/null",
+            f"--git-dir={git_dir}",
+            f"--work-tree={tree}",
+            "check-ignore",
+            "-q",
+            "--no-index",
+            "--",
+            rel,
+        ],
+        env=_GIT_ENV,
+        cwd=tree,
+        check=False,
+    )
+    if result.returncode not in (0, 1):
+        raise DataError(f"git check-ignore {rel}: exit {result.returncode}")
+    return result.returncode == 0
+
+
+_GIT_ENV = {"GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1", "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+
+
+def generated_input_refusals(tree: Path, case: dict[str, Any], scratch: Path) -> list[str]:
+    """Before the run: the generator is in the export, and each declared input is gitignored and absent."""
+    block = case["generated_inputs"]
+    refusals = []
+    generator = block["generator"]
+    if not (tree / generator).is_file() or gitignored(tree, generator, scratch):
+        refusals.append(f"generated inputs: generator {generator} is not a tracked file of the export")
+    for raw in block["paths"]:
+        if os.path.lexists(tree / raw):
+            refusals.append(f"generated inputs: {raw} exists before the run (tracked: stale declaration)")
+        elif not gitignored(tree, raw, scratch):
+            refusals.append(f"generated inputs: {raw} is not gitignored")
+    return refusals
+
+
+def _strings(node: Any) -> Iterator[str]:
+    if isinstance(node, str):
+        yield node
+    elif isinstance(node, dict):
+        for key, value in node.items():
+            yield from _strings(key)
+            yield from _strings(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _strings(value)
+
+
+def _input_values(path: Path) -> list[str]:
+    text = path.read_text(encoding="utf-8")
+    if path.suffix == ".csv":
+        return [cell for row in csv.reader(io.StringIO(text)) for cell in row]
+    if path.suffix == ".jsonl":
+        return [value for line in text.splitlines() if line.strip() for value in _strings(json.loads(line))]
+    return list(_strings(json.loads(text)))
+
+
+def generated_input_failures(root: Path, case: dict[str, Any]) -> tuple[list[str], list[str]]:
+    """After the run: each declared input exists inside the copy and names nothing off the copy.
+
+    A remote URL fails the case; so does an absolute (or file:) path, or a relative one, that
+    resolves outside the case copy.
+    """
+    failures: list[str] = []
+    evidence: list[str] = []
+    real_root = os.path.realpath(root)
+    for raw in generated_inputs_of(case):
+        path = root / raw
+        if not _within(os.path.realpath(path), real_root) or not path.is_file():
+            failures.append(f"generated input {raw}: not a file inside the case copy after the run")
+            continue
+        if path.stat().st_size >= 50_000_000:
+            failures.append(f"generated input {raw}: exceeds size bound")
+            continue
+        try:
+            values = _input_values(path)
+        except (OSError, UnicodeDecodeError, ValueError, csv.Error) as error:
+            failures.append(f"generated input {raw}: unreadable ({type(error).__name__})")
+            continue
+        bad = []
+        for value in values:
+            for match in URL_RE.finditer(value):
+                host = _url_host(match.group(0))
+                if host not in LOOPBACK_HOSTS:
+                    bad.append(f"remote URL host {host}")
+            target = value[len("file://") :] if value.startswith("file://") else value
+            if "\n" in target or not target:
+                continue
+            names_a_path = os.path.isabs(target) or os.path.normpath(target).split(os.sep)[0] == ".."
+            if names_a_path and not _within(os.path.realpath(root / target), real_root):
+                bad.append(f"path {target} outside the case copy")
+        if bad:
+            failures.append(f"generated input {raw}: {'; '.join(dict.fromkeys(bad))}")
+        else:
+            evidence.append(f"generated input {raw}: {len(values)} values, none remote or outside the copy")
+    return failures, evidence
+
+
 def _relative_home_path(raw: str, label: str) -> Path:
     path = Path(raw)
     if path.is_absolute() or path == Path(".") or "," in raw or any(part in {"..", ""} for part in path.parts):
@@ -122,6 +310,7 @@ def load_cases(path: Path) -> dict[str, Any]:
         "requires",
         "env",
         "files",
+        "generated_inputs",
     }
     audit_keys = {
         "db",
@@ -235,6 +424,8 @@ def load_cases(path: Path) -> dict[str, Any]:
                 raise DataError(f"case {case.get('id')!r}: missing {key!r}")
         if not re.fullmatch(r"[A-Za-z0-9_.-]+", case["id"]):
             raise DataError(f"case id {case['id']!r} is not filename-safe")
+        if "generated_inputs" in case:
+            _validate_generated_inputs(case, f"case {case['id']!r}")
     for name, entry in data["examples"].items():
         if entry.get("class") not in CLASSES:
             raise DataError(f"example {name!r}: class {entry.get('class')!r} not in {sorted(CLASSES)}")
@@ -512,10 +703,14 @@ def _source_paths(doc: dict[str, Any]) -> list[str]:
     return paths
 
 
-def network_findings(tree: Path, config: Path) -> list[str]:
+def network_findings(
+    tree: Path, config: Path, *, environment: dict[str, str] | None = None, deferred: frozenset[str] = frozenset()
+) -> list[str]:
     """Reasons a config would reach beyond loopback. Empty list = offline by construction.
 
-    Each finding is 'file:line: text -- reason', the deciding line.
+    Each finding is 'file:line: text -- reason', the deciding line. Source paths are resolved with
+    the case's own ``environment``. A path in ``deferred`` is a declared generated input that does
+    not exist yet; only cmd_preflight passes any, and only when this run's sandbox self-test passed.
     """
     text = config.read_text(encoding="utf-8")
     doc = yaml.safe_load(text)
@@ -553,8 +748,11 @@ def network_findings(tree: Path, config: Path) -> list[str]:
         if key == "vault_url":
             add("vault_url", "secret store URL")
     for raw in _source_paths(doc):
-        if "${" in raw:
-            raw = re.sub(r"\$\{[^}:]*:-([^}]*)\}", r"\1", raw)
+        raw = resolve_source_path(raw, environment or {})
+        if raw in deferred:
+            # Inspected after the run instead (generated_input_findings). Deferring the text guard is
+            # acceptable only because the case runs in the sandbox with no network to reach.
+            continue
         candidate = tree / raw
         if not candidate.is_file():
             add(raw, f"input fixture {raw} missing or unreadable")
@@ -797,8 +995,24 @@ def cmd_preflight(args: argparse.Namespace) -> int:
     case = case_by_id(data, args.case)
     tree = Path(args.tree)
     refusals = []
+    deferred: frozenset[str] = frozenset()
+    if "generated_inputs" in case:
+        # A declared generated input does not exist until the case's own launcher writes it, so the
+        # text guard cannot read it now. Deferring that read to after the run is acceptable only
+        # because the case runs in the sandbox, which has no network: without this run's self-test
+        # proof nothing is deferred and the missing input is refused as before.
+        if not sandbox_in_force(args.sandbox_proof, args.nonce):
+            refusals.append("generated inputs: no sandbox self-test proof for this run; not deferring the offline guard")
+        elif not args.scratch:
+            refusals.append("generated inputs: no scratch directory for the ignore check")
+        else:
+            gen_refusals = generated_input_refusals(tree, case, Path(args.scratch))
+            refusals.extend(gen_refusals)
+            if not gen_refusals:
+                deferred = frozenset(generated_inputs_of(case))
+    environment = case_environment(case)
     for cfg in case["configs"]:
-        for finding in network_findings(tree, tree / cfg):
+        for finding in network_findings(tree, tree / cfg, environment=environment, deferred=deferred):
             refusals.append(f"offline guard: {finding}")
     requires = case.get("requires") or {}
     for module in requires.get("python_modules", []):
@@ -810,7 +1024,8 @@ def cmd_preflight(args: argparse.Namespace) -> int:
     for line in refusals:
         print(line)
     if not refusals:
-        print(f"preflight ok: {len(case['configs'])} config(s) offline by construction")
+        note = f"; {len(deferred)} generated input(s) inspected after the run" if deferred else ""
+        print(f"preflight ok: {len(case['configs'])} config(s) offline by construction{note}")
     return 1 if refusals else 0
 
 
@@ -970,6 +1185,9 @@ def cmd_check(args: argparse.Namespace) -> int:
             more_failures, more_evidence = [f"{spec.get('db')}: capture error {type(error).__name__}: {error}"], []
         failures.extend(more_failures)
         evidence.extend(more_evidence)
+    more_failures, more_evidence = generated_input_failures(root, case)
+    failures.extend(more_failures)
+    evidence.extend(more_evidence)
     for rel, want in (case.get("files") or {}).items():
         path = root / rel
         if want == "absent_or_empty":
@@ -1016,6 +1234,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--cases", required=True)
     p.add_argument("--tree", required=True)
     p.add_argument("--case", required=True)
+    p.add_argument("--sandbox-proof", help="this run's self-test output (generated inputs only)")
+    p.add_argument("--nonce", help="this run's self-test nonce (generated inputs only)")
+    p.add_argument("--scratch", help="a gate-owned directory for the ignore check (generated inputs only)")
     p = sub.add_parser("check")
     p.add_argument("--cases", required=True)
     p.add_argument("--root", required=True)
