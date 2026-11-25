@@ -30,6 +30,7 @@ from elspeth.web.composer.bounded_json import (
     bounded_json_loads,
 )
 from elspeth.web.composer.protocol import ComposerAdmissionRefused
+from elspeth.web.credential_scan import CredentialScanSurface, scan_best_effort
 from elspeth.web.secrets.ref_policy import allowed_secret_ref_fields
 
 if TYPE_CHECKING:
@@ -44,6 +45,7 @@ _MODEL_OUTPUT_SURFACES: Final[frozenset[str]] = frozenset(
         "composer_planner_response",
         "composer_advisor_response",
         "composer_provider_thinking",
+        "composer_tool_arguments",
         "composer_tool_batch",
         "composer_tool_wire",
         "composer_recovery_reply",
@@ -53,6 +55,16 @@ _MODEL_OUTPUT_CREDENTIAL_REFUSAL_DETAIL: Final[str] = (
     "The model's output appears to contain a credential, so it was blocked. "
     "If you gave the Composer a credential, store it through the secret service and use a secret reference instead. "
     "Otherwise, retry your request."
+)
+
+
+# What a failed turn's progress view shows for a credential refusal, by who
+# wrote the refused content (``CredentialMaterialRefused.from_model_output``).
+CREDENTIAL_REFUSAL_HEADLINE: Final[str] = "Something in this session appears to be a credential, so the composer stopped."
+CREDENTIAL_REFUSAL_NEXT_STEP: Final[str] = "Remove the credential and retry. If you can't find or remove it, start a new session."
+MODEL_OUTPUT_CREDENTIAL_REFUSAL_HEADLINE: Final[str] = "The composer blocked the model's output."
+MODEL_OUTPUT_CREDENTIAL_REFUSAL_NEXT_STEP: Final[str] = (
+    "Retry the request without any credential you gave. If it is blocked again, rephrase it or start a new session."
 )
 
 
@@ -74,8 +86,19 @@ class CredentialMaterialRefused(ComposerAdmissionRefused):
     def __init__(self, *, surface: str, finding: CredentialMaterialFinding) -> None:
         self.surface = surface
         self.finding = finding
-        self.detail = _MODEL_OUTPUT_CREDENTIAL_REFUSAL_DETAIL if surface in _MODEL_OUTPUT_SURFACES else CREDENTIAL_REFUSAL_DETAIL
+        # Who wrote the refused content: the model, or the user and their
+        # pipeline. The detail and every per-cause message follow this one flag.
+        self.from_model_output = surface in _MODEL_OUTPUT_SURFACES
+        self.detail = _MODEL_OUTPUT_CREDENTIAL_REFUSAL_DETAIL if self.from_model_output else CREDENTIAL_REFUSAL_DETAIL
         super().__init__(self.detail)
+
+    @property
+    def progress_headline(self) -> str:
+        return MODEL_OUTPUT_CREDENTIAL_REFUSAL_HEADLINE if self.from_model_output else CREDENTIAL_REFUSAL_HEADLINE
+
+    @property
+    def progress_next_step(self) -> str:
+        return MODEL_OUTPUT_CREDENTIAL_REFUSAL_NEXT_STEP if self.from_model_output else CREDENTIAL_REFUSAL_NEXT_STEP
 
     def to_payload(self) -> CredentialMaterialRefusalPayload:
         return {
@@ -106,7 +129,12 @@ def require_no_credential_material_in_native_thinking(blocks: Sequence[Mapping[s
         if block["type"] == "redacted_thinking":
             continue
         text = block["thinking"]
-        finding = find_credential_material(text, CredentialTraversalPolicy(max_string_bytes=len(text.encode("utf-8"))))
+        # Conservative: the same finding either withholds the block or, when
+        # replay needs it whole, refuses the turn; withholding stays as broad as
+        # the other reasoning withholds.
+        finding = find_credential_material(
+            text, CredentialTraversalPolicy(max_string_bytes=len(text.encode("utf-8"))), purpose="conservative"
+        )
         if finding is not None:
             raise CurrentToolLoopThinkingRefused(finding=finding)
 
@@ -114,15 +142,16 @@ def require_no_credential_material_in_native_thinking(blocks: Sequence[Mapping[s
 def require_no_credential_material(
     value: Any,
     *,
-    surface: str,
+    surface: CredentialScanSurface,
     env_ref_names: Collection[str] = frozenset(),
     additional_credential_fields: Collection[str] = frozenset(),
     max_string_bytes: int = 262_144,
 ) -> None:
-    """Atomically reject one bounded control-plane value before side effects."""
-    finding = find_credential_material(
+    """Refuse one control-plane value that matches a known credential pattern, before side effects."""
+    finding = scan_best_effort(
         value,
-        CredentialTraversalPolicy(
+        surface=surface,
+        policy=CredentialTraversalPolicy(
             env_ref_names=env_ref_names,
             additional_credential_fields=additional_credential_fields,
             max_string_bytes=max_string_bytes,
@@ -174,7 +203,7 @@ def require_no_credential_material_in_llm_metadata(
     provider_request_id: str | None,
     finish_reason: str | None,
     provider_served: str | None,
-    surface: str,
+    surface: CredentialScanSurface,
     thinking_replay_required: bool | None = None,
 ) -> ReasoningScrubOutcome:
     """Refuse control output; withhold credential-shaped diagnostic reasoning."""
@@ -205,11 +234,11 @@ def require_no_credential_material_in_llm_metadata(
         },
         surface=surface,
     )
-    content_finding = find_credential_material(reasoning_content)
+    content_finding = find_credential_material(reasoning_content, purpose="conservative")
     if content_finding is not None:
         reasoning_content = None
         withholds.append(ReasoningWithhold(surface, content_finding.category, content_finding.detector_version, "reasoning_content"))
-    details_finding = find_credential_material(_readable_reasoning_details(reasoning_details))
+    details_finding = find_credential_material(_readable_reasoning_details(reasoning_details), purpose="conservative")
     if details_finding is not None:
         reasoning_details = None
         withholds.append(ReasoningWithhold(surface, details_finding.category, details_finding.detector_version, "reasoning_details"))
@@ -238,7 +267,7 @@ def field_mapper_credential_options_projection(options: Any) -> Any:
     if any(type(key) is not str or type(value) is not str for key, value in mapping.items()):
         return options
     projected = dict(options) | {"mapping": [[key, value] for key, value in mapping.items()]}
-    if find_credential_material(projected) is not None:
+    if find_credential_material(projected, purpose="admission") is not None:
         return options
     from elspeth.plugins.transforms.field_mapper import FieldMapperConfig
     from elspeth.web.interpretation_state import strip_authoring_options
@@ -410,7 +439,7 @@ def require_no_credential_material_for_tool(
     tool_name: str,
     arguments: Any,
     *,
-    surface: str,
+    surface: CredentialScanSurface,
     credential_state: CompositionState | None = None,
 ) -> None:
     """Apply the control-plane detector to one semantic tool invocation."""
@@ -424,7 +453,7 @@ def require_no_credential_material_in_tool_wire(
     tool_name: str,
     raw_arguments: Any,
     *,
-    surface: str,
+    surface: CredentialScanSurface,
     credential_state: CompositionState | None = None,
 ) -> None:
     """Scan one provider tool-argument wire value before audit or dispatch.
@@ -461,7 +490,7 @@ def _decode_bounded_tool_wire(raw_arguments: str) -> Any:
 def require_no_credential_material_in_state(
     state: CompositionState,
     *,
-    surface: str,
+    surface: CredentialScanSurface,
     env_ref_names: Collection[str] = frozenset(),
 ) -> None:
     """Reject credential material across one owned composition state.

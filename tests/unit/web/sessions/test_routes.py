@@ -55,7 +55,7 @@ from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.composer.advisor_transcript import AdvisorTranscriptHistory
-from elspeth.web.composer.context_budget_history import ContextBudgetHistory
+from elspeth.web.composer.context_budget_history import ContextBudgetHistory, MeasuredDensity
 from elspeth.web.composer.control_messages import advisor_signoff_withheld_control_envelope, anti_anchor_control_envelope
 from elspeth.web.composer.diagnostic_evidence import (
     DIAGNOSTIC_EVIDENCE_KIND,
@@ -12133,8 +12133,11 @@ class TestSendMessageTranscriptSnapshot:
 
         assert resp.status_code == 200, resp.text
         assert mock_composer.compose.await_count == 1
+        # The stored call also gives the session's measured density (400 wire bytes for 100
+        # prompt tokens), which prices the next turn's first call.
         assert mock_composer.compose.await_args.kwargs["context_budget_history"] == ContextBudgetHistory(
             previously_shed_history=frozenset({"history:1"}),
+            measured=(MeasuredDensity(model="test/composer-model", dialect=None, bytes_per_token=4.0),),
         )
 
     def test_send_message_transcript_snapshot_contains_prior_turns(self, tmp_path) -> None:

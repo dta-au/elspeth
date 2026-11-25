@@ -50,10 +50,12 @@ from elspeth.web.composer.protocol import ComposerPluginCrashError, ComposerResu
 from elspeth.web.composer.provider_errors import ProviderRequestFailure
 from elspeth.web.composer.state import CompositionState, ValidationSummary
 from elspeth.web.composer.tools._common import ToolResult
+from elspeth.web.credential_guard import CredentialMaterialRefused
 from elspeth.web.sessions._persist_payload import AuditOutcome, RedactedToolRow
 
 if TYPE_CHECKING:
     from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointVerdict
+    from elspeth.web.composer.turn_effects import BlobDeliveryAttempt
 
 _ToolOutcomeResponse = ToolResult | Mapping[str, Any] | None
 
@@ -267,13 +269,16 @@ class _ToolOutcome:
 class _CallModelOutcome:
     """Result of one LLM call in the compose loop (Phase P1).
 
-    The sole field is the frozen completion admitted before the provider
+    ``completion`` is the frozen completion admitted before the provider
     object leaves the Tier-3 boundary. P2 reads its owned message, P3 consumes
     its already-admitted tool batch and provider metadata, and P5's B-4D-3
-    last-chance path consumes the same carrier directly.
+    last-chance path consumes the same carrier directly. ``delivery`` is set
+    only for that last-chance call; its caller confirms the delivery itself,
+    and only when the reply carries no tool calls.
     """
 
     completion: _AdmittedLLMCompletion
+    delivery: BlobDeliveryAttempt | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -367,6 +372,12 @@ class _DispatchOutcome:
     # original exception type, but follows the same persist-before-propagate
     # discipline so the request_advisor_hint row is never left OPEN.
     advisor_failure: Exception | None
+
+    # The dispatcher's credential scan refused a call's arguments. The call's
+    # value-free ARG_ERROR row is already recorded; like plugin_crash, the
+    # driver raises this only after P4 has persisted the turn, so earlier
+    # calls' rows and state stay durable.
+    credential_refusal: CredentialMaterialRefused | None
 
     # Advisor-tool compose timeout — the tool envelope is already closed in
     # P3, but P4 must persist/redact the current assistant+tool turn before the

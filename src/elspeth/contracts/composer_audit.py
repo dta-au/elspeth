@@ -109,6 +109,9 @@ class ToolArgumentErrorCategory(StrEnum):
     DUPLICATE_RESOLVED_INTERPRETATION  — interpretation already resolved.
     RATE_CAP_PER_SESSION_DAY / RATE_CAP_PER_TERM — interpretation caps.
     SEMANTIC_RULE                      — any other handler rule.
+    CREDENTIAL_MATERIAL                — the dispatcher's credential scan
+                                         refused the arguments before any
+                                         handler ran.
     """
 
     WIRE_JSON_INVALID = "wire_json_invalid"
@@ -126,6 +129,7 @@ class ToolArgumentErrorCategory(StrEnum):
     RATE_CAP_PER_SESSION_DAY = "rate_cap_per_session_day"
     RATE_CAP_PER_TERM = "rate_cap_per_term"
     SEMANTIC_RULE = "semantic_rule"
+    CREDENTIAL_MATERIAL = "credential_material"
 
 
 @dataclass(frozen=True, slots=True)

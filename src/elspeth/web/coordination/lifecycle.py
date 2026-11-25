@@ -993,6 +993,7 @@ class SessionOperationLease:
         the immutable context, and checks the latch again for a renewal loss
         recorded while the CAS was in flight.
         """
+        # The compare-and-swap is the authority; these attribute checks are only an early exit.
         if self._closed or self._close_task is not None:
             raise RuntimeError("session operation lease is closing or closed")
         self.raise_if_lost()

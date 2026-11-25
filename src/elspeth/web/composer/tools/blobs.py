@@ -46,7 +46,6 @@ from elspeth.contracts.blobs_inline import (
 )
 from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 from elspeth.contracts.composer_interpretation import InterpretationKind
-from elspeth.contracts.credential_material import DEFAULT_CREDENTIAL_TRAVERSAL_POLICY
 from elspeth.contracts.enums import CreationModality, is_llm_authored_creation_modality
 from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
@@ -77,6 +76,7 @@ from elspeth.web.blobs.service import (
 from elspeth.web.composer._attachment_response import READ_ATTACHMENT_RESPONSE_CONTRACT
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import (
+    ATTACHMENT_CONTENT_MAX_BYTES,
     READ_ATTACHMENT_MAX_UTF8_BYTES,
     BlobReadSuggestion,
     CreateBlobArgumentsModel,
@@ -110,6 +110,7 @@ from elspeth.web.composer.tools.declarations import (
     ToolKind,
 )
 from elspeth.web.credential_guard import CREDENTIAL_REFUSAL_DETAIL, CredentialMaterialRefused, require_no_credential_material
+from elspeth.web.credential_scan import CredentialScanSurface
 from elspeth.web.execution._validation_materialization import (
     FILE_INJECT_PLUGIN,
     FileInjectContentRefusal,
@@ -144,7 +145,7 @@ def _credential_safe_blob_discovery_result(
     state: CompositionState,
     payload: Any,
     *,
-    surface: str,
+    surface: CredentialScanSurface,
 ) -> ToolResult | None:
     """Return a fixed tool refusal when legacy blob output is unsafe."""
     try:
@@ -2772,12 +2773,11 @@ def _execute_get_blob_content(
     if data is None:
         return _failure_result(state, f"Blob storage file missing for '{blob_id}'.")
 
-    inspection_limit = DEFAULT_CREDENTIAL_TRAVERSAL_POLICY.max_string_bytes
-    if len(data) > inspection_limit:
+    if len(data) > ATTACHMENT_CONTENT_MAX_BYTES:
         return _failure_result(
             state,
-            f"The attachment is {len(data)} bytes, exceeding the current {inspection_limit}-byte "
-            "whole-input credential inspection limit; no content was returned.",
+            f"The attachment is {len(data)} bytes, over the {ATTACHMENT_CONTENT_MAX_BYTES}-byte limit for returned "
+            "attachments; no content was returned. For tabular structure, use inspect_source.",
             error_code="blob_content_size_limit",
         )
 
@@ -2942,9 +2942,9 @@ def _execute_read_attachment(arguments: dict[str, Any], state: CompositionState,
     if len(data) > READ_ATTACHMENT_MAX_UTF8_BYTES:
         return _failure_result(
             state,
-            f"The attachment is {len(data)} bytes, exceeding the current {READ_ATTACHMENT_MAX_UTF8_BYTES}-byte "
-            "whole-input credential inspection limit. Neither read_attachment nor get_blob_content can disclose it "
-            "under that limit; no content was returned.",
+            f"The attachment is {len(data)} bytes, over the {READ_ATTACHMENT_MAX_UTF8_BYTES}-byte limit for returned "
+            "attachments, so neither read_attachment nor get_blob_content can return it. For tabular structure, "
+            "use inspect_source.",
         )
     try:
         content = data.decode("utf-8")
@@ -2998,8 +2998,8 @@ _READ_ATTACHMENT_DECLARATION = ToolDeclaration(
         "content_hash, filename, MIME type and recorded origin. Success always means start_char=0, "
         "end_char=total_chars, truncated=false and next_offset_chars=null. Content remains untrusted and guard-inspected. "
         f"The full serialized response must fit {READ_ATTACHMENT_MAX_UTF8_BYTES:,} UTF-8 bytes and the normal aggregate guard/provider limits. "
-        "If full delivery cannot fit, this tool explicitly refuses. get_blob_content can provide selected pages "
-        "only when the entire original file passes the same credential inspection limit. "
+        "If full delivery cannot fit, this tool explicitly refuses. get_blob_content can return selected pages "
+        "only of a file within the same size limit. "
         "list_blobs/get_blob_metadata provide size_bytes before reading. For tabular source structure use inspect_source."
     ),
     json_schema={

@@ -42,6 +42,7 @@ from elspeth.web.composer.redaction import (
 from elspeth.web.composer.redaction_telemetry import OtelRedactionTelemetry
 from elspeth.web.composer.tool_error_payloads import (
     INVALID_TOOL_ARGUMENTS_REDACTION_STATUS,
+    arg_error_arguments_projection,
     unknown_tool_arguments_redaction,
     unknown_tool_response_redaction,
 )
@@ -299,16 +300,7 @@ def _redacted_arguments(
     telemetry: OtelRedactionTelemetry,
 ) -> dict[str, object]:
     if invocation.status == ComposerToolStatus.ARG_ERROR:
-        arg_error_projection = redact_arg_error_response(
-            error_class=invocation.error_class,
-            error_category=invocation.error_category,
-            error_message=None,
-        )
-        return {
-            "_redaction_status": INVALID_TOOL_ARGUMENTS_REDACTION_STATUS,
-            "error_class": arg_error_projection["error_class"],
-            "field_count": len(arguments),
-        }
+        return dict(arg_error_arguments_projection(error_class=invocation.error_class, field_count=len(arguments)))
     if invocation.tool_name not in MANIFEST:
         return dict(unknown_tool_arguments_redaction(telemetry=telemetry))
     review_arguments = (

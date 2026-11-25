@@ -67,6 +67,29 @@ CONTEXT_BUDGET_PROVIDER_REFUSAL_DETAIL: Final[str] = (
     "An administrator can raise the gateway's limit or choose a model with a larger context window."
 )
 
+# What the user reads when the provider, or a proxy in front of it, refused a
+# request with HTTP 413: too large as a request body, which is not the model's
+# context limit. ELSPETH's own byte maximum let it through; the limit that
+# refused it is the provider's or the proxy's.
+CONTEXT_BUDGET_REQUEST_TOO_LARGE_DETAIL: Final[str] = (
+    "The model gateway, or a proxy in front of it, refused this request as too large. An administrator can raise that request size limit."
+)
+
+# The typed reason a sent request was refused as too large by the provider:
+# over the model's context limit, or over the provider's or a proxy's request
+# size limit (HTTP 413). The provider-ceiling refusals carry it so the user's
+# text is chosen by it, never by provider text.
+type ProviderSizeReason = Literal["context_length_exceeded", "request_too_large"]
+
+
+def context_budget_provider_refusal_detail(reason: ProviderSizeReason) -> str:
+    """The user's text for a sent request the provider refused as too large, chosen by its typed reason."""
+    if reason == "context_length_exceeded":
+        return CONTEXT_BUDGET_PROVIDER_REFUSAL_DETAIL
+    if reason == "request_too_large":
+        return CONTEXT_BUDGET_REQUEST_TOO_LARGE_DETAIL
+    raise ValueError(f"not a provider size reason: {reason!r}")
+
 
 type ComposerProgressPhase = Literal[
     "idle",

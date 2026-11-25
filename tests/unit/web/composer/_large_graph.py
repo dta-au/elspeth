@@ -151,5 +151,5 @@ def state_bytes(state: CompositionState) -> int:
 
 def default_scan_finding(state: CompositionState) -> str | None:
     """What the scanner's DEFAULT bounds say about the whole state, as a category or ``None``."""
-    finding = find_credential_material(state.to_dict(), CredentialTraversalPolicy())
+    finding = find_credential_material(state.to_dict(), CredentialTraversalPolicy(), purpose="admission")
     return None if finding is None else finding.category

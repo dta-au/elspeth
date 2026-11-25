@@ -6046,7 +6046,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="cdb73b156f37ffa7",
         ordinal=1,
         authority=None,
-        line=655,
+        line=1267,
         connection_escape=False,
     ),
 )
@@ -6500,7 +6500,9 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "dc8fccf0123f2410",
         1,
         None,
-        line=1221,
+        # fix/0818-late-call-record: +273 lines (refused-call record and its
+        # helpers added above); POSITION only.
+        line=1494,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -6512,7 +6514,8 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         1,
         None,
         # 039c88bd0: +18 lines (live_leader added above); POSITION only.
-        line=1720,
+        # fix/0818-late-call-record: +273 lines; POSITION only.
+        line=1993,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -6524,7 +6527,8 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         1,
         None,
         # 039c88bd0: +18 lines (live_leader added above); POSITION only.
-        line=1745,
+        # fix/0818-late-call-record: +273 lines; POSITION only.
+        line=2018,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/run_lifecycle_repository.py",
@@ -7071,6 +7075,9 @@ def _parent_node(node: ast.AST) -> ast.AST:
 def _attach_parents(tree: ast.AST) -> None:
     for parent in ast.walk(tree):
         for child in ast.iter_child_nodes(parent):
+            # CPython shares one Load/Store/Del instance across every parsed tree; a parent link there leaks.
+            if isinstance(child, ast.expr_context):
+                continue
             child._inventory_parent = parent  # type: ignore[attr-defined]
 
 

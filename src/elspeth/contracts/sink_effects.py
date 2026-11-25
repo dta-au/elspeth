@@ -286,7 +286,7 @@ def _freeze_bounded_evidence(evidence: Mapping[str, object], field_name: str) ->
     canonical = canonical_json(detached)
     if len(canonical.encode("utf-8")) > _SINK_EFFECT_EVIDENCE_MAX_BYTES:
         raise ValueError(f"{field_name} canonical JSON exceeds the 64 KiB limit")
-    if find_credential_material(detached, _SINK_EFFECT_EVIDENCE_CREDENTIAL_POLICY) is not None:
+    if find_credential_material(detached, _SINK_EFFECT_EVIDENCE_CREDENTIAL_POLICY, purpose="conservative") is not None:
         raise ValueError(f"{field_name} must be credential-free (known secret form detected)")
     return frozen
 

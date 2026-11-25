@@ -612,9 +612,9 @@ export interface SemanticEdgeContract {
 export interface SafeRequestRejection {
   category: "request_rejected";
   exception_type: "BadRequestError";
-  reason_code: "invalid_request" | "context_length_exceeded" | "unsupported_parameter" | null;
+  reason_code: "invalid_request" | "context_length_exceeded" | "unsupported_parameter" | "request_too_large" | null;
   reason_disposition: "retained" | "absent" | "unrecognized" | "unavailable";
-  reason_source: "sdk_body" | "http_response" | "sdk_class" | "message_pattern" | "unavailable";
+  reason_source: "sdk_body" | "http_response" | "sdk_class" | "message_pattern" | "http_status" | "unavailable";
   diagnostic_reference: string | null;
   retryable: false;
 }

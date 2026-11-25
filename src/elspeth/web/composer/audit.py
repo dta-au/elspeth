@@ -72,6 +72,7 @@ from elspeth.web.composer.authority_hashing import canonical_json_and_hash, proj
 from elspeth.web.composer.protocol import SchemaViolation, ToolArgumentError
 from elspeth.web.composer.visible_tool_event import VisibleToolEvent
 from elspeth.web.composer.withheld_replies import WithheldReply, WithheldReplyOrigin
+from elspeth.web.credential_guard import CredentialMaterialRefused
 
 if TYPE_CHECKING:
     from elspeth.web.composer.provider_quota import ProviderCallCustody
@@ -468,6 +469,7 @@ _LLM_CALL_PUBLIC_AUDIT_FIELDS: Final[tuple[str, ...]] = (
     "strict_tool_count",
     "request_byte_split",
     "context_budget",
+    "rejection_reason_source",
 )
 
 
@@ -1068,6 +1070,11 @@ class DispatchOutcome:
     version_after: int
 
 
+# The closed message an ARG_ERROR row records for a credential refusal at
+# dispatch. It names the refusal and holds nothing from the arguments.
+CREDENTIAL_REFUSAL_ERROR_MESSAGE: Final[str] = "credential_material_rejected"
+
+
 async def dispatch_with_audit(
     *,
     recorder: ComposerToolRecorder,
@@ -1109,6 +1116,14 @@ async def dispatch_with_audit(
         :func:`finish_arg_error` and the exception re-raises so the
         caller's ``except ToolArgumentError`` block runs the
         LLM-message-append branch unchanged.
+
+    ARG_ERROR (credential refusal)
+        ``do_dispatch`` raised :class:`CredentialMaterialRefused`: the
+        dispatcher's credential scan refused the model's arguments before
+        any handler ran. The ``finally`` clause records ARG_ERROR with
+        :attr:`ToolArgumentErrorCategory.CREDENTIAL_MATERIAL` and a closed
+        message, so storage keeps no argument value, and the refusal
+        re-raises for the caller to end the turn.
 
     PLUGIN_CRASH (narrow re-raise)
         ``do_dispatch`` raised one of
@@ -1162,6 +1177,7 @@ async def dispatch_with_audit(
 
     Raises:
         ``ToolArgumentError``: re-raised after recording ARG_ERROR.
+        ``CredentialMaterialRefused``: re-raised after recording ARG_ERROR.
         ``AssertionError``/``MemoryError``/``RecursionError``/``SystemError``:
             re-raised after recording PLUGIN_CRASH.
         ``Exception`` (other classes): re-raised after recording PLUGIN_CRASH.
@@ -1182,6 +1198,7 @@ async def dispatch_with_audit(
     success_version_after: int | None = None
     arg_error_exc: ToolArgumentError | None = None
     arg_error_payload: Mapping[str, Any] | None = None
+    credential_refusal: CredentialMaterialRefused | None = None
     crash_exc: BaseException | None = None
     try:
         try:
@@ -1195,6 +1212,12 @@ async def dispatch_with_audit(
             status = ComposerToolStatus.ARG_ERROR
             arg_error_exc = exc
             arg_error_payload = arg_error_payload_factory(exc)
+            raise
+        except CredentialMaterialRefused as refused:
+            # The dispatcher's credential scan, not a plugin fault. Capture
+            # here; record a value-free ARG_ERROR in finally.
+            status = ComposerToolStatus.ARG_ERROR
+            credential_refusal = refused
             raise
         except (AssertionError, MemoryError, RecursionError, SystemError) as narrow_exc:
             # Narrow re-raise — capture for finally. The audit envelope
@@ -1267,6 +1290,15 @@ async def dispatch_with_audit(
                 recorder.record(finish_plugin_crash(audit, exc=exc))
                 raise
             recorder.record(invocation)
+        elif status is ComposerToolStatus.ARG_ERROR and credential_refusal is not None:
+            recorder.record(
+                finish_arg_error(
+                    audit,
+                    error_class=type(credential_refusal).__name__,
+                    error_category=ToolArgumentErrorCategory.CREDENTIAL_MATERIAL,
+                    error_message=CREDENTIAL_REFUSAL_ERROR_MESSAGE,
+                )
+            )
         elif status is ComposerToolStatus.ARG_ERROR:
             if arg_error_exc is None:
                 raise RuntimeError("dispatch_with_audit: ARG_ERROR status with no captured exception")

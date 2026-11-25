@@ -62,7 +62,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import Enum
-from typing import Literal
+from typing import Literal, TypeIs
 
 from sqlalchemy import insert, select, update
 from sqlalchemy.engine import Connection
@@ -79,7 +79,7 @@ from elspeth.contracts.coordination import (
     WorkerMembershipLost,
     WorkerMembershipToken,
 )
-from elspeth.contracts.enums import RunStatus
+from elspeth.contracts.enums import CallStatus, CallType, RunStatus
 from elspeth.contracts.errors import (
     AuditIntegrityError,
     JoinRefusedError,
@@ -107,10 +107,12 @@ from elspeth.core.landscape.schema import (
 )
 
 __all__ = [
+    "RefusedCallRecord",
     "RunCoordinationRepository",
     "fenced_leader_transaction",
     "fenced_member_transaction",
     "record_coordination_event",
+    "record_refused_call",
     "verify_and_extend_leader_fence",
     "verify_membership_fence",
 ]
@@ -269,6 +271,138 @@ class CoordinationEventRow:
 
     def __post_init__(self) -> None:
         freeze_fields(self, "context")
+
+
+@dataclass(frozen=True, slots=True)
+class RefusedCallRecord:
+    """Identity and usage of an external call whose ``calls`` row a fence refused.
+
+    The call already happened (and may have been billed) by the time its
+    record is written. When the writer's authority has lapsed the fence keeps
+    the row out of ``calls``, so the ``fence_refusal`` event carrying this is
+    the call's only durable record. Values mirror the refused ``calls`` row.
+
+    ``call_index`` is ``None`` only when the fence refused the index
+    allocation itself (event verb ``allocate_operation_call_index``): no index
+    was ever assigned, so none is invented. ``call_id`` is then ``None`` too
+    unless the caller supplied an explicit attempt id.
+
+    The record is built before the fence, and construction normalises every
+    field to an exact built-in (see :func:`_exact_builtin`) and requires
+    ``call_type`` and ``status`` to be the enums themselves. A value of any
+    other type therefore fails at entry, where no refusal exists yet to be
+    replaced, and the refusal's unwind handles only exact built-ins.
+    """
+
+    call_id: str | None
+    state_id: str | None
+    operation_id: str | None
+    call_index: int | None
+    call_type: CallType
+    status: CallStatus
+    request_hash: str
+    response_hash: str | None
+    prompt_tokens: int | None
+    completion_tokens: int | None
+    cached_prompt_tokens: int | None
+    reasoning_tokens: int | None
+    latency_ms: float | None
+
+    def __post_init__(self) -> None:
+        if type(self.call_type) is not CallType:
+            raise TypeError("refused-call call_type must be CallType")
+        if type(self.status) is not CallStatus:
+            raise TypeError("refused-call status must be CallStatus")
+        object.__setattr__(self, "call_id", _exact_builtin(self.call_id))
+        object.__setattr__(self, "state_id", _exact_builtin(self.state_id))
+        object.__setattr__(self, "operation_id", _exact_builtin(self.operation_id))
+        object.__setattr__(self, "call_index", _exact_builtin(self.call_index))
+        object.__setattr__(self, "request_hash", _exact_builtin(self.request_hash))
+        object.__setattr__(self, "response_hash", _exact_builtin(self.response_hash))
+        object.__setattr__(self, "prompt_tokens", _exact_builtin(self.prompt_tokens))
+        object.__setattr__(self, "completion_tokens", _exact_builtin(self.completion_tokens))
+        object.__setattr__(self, "cached_prompt_tokens", _exact_builtin(self.cached_prompt_tokens))
+        object.__setattr__(self, "reasoning_tokens", _exact_builtin(self.reasoning_tokens))
+        object.__setattr__(self, "latency_ms", _exact_builtin(self.latency_ms))
+
+    def event_context(self) -> dict[str, str | int | float | None]:
+        """The record as exact built-in values (see :func:`_exact_builtin`)."""
+        return {
+            "call_id": _exact_builtin(self.call_id),
+            "state_id": _exact_builtin(self.state_id),
+            "operation_id": _exact_builtin(self.operation_id),
+            "call_index": _exact_builtin(self.call_index),
+            "call_type": _exact_builtin(self.call_type.value),
+            "status": _exact_builtin(self.status.value),
+            "request_hash": _exact_builtin(self.request_hash),
+            "response_hash": _exact_builtin(self.response_hash),
+            "prompt_tokens": _exact_builtin(self.prompt_tokens),
+            "completion_tokens": _exact_builtin(self.completion_tokens),
+            "cached_prompt_tokens": _exact_builtin(self.cached_prompt_tokens),
+            "reasoning_tokens": _exact_builtin(self.reasoning_tokens),
+            "latency_ms": _exact_builtin(self.latency_ms),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class RefusedCallWorkItem:
+    """The work item and attempt a refused state call ran under.
+
+    Built before the fence, like :class:`RefusedCallRecord`, and normalised the
+    same way at construction, so the refusal's unwind reads only exact
+    built-ins.
+    """
+
+    work_item_id: str
+    attempt: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "work_item_id", _exact_builtin(self.work_item_id))
+        object.__setattr__(self, "attempt", _exact_builtin(self.attempt))
+
+
+def _exact_builtin(value: object) -> str | int | float | None:
+    """One refused-call field as an exact built-in ``str``, ``int``, ``float``, ``bool`` or ``None``.
+
+    Record construction runs this before the fence, so nothing downstream of
+    it inside a refusal's unwind (canonical JSON, its refusal message, the
+    last-resort log) reaches a method of a subclass of a built-in type.
+    Each base-class conversion returns an exact-type copy for a
+    subclass. ``bool`` is kept as
+    itself: through ``int`` it would become ``1`` and change the event's
+    meaning. Any other type is a programming error and is refused.
+
+    Dispatch reads only the value's type, never the value: ``isinstance``
+    falls back to the instance's ``__class__`` when its type check misses, and
+    a subclass can intercept that attribute read. ``issubclass`` against a
+    built-in consults the built-in's metaclass, not the subclass's.
+    """
+    if value is None:
+        return None
+    if type(value) is bool:
+        return value
+    if _int_by_type(value):
+        return int.__int__(value)
+    if _float_by_type(value):
+        return float.__float__(value)
+    if _str_by_type(value):
+        return str.__str__(value)
+    raise TypeError(f"refused-call field holds {type(value).__qualname__}, not str, int, float, bool or None")
+
+
+def _int_by_type(value: object) -> TypeIs[int]:
+    """Whether the value's type is ``int`` or a subclass, judged from the type alone."""
+    return issubclass(type(value), int)
+
+
+def _float_by_type(value: object) -> TypeIs[float]:
+    """Whether the value's type is ``float`` or a subclass, judged from the type alone."""
+    return issubclass(type(value), float)
+
+
+def _str_by_type(value: object) -> TypeIs[str]:
+    """Whether the value's type is ``str`` or a subclass, judged from the type alone."""
+    return issubclass(type(value), str)
 
 
 def record_coordination_events(conn: Connection, *, run_id: str, events: Sequence[CoordinationEventRow]) -> None:
@@ -610,6 +744,145 @@ def fenced_member_transaction(
             context={"verb": verb, "fence": "membership"},
         )
         raise
+
+
+def record_refused_call(
+    engine: Tier1Engine,
+    *,
+    run_id: str,
+    worker_id: str,
+    leader_epoch: int | None,
+    verb: str,
+    fence: Literal["leader", "membership", "item"],
+    refused_call: RefusedCallRecord,
+    work_item: RefusedCallWorkItem | None,
+) -> None:
+    """Record a call whose ``calls`` row a fence refused; fresh connection; a database fault is logged, not raised.
+
+    Called after the refused transaction has rolled back, from inside the
+    caller's ``except <refusal>: ... raise``: raising here would replace the
+    fence's refusal. Unlike the fences' own refusal events, this one explains
+    durable state outside the database: the call already happened, and this
+    event is its only record. The leader and membership fences have already
+    written their own ``fence_refusal`` naming only the verb (and fence); the
+    row carrying ``refused_call`` is the call's. The item-lease fence writes no
+    row of its own.
+
+    When the audit store cannot hold the event, the last-resort ERROR log
+    carries the call's identity and usage, formatted without canonical JSON.
+    That covers a DB fault, and a provider-reported value the contracts admit
+    but canonical JSON refuses: a non-finite latency, or a token count beyond
+    the canonical integer range. The context is encoded here with the writer's
+    own encoder first, so no such value can raise inside the caller's unwind.
+    ``refused_call`` and ``work_item`` were normalised to exact built-ins when
+    they were built, before the fence; ``work_item`` is ``None`` for a call
+    made outside a work item (operation calls).
+    """
+    context: _RefusedCallEventContext = {
+        "verb": verb,
+        "fence": fence,
+        "work_item_id": None if work_item is None else work_item.work_item_id,
+        "attempt": None if work_item is None else work_item.attempt,
+        "refused_call": refused_call.event_context(),
+    }
+    refusal = _canonical_json_refusal(context)
+    if refusal is not None:
+        _log_unrecorded_refused_call(
+            run_id=run_id,
+            worker_id=worker_id,
+            verb=verb,
+            fence=fence,
+            refused_call=refused_call,
+            cause=f"not canonical JSON: {type(refusal).__name__}",
+            exc_info=refusal,
+        )
+        return
+    outcome = _record_best_effort_event(
+        engine,
+        run_id=run_id,
+        event_type="fence_refusal",
+        worker_id=worker_id,
+        leader_epoch=leader_epoch,
+        recorded_at=datetime.now(UTC),
+        context=context,
+    )
+    if outcome is BestEffortEventOutcome.LOST_TO_DB_FAULT:
+        _log_unrecorded_refused_call(
+            run_id=run_id, worker_id=worker_id, verb=verb, fence=fence, refused_call=refused_call, cause="database fault"
+        )
+
+
+_RefusedCallEventContext = dict[str, str | int | float | dict[str, str | int | float | None] | None]
+"""The ``fence_refusal`` context ``record_refused_call`` writes: the verb, fence,
+work item and attempt, and the ``refused_call`` record's own context."""
+
+
+def _canonical_json_refusal(context: _RefusedCallEventContext) -> ValueError | TypeError | None:
+    """Return the refusal ``canonical_json`` raises for ``context``, or ``None`` if it encodes.
+
+    The two documented refusals: ``ValueError`` for a non-finite float or an
+    out-of-range integer (the rfc8785 domain errors subclass it), and
+    ``TypeError`` for a type it cannot encode. The exception itself is returned
+    so the last-resort log keeps its message and traceback: an encoder defect
+    raising either class is then still diagnosable.
+    """
+    try:
+        canonical_json(context)
+    except (ValueError, TypeError) as exc:
+        return exc
+    return None
+
+
+# Canonical JSON's integer range (RFC 8785 refuses any int beyond it).
+_CANONICAL_INTEGER_MAX = 2**53 - 1
+
+
+def _last_resort_log_value(value: str | int | float | None) -> str:
+    """Format one refused-call field for the last-resort log; never raises.
+
+    Formatting goes through the built-in base class's own methods, so a subclass
+    of a built-in type (``int``, ``float`` or ``str``) cannot reach its own
+    ``__repr__``,
+    ``__format__`` or comparisons. An integer beyond the canonical range, which
+    is how it reached this log, is written in hex: Python refuses decimal
+    conversion of an integer longer than its digit limit, and hex has no such
+    limit. ``bool`` is formatted as itself, not as the integer it subclasses.
+    Dispatch reads only the value's type, as in :func:`_exact_builtin`.
+    """
+    if value is None:
+        return "None"
+    if type(value) is bool:
+        return bool.__repr__(value)
+    if _int_by_type(value):
+        exact = int.__int__(value)
+        if -_CANONICAL_INTEGER_MAX <= exact <= _CANONICAL_INTEGER_MAX:
+            return int.__repr__(exact)
+        return int.__format__(exact, "#x")
+    if _float_by_type(value):
+        return float.__repr__(value)
+    return str.__repr__(value)
+
+
+def _log_unrecorded_refused_call(
+    *,
+    run_id: str,
+    worker_id: str,
+    verb: str,
+    fence: str,
+    refused_call: RefusedCallRecord,
+    cause: str,
+    exc_info: ValueError | TypeError | None = None,
+) -> None:
+    logger.error(
+        "refused call record for run %r (worker %r, verb %r, fence %r) was not recorded (%s): %s",
+        run_id,
+        worker_id,
+        verb,
+        fence,
+        cause,
+        ", ".join(f"{key}={_last_resort_log_value(value)}" for key, value in refused_call.event_context().items()),
+        exc_info=exc_info,
+    )
 
 
 class RunCoordinationRepository:
