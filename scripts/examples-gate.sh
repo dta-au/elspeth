@@ -36,19 +36,34 @@
 #          conservation for stochastic fault-injection cases (examples_gate.py check).
 #   4. Hashes the exported tree before and after; a tree that moved is not evidence.
 #
-# --execute requires bwrap (bubblewrap). Each case runs in a sandbox whose
-# filesystem is an allowlist: /usr, the venv and a short list of /etc entries
-# read-only, the case directory read-write, and the case's declared cached
-# prerequisites read-only in its otherwise empty HOME. Nothing else from the
-# host exists inside, and the sandbox root is read-only. Before a case starts,
-# every bound path is walked and the run refuses, naming the bind, if a socket
-# file is under one. The case's server and command share one private network
-# with loopback only, in a private PID namespace; /tmp and /run start empty;
-# stdin is /dev/null and no file descriptor above 2 is inherited. Before the
-# first case, a self-test checks these properties inside the sandbox and must
-# echo a per-run nonce. The text guard remains an early refusal. The case
-# environment has no inherited credentials. The shared venv is read-only inside
-# cases but remains outside the exported-tree digest.
+# --execute requires bwrap (bubblewrap) and assumes the bwrap on PATH is the
+# system's own. Each case runs in a sandbox whose filesystem is an allowlist:
+# /usr, the venv and a fixed list of /etc entries read-only, the case directory
+# read-write, and the case's declared ~/.cache prerequisites read-only in its
+# otherwise empty HOME. The sandbox root is read-only. The case's server and
+# command share one private network with loopback only, in private PID and IPC
+# namespaces and a new session; /tmp and /run start empty; stdin is /dev/null
+# and no file descriptor above 2 is inherited. The case environment has no
+# inherited credentials. The shared venv is outside the exported-tree digest.
+#
+# Checked before the first case, with the shared binds: every bind source is
+# inside its allowed root (an /etc source is one of the listed entries), and no
+# mount point, socket or FIFO is beneath it. Checked before each case: the
+# same for the shared binds' sources and mount points, and the full walk for
+# the case's own binds. The gate assumes the shared bind sources do not change
+# during the run.
+#
+# Self-test, before the first case, inside the sandbox: network interfaces are
+# loopback only and an outbound connect fails; an abstract socket and a path
+# socket held outside are unreachable, and a host path that is not bound is
+# absent; /run is empty and no SysV IPC object is visible; no descriptor above
+# 2 is open; every mount is read-only except a listed writable set (the
+# private /dev, /proc, /tmp, /run) and its own directory; writes into the venv,
+# into /usr and into a read-only probe bind, and a mkdir at /, fail read-only;
+# /etc holds only the listed entries. Each case, before its command, checks the
+# mounts the same way with its own directory as the writable one. It must
+# print this run's nonce, which shows the output came from this run. The text
+# guard remains an early refusal.
 #
 # Verdicts (summary.txt, one line per case, then one SKIP line per excluded config)
 #   PASS     ran and matched every documented expectation
@@ -288,8 +303,7 @@ echo "selected=$count total=$total_count only=${ONLY:-ALL}" >> "$PREFLIGHT"
 BWRAP="$(command -v bwrap || true)"
 [ -n "$BWRAP" ] || refuse "bwrap (bubblewrap) is required for kernel-enforced offline execution"
 BWRAP="$(realpath "$BWRAP")"
-# The self-test below proves what the sandbox enforces when this bwrap is the real launcher; it
-# cannot authenticate a substituted executable. Record which binary ran.
+# The self-test below assumes this bwrap is the system's own. Record which binary ran.
 echo "bwrap=$BWRAP owner=$(stat -c %U "$BWRAP") sha256=$(sha256sum "$BWRAP" | cut -d' ' -f1)" >> "$PREFLIGHT"
 pin() { if [ -n "$CPUS" ]; then echo taskset -c "$CPUS"; fi; }
 # The sandbox filesystem is an allowlist: what is not bound here, or per case below, does not
@@ -303,12 +317,15 @@ for top in bin sbin lib lib32 lib64 libx32; do
         BWRAP_ARGS+=(--ro-bind "/$top" "/$top")
     fi
 done
-for etc_entry in passwd group nsswitch.conf hosts resolv.conf ld.so.cache localtime protocols services \
-                 mime.types alternatives ssl/certs ssl/openssl.cnf; do
+# The helper refuses any /etc source not in its own copy of this list (ETC_BIND_SOURCES).
+ETC_ENTRIES=(passwd group nsswitch.conf hosts resolv.conf ld.so.cache localtime protocols services
+             mime.types alternatives ssl/certs ssl/openssl.cnf)
+ETC_TOPS="$(printf '%s\n' "${ETC_ENTRIES[@]%%/*}" | sort -u | paste -sd, -)"
+for etc_entry in "${ETC_ENTRIES[@]}"; do
     BWRAP_ARGS+=(--ro-bind-try "/etc/$etc_entry" "/etc/$etc_entry")
 done
 BWRAP_ARGS+=(--ro-bind "$VENV" "$VENV" --dev /dev --proc /proc --tmpfs /tmp --tmpfs /run
-             --unshare-net --unshare-pid --die-with-parent)
+             --unshare-net --unshare-pid --unshare-ipc --new-session --die-with-parent)
 
 # bind_check LABEL [--allow ROOT]... [--shared-count N] -- BWRAP-OPTIONS...
 # Refuses, naming the bind, when a bind source is outside the allowed roots or a socket file or
@@ -351,12 +368,44 @@ in_sandbox() {
     )
 }
 
-# Self-test: every property above, checked inside the sandbox. The probe must echo this run's
-# nonce, so a launch that ends without running the probe cannot pass (the launcher itself is
-# trusted; see the bwrap record above).
+# Every mount inside the sandbox is read-only except these, and the run's own directory (the
+# self-test's, or the case's). An entry that is absent is fine; a writable mount not listed refuses.
+WRITABLE_MOUNTS=(
+    /dev            # bwrap --dev: a private minimal device directory
+    /dev/null       # device node bound by --dev
+    /dev/zero       # device node bound by --dev
+    /dev/full       # device node bound by --dev
+    /dev/random     # device node bound by --dev
+    /dev/urandom    # device node bound by --dev
+    /dev/tty        # device node bound by --dev
+    /dev/pts        # --dev: a private devpts instance
+    /proc           # --proc: procfs for the private PID namespace
+    /tmp            # --tmpfs: empty, private
+    /run            # --tmpfs: empty, private
+)
+# Read /proc/self/mountinfo inside the sandbox; argv: the writable set.
+MOUNT_CHECK_PY='
+import re
+import sys
+
+writable = set(sys.argv[1:])
+loose = []
+for line in open("/proc/self/mountinfo"):
+    fields = line.split()
+    point = re.sub(r"\\([0-7]{3})", lambda match: chr(int(match.group(1), 8)), fields[4])
+    if "ro" not in fields[5].split(",") and point not in writable:
+        loose.append(point)
+if loose:
+    sys.exit("writable mount outside the writable set: " + ", ".join(loose))
+print("mount-check-ok")
+'
+
+# Self-test: the properties listed in the header, checked inside the sandbox. The probe must echo
+# this run's nonce, which shows its output came from this run.
 SELF_TEST_DIR="$CASE_BASE/self-test"
 OUTSIDE_DIR="$CASE_BASE/outside"
 mkdir -p "$SELF_TEST_DIR/ro" "$OUTSIDE_DIR"
+printf '%s' "$MOUNT_CHECK_PY" > "$SELF_TEST_DIR/mount-check.py"
 NONCE="$("$PY" -I -c 'import secrets; print(secrets.token_hex(16))')"
 # A listener outside every bind (path and abstract name), reachable from here.
 "$PY" -I -c '
@@ -395,8 +444,22 @@ in_sandbox HOME="$SELF_TEST_DIR" PATH="/usr/local/bin:/usr/bin:/bin" TMPDIR="$SE
 import errno
 import os
 import socket
+import subprocess
 import sys
-nonce, listener, abstract, read_only_target, absent = sys.argv[1:6]
+nonce, listener, abstract, read_only_target, absent, venv, etc_tops, mount_check = sys.argv[1:9]
+writable = sys.argv[9:]
+
+
+def write_refused(path):
+    # O_EXCL: a file this probe did not make is never opened, and one it made by mistake is removed.
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except OSError as error:
+        assert error.errno == errno.EROFS, (path, error)
+    else:
+        os.close(descriptor)
+        os.unlink(path)
+        raise AssertionError(f"write {path} succeeded")
 
 
 def refused(code, action, *args):
@@ -413,8 +476,16 @@ assert interfaces == {"lo"}, interfaces
 assert os.listdir("/run") == [], os.listdir("/run")
 inherited = [fd for fd in os.listdir("/proc/self/fd") if int(fd) > 2 and os.path.exists(f"/proc/self/fd/{fd}")]
 assert inherited == [], {fd: os.readlink(f"/proc/self/fd/{fd}") for fd in inherited}
-refused(errno.EROFS, lambda path: open(path, "w").close(), read_only_target)
+for kind in ("shm", "msg", "sem"):
+    rows = [row for row in open(f"/proc/sysvipc/{kind}").read().splitlines()[1:] if row.strip()]
+    assert rows == [], (kind, rows)
+checked = subprocess.run([sys.executable, "-I", mount_check, *writable], capture_output=True, text=True, check=False)
+assert checked.returncode == 0 and checked.stdout.strip() == "mount-check-ok", (checked.stdout, checked.stderr)
+for target in (read_only_target, os.path.join(venv, "examples-gate-probe"), "/usr/examples-gate-probe"):
+    write_refused(target)
 refused(errno.EROFS, os.mkdir, "/examples-gate-probe")
+unlisted = set(os.listdir("/etc")) - set(etc_tops.split(","))
+assert not unlisted, ("/etc", sorted(unlisted))
 refused(errno.ENOENT, os.stat, absent)
 refused(errno.ENOENT, os.stat, listener)
 refused(errno.ENOENT, os.chdir, os.path.dirname(listener))
@@ -435,7 +506,8 @@ with socket.socket() as server:
         peer, _ = server.accept()
         peer.close()
 print(f"self-test-ok {nonce}")
-' "$NONCE" "$OUTSIDE_DIR/listener.sock" "examples-gate-$NONCE" "$SELF_TEST_DIR/ro/write-probe" "$LOG_DIR" \
+' "$NONCE" "$OUTSIDE_DIR/listener.sock" "examples-gate-$NONCE" "$SELF_TEST_DIR/ro/write-probe" "$LOG_DIR" "$VENV" "$ETC_TOPS" \
+    "$SELF_TEST_DIR/mount-check.py" "${WRITABLE_MOUNTS[@]}" "$SELF_TEST_DIR" \
     > "$LOG_DIR/self-test.out" 2>&1
 self_test_rc=$?
 : > "$OUTSIDE_DIR/done"
@@ -445,7 +517,7 @@ set -e
 cat "$LOG_DIR/self-test.out" >> "$PREFLIGHT"
 echo "self_test_rc=$self_test_rc listener_rc=$listener_rc" >> "$PREFLIGHT"
 if [ "$self_test_rc" -ne 0 ] || [ "$listener_rc" -ne 0 ] || ! grep -Fxq "self-test-ok $NONCE" "$LOG_DIR/self-test.out"; then
-    refuse "bwrap private-network self-test failed (see $PREFLIGHT)"
+    refuse "bwrap sandbox self-test failed (see $PREFLIGHT)"
 fi
 
 tree_digest() {
@@ -535,25 +607,33 @@ for line in "${CASE_LINES[@]}"; do
     if [ "$rc" -ne 0 ]; then
         record "NOTRUN $id -- $(echo "$pre" | tr '\n' ' ')"; NOTRUN=$((NOTRUN + 1)); continue
     fi
-    home_binds=()
+    # The case's own binds, one list for the check and the launch. A home_ro directory is bound
+    # from the physical ~/.cache and judged against that root, so a link out of it is refused.
+    case_binds=(--bind "$case_dir" "$case_dir")
     home_allow=()
     if [ -n "$homero" ]; then
+        home_cache="$(realpath -m "$HOME/.cache")"
+        home_allow=(--allow "$home_cache")
         IFS=, read -r -a home_dirs <<< "$homero"
         for rel in "${home_dirs[@]}"; do
-            host_dir="$HOME/$rel"
             mkdir -p "$case_dir/home/$rel"
-            home_binds+=(--ro-bind "$host_dir" "$case_dir/home/$rel")
-            home_allow+=(--allow "$host_dir")
+            case_binds+=(--ro-bind "$home_cache/${rel#.cache/}" "$case_dir/home/$rel")
         done
     fi
     # Every bind of this launch: sources and mount points of the shared binds again, sockets for
     # the case's own binds (the shared binds' sockets were walked once, before the first case).
     bind_check "case $id" --allow "$VENV" --allow "$CASE_BASE" "${home_allow[@]}" --shared-count "${#BWRAP_ARGS[@]}" -- \
-        "${BWRAP_ARGS[@]}" --bind "$case_dir" "$case_dir" "${home_binds[@]}"
+        "${BWRAP_ARGS[@]}" "${case_binds[@]}"
     cat > "$case_dir/inner.sh" <<'INNER'
 #!/usr/bin/env bash
 set -u
 root="$1"; cmd="$2"; scmd="$3"; sport="$4"; log="$5"; server_log="$6"; rc_file="$7"; server_marker="$8"
+python="$9"; mount_check="${10}"; mount_out="${11}"; mount_marker="${12}"
+shift 12
+if ! "$python" -I "$mount_check" "$@" > "$mount_out" 2>&1; then
+    : > "$mount_marker"
+    exit 2
+fi
 cd "$root" || exit 2
 port_busy() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
 if [ -n "$scmd" ]; then
@@ -569,13 +649,19 @@ rc=$?
 printf '%s\n' "$rc" > "$rc_file"
 exit "$rc"
 INNER
+    printf '%s' "$MOUNT_CHECK_PY" > "$case_dir/mount-check.py"
     t0=$(date +%s)
     set +e
-    in_sandbox "${ENVV[@]}" -- --bind "$case_dir" "$case_dir" "${home_binds[@]}" -- \
+    in_sandbox "${ENVV[@]}" -- "${case_binds[@]}" -- \
         bash "$case_dir/inner.sh" "$root" "$cmd" "$scmd" "$sport" "$case_dir/command.log" "$case_dir/server.log" \
-        "$case_dir/command.exit" "$case_dir/server.failed" > "$LOG_DIR/logs/$id.sandbox.log" 2>&1
+        "$case_dir/command.exit" "$case_dir/server.failed" \
+        "$PY" "$case_dir/mount-check.py" "$case_dir/mount-check.out" "$case_dir/mount.failed" \
+        "${WRITABLE_MOUNTS[@]}" "$case_dir" > "$LOG_DIR/logs/$id.sandbox.log" 2>&1
     sandbox_rc=$?
     set -e
+    if [ -e "$case_dir/mount.failed" ]; then
+        refuse "case $id sandbox mount check failed: $(tr '\n' ' ' < "$case_dir/mount-check.out")"
+    fi
     [ ! -f "$case_dir/command.log" ] || cp -- "$case_dir/command.log" "$log"
     [ ! -f "$case_dir/server.log" ] || cp -- "$case_dir/server.log" "$LOG_DIR/logs/$id.server.log"
     secs=$(( $(date +%s) - t0 ))
