@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 import threading
 from collections.abc import AsyncIterator, Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -112,11 +113,19 @@ async def test_session_renewal_advances_database_deadline_with_ordinary_pool_occ
             assert _fence_expiry(engine, UUID(str(session.id))) > before
             assert lease.renewal_error is None
     finally:
+        body_error = sys.exception()
+        cleanup_error = None
         try:
-            with suppress(async_workers.AsyncWorkerAdmissionTimeoutError):
-                await asyncio.wait_for(lease.close(), timeout=5)
+            await asyncio.wait_for(lease.close(), timeout=5)
+        except async_workers.AsyncWorkerAdmissionTimeoutError as exc:
+            cleanup_error = exc
         finally:
             await asyncio.wait_for(async_workers.shutdown_async_workers(), timeout=5)
+        if cleanup_error is not None:
+            if body_error is not None:
+                body_error.add_note(f"Lease cleanup admission timed out: {cleanup_error}")
+            else:
+                raise cleanup_error
 
 
 @pytest.mark.asyncio
@@ -156,14 +165,22 @@ async def test_membership_heartbeat_advances_database_deadline_with_ordinary_poo
             await _poll_until(lambda: _member_expiry(engine, identity.instance_id) > before, seconds=2.5)
             assert _member_expiry(engine, identity.instance_id) > before
     finally:
+        body_error = sys.exception()
+        cleanup_error = None
         try:
             await asyncio.wait_for(membership.begin_drain(), timeout=5)
         finally:
             try:
-                with suppress(async_workers.AsyncWorkerAdmissionTimeoutError):
-                    await asyncio.wait_for(membership.stop(), timeout=5)
+                await asyncio.wait_for(membership.stop(), timeout=5)
+            except async_workers.AsyncWorkerAdmissionTimeoutError as exc:
+                cleanup_error = exc
             finally:
                 await asyncio.wait_for(async_workers.shutdown_async_workers(), timeout=5)
+        if cleanup_error is not None:
+            if body_error is not None:
+                body_error.add_note(f"Membership cleanup admission timed out: {cleanup_error}")
+            else:
+                raise cleanup_error
 
 
 @pytest.mark.asyncio
