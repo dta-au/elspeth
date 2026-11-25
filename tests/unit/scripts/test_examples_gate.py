@@ -863,6 +863,11 @@ def test_fake_bwrap_records_shared_mount_flags_and_partial_summary(tmp_path: Pat
     assert self_args[-2:] == ["--remount-ro", "/"] and case_args[-2:] == ["--remount-ro", "/"]
     assert {source for source, _ in examples_gate.bind_sources(case_args)} >= {"/usr", str(Path(sys.executable).parent.parent.resolve())}
     assert "only=demo" in (log_dir / "preflight.txt").read_text()
+    # The case's check covered the shared binds again (sources and mount points) and walked only its own.
+    case_checks = [line for line in (log_dir / "preflight.txt").read_text().splitlines() if line.startswith("socket-walk complete: ")]
+    assert len(case_checks) == 2, case_checks
+    checked, walked = (int(word) for word in case_checks[1].replace(",", "").split() if word.isdigit())
+    assert walked == 1 and checked > walked, case_checks
     assert "scope=PARTIAL" in (log_dir / "summary.txt").read_text()
     assert (log_dir / "overall.exit").read_text().strip() == "0"
 
@@ -1370,3 +1375,137 @@ def test_a_host_root_in_the_shared_binds_is_refused_by_the_bind_check_before_the
     assert result.returncode == 2, (result.stdout, result.stderr)
     assert "REFUSED: shared sandbox bind check failed: REFUSE bind /: the host root" in result.stderr
     assert not (log_dir / "self-test.out").exists()
+
+
+@pytest.mark.parametrize("source", ["/usr/../var", "/etc/../home"])
+def test_a_source_with_dot_segments_is_judged_where_it_points(source: str) -> None:
+    assert examples_gate.bind_source_refusal(source, []) == "outside the allowed bind roots"
+
+
+def test_a_directory_linked_out_of_an_allowed_root_is_refused_but_a_linked_file_is_not(tmp_path: Path) -> None:
+    allowed = tmp_path / "allowed"
+    outside = tmp_path / "outside"
+    allowed.mkdir()
+    outside.mkdir()
+    (outside / "file.txt").write_text("x")
+    (allowed / "dir-link").symlink_to(outside)
+    (allowed / "file-link").symlink_to(outside / "file.txt")
+    reason = examples_gate.bind_source_refusal(str(allowed / "dir-link"), [str(allowed)])
+    assert reason == f"resolves to {outside}, outside the allowed bind roots"
+    assert examples_gate.bind_source_refusal(str(allowed / "file-link"), [str(allowed)]) is None
+    assert examples_gate.bind_source_refusal(str(allowed), [str(allowed)]) is None
+
+
+def test_mount_points_are_decoded_and_found_beneath_a_source_whatever_their_device(tmp_path: Path) -> None:
+    source = tmp_path / "venv"
+    source.mkdir()
+    mountinfo = "\n".join(
+        [
+            "22 1 8:2 / / rw - ext4 /dev/sda2 rw",
+            # A bind mount on the same filesystem (same device as its parent) and a mount over one file.
+            f"40 22 8:2 /elsewhere {source}/lib/same\\040fs rw - ext4 /dev/sda2 rw",
+            f"41 22 8:2 /a-file {source}/bin/tool rw - ext4 /dev/sda2 rw",
+            f"42 22 0:5 / {source}2 rw - tmpfs tmpfs rw",
+        ]
+    )
+    points = examples_gate.mount_points(mountinfo)
+    assert f"{source}/lib/same fs" in points
+    assert examples_gate.mounts_beneath(str(source), points) == [f"{source}/bin/tool", f"{source}/lib/same fs"]
+
+
+def test_socket_walk_prints_its_completion_line_only_when_it_finished(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    clean = tmp_path / "clean"
+    clean.mkdir()
+    assert examples_gate.main(["socket-walk", "--allow", str(tmp_path), "--", "--ro-bind", str(clean), "/x"]) == 0
+    assert capsys.readouterr().out.splitlines()[-1] == "socket-walk complete: 1 binds checked, 1 walked"
+    _plant_socket(clean)
+    assert examples_gate.main(["socket-walk", "--allow", str(tmp_path), "--", "--ro-bind", str(clean), "/x"]) == 1
+    assert "socket-walk complete" not in capsys.readouterr().out
+
+
+def test_shared_binds_are_checked_again_but_not_walked_again(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    shared = tmp_path / "shared"
+    case = tmp_path / "case"
+    case.mkdir()
+    _plant_socket(shared)
+    argv = ["--ro-bind", str(shared), "/s", "--bind", str(case), "/c"]
+    assert examples_gate.main(["socket-walk", "--allow", str(tmp_path), "--shared-count", "3", "--", *argv]) == 0
+    assert capsys.readouterr().out.splitlines()[-1] == "socket-walk complete: 2 binds checked, 1 walked"
+    # Control: the same list with nothing marked shared walks the shared bind and finds its socket.
+    assert examples_gate.main(["socket-walk", "--allow", str(tmp_path), "--", *argv]) == 1
+    assert f"REFUSE bind {shared}: socket" in capsys.readouterr().out
+    # The source check still covers shared binds.
+    assert examples_gate.main(["socket-walk", "--shared-count", "3", "--", *argv]) == 1
+    assert f"REFUSE bind {shared}: outside the allowed bind roots" in capsys.readouterr().out
+
+
+def test_a_bind_check_that_exits_zero_early_is_no_verdict(tmp_path: Path) -> None:
+    _fixture(tmp_path)
+    driver = tmp_path / "driver"
+    driver.mkdir()
+    shutil.copy2(GATE, driver / "examples-gate.sh")
+    helper_text = (GATE.parent / "examples_gate.py").read_text()
+    needle = "def cmd_socket_walk(args: argparse.Namespace) -> int:\n"
+    assert helper_text.count(needle) == 1
+    (driver / "examples_gate.py").write_text(helper_text.replace(needle, needle + "    return 0\n"))
+    log_dir = tmp_path / "logs"
+    result = _dry_run(
+        tmp_path,
+        "--execute",
+        "--tmp-root",
+        str(tmp_path / "work"),
+        "--log-dir",
+        str(log_dir),
+        "--min-mem-gb",
+        "0",
+        gate=driver / "examples-gate.sh",
+    )
+    assert result.returncode == 2, (result.stdout, result.stderr)
+    assert "REFUSED: shared sandbox bind check ended without a result (exit 0)" in result.stderr
+
+
+def test_a_same_filesystem_bind_mount_is_missed_by_device_and_caught_by_the_mount_table(tmp_path: Path) -> None:
+    reason = _bwrap_unusable_reason()
+    if reason is not None:
+        pytest.skip(reason)
+    source = tmp_path / "source"
+    (source / "sub").mkdir(parents=True)
+    (source / "file.txt").write_text("x")
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "file.txt").write_text("y")
+    probe = (
+        "import json, sys; from pathlib import Path; import examples_gate as g; "
+        "source = sys.argv[1]; "
+        "by_device = [f for f in g.sockets_under(Path(source))[0] if f.startswith('mount point')]; "
+        "by_table = g.mounts_beneath(source, g.mount_points(Path('/proc/self/mountinfo').read_text())); "
+        "print(json.dumps({'by_device': by_device, 'by_table': by_table}))"
+    )
+    result = subprocess.run(
+        [
+            shutil.which("bwrap") or "bwrap",
+            "--dev-bind",
+            "/",
+            "/",
+            "--bind",
+            str(other),
+            str(source / "sub"),
+            "--bind",
+            str(other / "file.txt"),
+            str(source / "file.txt"),
+            "--",
+            sys.executable,
+            "-I",
+            "-c",
+            f"import sys; sys.path.insert(0, {str(GATE.parent)!r}); {probe}",
+            str(source),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    seen = json.loads(result.stdout)
+    # Both mounts are on the same filesystem as the source: the device check sees neither.
+    assert seen["by_device"] == []
+    assert seen["by_table"] == [str(source / "file.txt"), str(source / "sub")]

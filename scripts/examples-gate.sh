@@ -288,6 +288,9 @@ echo "selected=$count total=$total_count only=${ONLY:-ALL}" >> "$PREFLIGHT"
 BWRAP="$(command -v bwrap || true)"
 [ -n "$BWRAP" ] || refuse "bwrap (bubblewrap) is required for kernel-enforced offline execution"
 BWRAP="$(realpath "$BWRAP")"
+# The self-test below proves what the sandbox enforces when this bwrap is the real launcher; it
+# cannot authenticate a substituted executable. Record which binary ran.
+echo "bwrap=$BWRAP owner=$(stat -c %U "$BWRAP") sha256=$(sha256sum "$BWRAP" | cut -d' ' -f1)" >> "$PREFLIGHT"
 pin() { if [ -n "$CPUS" ]; then echo taskset -c "$CPUS"; fi; }
 # The sandbox filesystem is an allowlist: what is not bound here, or per case below, does not
 # exist inside. Read-only: /usr (and the top-level links or directories that lead into it), a
@@ -307,9 +310,9 @@ done
 BWRAP_ARGS+=(--ro-bind "$VENV" "$VENV" --dev /dev --proc /proc --tmpfs /tmp --tmpfs /run
              --unshare-net --unshare-pid --die-with-parent)
 
-# bind_check LABEL [--allow ROOT]... -- BWRAP-OPTIONS...
+# bind_check LABEL [--allow ROOT]... [--shared-count N] -- BWRAP-OPTIONS...
 # Refuses, naming the bind, when a bind source is outside the allowed roots or a socket file or
-# mount point is beneath one; a check that ends without a verdict says how it ended.
+# mount point is beneath one; a check that ends without its completion line says how it ended.
 bind_check() {
     local label="$1" out rc how
     shift
@@ -318,7 +321,9 @@ bind_check() {
     rc=$?
     set -e
     printf '%s\n' "$out" >> "$PREFLIGHT"
-    [ "$rc" -eq 0 ] && return 0
+    if [ "$rc" -eq 0 ] && grep -q '^socket-walk complete: ' <<< "$out"; then
+        return 0
+    fi
     if [ "$rc" -eq 1 ] && grep -q '^REFUSE ' <<< "$out"; then
         refuse "$label sandbox bind check failed: $(grep '^REFUSE ' <<< "$out" | tr '\n' ' ')"
     fi
@@ -347,7 +352,8 @@ in_sandbox() {
 }
 
 # Self-test: every property above, checked inside the sandbox. The probe must echo this run's
-# nonce, so a sandbox command that never ran the probe cannot pass.
+# nonce, so a launch that ends without running the probe cannot pass (the launcher itself is
+# trusted; see the bwrap record above).
 SELF_TEST_DIR="$CASE_BASE/self-test"
 OUTSIDE_DIR="$CASE_BASE/outside"
 mkdir -p "$SELF_TEST_DIR/ro" "$OUTSIDE_DIR"
@@ -370,7 +376,9 @@ with socket.socket(socket.AF_UNIX) as server, socket.socket(socket.AF_UNIX) as n
             client.connect(address)
     open("ready", "w").close()
     deadline = time.monotonic() + 600
-    while not os.path.exists(done) and time.monotonic() < deadline:
+    while not os.path.exists(done):
+        if time.monotonic() > deadline:
+            sys.exit("the self-test never finished; the listener stopped without it")
         time.sleep(0.1)
 ' "$OUTSIDE_DIR" "examples-gate-$NONCE" "$OUTSIDE_DIR/done" > "$LOG_DIR/self-test-listener.log" 2>&1 &
 listener_pid=$!
@@ -536,7 +544,10 @@ for line in "${CASE_LINES[@]}"; do
             home_allow+=(--allow "$host_dir")
         done
     fi
-    bind_check "case $id" --allow "$CASE_BASE" "${home_allow[@]}" -- --bind "$case_dir" "$case_dir" "${home_binds[@]}"
+    # Every bind of this launch: sources and mount points of the shared binds again, sockets for
+    # the case's own binds (the shared binds' sockets were walked once, before the first case).
+    bind_check "case $id" --allow "$VENV" --allow "$CASE_BASE" "${home_allow[@]}" --shared-count "${#BWRAP_ARGS[@]}" -- \
+        "${BWRAP_ARGS[@]}" --bind "$case_dir" "$case_dir" "${home_binds[@]}"
     cat > "$case_dir/inner.sh" <<'INNER'
 #!/usr/bin/env bash
 set -u

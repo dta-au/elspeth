@@ -350,16 +350,47 @@ def _within(path: str, root: str) -> bool:
 
 
 def bind_source_refusal(source: str, allowed_roots: list[str]) -> str | None:
-    """Why a bind source may not be bound at all, decided before anything is walked."""
+    """Why a bind source may not be bound at all, decided before anything is walked.
+
+    The source is judged as written with dot segments removed, and a directory also by where it
+    resolves: bwrap binds the resolved directory, so a link out of an allowed root is refused.
+    A file source may resolve elsewhere (the /etc links into /usr and /run): only that file is bound.
+    """
+    lexical = os.path.normpath(source)
     real = os.path.realpath(source)
-    for path in (source, real):
+    for path in (lexical, real):
         if path == "/":
             return "the host root"
         if any(_within(path, never) for never in NEVER_BOUND):
             return f"{path} is a kernel or device tree"
-    if not any(_within(source, root) for root in (*SYSTEM_BIND_ROOTS, *allowed_roots) if root.rstrip("/")):
+    roots = [root for root in (*SYSTEM_BIND_ROOTS, *allowed_roots) if root.rstrip("/")]
+    if not any(_within(lexical, root) for root in roots):
         return "outside the allowed bind roots"
+    if os.path.isdir(real) and not any(_within(real, os.path.realpath(root)) for root in roots):
+        return f"resolves to {real}, outside the allowed bind roots"
     return None
+
+
+def _decode_mount_path(field: str) -> str:
+    # mountinfo escapes space, tab, newline and backslash as \ooo octal.
+    return re.sub(r"\\([0-7]{3})", lambda match: chr(int(match.group(1), 8)), field)
+
+
+def mount_points(mountinfo: str) -> list[str]:
+    """Every mount point in /proc/self/mountinfo text, decoded."""
+    return [_decode_mount_path(line.split()[4]) for line in mountinfo.splitlines() if line.strip()]
+
+
+def mounts_beneath(source: str, points: list[str]) -> list[str]:
+    """Mount points strictly beneath a bound source: bwrap binds recursively, so each would be inside.
+
+    Read from the mount table, not from st_dev, so a bind mount on the same filesystem and a
+    mount over a single file are both seen.
+    """
+    real = os.path.realpath(source)
+    if real == "/":
+        return [point for point in points if point != "/"]
+    return sorted({point for point in points if point.startswith(real.rstrip("/") + "/")})
 
 
 def sockets_under(source: Path) -> tuple[list[str], int]:
@@ -409,14 +440,21 @@ def cmd_socket_walk(args: argparse.Namespace) -> int:
     if bwrap_args[:1] == ["--"]:
         bwrap_args = bwrap_args[1:]
     sources = bind_sources(bwrap_args)
-    refusals = [(source, bind_source_refusal(source, args.allow)) for source, _optional in sources]
-    if any(reason for _source, reason in refusals):
-        for source, reason in refusals:
-            if reason:
-                print(f"REFUSE bind {source}: {reason}")
+    points = mount_points(Path("/proc/self/mountinfo").read_text())
+    refusals: list[str] = []
+    for source, _optional in sources:
+        reason = bind_source_refusal(source, args.allow)
+        if reason:
+            refusals.append(f"REFUSE bind {source}: {reason}")
+        elif os.path.lexists(source):
+            refusals.extend(f"REFUSE bind {source}: mount point {point}" for point in mounts_beneath(source, points))
+    if refusals:
+        print("\n".join(refusals))
         return 1
+    # The first --shared-count options were walked for sockets earlier in this run.
+    shared = len(bind_sources(bwrap_args[: args.shared_count]))
     status = 0
-    for source, optional in sources:
+    for source, optional in sources[shared:]:
         if not os.path.lexists(source):
             if optional:
                 print(f"bind {source}: absent, optional")
@@ -430,6 +468,9 @@ def cmd_socket_walk(args: argparse.Namespace) -> int:
             status = 1
         if unsearchable:
             print(f"bind {source}: {unsearchable} directories this user cannot search")
+    if status == 0:
+        # The gate accepts exit 0 only with this line: an exit before the walk ends is no verdict.
+        print(f"socket-walk complete: {len(sources)} binds checked, {len(sources) - shared} walked")
     return status
 
 
@@ -1006,6 +1047,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--frozen", choices=["YES", "NO"], required=True)
     p = sub.add_parser("socket-walk")
     p.add_argument("--allow", action="append", default=[], help="an allowed bind root besides the system trees")
+    p.add_argument("--shared-count", type=int, default=0, help="leading bwrap options already walked for sockets this run")
     p.add_argument("bwrap_args", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     handlers = {
