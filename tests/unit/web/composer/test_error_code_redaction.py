@@ -177,6 +177,7 @@ _REVIEWED_FORWARDERS: frozenset[tuple[str, str, str]] = frozenset(
         ("sessions/routes/composer/state.py", "seed_state_from_runtime_yaml", "exc.error_code"),
         # PromptFileTooLargeError's only code is a class constant (pinned below).
         ("sessions/routes/composer/state.py", "_import_prompt_file_too_large_refusal", "exc.error_code"),
+        ("sessions/composer_operation_errors.py", "project_composer_operation_error", "leaf.error_code"),
         ("coordination/repository.py", "record_composition_rejection", "error_code"),
         ("sessions/protocol.py", "decode_stored_composition_validation_errors", "error_code"),
         ("sessions/protocol.py", "serialize_composition_validation_error", "value.error_code"),
