@@ -1160,6 +1160,48 @@ def test_lease_loss_after_an_ordinary_processing_error_abandons_the_claim() -> N
     assert "mark_pending_sink" not in verbs
 
 
+@pytest.mark.parametrize("processing_error_kind", ["tier-1", "ordinary"])
+@pytest.mark.parametrize("kind", ["eviction", "membership"])
+def test_failure_bookkeeping_refused_by_the_membership_fence(kind: str, processing_error_kind: str) -> None:
+    """A membership refusal of the failure bookkeeping supersedes an ordinary processing error, never a Tier-1 one."""
+    processor, spy, setup, clock = _build(lease_owner=LEADER_OWNER)
+    work_item_id, _token = _enqueue_ready(setup, spy, clock, sequence=0)
+    lower_level_error = OSError("connection reset")
+    processing_error: Exception = (
+        AuditIntegrityError("claimed token's ledger row disagrees with the work item")
+        if processing_error_kind == "tier-1"
+        else ValueError("plugin failure")
+    )
+    refusal = _coordination_signal(kind, work_item_id=work_item_id, run_id=setup.run_id)
+
+    def fail_processing(**_kwargs: Any) -> tuple[RowResult, list[Any]]:
+        raise processing_error from lower_level_error
+
+    def refuse_failure_bookkeeping(**_kwargs: Any) -> None:
+        raise refusal
+
+    spy.calls.clear()
+    with (
+        patch.object(processor, "_process_single_token", new=fail_processing),
+        patch.object(processor._scheduler_drain, "heartbeat_active_claim", new=lambda: None),
+        patch.object(spy, "mark_failed", new=refuse_failure_bookkeeping),
+        pytest.raises(type(processing_error) if processing_error_kind == "tier-1" else type(refusal)) as exc_info,
+    ):
+        processor._drain_scheduler_claims(ctx=_ctx(setup), pending_items={}, recover_pending_sinks=False)
+
+    if processing_error_kind == "tier-1":
+        assert exc_info.value is processing_error
+        assert (processing_error.__cause__, processing_error.__context__, processing_error.__suppress_context__) == (
+            lower_level_error,
+            None,
+            True,
+        )
+        assert len([note for note in processing_error.__notes__ if f": {type(refusal).__name__}: " in note]) == 1
+    else:
+        assert exc_info.value is refusal
+        assert refusal.__context__ is processing_error
+
+
 @pytest.mark.parametrize("surviving_peer", [False, True], ids=["leader-only", "with-follower-peer"])
 def test_heartbeat_membership_loss_propagates_without_failure_disposition(surviving_peer: bool) -> None:
     """A heartbeat membership refusal is not a plugin-processing failure.
