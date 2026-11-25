@@ -30,7 +30,7 @@ from elspeth.contracts.credential_material import (
         ("sk-or-v1-" + "a" * 24, "token_shape"),
         ("sk-proj-" + "a" * 24, "token_shape"),
         ("github_pat_" + "a" * 24, "token_shape"),
-        ("-----BEGIN PRIVATE KEY-----", "private_key"),
+        ("-----BEGIN PRIVATE KEY-----", "private_key"),  # secret-scan: allow-this-line
         ("https://user:pass@example.test/path", "credential_url"),
         ("https://example.test/path?api%5Fkey=value", "sensitive_url_parameter"),
         ("mongodb://user:pass@example.test/db", "credential_url"),  # secret-scan: allow-this-line

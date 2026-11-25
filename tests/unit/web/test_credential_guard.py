@@ -207,7 +207,7 @@ def test_field_mapper_domain_does_not_allow_credentials_or_unknown_shapes(change
     else:
         node["options"]["mapping"]["customer_key"] = {
             "token": "sk-" + "a" * 24,
-            "private_key": "-----BEGIN PRIVATE KEY-----",
+            "private_key": "-----BEGIN PRIVATE KEY-----",  # secret-scan: allow-this-line
             "url": "https://synthetic:password@example.test",
         }[change]
     with pytest.raises(CredentialMaterialRefused):
