@@ -15,6 +15,87 @@ changes land and is not a release.
 
 ### Upgrade notes
 
+- **No schema epoch change.** The session epoch stays at 79 and the Landscape
+  epoch at 51, and no table, column or CHECK changes, so 0.8.17 session and
+  Landscape stores open unchanged. This authorizes no migration, reset,
+  restamping or downgrade.
+- **Upgrading from 0.8.16 or earlier: apply the 0.8.17 and 0.8.16 upgrade
+  notes first.**
+- **Finish runs before upgrading (canonical form v2).** New runs record the
+  canonical version `sha256-rfc8785-v2`: byte values are hashed as base64 text
+  and mappings that use reserved keys are no longer wrapped. A run recorded
+  under an earlier canonical version cannot be continued:
+  - `elspeth resume` exits 1 with the `not_resumable` event and the reason
+    `canonical_version_changed`.
+  - `elspeth join` on such a run exits 1 with `join_refused`, naming the
+    version change.
+  - A replay or verify run whose source run has an earlier canonical version
+    is refused as an audit-integrity error (exit 4).
+  - `elspeth explain` still reads earlier runs, checks stored payloads against
+    their recorded SHA-256 and keeps their recorded hashes. Export keeps each
+    run's recorded canonical version.
+
+  Let CLI runs finish before upgrading, or run them again afterwards.
+- **Finish interrupted web runs before upgrading.** This release changes the
+  application code a web run is bound to, so a web run admitted under 0.8.17
+  is refused on resume as `IMPLEMENTATION_CHANGED` (implementation drift).
+  The ChromaDB sink's declared identity also changes, so where `chroma_sink`
+  is an authorized plugin the plugin policy changes too.
+- **Sessions database: up to 12 connections per application process.** Each
+  web process now has a second session-database pool of 2 connections, with
+  no overflow, for lease renewal and release and the membership heartbeat.
+  The main pool is unchanged (5 plus 5 overflow). On PostgreSQL, size
+  `max_connections` for 12 per process across all replicas, plus Landscape,
+  Jobs, probes and operator connections. These pools have no sizing setting.
+  In-memory SQLite shares one engine and needs no action.
+- **Changed:** when processing a row raises an audit-integrity or framework
+  (Tier-1) error and the worker's claim lease, run membership or run
+  leadership is found lost while that error propagates, or the membership
+  fence refuses the failure bookkeeping for that row, `elspeth run`,
+  `elspeth resume` and `elspeth join` exit 4 and print that error's
+  traceback, with the coordination loss noted on it. No disposition is
+  written for the abandoned claim.
+- **Changed:** `elspeth join` refuses with `join_not_ready` (exit 1) while the
+  run's graph registration is incomplete; retry once the leader has
+  registered the graph. Before and after admission, join now checks the run's
+  whole graph: its nodes, edges and plugin identities.
+- **Changed:** the composer's credential check uses detector version 2. It is
+  best effort: it matches known credential patterns. It checks each message
+  sent to the model individually and checks prompt-file text before it is
+  saved, as well as text entered into the pipeline. A prompt-file save
+  containing credential-shaped text is refused with 422
+  `credential_material_rejected`. A refusal says whether the text came from
+  the model's output or from the user's or session's own content, and keeps
+  the tool results and changes made earlier in the turn. Stored detector
+  evidence written by this release records version `"2"`.
+- **Changed:** a credential-refused composer MCP tool call is recorded as
+  `ARG_ERROR` with category `credential_material` and a fixed refusal message.
+  Its failed-argument evidence keeps a redaction marker, the exception class
+  and the field count, and leaves out argument names and values. MCP sidecars
+  written before this release are not rewritten.
+- **Changed:** accepting a pipeline proposal that binds a prompt file over the
+  inline limit answers 413 with `error_code` `prompt_file_too_large`, naming
+  the node and the limit, and keeps the proposal pending. It used to answer
+  500.
+- **Changed:** a model call that a fence refuses its ordinary `calls` row (a
+  lost item claim, membership or leadership) is recorded in the fence-refusal
+  event's `context.refused_call`, with its identity, hashes, status, token
+  usage and latency. Audit consumers that count attempted calls should read
+  these refusal events as well as `calls`.
+- **Changed:** the ChromaDB retriever and sink read a collection's distance
+  function from its configuration (`hnsw` or `spann`) and reconcile it with
+  the older `hnsw:space` metadata. A collection whose distance function is
+  missing, malformed or in conflict refuses startup; `distance_function` in
+  your settings must still match it.
+- **Changed:** the Composer's context-budget policy is now
+  `composer.context-budget.v5`. Earlier turns already left out of an existing
+  session stay out until the request is below 60% of the limit at the new
+  rate. A model or tool dialect with no successful call yet is priced at 3.0
+  bytes per token. `authored_refuted` now means the rate used differs from the
+  fallback rate. Advisor review records may carry up to 3 `provider_attempts`
+  (one size resend). With the byte maximum derived from the token limit (next
+  entry), a token limit below 122,880 gives a byte maximum below the former
+  fixed 983,040 bytes (960 KiB).
 - **Changed:** `elspeth join` exits 0 when the leader finishes the run while
   the follower is still working. Before this release it could exit 4, or exit
   2 with "The run is incomplete", although the run had finished. Exit 2 now
@@ -130,6 +211,49 @@ changes land and is not a release.
   longer claims "Saved draft progress remains available" when the pipeline
   draft is empty. Both corrections also apply to the existing withhold after a
   provider 503.
+- A batch attempt that had already timed out and been evicted no longer stops
+  later processing when its row fails late: the ordinary late failure is
+  discarded and the row keeps its original disposition. A late Tier-1 error
+  still stops the run.
+- When a sink or failsink boundary check fails during a re-drive, only the
+  batch's fresh rows fail. Rows recovered from an earlier attempt keep their
+  recorded effects and outcomes.
+- Web recovery treats a run whose leader seat has expired like a released
+  one, so a dead owner's run is no longer held back from recovery.
+- Lease renewal and the composer's poll, reap and claim loop retry a
+  transient database error while another attempt still fits the lease
+  window, up to five in a row, before giving up.
+- A closing session operation releases its own fence after its renewal fails
+  or expires, once its work has stopped, without waiting for recovery. The
+  composer reaper settles its own lapsed job the same way.
+- An expired fork or revert receipt no longer blocks archiving a session.
+  Rejoining an archived fork parent answers 404, and the confirmation says
+  archived sessions cannot be reopened.
+- When an authentication audit write fails after its HTTP caller has
+  disconnected, the server logs `Abandoned auth audit failed` at ERROR with
+  the original exception.
+- A turn that starts with an empty pipeline and fails to build no longer
+  reports that the pipeline was emptied; it reports the failed build.
+- The file list no longer claims a file is missing, or that the list is
+  empty, before the session's list has been read. A list that failed to load
+  or was cut short shows "File name unavailable". A refused upload, delete or
+  download no longer disables Edit file, and the list's Retry stays with the
+  list failure.
+- The composer's splice refusals tell errors the insertion introduced apart
+  from standing errors whose wording changed. The composer instructions and
+  the `splice_transform` description say that a set or splice must leave the
+  whole pipeline valid.
+
+### Examples
+
+- The `multi_worker` and `multi_worker_showcase` examples hold each worker's
+  first row until every requested worker has joined and holds live work, for
+  at most 60 seconds (less if the lease would expire sooner). `WORKERS + 1`
+  must fit in the first fan-out, and a launcher stops a worker that does not
+  respond to TERM within a few seconds. Run them through their `run.sh`.
+- The `rate_limited_llm` example's ChaosLLM command passes `--no-burst`.
+- `scripts/examples-gate.sh` runs every offline example in a sandbox without
+  network access (it needs bubblewrap) and checks each documented result.
 
 ---
 
