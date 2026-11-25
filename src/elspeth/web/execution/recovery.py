@@ -199,7 +199,7 @@ class RunRecoveryCoordinator:
         so the ledger writer can settle them without process-local state.
         """
         if observation.token_usage_entries:
-            lease.guard_external_effect()
+            await run_sync_in_worker(lease.guard_external_effect)
             await self._sessions.record_token_usage(
                 session_operation_context=lease.context,
                 source="run",
@@ -293,7 +293,7 @@ class RunRecoveryCoordinator:
                 create_tables=self._create_tables,
                 passphrase=self._landscape_passphrase,
             )
-            lease.guard_external_effect()
+            await run_sync_in_worker(lease.guard_external_effect)
             if observation.live_leader:
                 return
             if run.saga_state is RunSagaState.ADMISSION_REFUSAL_PENDING:
