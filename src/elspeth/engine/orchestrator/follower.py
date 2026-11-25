@@ -99,13 +99,20 @@ from typing import TYPE_CHECKING, Protocol
 
 from sqlalchemy.exc import OperationalError
 
+import elspeth.contracts.errors as contract_errors
 from elspeth.contracts.coordination import (
     DEFAULT_RUN_HEARTBEAT_SECONDS,
     DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
     WorkerMembershipToken,
 )
 from elspeth.contracts.enums import RunStatus
-from elspeth.contracts.errors import AuditIntegrityError, FollowerSeatDeadError, RunMembershipLostError, RunWorkerEvictedError
+from elspeth.contracts.errors import (
+    AuditIntegrityError,
+    FollowerSeatDeadError,
+    OrchestrationInvariantError,
+    RunMembershipLostError,
+    RunWorkerEvictedError,
+)
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.engine.orchestrator.heartbeat import RunHeartbeatThread
 
@@ -161,6 +168,27 @@ class _SeatDeadError(Exception):
         super().__init__(f"Follower {worker_id!r} detected no live leader for run {run_id!r}; run can be taken over via `elspeth resume`")
         self.worker_id = worker_id
         self.run_id = run_id
+
+
+def _tier_1_error_in_chain(error: BaseException) -> BaseException | None:
+    """Return a Tier-1 error from ``error``'s cause and context chain, or None.
+
+    When processing fails and the membership-fenced failure bookkeeping is then
+    refused, the drain re-raises the refusal with the processing error only as
+    its context, so a Tier-1 error can arrive inside a membership loss. Each
+    exception is walked once, so a chain that loops back on itself still ends.
+    """
+    seen: set[int] = set()
+    pending: list[BaseException] = [error]
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, contract_errors.TIER_1_ERRORS):
+            return current
+        pending.extend(linked for linked in (current.__cause__, current.__context__) if linked is not None)
+    return None
 
 
 class FollowerProcessor:
@@ -295,36 +323,55 @@ class FollowerProcessor:
         )
         heartbeat.start()
         terminal_exit = False
+        # A Tier-1 error found inside a membership loss, raised after the try
+        # statement below.
+        tier_1_error: BaseException | None = None
         try:
             self._drain_loop(ctx, heartbeat)
-        except (RunWorkerEvictedError, RunMembershipLostError) as exc:
+        except RunMembershipLostError as exc:
             # A drain pass can lose membership mid-pass when the leader's
             # complete_run departed our run_workers row in the SAME txn that
             # stamped the run terminal (finalize-departure, design case a).
             # Every membership-fenced verb the drain reaches (claim_ready, the
             # node-state and disposition writes, heartbeat_lease) refuses with
             # RunMembershipLostError; the in-verb CAS re-probes raise
-            # RunWorkerEvictedError. The top-of-loop discrimination only covers
-            # the heartbeat-latch path; recheck run status here before
-            # reporting a true eviction.
-            if self._run_is_terminal():
-                logger.info(
-                    "follower %r: membership lost, run %r is terminal — exiting cleanly",
-                    self._token.worker_id,
-                    self._token.run_id,
-                )
-                terminal_exit = True
-                return self._observed_terminal_status
-            # True eviction: leader's housekeeping sweep evicted us while the
-            # run is still RUNNING (design case b). Report it as the eviction
-            # it is (CLI exit 3), whichever fence observed it.
-            if isinstance(exc, RunMembershipLostError):
+            # RunWorkerEvictedError (the arm below). The top-of-loop
+            # discrimination only covers the heartbeat-latch path; recheck run
+            # status here before reporting a true eviction.
+            #
+            # A Tier-1 error the processing raised before the refusal leaves
+            # as itself, whatever the run's status (CLI exit 4).
+            tier_1_error = self._tier_1_error_noting_membership_loss(exc)
+            if tier_1_error is None:
+                if self._run_is_terminal():
+                    logger.info(
+                        "follower %r: membership lost, run %r is terminal — exiting cleanly",
+                        self._token.worker_id,
+                        self._token.run_id,
+                    )
+                    terminal_exit = True
+                    return self._observed_terminal_status
+                # True eviction: leader's housekeeping sweep evicted us while the
+                # run is still RUNNING (design case b). Report it as the eviction
+                # it is (CLI exit 3), whichever fence observed it.
                 raise RunWorkerEvictedError(
                     worker_id=self._token.worker_id,
                     run_id=self._token.run_id,
                     reason=f"membership fence refused verb {exc.verb!r}",
                 ) from exc
-            raise
+        except RunWorkerEvictedError as exc:
+            # The claim re-probe's eviction: discriminated as the arm above.
+            tier_1_error = self._tier_1_error_noting_membership_loss(exc)
+            if tier_1_error is None:
+                if self._run_is_terminal():
+                    logger.info(
+                        "follower %r: membership lost, run %r is terminal — exiting cleanly",
+                        self._token.worker_id,
+                        self._token.run_id,
+                    )
+                    terminal_exit = True
+                    return self._observed_terminal_status
+                raise
         except KeyboardInterrupt:
             logger.info(
                 "follower %r: SIGINT received — departing from run %r",
@@ -372,6 +419,25 @@ class FollowerProcessor:
                     self._best_effort_depart()
                 finally:
                     heartbeat.raise_fatal_failure()
+        # Reached only from a membership-loss arm that found a Tier-1 error.
+        # Raising it here, after the cleanup above and outside every handler,
+        # leaves its own cause, context and traceback as the processing raised
+        # them; the membership loss is recorded on it as a note.
+        if tier_1_error is None:
+            raise OrchestrationInvariantError(
+                f"follower {self._token.worker_id!r} left its drain for run {self._token.run_id!r} without an outcome"
+            )
+        raise tier_1_error
+
+    def _tier_1_error_noting_membership_loss(self, membership_loss: BaseException) -> BaseException | None:
+        """Return a Tier-1 error from the membership loss's chain, noted with the loss, or None."""
+        tier_1_error = _tier_1_error_in_chain(membership_loss)
+        if tier_1_error is not None:
+            tier_1_error.add_note(
+                f"follower {self._token.worker_id!r} lost its run membership while this error was propagating: "
+                f"{type(membership_loss).__name__}: {membership_loss}"
+            )
+        return tier_1_error
 
     # ------------------------------------------------------------------
     # Internal
