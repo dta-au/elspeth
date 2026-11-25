@@ -941,6 +941,13 @@ def _scripted_advisor(monkeypatch: pytest.MonkeyPatch, script: list[str]) -> lis
             from tests.unit.web.composer.test_request_too_large import mapped_provider_error
 
             raise mapped_provider_error("openai", 413)
+        if step == "cutoff_junk":
+            return ModelResponse(
+                id="advisor-cutoff",
+                model=kwargs["model"],
+                choices=[{"finish_reason": "length", "message": {"role": "assistant", "content": "no verdict here", "tool_calls": None}}],
+                usage=Usage(prompt_tokens=100, completion_tokens=5, total_tokens=105),
+            )
         return ModelResponse(
             id=f"advisor-{step}",
             model=kwargs["model"],
@@ -1007,6 +1014,53 @@ async def test_checkpoint_reports_the_last_dispatched_request_after_an_unsent_re
     assert verdict.provider_failure is None
     (record,) = records
     assert (record.verdict, record.provider_attempts) == (failure_class, provider_attempts)
+
+
+@pytest.mark.asyncio
+async def test_cut_off_detail_survives_retry_that_times_out_before_dispatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from tests.unit.web.composer._helpers import _empty_state
+
+    sent = _scripted_advisor(monkeypatch, ["cutoff_junk", "predispatch_timeout"])
+    recorder = BufferingRecorder()
+    owner = _owner(tmp_path)
+    verdict = await owner._run_advisor_checkpoint(
+        phase="end",
+        state=_empty_state(),
+        session_id=None,
+        recorder=recorder,
+        publication_review=_review(_probe(8)),
+    )
+
+    expected = advisor_policy.advisor_reply_cut_off_detail(
+        cap=owner._settings.composer_advisor_max_completion_tokens, planner_cap_applied=False
+    )
+    assert len(sent) == 2
+    assert recorder.llm_calls[0].finish_reason == "length"
+    assert (verdict.failure_class, verdict.findings_text) == ("malformed", expected)
+    assert expected != advisor_policy.ADVISOR_MALFORMED_USER_DETAIL
+
+
+@pytest.mark.asyncio
+async def test_first_unsent_failure_remains_advisor_unavailable_when_deadline_expires(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from elspeth.web.composer import advisor_checkpoint
+    from tests.unit.web.composer._helpers import _empty_state
+
+    clock = iter([0.0] + [100.0] * 50)
+    monkeypatch.setattr(advisor_checkpoint, "_compose_deadline_time", lambda: next(clock))
+    sent = _scripted_advisor(monkeypatch, ["predispatch_timeout", "ok"])
+    verdict = await _owner(tmp_path)._run_advisor_checkpoint(
+        phase="end",
+        state=_empty_state(),
+        session_id=None,
+        recorder=BufferingRecorder(),
+        publication_review=_review(_probe(8)),
+        deadline=10.0,
+    )
+
+    assert len(sent) == 1
+    assert (verdict.failure_class, verdict.retryable) == ("unavailable", True)
 
 
 @pytest.mark.asyncio

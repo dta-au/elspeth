@@ -336,6 +336,46 @@ def _admit_context_length_evidence(
 
 
 _REQUEST_TOO_LARGE = SafeRequestRejection(reason_code="request_too_large", reason_disposition="retained", reason_source="http_status")
+_REQUEST_TOO_LARGE_FAILURE = ProviderFailure(ComposerLLMCallStatus.BAD_REQUEST_ERROR, "bad_request", False, _REQUEST_TOO_LARGE)
+
+
+def _chained_provider_status_413(exc: BaseException) -> bool:
+    """Recognise a provider 413 that LiteLLM exposed under a different status."""
+    from litellm.exceptions import BadRequestError as LiteLLMBadRequestError
+    from litellm.exceptions import RateLimitError as LiteLLMRateLimitError
+    from litellm.llms.anthropic.common_utils import AnthropicError
+    from litellm.llms.custom_httpx.http_handler import MaskedHTTPStatusError
+    from litellm.llms.openai.common_utils import OpenAIError as LiteLLMOpenAIError
+    from openai import APIStatusError
+
+    # LiteLLM's provider wrapper is authoritative: it holds the HTTP status
+    # LiteLLM read before relabelling. The lower SDK/HTTP error must agree.
+    # LiteLLM does not promise this implicit __context__ chain; the
+    # MockTransport route tests pin it so an upstream change is detected.
+    wrapper = exc.__context__
+    if isinstance(exc, LiteLLMRateLimitError):
+        if not isinstance(wrapper, LiteLLMOpenAIError):
+            return False
+        wrapper_status: object = wrapper.status_code
+        if type(wrapper_status) is not int or wrapper_status != 413:
+            return False
+        lower = wrapper.__context__
+        if not isinstance(lower, APIStatusError):
+            return False
+        lower_status: object = lower.status_code
+        return type(lower_status) is int and lower_status == 413
+    if isinstance(exc, LiteLLMBadRequestError):
+        if not isinstance(wrapper, AnthropicError):
+            return False
+        wrapper_status = wrapper.status_code
+        if type(wrapper_status) is not int or wrapper_status != 413:
+            return False
+        lower = wrapper.__context__
+        if not isinstance(lower, MaskedHTTPStatusError):
+            return False
+        lower_status = lower.status_code
+        return type(lower_status) is int and lower_status == 413
+    return False
 
 
 def request_size_rejection(exc: BaseException | None) -> SafeRequestRejection | None:
@@ -400,7 +440,11 @@ def classify_provider_failure(exc: BaseException) -> ProviderFailure | None:
         # provider's own (413 for a Bedrock request-size rejection), so it is
         # read as a value.
         status: object = exc.status_code
-        if not specific_code_seen and rejection.reason_code != "context_length_exceeded" and status == 413:
+        if (
+            not specific_code_seen
+            and rejection.reason_code != "context_length_exceeded"
+            and (status == 413 or _chained_provider_status_413(exc))
+        ):
             rejection = _REQUEST_TOO_LARGE
         return ProviderFailure(ComposerLLMCallStatus.BAD_REQUEST_ERROR, "bad_request", False, rejection)
     if disposition == "timeout":
@@ -413,13 +457,15 @@ def classify_provider_failure(exc: BaseException) -> ProviderFailure | None:
         if isinstance(exc, LiteLLMAPIError) and exc.status_code == 413:
             # Too large for the provider or a proxy in front of it. Only the
             # status is read. An unchanged resend is refused the same way: a
-            # rejected request, not an outage. (The installed litellm keeps
-            # 413 as the status for OpenAI-compatible routes and Bedrock; its
-            # Anthropic mapping reports 400, an ordinary rejected request.)
-            return ProviderFailure(ComposerLLMCallStatus.BAD_REQUEST_ERROR, "bad_request", False, _REQUEST_TOO_LARGE)
+            # rejected request, not an outage. The installed LiteLLM keeps
+            # 413 for OpenAI-compatible routes and Bedrock; Anthropic reports
+            # 400 but is recognised through its typed provider chain above.
+            return _REQUEST_TOO_LARGE_FAILURE
         return ProviderFailure(ComposerLLMCallStatus.API_ERROR, "unavailable", True)
     if disposition == "rate_limit":
         assert isinstance(exc, OpenAIRateLimitError)
+        if _chained_provider_status_413(exc):
+            return _REQUEST_TOO_LARGE_FAILURE
         observed = observe_rate_limit(exc)
         return ProviderFailure(
             ComposerLLMCallStatus.API_ERROR,
