@@ -992,6 +992,7 @@ class _TierOneThenMembershipLossProcessor:
         self._signal = signal
         self._link = link
         self._lower_link = lower_link
+        self.drain_calls = 0
 
     def _raise_tier_1_error(self) -> None:
         raise self.tier_1_error
@@ -1019,6 +1020,7 @@ class _TierOneThenMembershipLossProcessor:
                 raise refusal from processing_error
 
     def drain_follower_ready_work(self, ctx: PluginContext, *, before_claim: object = None) -> list[object]:
+        self.drain_calls += 1
         try:
             self._process()
         except AuditIntegrityError as processing_exc:
@@ -1042,6 +1044,19 @@ class _LoopingChainMembershipLossProcessor:
         middle.__cause__ = refusal
         refusal.__cause__ = middle
         raise refusal
+
+
+class _FinalBeatFailsHeartbeat(_StubHeartbeat):
+    """Latches a fatal failure from the final beat taken at stop(), as a failed final heartbeat write would."""
+
+    def __init__(self, final_beat_error: BaseException) -> None:
+        super().__init__(evicted=False)
+        self._final_beat_error = final_beat_error
+
+    def stop(self, *, final_beat: bool = True) -> None:
+        super().stop(final_beat=final_beat)
+        if final_beat:
+            self.fatal_error = self._final_beat_error
 
 
 class TestFollowerTierOneErrorOutranksMembershipLoss:
@@ -1094,8 +1109,8 @@ class TestFollowerTierOneErrorOutranksMembershipLoss:
     def test_cleanup_failure_after_the_tier_1_error_carries_it_as_context(self) -> None:
         processor = _TierOneThenMembershipLossProcessor(signal=RunMembershipLostError, link="context", lower_link="context")
         coord_repo = _StubRunCoordRepo()
-        heartbeat = _StubHeartbeat(evicted=False)
-        heartbeat.fatal_error = AuditIntegrityError("heartbeat write corrupted the coordination ledger")
+        final_beat_error = AuditIntegrityError("final heartbeat write found the coordination ledger corrupt")
+        heartbeat = _FinalBeatFailsHeartbeat(final_beat_error)
         follower = FollowerProcessor(
             processor=processor,
             member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID),
@@ -1110,8 +1125,11 @@ class TestFollowerTierOneErrorOutranksMembershipLoss:
         ):
             follower.run(ctx=_ctx())
 
+        # The processing ran, and the final beat's fatal failure latched only at cleanup.
+        assert processor.drain_calls == 1
+        assert heartbeat.stop_final_beats == [True]
         # The heartbeat's fatal failure still wins, and still carries the processing error.
-        assert exc_info.value is heartbeat.fatal_error
+        assert exc_info.value is final_beat_error
         tier_1_error = exc_info.value.__context__
         assert tier_1_error is processor.tier_1_error
         assert (tier_1_error.__cause__, tier_1_error.__context__, tier_1_error.__suppress_context__) == (
