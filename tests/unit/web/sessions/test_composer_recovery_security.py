@@ -228,7 +228,9 @@ async def test_corrupt_park_identity_never_enters_trusted_provider_context(opera
 @pytest.mark.asyncio
 @pytest.mark.parametrize("managed_reference", [False, True])
 async def test_recovery_restores_the_sessions_own_checkpoint_with_literal_or_referenced_options(operation_store, managed_reference):
-    # Recovery restores the session's own graph; credential admission ran when the text arrived.
+    # Entry admission is the credential control: a saved graph holding a literal is not a state the
+    # composer can produce. This pins only that recovery does not re-scan the session's own graph;
+    # it makes no claim to protect a corrupted one.
     engine, repository, _authority, service, session_id = operation_store
     credential = {"secret_ref": "UNAVAILABLE_CREDENTIAL"} if managed_reference else "private-literal-credential"
     state = CompositionState(
