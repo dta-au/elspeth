@@ -47,25 +47,41 @@ if ! .venv/bin/python examples/multi_worker/start_barrier.py --check-fanout exam
     exit 2
 fi
 
-cleanup() {
-    # Kill any still-running followers and the leader, then the ChaosLLM server.
-    # Array-length-guarded so an empty FOLLOWER_PIDS under `set -u` does not
-    # expand to one empty-string element (which would run `kill -0 ""`).
-    if [ ${#FOLLOWER_PIDS[@]} -gt 0 ]; then
-        for pid in "${FOLLOWER_PIDS[@]}"; do
-            kill -0 "$pid" 2>/dev/null && kill "$pid" 2>/dev/null || true
-            wait "$pid" 2>/dev/null || true
+stop_children() {
+    local pid attempt alive
+    for pid in "$@"; do
+        kill -0 "$pid" 2>/dev/null && kill -TERM "$pid" 2>/dev/null || true
+    done
+    # Three seconds is enough for normal CLI teardown and well inside the
+    # barrier's 60-second startup budget. Never wait indefinitely on a stop.
+    for attempt in $(seq 1 30); do
+        alive=0
+        for pid in "$@"; do
+            if kill -0 "$pid" 2>/dev/null; then alive=1; fi
         done
-    fi
-    [ -n "$LEADER_PID" ] && kill -0 "$LEADER_PID" 2>/dev/null && kill "$LEADER_PID" 2>/dev/null || true
-    [ -n "$LEADER_PID" ] && wait "$LEADER_PID" 2>/dev/null || true
+        if [ "$alive" -eq 0 ]; then break; fi
+        sleep 0.1
+    done
+    for pid in "$@"; do
+        kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+    done
+}
+
+cleanup() {
+    local status=$?
+    trap - EXIT INT TERM
+    # Stop all workers together, then the server, even on a failed launch.
+    local -a children=()
+    if [ -n "$LEADER_PID" ]; then children+=("$LEADER_PID"); fi
+    if [ ${#FOLLOWER_PIDS[@]} -gt 0 ]; then children+=("${FOLLOWER_PIDS[@]}"); fi
+    if [ ${#children[@]} -gt 0 ]; then stop_children "${children[@]}"; fi
     if [ -n "$CHAOS_PID" ] && kill -0 "$CHAOS_PID" 2>/dev/null; then
         echo ""
         echo "Stopping ChaosLLM server (PID $CHAOS_PID)..."
-        kill "$CHAOS_PID" 2>/dev/null || true
-        wait "$CHAOS_PID" 2>/dev/null || true
+        stop_children "$CHAOS_PID"
     fi
     [ -n "$BARRIER_DIR" ] && rm -rf "$BARRIER_DIR"
+    exit "$status"
 }
 trap cleanup EXIT
 trap 'exit 130' INT

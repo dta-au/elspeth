@@ -100,10 +100,50 @@ class StartBarrier:
         self.budget_seconds = budget_seconds
         self._released = False
 
-    def _decide(self, run_id: str, failure_message: str | None = None) -> None:
+    def _release_failure(self, run_id: str) -> str | None:
+        """Recheck arrival, process, membership and lease while holding the decision lock."""
+        manifest = self.directory / "workers.json"
+        if not manifest.exists():
+            return "start barrier: worker manifest missing before release"
+        pids: list[int] = json.loads(manifest.read_text())
+        if len(pids) != self.workers or len(set(pids)) != self.workers:
+            return "start barrier: invalid launcher worker manifest"
+        arrivals = []
+        for pid in pids:
+            path = self.directory / f"{pid}.json"
+            if not path.exists():
+                return "start barrier: worker missing before release"
+            arrival = json.loads(path.read_text())
+            if arrival["pid"] != pid:
+                return "start barrier: invalid worker arrival before release"
+            arrivals.append(arrival)
+        for pid in pids:
+            if not self.alive(pid):
+                return f"start barrier: worker process {pid} exited before release"
+        identities = {item["worker_id"] for item in arrivals}
+        roles = [item["role"] for item in arrivals]
+        members = self.live_members(run_id)
+        if (
+            len(identities) != self.workers
+            or roles.count("leader") != 1
+            or roles.count("follower") != self.workers - 1
+            or any(item["run_id"] != run_id or members.get(item["worker_id"]) != item["role"] for item in arrivals)
+        ):
+            return "start barrier: active membership or live lease missing before release"
+        return None
+
+    def _decide(self, run_id: str, deadline: float, timeout_message: str, failure_message: str | None = None) -> None:
         """Serialize success and failure so a late arrival cannot undo failure."""
         with (self.directory / "decision.lock").open("a+") as lock:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            while True:
+                try:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    remaining = deadline - self.monotonic()
+                    if remaining <= 0:
+                        raise BarrierFailure("start barrier: decision lock unavailable at deadline") from None
+                    self.sleep(min(POLL_SECONDS, remaining))
             failure = self.directory / "failed.json"
             if failure.exists():
                 raise BarrierFailure(json.loads(failure.read_text())["message"])
@@ -111,11 +151,26 @@ class StartBarrier:
             if release.exists():
                 if json.loads(release.read_text())["run_id"] != run_id:
                     raise BarrierFailure("start barrier: release belongs to another run")
-            elif failure_message is not None:
-                _write_json(failure, {"message": failure_message})
-                raise BarrierFailure(failure_message)
             else:
-                _write_json(release, {"run_id": run_id, "released_at": time.time()})
+                if failure_message is None:
+                    if self.monotonic() >= deadline:
+                        failure_message = timeout_message
+                    else:
+                        failure_message = self._release_failure(run_id)
+                    if failure_message is None and self.monotonic() >= deadline:
+                        failure_message = timeout_message
+                if failure_message is not None:
+                    _write_json(failure, {"message": failure_message})
+                    raise BarrierFailure(failure_message)
+                staging = release.with_name(f".{release.name}.{os.getpid()}")
+                try:
+                    staging.write_text(json.dumps({"run_id": run_id, "released_at": time.time()}))
+                    if self.monotonic() >= deadline:
+                        _write_json(failure, {"message": timeout_message})
+                        raise BarrierFailure(timeout_message)
+                    os.replace(staging, release)
+                finally:
+                    staging.unlink(missing_ok=True)
             self._released = True
 
     def arrive(self, run_id: str, worker_id: str, role: str, pid: int, lease_remaining_seconds: float = 300) -> None:
@@ -123,10 +178,17 @@ class StartBarrier:
             return
         _write_json(self.directory / f"{pid}.json", {"pid": pid, "run_id": run_id, "worker_id": worker_id, "role": role})
         if lease_remaining_seconds <= LEASE_SAFETY_MARGIN_SECONDS:
-            self._decide(run_id, "start barrier: item lease too close to expiry")
+            self._decide(
+                run_id, self.monotonic(), "start barrier: item lease too close to expiry", "start barrier: item lease too close to expiry"
+            )
             return
         effective_budget = min(self.budget_seconds, lease_remaining_seconds - LEASE_SAFETY_MARGIN_SECONDS)
         deadline = self.monotonic() + effective_budget
+        timeout_message = (
+            "start barrier: item lease safety deadline reached"
+            if effective_budget < self.budget_seconds
+            else f"start barrier: deadline reached after {self.budget_seconds}s"
+        )
         while True:
             failure_reason = "worker missing"
             failure = self.directory / "failed.json"
@@ -153,7 +215,7 @@ class StartBarrier:
                     if not self.alive(other):
                         phase = "before release" if other in arrived_pids else "before arrival"
                         message = f"start barrier: worker process {other} exited {phase}"
-                        self._decide(run_id, message)
+                        self._decide(run_id, deadline, timeout_message, message)
                         return
                 if len(arrivals) == self.workers:
                     failure_reason = "active membership or live lease missing"
@@ -166,16 +228,18 @@ class StartBarrier:
                         and roles.count("follower") == self.workers - 1
                         and all(item["run_id"] == run_id and members.get(item["worker_id"]) == item["role"] for item in arrivals)
                     ):
-                        self._decide(run_id)
+                        self._decide(run_id, deadline, timeout_message)
                         return
             if self.monotonic() >= deadline:
                 if effective_budget < self.budget_seconds:
                     message = "start barrier: item lease safety deadline reached"
                 else:
                     message = f"start barrier: {failure_reason} after {self.budget_seconds}s"
-                self._decide(run_id, message)
+                self._decide(run_id, deadline, timeout_message, message)
                 return
-            self.sleep(min(POLL_SECONDS, deadline - self.monotonic()))
+            remaining = deadline - self.monotonic()
+            if remaining > 0:
+                self.sleep(min(POLL_SECONDS, remaining))
 
 
 class DemonstrationStartBarrierConfig(TransformDataConfig):
@@ -199,12 +263,7 @@ class DemonstrationStartBarrier(BaseTransform):
         self._schema_config = cfg.schema_config
         self._output_schema_config = self._build_output_schema_config(cfg.schema_config)
         self.input_schema, self.output_schema = self._create_schemas(cfg.schema_config, "DemonstrationStartBarrier")
-        directory = Path(os.environ["ELSPETH_DEMO_BARRIER_DIR"])
-        workers = int(os.environ["ELSPETH_DEMO_BARRIER_WORKERS"])
-        db = Path(os.environ["ELSPETH_DEMO_BARRIER_DB"])
-        self._barrier = StartBarrier(
-            directory, workers, time.monotonic, time.sleep, _process_alive, lambda run_id: _live_members(db, run_id)
-        )
+        self._barrier: StartBarrier | None = None
 
     @classmethod
     def probe_config(cls) -> dict[str, Any]:
@@ -219,6 +278,13 @@ class DemonstrationStartBarrier(BaseTransform):
         lease_deadline = lease_expires_at.replace(tzinfo=UTC) if lease_expires_at.tzinfo is None else lease_expires_at
         lease_remaining_seconds = (lease_deadline - datetime.now(UTC)).total_seconds()
         role = os.environ["ELSPETH_DEMO_BARRIER_ROLE"]
+        if self._barrier is None:
+            directory = Path(os.environ["ELSPETH_DEMO_BARRIER_DIR"])
+            workers = int(os.environ["ELSPETH_DEMO_BARRIER_WORKERS"])
+            db = Path(os.environ["ELSPETH_DEMO_BARRIER_DB"])
+            self._barrier = StartBarrier(
+                directory, workers, time.monotonic, time.sleep, _process_alive, lambda run_id: _live_members(db, run_id)
+            )
         self._barrier.arrive(ctx.run_id, membership.worker_id, role, os.getpid(), lease_remaining_seconds)
         output_contract = self._align_output_contract(self._apply_declared_output_field_contracts(row.contract))
         return TransformResult.success(PipelineRow(copy.deepcopy(row.to_dict()), output_contract), success_reason={"action": "passthrough"})
