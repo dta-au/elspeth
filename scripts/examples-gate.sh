@@ -2,7 +2,8 @@
 # examples-gate.sh — run every offline shipped example the way its documentation
 # says to run it, and check each against its documented result.
 #
-# The examples gate runs the non-network examples. Before this script, the
+# The examples gate runs the non-network examples to catch documented result
+# drift that config validation alone cannot see. Before this script, the
 # test suite validates every config and executes only a handful
 # (tests/e2e/examples/test_shipped_examples.py).
 #
@@ -14,10 +15,10 @@
 #      already-exported directory). It never runs anything inside --root and
 #      never writes there, so a shared landing worktree is safe to gate.
 #   2. Refuses unless scripts/examples-gate-cases.yaml classifies EVERY example
-#      directory, top-level pipeline config and launcher in that tree
+#      directory, top-level pipeline config and *.sh launcher in that tree
 #      (examples_gate.py validate). A new example cannot be silently left out.
 #   3. For each case, in order, serially:
-#        - a fresh copy of the tree (tests/, docs/, website/ left out; .venv is a
+#        - a fresh copy of the tree (tests/, docs/, website/, .claude/ left out; .venv is a
 #          symlink to --venv), so audit DBs, outputs and .elspeth/ never collide
 #          and every launcher sees a clean checkout;
 #        - proves elspeth.__file__ and elspeth_lints.__file__ resolve inside that
@@ -35,10 +36,19 @@
 #          conservation for stochastic fault-injection cases (examples_gate.py check).
 #   4. Hashes the exported tree before and after; a tree that moved is not evidence.
 #
-# --execute requires bwrap (bubblewrap): each case's server and command share
-# one private network with loopback, and the kernel blocks outbound traffic.
-# The text guard remains an early, explanatory refusal. The case environment
-# has no inherited credentials, and each case gets an empty HOME.
+# --execute requires bwrap (bubblewrap). Each case runs in a sandbox whose
+# filesystem is an allowlist: /usr, the venv and a short list of /etc entries
+# read-only, the case directory read-write, and the case's declared cached
+# prerequisites read-only in its otherwise empty HOME. Nothing else from the
+# host exists inside, and the sandbox root is read-only. Before a case starts,
+# every bound path is walked and the run refuses, naming the bind, if a socket
+# file is under one. The case's server and command share one private network
+# with loopback only, in a private PID namespace; /tmp and /run start empty;
+# stdin is /dev/null and no file descriptor above 2 is inherited. Before the
+# first case, a self-test checks these properties inside the sandbox and must
+# echo a per-run nonce. The text guard remains an early refusal. The case
+# environment has no inherited credentials. The shared venv is read-only inside
+# cases but remains outside the exported-tree digest.
 #
 # Verdicts (summary.txt, one line per case, then one SKIP line per excluded config)
 #   PASS     ran and matched every documented expectation
@@ -80,6 +90,7 @@
 #   -h, --help
 set -euo pipefail
 
+main() {
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EXECUTE=0
 ROOT=""
@@ -113,7 +124,7 @@ while [ $# -gt 0 ]; do
         --stop-file) STOP_FILE="$2"; shift ;;
         --min-mem-gb) MIN_MEM_GB="$2"; shift ;;
         --keep-passing) KEEP_PASSING=1 ;;
-        -h|--help) usage; exit 0 ;;
+        -h|--help) usage; return 0 ;;
         *) die "unknown option $1 (see --help)" ;;
     esac
     shift
@@ -126,12 +137,13 @@ TMP_ROOT="$(realpath -m "$TMP_ROOT")"
 if [ -z "$ROOT" ]; then
     ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not in a git checkout; pass --root"
 fi
-ROOT="$(cd "$ROOT" && pwd)"
+ROOT="$(cd -P "$ROOT" && pwd -P)"
 case "$TMP_ROOT/" in "$(realpath "$ROOT")"/*) die "--tmp-root must not be inside the checkout ($ROOT)" ;; esac
 case "$TMP_ROOT" in /tmp|/tmp/*) die "--tmp-root must not be under /tmp" ;; esac
 [ -n "$VENV" ] || VENV="$ROOT/.venv"
 VENV="$(cd "$VENV" && pwd -P)" || die "--venv $VENV does not exist"
-CASES="$(cd "$(dirname "$CASES")" && pwd)/$(basename "$CASES")"
+cases_dir="$(cd -P "$(dirname "$CASES")" && pwd -P)" || die "case data directory for $CASES does not exist"
+CASES="$cases_dir/$(basename "$CASES")"
 [ -f "$CASES" ] || die "case data file $CASES not found"
 if [ "$EXECUTE" -eq 1 ]; then
     mkdir -p "$TMP_ROOT"
@@ -146,6 +158,7 @@ STAMP="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 LOG_DIR="$(realpath -m "$LOG_DIR")"
 for output_path in "$LOG_DIR" "$STOP_FILE"; do
     case "$output_path/" in "$(realpath "$ROOT")"/*) die "$output_path must not be inside the checkout" ;; esac
+    case "$output_path" in /tmp|/tmp/*) die "$output_path must not be under /tmp" ;; esac
 done
 PY="$VENV/bin/python"
 [ -x "$PY" ] || die "no interpreter at $PY"
@@ -154,8 +167,11 @@ SEP=$'\x1f'
 
 # ------------------------------------------------------------------ the tree
 if [ -n "$TREE" ]; then
-    TREE="$(cd "$TREE" && pwd)"
+    TREE="$(cd -P "$TREE" && pwd -P)"
     case "$TMP_ROOT/" in "$TREE"/*) die "--tmp-root must not be inside --tree ($TREE)" ;; esac
+    for output_path in "$LOG_DIR" "$STOP_FILE"; do
+        case "$output_path/" in "$TREE"/*) die "$output_path must not be inside --tree" ;; esac
+    done
     while IFS= read -r -d '' link; do
         target="$(realpath -m "$link")"
         case "$target/" in "$TREE"/*) ;; *) die "tree symlink $link resolves outside --tree" ;; esac
@@ -172,6 +188,7 @@ plan() {
     echo "  source     : $SOURCE_DESC"
     echo "  venv       : $VENV"
     echo "  cases      : $CASES"
+    echo "  only       : ${ONLY:-ALL}"
     echo "  cpus       : ${CPUS:-unpinned}"
     echo "  tmp-root   : $TMP_ROOT"
     echo "  log-dir    : $LOG_DIR"
@@ -188,12 +205,12 @@ if [ "$EXECUTE" -eq 0 ]; then
         "${HELPER[@]}" validate --cases "$CASES" --tree "$ROOT"
     fi
     echo "cases:"
-    "${HELPER[@]}" list --cases "$CASES" ${ONLY:+--only "$ONLY"} | while IFS="$SEP" read -r id cmd scmd sport ports envx fpk skip; do
+    "${HELPER[@]}" list --cases "$CASES" ${ONLY:+--only "$ONLY"} | while IFS="$SEP" read -r id cmd scmd sport ports envx fpk homero skip; do
         if [ -n "$skip" ]; then echo "  SKIP $id -- $skip"; continue; fi
         echo "  $id: ${envx:+$envx }$cmd${scmd:+   [server: $scmd]}${ports:+   [ports: $ports]}"
     done
     echo "dry run: nothing executed (pass --execute)"
-    exit 0
+    return 0
 fi
 
 # ---------------------------------------------------------------- preflight
@@ -204,6 +221,13 @@ PREFLIGHT="$LOG_DIR/preflight.txt"
 : > "$SUMMARY"
 plan > "$PREFLIGHT"
 echo "overall=running" > "$LOG_DIR/overall.exit"
+on_exit() {
+    local rc=$?
+    if [ -f "$LOG_DIR/overall.exit" ] && [ "$(cat "$LOG_DIR/overall.exit")" = overall=running ]; then
+        printf 'overall=%s (aborted)\n' "$rc" > "$LOG_DIR/overall.exit"
+    fi
+}
+trap on_exit EXIT
 
 refuse() { echo "REFUSED: $*" | tee -a "$PREFLIGHT" >&2; echo 2 > "$LOG_DIR/overall.exit"; exit 2; }
 
@@ -213,6 +237,7 @@ CASES="$LOG_DIR/cases.yaml"
 HELPER=("$PY" -I "$LOG_DIR/examples_gate.py")
 echo "cases_sha256=$(sha256sum "$CASES" | cut -d' ' -f1)" >> "$PREFLIGHT"
 echo "helper_sha256=$(sha256sum "$LOG_DIR/examples_gate.py" | cut -d' ' -f1)" >> "$PREFLIGHT"
+echo "driver_sha256=$(sha256sum "${BASH_SOURCE[0]}" | cut -d' ' -f1)" >> "$PREFLIGHT"
 
 mem_kb="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)"
 echo "MemAvailable_kB=$mem_kb (floor ${MIN_MEM_GB} GB)" >> "$PREFLIGHT"
@@ -257,16 +282,136 @@ set -e
 mapfile -t CASE_LINES < "$LOG_DIR/cases.list"
 [ "${#CASE_LINES[@]}" -eq "$count" ] || refuse "case list has ${#CASE_LINES[@]} rows, selection reports $count"
 [ "$count" -gt 0 ] || refuse "no cases selected"
+total_count="$("${HELPER[@]}" count --cases "$CASES")"
+echo "selected=$count total=$total_count only=${ONLY:-ALL}" >> "$PREFLIGHT"
 
 BWRAP="$(command -v bwrap || true)"
 [ -n "$BWRAP" ] || refuse "bwrap (bubblewrap) is required for kernel-enforced offline execution"
 BWRAP="$(realpath "$BWRAP")"
 pin() { if [ -n "$CPUS" ]; then echo taskset -c "$CPUS"; fi; }
-if ! env -i HOME="$LOG_DIR" PATH="/usr/local/bin:/usr/bin:/bin" TMPDIR="$LOG_DIR" LANG=C.UTF-8 \
-    $(pin) "$BWRAP" --dev-bind / / --unshare-net --unshare-pid --proc /proc --die-with-parent -- "$PY" -c '
+# The sandbox filesystem is an allowlist: what is not bound here, or per case below, does not
+# exist inside. Read-only: /usr (and the top-level links or directories that lead into it), a
+# short list of /etc entries, and the venv.
+BWRAP_ARGS=(--ro-bind /usr /usr)
+for top in bin sbin lib lib32 lib64 libx32; do
+    if [ -L "/$top" ]; then
+        BWRAP_ARGS+=(--symlink "$(readlink "/$top")" "/$top")
+    elif [ -d "/$top" ]; then
+        BWRAP_ARGS+=(--ro-bind "/$top" "/$top")
+    fi
+done
+for etc_entry in passwd group nsswitch.conf hosts resolv.conf ld.so.cache localtime protocols services \
+                 mime.types alternatives ssl/certs ssl/openssl.cnf; do
+    BWRAP_ARGS+=(--ro-bind-try "/etc/$etc_entry" "/etc/$etc_entry")
+done
+BWRAP_ARGS+=(--ro-bind "$VENV" "$VENV" --dev /dev --proc /proc --tmpfs /tmp --tmpfs /run
+             --unshare-net --unshare-pid --die-with-parent)
+
+# bind_check LABEL [--allow ROOT]... -- BWRAP-OPTIONS...
+# Refuses, naming the bind, when a bind source is outside the allowed roots or a socket file or
+# mount point is beneath one; a check that ends without a verdict says how it ended.
+bind_check() {
+    local label="$1" out rc how
+    shift
+    set +e
+    out="$("${HELPER[@]}" socket-walk "$@" 2>&1)"
+    rc=$?
+    set -e
+    printf '%s\n' "$out" >> "$PREFLIGHT"
+    [ "$rc" -eq 0 ] && return 0
+    if [ "$rc" -eq 1 ] && grep -q '^REFUSE ' <<< "$out"; then
+        refuse "$label sandbox bind check failed: $(grep '^REFUSE ' <<< "$out" | tr '\n' ' ')"
+    fi
+    if [ "$rc" -gt 128 ]; then how="signal $((rc - 128))"; else how="exit $rc"; fi
+    refuse "$label sandbox bind check ended without a result ($how): $(tr '\n' ' ' <<< "$out")"
+}
+bind_check "shared" --allow "$VENV" -- "${BWRAP_ARGS[@]}"
+
+# in_sandbox ENV... -- BINDS... -- COMMAND...
+# Runs COMMAND under env -i ENV in the sandbox with the shared binds plus BINDS and a read-only
+# root; stdin is /dev/null and no file descriptor above 2 is inherited.
+in_sandbox() {
+    local -a envv=() binds=()
+    while [ "$1" != -- ]; do envv+=("$1"); shift; done
+    shift
+    while [ "$1" != -- ]; do binds+=("$1"); shift; done
+    shift
+    (
+        exec < /dev/null
+        for fd in /proc/"$BASHPID"/fd/*; do
+            fd="${fd##*/}"
+            if [ "$fd" -gt 2 ]; then exec {fd}>&-; fi
+        done
+        exec env -i "${envv[@]}" $(pin) "$BWRAP" "${BWRAP_ARGS[@]}" "${binds[@]}" --remount-ro / -- "$@"
+    )
+}
+
+# Self-test: every property above, checked inside the sandbox. The probe must echo this run's
+# nonce, so a sandbox command that never ran the probe cannot pass.
+SELF_TEST_DIR="$CASE_BASE/self-test"
+OUTSIDE_DIR="$CASE_BASE/outside"
+mkdir -p "$SELF_TEST_DIR/ro" "$OUTSIDE_DIR"
+NONCE="$("$PY" -I -c 'import secrets; print(secrets.token_hex(16))')"
+# A listener outside every bind (path and abstract name), reachable from here.
+"$PY" -I -c '
+import os
 import socket
+import sys
+import time
+directory, abstract, done = sys.argv[1:4]
+os.chdir(directory)  # a relative name: no AF_UNIX path-length limit
+with socket.socket(socket.AF_UNIX) as server, socket.socket(socket.AF_UNIX) as named:
+    server.bind("listener.sock")
+    server.listen(4)
+    named.bind("\0" + abstract)
+    named.listen(4)
+    for address in ("listener.sock", "\0" + abstract):
+        with socket.socket(socket.AF_UNIX) as client:
+            client.connect(address)
+    open("ready", "w").close()
+    deadline = time.monotonic() + 600
+    while not os.path.exists(done) and time.monotonic() < deadline:
+        time.sleep(0.1)
+' "$OUTSIDE_DIR" "examples-gate-$NONCE" "$OUTSIDE_DIR/done" > "$LOG_DIR/self-test-listener.log" 2>&1 &
+listener_pid=$!
+for _ in $(seq 1 100); do
+    [ -e "$OUTSIDE_DIR/ready" ] && break
+    kill -0 "$listener_pid" 2>/dev/null || break
+    sleep 0.1
+done
+[ -e "$OUTSIDE_DIR/ready" ] || refuse "self-test listener did not start (see $LOG_DIR/self-test-listener.log)"
+set +e
+in_sandbox HOME="$SELF_TEST_DIR" PATH="/usr/local/bin:/usr/bin:/bin" TMPDIR="$SELF_TEST_DIR" LANG=C.UTF-8 -- \
+    --bind "$SELF_TEST_DIR" "$SELF_TEST_DIR" --ro-bind "$SELF_TEST_DIR/ro" "$SELF_TEST_DIR/ro" -- \
+    "$PY" -I -c '
+import errno
+import os
+import socket
+import sys
+nonce, listener, abstract, read_only_target, absent = sys.argv[1:6]
+
+
+def refused(code, action, *args):
+    try:
+        action(*args)
+    except OSError as error:
+        assert error.errno == code, (action, args, error)
+    else:
+        raise AssertionError(f"{action} {args} succeeded")
+
+
 interfaces = {line.split(":", 1)[0].strip() for line in open("/proc/net/dev").read().splitlines() if ":" in line}
 assert interfaces == {"lo"}, interfaces
+assert os.listdir("/run") == [], os.listdir("/run")
+inherited = [fd for fd in os.listdir("/proc/self/fd") if int(fd) > 2 and os.path.exists(f"/proc/self/fd/{fd}")]
+assert inherited == [], {fd: os.readlink(f"/proc/self/fd/{fd}") for fd in inherited}
+refused(errno.EROFS, lambda path: open(path, "w").close(), read_only_target)
+refused(errno.EROFS, os.mkdir, "/examples-gate-probe")
+refused(errno.ENOENT, os.stat, absent)
+refused(errno.ENOENT, os.stat, listener)
+refused(errno.ENOENT, os.chdir, os.path.dirname(listener))
+with socket.socket(socket.AF_UNIX) as client:
+    refused(errno.ECONNREFUSED, client.connect, "\0" + abstract)
 with socket.socket() as outside:
     try:
         outside.connect(("1.1.1.1", 53))
@@ -281,7 +426,17 @@ with socket.socket() as server:
         client.connect(server.getsockname())
         peer, _ = server.accept()
         peer.close()
-' >> "$PREFLIGHT" 2>&1; then
+print(f"self-test-ok {nonce}")
+' "$NONCE" "$OUTSIDE_DIR/listener.sock" "examples-gate-$NONCE" "$SELF_TEST_DIR/ro/write-probe" "$LOG_DIR" \
+    > "$LOG_DIR/self-test.out" 2>&1
+self_test_rc=$?
+: > "$OUTSIDE_DIR/done"
+wait "$listener_pid"
+listener_rc=$?
+set -e
+cat "$LOG_DIR/self-test.out" >> "$PREFLIGHT"
+echo "self_test_rc=$self_test_rc listener_rc=$listener_rc" >> "$PREFLIGHT"
+if [ "$self_test_rc" -ne 0 ] || [ "$listener_rc" -ne 0 ] || ! grep -Fxq "self-test-ok $NONCE" "$LOG_DIR/self-test.out"; then
     refuse "bwrap private-network self-test failed (see $PREFLIGHT)"
 fi
 
@@ -299,7 +454,7 @@ make_case_root() {
     for entry in "$TREE"/* "$TREE"/.[!.]*; do
         [ -e "$entry" ] || [ -L "$entry" ] || continue
         case "$(basename "$entry")" in
-            tests|docs|website|.venv|.git) ;;
+            tests|docs|website|.venv|.git|.claude) ;;
             *) cp -a "$entry" "$root/" ;;
         esac
     done
@@ -314,7 +469,7 @@ STOPPED=0
 record() { echo "$1" >> "$SUMMARY"; echo "$1"; }
 
 for line in "${CASE_LINES[@]}"; do
-    IFS="$SEP" read -r id cmd scmd sport ports envx fpk skip <<< "$line"
+    IFS="$SEP" read -r id cmd scmd sport ports envx fpk homero skip <<< "$line"
     if [ -n "$skip" ]; then record "SKIP($skip) $id"; SKIP=$((SKIP + 1)); continue; fi
     if [ "$STOPPED" -eq 1 ] || [ -f "$STOP_FILE" ]; then
         STOPPED=1; record "NOTRUN $id -- stop file present"; NOTRUN=$((NOTRUN + 1)); continue
@@ -322,6 +477,7 @@ for line in "${CASE_LINES[@]}"; do
     case_dir="$CASE_BASE/$id"; root="$case_dir/root"; log="$LOG_DIR/logs/$id.log"
     make_case_root "$root"
     mkdir -p "$case_dir/tmp" "$case_dir/home"
+    "${HELPER[@]}" reset-audit --cases "$CASES" --root "$root" --case "$id" > "$case_dir/reset-audit.log"
     dir="$root"
     while :; do
         { [ -e "$dir/.env" ] || [ -L "$dir/.env" ]; } && refuse "$dir/.env exists; the elspeth CLI loads the nearest .env above its cwd"
@@ -338,7 +494,10 @@ for line in "${CASE_LINES[@]}"; do
           http_proxy=http://127.0.0.1:9 https_proxy=http://127.0.0.1:9
           NO_PROXY=127.0.0.1,localhost,::1 no_proxy=127.0.0.1,localhost,::1)
     [ "$fpk" = 1 ] && ENVV+=(ELSPETH_FINGERPRINT_KEY="$FINGERPRINT_KEY")
-    for kv in $envx; do ENVV+=("$kv"); done
+    if [ -n "$envx" ]; then
+        read -r -a extra_env <<< "$envx"
+        ENVV+=("${extra_env[@]}")
+    fi
     for kv in "${ENVV[@]}"; do
         name="${kv%%=*}"
         if [[ "$name" =~ (KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|^AWS_|^AZURE_|OPENROUTER|OPENAI|ANTHROPIC) ]] \
@@ -366,6 +525,18 @@ for line in "${CASE_LINES[@]}"; do
     if [ "$rc" -ne 0 ]; then
         record "NOTRUN $id -- $(echo "$pre" | tr '\n' ' ')"; NOTRUN=$((NOTRUN + 1)); continue
     fi
+    home_binds=()
+    home_allow=()
+    if [ -n "$homero" ]; then
+        IFS=, read -r -a home_dirs <<< "$homero"
+        for rel in "${home_dirs[@]}"; do
+            host_dir="$HOME/$rel"
+            mkdir -p "$case_dir/home/$rel"
+            home_binds+=(--ro-bind "$host_dir" "$case_dir/home/$rel")
+            home_allow+=(--allow "$host_dir")
+        done
+    fi
+    bind_check "case $id" --allow "$CASE_BASE" "${home_allow[@]}" -- --bind "$case_dir" "$case_dir" "${home_binds[@]}"
     cat > "$case_dir/inner.sh" <<'INNER'
 #!/usr/bin/env bash
 set -u
@@ -387,29 +558,26 @@ exit "$rc"
 INNER
     t0=$(date +%s)
     set +e
-    env -i "${ENVV[@]}" $(pin) "$BWRAP" --dev-bind / / --unshare-net --unshare-pid --proc /proc --die-with-parent -- \
-        bash "$case_dir/inner.sh" "$root" "$cmd" "$scmd" "$sport" "$log" "$LOG_DIR/logs/$id.server.log" \
+    in_sandbox "${ENVV[@]}" -- --bind "$case_dir" "$case_dir" "${home_binds[@]}" -- \
+        bash "$case_dir/inner.sh" "$root" "$cmd" "$scmd" "$sport" "$case_dir/command.log" "$case_dir/server.log" \
         "$case_dir/command.exit" "$case_dir/server.failed" > "$LOG_DIR/logs/$id.sandbox.log" 2>&1
     sandbox_rc=$?
     set -e
+    [ ! -f "$case_dir/command.log" ] || cp -- "$case_dir/command.log" "$log"
+    [ ! -f "$case_dir/server.log" ] || cp -- "$case_dir/server.log" "$LOG_DIR/logs/$id.server.log"
     secs=$(( $(date +%s) - t0 ))
-    if [ -e "$case_dir/server.failed" ]; then
-        record "FAIL $id -- fixture server ($scmd) did not listen on $sport; see logs/$id.server.log"
-        FAIL=$((FAIL + 1)); continue
-    fi
-    if [ ! -f "$case_dir/command.exit" ]; then
-        record "FAIL $id -- sandbox error: command exit file missing (bwrap exit $sandbox_rc; see logs/$id.sandbox.log)"
-        FAIL=$((FAIL + 1)); continue
-    fi
-    rc="$(cat "$case_dir/command.exit")"
-    if ! [[ "$rc" =~ ^(0|[1-9][0-9]{0,2})$ ]] || [ "$rc" -gt 255 ] || [ "$rc" -ne "$sandbox_rc" ]; then
-        record "FAIL $id -- sandbox error: invalid command exit file or bwrap exit mismatch ($sandbox_rc; see logs/$id.sandbox.log)"
+    set +e
+    rc="$("${HELPER[@]}" classify --server-marker "$case_dir/server.failed" --exit-file "$case_dir/command.exit" --sandbox-rc "$sandbox_rc")"
+    classified=$?
+    set -e
+    if [ "$classified" -ne 0 ]; then
+        record "FAIL $id -- $rc; see logs/$id.sandbox.log"
         FAIL=$((FAIL + 1)); continue
     fi
 
     set +e
     verdict="$("${HELPER[@]}" check --cases "$CASES" --root "$root" --case "$id" --exit "$rc" \
-        --log "$log" --evidence "$LOG_DIR/evidence/$id.json" 2>&1)"
+        --log "$log" --evidence "$LOG_DIR/evidence/$id.json" 2> "$LOG_DIR/logs/$id.check.stderr.log")"
     crc=$?
     set -e
     extra=" [${secs}s]"
@@ -428,15 +596,22 @@ rm -f "$LOG_DIR/current-case.txt"
 DIGEST_AFTER="$(tree_digest "$TREE" "$LOG_DIR/tree-after.sha256")"
 FROZEN=YES
 [ "$DIGEST_BEFORE" = "$DIGEST_AFTER" ] || FROZEN=NO
+[ "$(sha256sum "$CASES" | cut -d' ' -f1)" = "$(awk -F= '/^cases_sha256=/{print $2}' "$PREFLIGHT")" ] || FROZEN=NO
+[ "$(sha256sum "$LOG_DIR/examples_gate.py" | cut -d' ' -f1)" = "$(awk -F= '/^helper_sha256=/{print $2}' "$PREFLIGHT")" ] || FROZEN=NO
 WALL=$(( $(date +%s) - GATE_START ))
+totals="$("${HELPER[@]}" totals --pass-count "$PASS" --fail-count "$FAIL" --notrun-count "$NOTRUN" \
+    --skip-count "$SKIP" --selected "$count" --total "$total_count" --frozen "$FROZEN" --wall "$WALL")"
 {
     echo "----"
     echo "source=$SOURCE_DESC"
-    echo "totals: PASS=$PASS FAIL=$FAIL NOTRUN=$NOTRUN SKIP=$SKIP (cases) frozen=$FROZEN wall=${WALL}s"
+    echo "only=${ONLY:-ALL}"
+    echo "$totals"
 } >> "$SUMMARY"
-overall=0
-{ [ "$FAIL" -eq 0 ] && [ "$NOTRUN" -eq 0 ] && [ "$FROZEN" = YES ]; } || overall=1
+overall="$("${HELPER[@]}" overall --pass-count "$PASS" --fail-count "$FAIL" --notrun-count "$NOTRUN" --frozen "$FROZEN")"
 echo "$overall" > "$LOG_DIR/overall.exit"
 echo "summary: $SUMMARY"
-echo "totals: PASS=$PASS FAIL=$FAIL NOTRUN=$NOTRUN SKIP=$SKIP frozen=$FROZEN wall=${WALL}s overall=$overall"
-exit "$overall"
+echo "$totals overall=$overall"
+return "$overall"
+}
+
+main "$@"; exit $?

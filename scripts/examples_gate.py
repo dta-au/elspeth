@@ -28,6 +28,7 @@ import importlib.util
 import json
 import os
 import re
+import shlex
 import sqlite3
 import stat
 import sys
@@ -69,13 +70,162 @@ class DataError(Exception):
 # --------------------------------------------------------------------------- data
 
 
+def _mapping(node: Any, allowed: set[str], label: str) -> dict[str, Any]:
+    if not isinstance(node, dict) or any(not isinstance(key, str) for key in node):
+        raise DataError(f"{label}: expected a mapping")
+    unknown = set(node) - allowed
+    if unknown:
+        raise DataError(f"{label}: unknown keys {sorted(unknown)}")
+    return cast("dict[str, Any]", node)
+
+
+def _typed(node: Any, expected: type, label: str) -> None:
+    if type(node) is not expected:
+        raise DataError(f"{label}: expected {expected.__name__}")
+
+
+def _list_of(node: Any, expected: type, label: str) -> None:
+    if not isinstance(node, list) or any(type(value) is not expected for value in node):
+        raise DataError(f"{label}: expected a list of {expected.__name__}")
+
+
+def _relative_home_path(raw: str, label: str) -> Path:
+    path = Path(raw)
+    if path.is_absolute() or path == Path(".") or "," in raw or any(part in {"..", ""} for part in path.parts):
+        raise DataError(f"{label}: expected a HOME-relative path")
+    return path
+
+
 def load_cases(path: Path) -> dict[str, Any]:
     data = yaml.safe_load(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict) or data.get("version") != 1:
         raise DataError(f"{path}: expected a mapping with version: 1")
+    _mapping(data, {"version", "examples", "cases"}, str(path))
     for key in ("examples", "cases"):
         if key not in data:
             raise DataError(f"{path}: missing top-level key {key!r}")
+    if not isinstance(data["cases"], list) or not isinstance(data["examples"], dict):
+        raise DataError(f"{path}: cases must be a list and examples a mapping")
+    case_keys = {
+        "id",
+        "example",
+        "command",
+        "expect_exit",
+        "configs",
+        "expectation_source",
+        "audit",
+        "log_markers",
+        "skip",
+        "ports",
+        "server",
+        "fingerprint_key",
+        "requires",
+        "env",
+        "files",
+    }
+    audit_keys = {
+        "db",
+        "runs",
+        "status",
+        "source_rows",
+        "sinks",
+        "outcomes",
+        "sql",
+        "label",
+        "conservation",
+        "mode",
+        "run_index",
+        "allow_zero_rows",
+    }
+    for case in data["cases"]:
+        label = f"case {case.get('id')!r}" if isinstance(case, dict) else "case"
+        _mapping(case, case_keys, label)
+        for key in ("id", "example", "command", "expectation_source"):
+            if key in case:
+                _typed(case[key], str, f"{label}.{key}")
+        for key in ("expect_exit", "configs", "ports"):
+            if key in case:
+                _list_of(case[key], int if key in {"expect_exit", "ports"} else str, f"{label}.{key}")
+        if "log_markers" in case:
+            if not isinstance(case["log_markers"], list):
+                raise DataError(f"{label}.log_markers: expected a list")
+            for marker in case["log_markers"]:
+                if isinstance(marker, str):
+                    continue
+                block = _mapping(marker, {"text", "count"}, f"{label}.log_markers")
+                _typed(block.get("text"), str, f"{label}.log_markers.text")
+                _typed(block.get("count"), int, f"{label}.log_markers.count")
+        for key in ("skip",):
+            if key in case:
+                _typed(case[key], str, f"{label}.{key}")
+        if "fingerprint_key" in case:
+            _typed(case["fingerprint_key"], bool, f"{label}.fingerprint_key")
+        if "env" in case:
+            env = _mapping(case["env"], set(case["env"]) if isinstance(case["env"], dict) else set(), f"{label}.env")
+            for name, value in env.items():
+                _typed(value, str, f"{label}.env.{name}")
+                if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) or re.search(r"[\s*?\[\]]", value):
+                    raise DataError(f"{label}.env.{name}: unsafe name or value")
+        if "files" in case:
+            files = _mapping(case["files"], set(case["files"]) if isinstance(case["files"], dict) else set(), f"{label}.files")
+            if any(value != "absent_or_empty" for value in files.values()):
+                raise DataError(f"{label}.files: expected absent_or_empty")
+        if "server" in case:
+            server = _mapping(case["server"], {"command", "port"}, f"{label}.server")
+            _typed(server.get("command"), str, f"{label}.server.command")
+            _typed(server.get("port"), int, f"{label}.server.port")
+            server_command = server["command"]
+            try:
+                server_words = shlex.split(server_command)
+            except ValueError as error:
+                raise DataError(f"{label}.server: invalid command: {error}") from error
+            if re.search(r"[;&|$<>()`\n\r]", server_command) or server_words[:2] not in (["chaosllm", "serve"], ["chaosweb", "serve"]):
+                raise DataError(f"{label}.server: unsupported fixture server")
+        if "requires" in case:
+            requires = _mapping(case["requires"], {"python_modules", "files", "home_ro"}, f"{label}.requires")
+            for key in ("python_modules", "files", "home_ro"):
+                if key in requires:
+                    _list_of(requires[key], str, f"{label}.requires.{key}")
+            home_ro = [_relative_home_path(raw, f"{label}.requires.home_ro") for raw in requires.get("home_ro", [])]
+            for raw in requires.get("files", []):
+                if not raw.startswith("~/"):
+                    raise DataError(f"{label}.requires.files: expected ~/ path")
+                file_path = _relative_home_path(raw[2:], f"{label}.requires.files")
+                if not any(file_path.is_relative_to(directory) for directory in home_ro):
+                    raise DataError(f"{label}.requires.files: {raw} is outside home_ro")
+        if "audit" in case:
+            if not isinstance(case["audit"], list):
+                raise DataError(f"{label}.audit: expected a list")
+            for spec in case["audit"]:
+                audit = _mapping(spec, audit_keys, f"{label}.audit")
+                _typed(audit.get("db"), str, f"{label}.audit.db")
+                if Path(audit["db"]).is_absolute() or ".." in Path(audit["db"]).parts:
+                    raise DataError(f"{label}.audit.db: expected a tree-relative path")
+                for key in ("runs", "source_rows", "run_index"):
+                    if key in audit:
+                        _typed(audit[key], int, f"{label}.audit.{key}")
+                if "status" in audit:
+                    _list_of(audit["status"], str, f"{label}.audit.status")
+                for key in ("conservation", "allow_zero_rows"):
+                    if key in audit:
+                        _typed(audit[key], bool, f"{label}.audit.{key}")
+                for key in ("label", "mode"):
+                    if key in audit:
+                        _typed(audit[key], str, f"{label}.audit.{key}")
+                for key in ("sinks", "outcomes"):
+                    if key in audit:
+                        values = audit[key]
+                        if not isinstance(values, dict) or any(type(k) is not str or type(v) is not int for k, v in values.items()):
+                            raise DataError(f"{label}.audit.{key}: expected string-to-int mapping")
+                if "sql" in audit:
+                    if not isinstance(audit["sql"], list):
+                        raise DataError(f"{label}.audit.sql: expected a list")
+                    for query in audit["sql"]:
+                        block = _mapping(query, {"name", "query", "expect"}, f"{label}.audit.sql")
+                        _typed(block.get("name"), str, f"{label}.audit.sql.name")
+                        _typed(block.get("query"), str, f"{label}.audit.sql.query")
+                        if not isinstance(block.get("expect"), list):
+                            raise DataError(f"{label}.audit.sql.expect: expected a list")
     ids = [case["id"] for case in data["cases"]]
     if len(ids) != len(set(ids)):
         raise DataError(f"{path}: duplicate case ids")
@@ -124,7 +274,7 @@ def digest_tree(tree: Path, manifest: Path) -> str:
     """Hash every entry's name, type, mode, link target, and regular-file bytes."""
     digest = hashlib.sha256()
     with manifest.open("wb") as output:
-        for base, dirs, files in os.walk(tree, followlinks=False):
+        for base, dirs, files in os.walk(tree, followlinks=False, onerror=_raise_walk_error):
             dirs.sort()
             for name in sorted([*dirs, *files]):
                 path = Path(base) / name
@@ -142,9 +292,145 @@ def digest_tree(tree: Path, manifest: Path) -> str:
     return digest.hexdigest()
 
 
+def _raise_walk_error(error: OSError) -> None:
+    raise error
+
+
 def cmd_digest(args: argparse.Namespace) -> int:
     print(digest_tree(Path(args.tree), Path(args.manifest)))
     return 0
+
+
+# ----------------------------------------------------------------- sandbox binds
+
+# Every bwrap option the gate passes, with its argument count. An option missing here is
+# refused, so a new mount can never be added without its source being walked.
+BWRAP_OPTION_ARITY = {
+    "--bind": 2,
+    "--ro-bind": 2,
+    "--ro-bind-try": 2,
+    "--symlink": 2,
+    "--dev": 1,
+    "--proc": 1,
+    "--tmpfs": 1,
+    "--remount-ro": 1,
+    "--unshare-net": 0,
+    "--unshare-pid": 0,
+    "--die-with-parent": 0,
+}
+BIND_OPTIONS = frozenset({"--bind", "--ro-bind", "--ro-bind-try"})
+
+
+def bind_sources(bwrap_args: list[str]) -> list[tuple[str, bool]]:
+    """The host source of every bind in a bwrap option list, and whether the bind is optional."""
+    sources: list[tuple[str, bool]] = []
+    index = 0
+    while index < len(bwrap_args):
+        option = bwrap_args[index]
+        if option not in BWRAP_OPTION_ARITY:
+            raise DataError(f"unclassified bwrap option {option!r}")
+        arity = BWRAP_OPTION_ARITY[option]
+        if index + arity >= len(bwrap_args):
+            raise DataError(f"bwrap option {option} is missing its arguments")
+        if option in BIND_OPTIONS:
+            sources.append((bwrap_args[index + 1], option.endswith("-try")))
+        index += 1 + arity
+    return sources
+
+
+# Bind sources always allowed (system trees); the gate adds the venv, the case base and the
+# declared home caches with --allow. Nothing is ever bound from these, at any depth.
+SYSTEM_BIND_ROOTS = ("/usr", "/etc", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32")
+NEVER_BOUND = ("/proc", "/sys", "/dev")
+
+
+def _within(path: str, root: str) -> bool:
+    root = root.rstrip("/")
+    return path == root or path.startswith(root + "/")
+
+
+def bind_source_refusal(source: str, allowed_roots: list[str]) -> str | None:
+    """Why a bind source may not be bound at all, decided before anything is walked."""
+    real = os.path.realpath(source)
+    for path in (source, real):
+        if path == "/":
+            return "the host root"
+        if any(_within(path, never) for never in NEVER_BOUND):
+            return f"{path} is a kernel or device tree"
+    if not any(_within(source, root) for root in (*SYSTEM_BIND_ROOTS, *allowed_roots) if root.rstrip("/")):
+        return "outside the allowed bind roots"
+    return None
+
+
+def sockets_under(source: Path) -> tuple[list[str], int]:
+    """Socket files under a bound source, and how many directories this user cannot search.
+
+    A directory that cannot be listed is a finding unless this user also cannot search it:
+    nothing beneath an unsearchable directory is reachable by name. A mount point beneath the
+    source is a finding and is not entered: bwrap binds recursively, so it would be inside too.
+    """
+    real = Path(os.path.realpath(source))
+    info = real.lstat()
+    if stat.S_ISSOCK(info.st_mode):
+        return [f"socket {real}"], 0
+    if not stat.S_ISDIR(info.st_mode):
+        return [], 0
+    device = info.st_dev
+    findings: list[str] = []
+    unsearchable = 0
+    pending = [real]
+    while pending:
+        directory = pending.pop()
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    if entry.is_dir(follow_symlinks=False):
+                        if entry.stat(follow_symlinks=False).st_dev != device:
+                            findings.append(f"mount point {entry.path}")
+                            continue
+                        pending.append(Path(entry.path))
+                    elif not entry.is_file(follow_symlinks=False) and not entry.is_symlink():
+                        try:
+                            mode = entry.stat(follow_symlinks=False).st_mode
+                        except FileNotFoundError:
+                            continue
+                        if stat.S_ISSOCK(mode):
+                            findings.append(f"socket {entry.path}")
+        except OSError as error:
+            if os.access(directory, os.X_OK):
+                findings.append(f"unlistable directory {directory}: {error.strerror}")
+            else:
+                unsearchable += 1
+    return findings, unsearchable
+
+
+def cmd_socket_walk(args: argparse.Namespace) -> int:
+    bwrap_args = list(args.bwrap_args)
+    if bwrap_args[:1] == ["--"]:
+        bwrap_args = bwrap_args[1:]
+    sources = bind_sources(bwrap_args)
+    refusals = [(source, bind_source_refusal(source, args.allow)) for source, _optional in sources]
+    if any(reason for _source, reason in refusals):
+        for source, reason in refusals:
+            if reason:
+                print(f"REFUSE bind {source}: {reason}")
+        return 1
+    status = 0
+    for source, optional in sources:
+        if not os.path.lexists(source):
+            if optional:
+                print(f"bind {source}: absent, optional")
+                continue
+            print(f"REFUSE bind {source}: missing")
+            status = 1
+            continue
+        findings, unsearchable = sockets_under(Path(source))
+        for finding in findings:
+            print(f"REFUSE bind {source}: {finding}")
+            status = 1
+        if unsearchable:
+            print(f"bind {source}: {unsearchable} directories this user cannot search")
+    return status
 
 
 # ----------------------------------------------------------------- offline guard
@@ -432,6 +718,7 @@ def cmd_list(args: argparse.Namespace) -> int:
             ",".join(str(p) for p in case.get("ports", [])),
             env,
             "1" if case.get("fingerprint_key") else "0",
+            ",".join((case.get("requires") or {}).get("home_ro", [])),
             case.get("skip", ""),
         ]
         # \x1f (unit separator): bash `read` collapses runs of whitespace IFS characters,
@@ -477,13 +764,55 @@ def cmd_preflight(args: argparse.Namespace) -> int:
         if importlib.util.find_spec(module) is None:
             refusals.append(f"prerequisite: python module {module} not importable")
     for raw in requires.get("files", []):
-        if not Path(os.path.expanduser(raw)).is_file():
+        if not (Path.home() / raw[2:]).is_file():
             refusals.append(f"prerequisite: file {raw} absent (would be downloaded; refusing)")
     for line in refusals:
         print(line)
     if not refusals:
         print(f"preflight ok: {len(case['configs'])} config(s) offline by construction")
     return 1 if refusals else 0
+
+
+def cmd_reset_audit(args: argparse.Namespace) -> int:
+    case = case_by_id(load_cases(Path(args.cases)), args.case)
+    root = Path(args.root)
+    for spec in case.get("audit", []):
+        path = root / spec["db"]
+        for stale in (path, Path(f"{path}-wal"), Path(f"{path}-shm"), Path(f"{path}-journal")):
+            if stale.is_file():
+                stale.unlink()
+                print(f"removed stale audit file {stale.relative_to(root)}")
+    return 0
+
+
+def cmd_classify(args: argparse.Namespace) -> int:
+    if Path(args.server_marker).exists():
+        print("fixture server did not listen")
+        return 1
+    exit_file = Path(args.exit_file)
+    if not exit_file.is_file():
+        print(f"sandbox error: command exit file missing (bwrap exit {args.sandbox_rc})")
+        return 1
+    value = exit_file.read_text(encoding="utf-8").strip()
+    if not re.fullmatch(r"0|[1-9][0-9]{0,2}", value) or int(value) > 255 or int(value) != args.sandbox_rc:
+        print(f"sandbox error: invalid command exit file or bwrap exit mismatch ({args.sandbox_rc})")
+        return 1
+    print(value)
+    return 0
+
+
+def cmd_totals(args: argparse.Namespace) -> int:
+    print(
+        f"totals: PASS={args.pass_count} FAIL={args.fail_count} NOTRUN={args.notrun_count} "
+        f"SKIP={args.skip_count} selected={args.selected} total={args.total} "
+        f"scope={'PARTIAL' if args.selected < args.total else 'FULL'} frozen={args.frozen} wall={args.wall}s"
+    )
+    return 0
+
+
+def cmd_overall(args: argparse.Namespace) -> int:
+    print(int(not (args.pass_count > 0 and args.fail_count == 0 and args.notrun_count == 0 and args.frozen == "YES")))
+    return 0
 
 
 # ------------------------------------------------------------------------ check
@@ -653,6 +982,31 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--exit", type=int, required=True)
     p.add_argument("--log", required=True)
     p.add_argument("--evidence", required=True)
+    p = sub.add_parser("reset-audit")
+    p.add_argument("--cases", required=True)
+    p.add_argument("--root", required=True)
+    p.add_argument("--case", required=True)
+    p = sub.add_parser("classify")
+    p.add_argument("--server-marker", required=True)
+    p.add_argument("--exit-file", required=True)
+    p.add_argument("--sandbox-rc", type=int, required=True)
+    p = sub.add_parser("totals")
+    p.add_argument("--pass-count", type=int, required=True)
+    p.add_argument("--fail-count", type=int, required=True)
+    p.add_argument("--notrun-count", type=int, required=True)
+    p.add_argument("--skip-count", type=int, required=True)
+    p.add_argument("--selected", type=int, required=True)
+    p.add_argument("--total", type=int, required=True)
+    p.add_argument("--frozen", choices=["YES", "NO"], required=True)
+    p.add_argument("--wall", type=int, required=True)
+    p = sub.add_parser("overall")
+    p.add_argument("--pass-count", type=int, required=True)
+    p.add_argument("--fail-count", type=int, required=True)
+    p.add_argument("--notrun-count", type=int, required=True)
+    p.add_argument("--frozen", choices=["YES", "NO"], required=True)
+    p = sub.add_parser("socket-walk")
+    p.add_argument("--allow", action="append", default=[], help="an allowed bind root besides the system trees")
+    p.add_argument("bwrap_args", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     handlers = {
         "validate": cmd_validate,
@@ -663,6 +1017,11 @@ def main(argv: list[str] | None = None) -> int:
         "excluded": cmd_excluded,
         "preflight": cmd_preflight,
         "check": cmd_check,
+        "reset-audit": cmd_reset_audit,
+        "classify": cmd_classify,
+        "totals": cmd_totals,
+        "overall": cmd_overall,
+        "socket-walk": cmd_socket_walk,
     }
     try:
         return handlers[args.command](args)

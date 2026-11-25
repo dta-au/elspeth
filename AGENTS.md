@@ -66,8 +66,8 @@ elspeth run --settings examples/<name>/settings.yaml --execute
 ### Canonical scripts: worktree cleanup, branch safety, full-suite gate, examples gate
 
 Four scripts under `scripts/` are the canonical way to do the tasks agents
-otherwise improvise by hand (the header of each one cites the transcript
-measurement and the incident behind every rule it enforces). All four are
+otherwise improvise by hand. Their headers explain the safety rules and the
+reasons behind them. All four are
 **dry-run by default** and print the exact commands they would run; nothing
 changes without `--execute`. Prefer them over retyping the underlying git and
 pytest incantations, and fix the script when a rule is wrong rather than

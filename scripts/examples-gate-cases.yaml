@@ -19,7 +19,7 @@
 # Case fields:
 #   command      run from the case's tree root with `bash -c`, exactly as documented
 #   server       a fixture server the documentation tells the operator to start first
-#   ports        loopback ports the case binds; must be free before and after
+#   ports        loopback ports the case binds; shown in the plan
 #   env          extra environment the documented command sets
 #   fingerprint_key  the documentation tells the operator to export ELSPETH_FINGERPRINT_KEY
 #   expect_exit  accepted exit codes of `command`
@@ -1148,6 +1148,7 @@ cases:
     configs: [examples/chroma_rag/settings.yaml]
     requires: &chroma_requires
       python_modules: [chromadb]
+      home_ro: [.cache/chroma/onnx_models/all-MiniLM-L6-v2]
       files:
         - ~/.cache/chroma/onnx_models/all-MiniLM-L6-v2/onnx/model.onnx
         - ~/.cache/chroma/onnx_models/all-MiniLM-L6-v2/onnx/config.json
