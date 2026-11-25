@@ -39,9 +39,11 @@ def raise_keeping_own_links(error: BaseException) -> NoReturn:
     """Raise ``error`` with its own cause, context and suppression flag as they were.
 
     Raised while another exception is being handled, ``error`` would take
-    that exception as its context. The links are restored as it propagates,
-    so it leaves with its chain as it was first raised, and any exception
-    raised later during its propagation takes it, chain and all, as context.
+    that exception as its context. Its own links are restored as it
+    propagates, so it leaves with them as they were, and any exception raised
+    later during its propagation takes it as context. Only ``error``'s own
+    links are restored: where Python breaks a context cycle by clearing a
+    link on another exception in the chain, that link stays cleared.
     """
     links = (error.__cause__, error.__context__, error.__suppress_context__)
     try:
