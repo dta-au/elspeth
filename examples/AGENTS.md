@@ -1,6 +1,6 @@
 # Examples — Agent Guide
 
-Instructions for running the examples in this directory.
+Instructions for running the examples in this directory. To run every offline example and check its documented result: `scripts/examples-gate.sh --execute`. Without `--execute`, the script prints its plan.
 
 ## Prerequisites
 
@@ -38,7 +38,7 @@ These run immediately with no setup:
 | `error_routing` | 17 | Error-triggered routing; fixture ends PARTIAL/exit 1 with 4 blocked rows quarantined by design |
 | `explicit_routing` | 10 | Named route destinations |
 | `fork_coalesce` | 5 each | Parallel path fork/join DAG; ships five `settings*.yaml` files, run one at a time. `settings.yaml` coalesces both branches; `settings_per_branch.yaml` runs a different transform chain per branch (ARCH-15); the three union variants exercise the field-collision policies — `settings_union_last_wins.yaml` and `settings_union_first_wins.yaml` resolve the same collision to opposite branches (`path_b` / `path_a`), and `settings_union_fail.yaml` fails every row's group with `union_field_collision` and ends `FAILED` (exit 2) **by design** |
-| `row_union_ab_experiment` | 8 (16 unioned, 1 comparison row) | Fork-based A/B: `row_union` releases both variant branches as one correlated group; run one `settings*.yaml` at a time. `settings_screened.yaml` screens ahead of the fork and ends SUCCESS (3 tickets screened out before forking); `settings_screened_at_settlement.yaml` screens mid-branch on a post-fork field and ends PARTIAL **by design** (3 tickets discarded inside the control branch, their orphaned treatment siblings fail closed) |
+| `row_union_ab_experiment` | 8 (16 unioned, 1 comparison row) | Fork-based A/B: `row_union` releases both variant branches as one correlated group; run one `settings*.yaml` at a time. `settings_paired_preference.yaml` compares the two variants within each ticket (`paired_input.csv`) and ends COMPLETED/exit 0 with one comparison row (6 wins, 2 losses, `win_rate 0.75`); `settings_identity_branches.yaml` (list-form `branches`) ends COMPLETED/exit 0 with all 16 released tokens written; `settings_screened.yaml` screens ahead of the fork and ends SUCCESS (3 tickets screened out before forking); `settings_screened_at_settlement.yaml` screens mid-branch on a post-fork field and ends PARTIAL **by design** (3 tickets discarded inside the control branch, their orphaned treatment siblings fail closed) |
 | `json_explode` | 3 | JSON source with array expansion (3→6 output) |
 | `transform_pipeline` | 5 | Type coercion followed by dependent derived-field calculations |
 | `reference_join` | 5 / 5 / 3 / 5 / 4 | Keyed enrichment from config-bound reference tables; run one `settings*.yaml` file at a time. `settings.yaml` joins a flat CSV table, `settings_nested.yaml` a sparse nested JSON table with per-field defaults, and `settings_missing_product.yaml` ends PARTIAL/exit 1 **by design** with one missing product. `settings_multi.yaml` performs three independent lookups across three CSVs, supplies separate product/region defaults, and ends PARTIAL/exit 1 **by design**: four enriched orders and one original whole row quarantined on a later tax lookup miss. `settings_chained.yaml` resolves a shared product key then consumes it in two later tables: three enriched orders and one original row quarantined, PARTIAL/exit 1 **by design**. `reference_file` resolves relative to the SETTINGS directory, not the repo root |
@@ -86,10 +86,13 @@ per config, not a blanket `-eq 0`:
 | `batch_error_routing/settings.yaml` | 1 | 1 wrongly typed amount fails its batch; all 3 rows of it routed to `failed_batches` |
 | `batch_error_routing/settings_discard.yaml` | 1 | the same failed batch under `on_error: discard`; its 3 rows recorded as quarantined |
 | `batch_error_routing/settings_declared.yaml` | 1 | the declared `amount_cents: int` routes the 1 bad row before the batch |
+| `llm_ordered_chain/settings.yaml` | 1 | 1 invalid receipt quarantined (its launcher exits 0 when that and every other expected condition hold) |
 | `chaosweb/settings.yaml` | 1, stochastic | injected fetch faults route to `scrape_failures.csv` |
 | `chaosllm_endurance/settings.yaml` | 1, stochastic | injected LLM faults route to `quarantined.json` |
+| `chaosllm_sentiment/settings.yaml` | 1, stochastic | injected LLM faults route to `quarantined.json` |
+| `rate_limited_llm/settings.yaml` | 1, stochastic | injected LLM faults route to `quarantined.json` |
 
-The entries above `chaosweb` are deterministic fixtures with fixed counts. The last two
+The entries above `chaosweb` are deterministic fixtures with fixed counts. The last four
 depend on randomly injected faults, so they may also exit 0 — for those the
 acceptance criterion is **conservation**, not the exit code: every source row
 reaches either the result sink or the error sink, with the failure reason
@@ -126,8 +129,9 @@ export ELSPETH_FINGERPRINT_KEY="$(
   .venv/bin/python -c 'import secrets; print(secrets.token_hex(32))'
 )"
 
-# Start server (must use --workers=1 due to errorworks bug with multi-worker presets)
-chaosllm serve --port 8199 --preset=realistic --workers=1 &
+# Start server (must use --workers=1 due to errorworks bug with multi-worker presets;
+# --no-burst drops the preset's opening fault burst, which otherwise lands on runtime preflight)
+chaosllm serve --port 8199 --preset=realistic --workers=1 --no-burst &
 sleep 3
 
 # Run examples
@@ -152,8 +156,9 @@ category.
 
 | Example | Rows | Notes |
 |---------|------|-------|
-| `chaosllm_sentiment` | 10 | Basic sentiment with fault injection |
-| `rate_limited_llm` | 8 | Rate limiter with ChaosLLM |
+| `chaosllm_sentiment` | 10 | Basic sentiment with fault injection. `./examples/chaosllm_sentiment/run.sh` starts its OWN ChaosLLM on 8199 with `chaos_config.yaml` (about 20% steady-state injected faults; never alongside a shared server); a bare `elspeth run` uses the shared server above. Stochastic: may end PARTIAL/exit 1, and if every runtime preflight attempt faults the run stops before any row is read — rerun it |
+| `rate_limited_llm` | 8 | Rate limiter with ChaosLLM on the shared server above. Stochastic: may end PARTIAL/exit 1, and if every runtime preflight attempt faults the run stops before any row is read — rerun it |
+| `llm_ordered_chain` | 4 | One `llm` node, two ordered queries (`extract`, then `apply` on its typed fields). Run `./examples/llm_ordered_chain/run.sh` — it starts its OWN ChaosLLM on 8199 (no injected faults) and self-verifies. The pipeline ends PARTIAL/exit 1 **by design** (3 rows assessed, 1 invalid receipt quarantined); the launcher exits 0 when every expected condition holds. Refuses existing audit/output files |
 | `join_refused` | 80 | The admission fence returning a NEGATIVE: one follower admitted on the leader's own `settings.yaml` shares work while a second, launched with `settings_mismatched.yaml` (one scalar different), is refused with `JoinRefusedError`/exit 1. Run `./examples/join_refused/run.sh`; starts its OWN ChaosLLM on 8199 and self-verifies. Ends SUCCESS/exit 0 — the exit-1 arm is INTERNAL and asserted by the launcher. The assertion is on the refusal REASON, not the code: all four admission refusal arms exit 1, so an exit-only check passes for a run that merely finished first |
 | `chaosllm_endurance` | 10,000 | Long-running endurance test; may end PARTIAL/exit 1 with rows in `quarantined.json` — see "Exit 0 is not the corpus gate" |
 | `reference_join_fork_llm` | 5 | ONE lookup, TWO consumers: `reference_join` enriches each ticket BEFORE a fork, then two `llm` branches (separate endpoints, ports 8201/8202) consume the enriched row alongside the original message, and a `require_all` / `merge: nested` coalesce writes only fully-answered tickets. Run `./examples/reference_join_fork_llm/run.sh` — it starts BOTH ChaosLLM servers with ZERO fault injection and tears them down; ends SUCCESS/exit 0. Shows the config-time payoff of the join declaring its output fields: the downstream `llm` nodes name them in `required_input_fields` and a misspelling refuses the run |
@@ -192,6 +197,15 @@ field mapped to query parameter `q`, and asserts three requests and output
 rows, then offline replay and live verification. It refuses to overwrite an existing audit DB or output. The separate
 `settings_abn_page.yaml` targets the public ABN Lookup results page as a small
 live example; it is not part of the offline fixture check.
+
+`run_fixture.sh` takes a variant: `directory` (the default above), `registry`
+(`term` query, HTML articles with detail links), `form` (ordered URL-encoded
+POST fields) and `multipart` (text plus a content-addressed file part; a
+fourth, malformed input row is routed to the error sink). Each asserts three
+HTTP requests and three output rows, then offline replay and live verify.
+`pagination` follows one next link per page: six live, six replayed and six
+verified calls. `run_batch.py --count 10000` is a hermetic 10,000-row batch
+in a temporary directory; it is not part of the offline fixture check.
 
 `./examples/fixed_web_search/run_detail_fixture.sh` runs a separate loopback
 search-to-detail pipeline on port 8215. It checks zero, one, and multiple
@@ -234,6 +248,13 @@ If a pipeline is interrupted, resume with the command shown in the output.
 | `azure_keyvault_secrets` | Azure Key Vault secrets |
 | `azure_openai_sentiment` | Azure OpenAI endpoint |
 | `multi_query_assessment` | Azure OpenAI multi-query (settings say `provider: azure`) |
+| `azure_search_rag` | Azure AI Search retrieval only (no answer generation) from an existing index; needs `AZURE_SEARCH_ENDPOINT`, `AZURE_SEARCH_INDEX` and a query key |
+
+### Power Automate (real flows; credential-free check is a test)
+
+| Example | Notes |
+|---------|-------|
+| `power_automate` | HTTP-triggered flow source and sink. A live run needs the flows described in `docs/reference/power-automate.md`. Without credentials, run the two pytest files named in its README; they use the durable flow emulator and block external requests |
 
 ### AWS (skip unless AWS credentials configured — billable)
 

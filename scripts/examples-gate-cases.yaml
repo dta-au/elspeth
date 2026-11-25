@@ -1,0 +1,1190 @@
+# Data file for scripts/examples-gate.sh — which shipped examples run offline,
+# how each is run, and what each must produce.
+#
+# Source of truth for every expectation is examples/AGENTS.md (cited as
+# "AGENTS.md L<n>", line numbers as of the tree this file was derived from) or,
+# where that table is silent, the example's own README or self-verifying
+# launcher (cited as such). Counts that are neither stated there nor asserted by
+# a launcher are NOT encoded: those cases assert exit code, terminal status and
+# a non-zero source row count only.
+#
+# `scripts/examples_gate.py validate` refuses this file if any example
+# directory, top-level pipeline config or launcher in the tree is missing here,
+# so a new example cannot be silently left out of the gate.
+#
+# Classes: NON-NETWORK (runs fully offline; loopback fixture servers count as
+# offline), NETWORK (needs a real provider, cloud service or internet),
+# CONTAINER (offline but only inside the Docker image), NOT-A-PIPELINE, UNSURE.
+#
+# Case fields:
+#   command      run from the case's tree root with `bash -c`, exactly as documented
+#   server       a fixture server the documentation tells the operator to start first
+#   ports        loopback ports the case binds; shown in the plan
+#   env          extra environment the documented command sets
+#   fingerprint_key  the documentation tells the operator to export ELSPETH_FINGERPRINT_KEY
+#   expect_exit  accepted exit codes of `command`
+#   configs      every pipeline config the case executes (offline guard input)
+#   requires     python_modules / files that must already exist (never downloaded)
+#   log_markers  strings a self-verifying launcher prints only after its own assertions pass
+#   audit        read-only checks against the case's audit DB(s) after the run:
+#                db, mode (run_mode, default live), runs (expected count of such runs;
+#                omitted = not asserted), run_index (which run to check, default -1),
+#                status, source_rows, sinks {name: completed outcomes}, outcomes
+#                {"outcome/path": n}, conservation (every row has exactly one terminal
+#                outcome, and failures carry a transform_errors reason), sql
+#   skip         reason string; the case is reported SKIP and never run
+
+version: 1
+
+examples:
+  ab_llm_experiment:
+    class: NON-NETWORK
+    table: "AGENTS.md L165 (ChaosLLM, own server on 8199)"
+    configs:
+      settings.yaml: {class: NON-NETWORK, covered_by: ab_llm_experiment}
+      settings_models.yaml: {class: NON-NETWORK, covered_by: ab_llm_experiment}
+      settings_arm_loss.yaml: {class: NON-NETWORK, covered_by: ab_llm_experiment}
+    launchers:
+      run.sh: {class: NON-NETWORK, case: ab_llm_experiment}
+  audit_export:
+    class: NON-NETWORK
+    table: "AGENTS.md L27"
+    configs:
+      settings.yaml: {class: NON-NETWORK, case: audit_export}
+  azure_blob_sentiment:
+    class: NETWORK
+    table: "AGENTS.md L247 (Azure)"
+    configs:
+      settings.yaml: {class: NETWORK, note: "Azure Blob source/sinks, Azure Content Safety, Azure OpenAI"}
+      settings_pooled.yaml: {class: NETWORK, note: "Azure Blob + Azure OpenAI"}
+  azure_keyvault_secrets:
+    class: NETWORK
+    table: "AGENTS.md L248 (Azure)"
+    configs:
+      settings.yaml: {class: NETWORK, note: "secrets resolved from Azure Key Vault"}
+  azure_openai_sentiment:
+    class: NETWORK
+    table: "AGENTS.md L249 (Azure)"
+    configs:
+      settings.yaml: {class: NETWORK, note: "Azure OpenAI endpoint"}
+      settings_pooled.yaml: {class: NETWORK, note: "Azure OpenAI endpoint"}
+  azure_search_rag:
+    class: NETWORK
+    table: "not in AGENTS.md; examples/README.md lists it (requires AZURE_SEARCH_ENDPOINT)"
+    configs:
+      settings.yaml: {class: NETWORK, note: "Azure AI Search retrieval (AGENTS.md L251)"}
+  batch_aggregation:
+    class: NON-NETWORK
+    table: "AGENTS.md L28"
+    configs:
+      settings.yaml: {class: NON-NETWORK, case: batch_aggregation}
+  batch_error_routing:
+    class: NON-NETWORK
+    table: "AGENTS.md L29, L86-L88"
+    configs:
+      settings.yaml: {class: NON-NETWORK, case: batch_error_routing}
+      settings_discard.yaml: {class: NON-NETWORK, case: batch_error_routing.discard}
+      settings_declared.yaml: {class: NON-NETWORK, case: batch_error_routing.declared}
+  batch_rank_passthrough:
+    class: NON-NETWORK
+    table: "AGENTS.md L30"
+    configs:
+      settings.yaml: {class: NON-NETWORK, case: batch_rank_passthrough}
+      settings_transform.yaml: {class: NON-NETWORK, case: batch_rank_passthrough.transform}
+  blob_transforms:
+    class: NON-NETWORK
+    table: "AGENTS.md L52"
+    configs:
+      settings_expand_csv_blobs.yaml: {class: NON-NETWORK, covered_by: blob_transforms}
+      settings_expand_json_blobs.yaml: {class: NON-NETWORK, covered_by: blob_transforms}
+      settings_expand_text_blobs.yaml: {class: NON-NETWORK, covered_by: blob_transforms}
+      settings_expand_inline_csv.yaml: {class: NON-NETWORK, covered_by: blob_transforms}
+      settings_expand_inline_json.yaml: {class: NON-NETWORK, covered_by: blob_transforms}
+      settings_fetch_tutorial_html.yaml: {class: NETWORK, note: "hosted HTML fetch (opt-in run_hosted_fetch.sh, AGENTS.md L52)"}
+    launchers:
+      run.sh: {class: NON-NETWORK, case: blob_transforms}
+      run_hosted_fetch.sh: {class: NETWORK, note: "fetches public tutorial pages"}
+  boolean_routing:
+    class: NON-NETWORK
+    table: "AGENTS.md L33"
+    configs:
+      settings.yaml: {class: NON-NETWORK, case: boolean_routing}
+  chaosllm:
+    class: NOT-A-PIPELINE
+    table: "AGENTS.md L269"
+    note: "ChaosLLM response data only"
+  chaosllm_endurance:
+    class: NON-NETWORK
+    table: "AGENTS.md L163, L143-L149 (bounded smoke), L91"
+    configs:
+      settings.yaml: {class: NON-NETWORK, covered_by: chaosllm_endurance}
+    launchers:
+      run.sh: {class: NON-NETWORK, case: chaosllm_endurance}
+  chaosllm_sentiment:
+    class: NON-NETWORK
+    table: "AGENTS.md L159; examples/chaosllm_sentiment/README.md L34 (run.sh)"
+    configs:
+      settings.yaml: {class: NON-NETWORK, covered_by: chaosllm_sentiment}
+    launchers:
+      run.sh: {class: NON-NETWORK, case: chaosllm_sentiment}
+  chaosweb:
+    class: NON-NETWORK
+    table: "AGENTS.md L180, L90"
+    configs:
+      settings.yaml: {class: NON-NETWORK, case: chaosweb}
+  checkpoint_resume:
+    class: NON-NETWORK
+    table: "AGENTS.md L34"
+    configs:
+      settings.yaml: {class: NON-NETWORK, case: checkpoint_resume, note: "clean run only; interruption/resume is not exercised"}
+  chroma_rag:
+    class: NON-NETWORK
+    table: "AGENTS.md L220 (embedded ChromaDB)"
+    configs:
+      settings.yaml: {class: NON-NETWORK, covered_by: chroma_rag, note: "needs chromadb and a cached default embedding model"}
+    launchers:
+      run.sh: {class: NON-NETWORK, case: chroma_rag}
+  chroma_rag_indexed:
+    class: NON-NETWORK
+    table: "AGENTS.md L221"
+    configs:
+      index_pipeline.yaml: {class: NON-NETWORK, covered_by: chroma_rag_indexed, note: "run as the query pipeline's dependency"}
+      query_pipeline.yaml: {class: NON-NETWORK, case: chroma_rag_indexed}
+  chroma_rag_qa:
+    class: NETWORK
+    table: "AGENTS.md L222"
+    configs:
+      settings.yaml: {class: NETWORK, note: "OpenRouter LLM (public API)"}
+    launchers:
+      run.sh: {class: NETWORK, note: "uses API credits"}
+  concurrent_scheduler:
+    class: NON-NETWORK
+    table: "AGENTS.md L302"
+    configs:
+      settings.yaml: {class: NON-NETWORK, case: concurrent_scheduler}
+  database_sink:
+    class: NON-NETWORK
+    table: "AGENTS.md L35"
+    configs:
+      settings.yaml: {class: NON-NETWORK, covered_by: database_sink}
+    launchers:
+      run.sh: {class: NON-NETWORK, case: database_sink}
+  deaggregation:
+    class: NON-NETWORK
+    table: "AGENTS.md L36"
+    configs:
+      settings.yaml: {class: NON-NETWORK, case: deaggregation}
+  deep_routing:
+    class: NON-NETWORK
+    table: "AGENTS.md L37, L71"
+    configs:
+      settings.yaml: {class: NON-NETWORK, case: deep_routing}
+  document_review_panel:
+    class: NON-NETWORK
+    table: "AGENTS.md L166, L79-L80"
+    configs:
+      settings.yaml: {class: NON-NETWORK, covered_by: document_review_panel}
+      settings_incomplete.yaml: {class: NON-NETWORK, covered_by: document_review_panel}
+      settings_run_as_row.yaml: {class: NON-NETWORK, covered_by: document_review_panel}
+    launchers:
+      run.sh: {class: NON-NETWORK, case: document_review_panel}
+  error_routing:
+    class: NON-NETWORK
+    table: "AGENTS.md L38, L72"
+    configs:
+      settings.yaml: {class: NON-NETWORK, case: error_routing}
+  explicit_routing:
+    class: NON-NETWORK
+    table: "AGENTS.md L39"
+    configs:
+      settings.yaml: {class: NON-NETWORK, case: explicit_routing}
+  file_inject:
+    class: NON-NETWORK
+    table: "AGENTS.md L45, L85"
+    configs:
+      settings.yaml: {class: NON-NETWORK, case: file_inject}
+      settings_all.yaml: {class: NON-NETWORK, case: file_inject.all}
+      settings_miss.yaml: {class: NON-NETWORK, case: file_inject.miss}
+  fixed_web_search:
+    class: NON-NETWORK
+    table: "AGENTS.md L192-L212 (own fixture server); README L15-L31 names five fixture variants"
+    configs:
+      settings_fixture.yaml: {class: NON-NETWORK, covered_by: fixed_web_search.directory}
+      settings_fixture_registry.yaml: {class: NON-NETWORK, covered_by: fixed_web_search.registry}
+      settings_fixture_form.yaml: {class: NON-NETWORK, covered_by: fixed_web_search.form}
+      settings_fixture_multipart.yaml: {class: NON-NETWORK, covered_by: fixed_web_search.multipart}
+      settings_fixture_pagination.yaml: {class: NON-NETWORK, covered_by: fixed_web_search.pagination}
+      settings_fixture_detail.yaml: {class: NON-NETWORK, covered_by: fixed_web_search.detail}
+      settings_abn_page.yaml: {class: NETWORK, note: "public ABN Lookup page (AGENTS.md L198-L199)"}
+    launchers:
+      run_fixture.sh: {class: NON-NETWORK, case: fixed_web_search.directory}
+      run_detail_fixture.sh: {class: NON-NETWORK, case: fixed_web_search.detail}
+  fork_coalesce:
+    class: NON-NETWORK
+    table: "AGENTS.md L40, L75"
+    configs:
+      settings.yaml: {class: NON-NETWORK, case: fork_coalesce}
+      settings_per_branch.yaml: {class: NON-NETWORK, case: fork_coalesce.per_branch}
+      settings_union_last_wins.yaml: {class: NON-NETWORK, case: fork_coalesce.union_last_wins}
+      settings_union_first_wins.yaml: {class: NON-NETWORK, case: fork_coalesce.union_first_wins}
+      settings_union_fail.yaml: {class: NON-NETWORK, case: fork_coalesce.union_fail}
+  join_refused:
+    class: NON-NETWORK
+    table: "AGENTS.md L162"
+    configs:
+      settings.yaml: {class: NON-NETWORK, covered_by: join_refused}
+      settings_mismatched.yaml: {class: NON-NETWORK, covered_by: join_refused, note: "the refused follower; asserted inside run.sh"}
+    launchers:
+      run.sh: {class: NON-NETWORK, case: join_refused}
+  json_explode:
+    class: NON-NETWORK
+    table: "AGENTS.md L42"
+    configs:
+      settings.yaml: {class: NON-NETWORK, case: json_explode}
+  landscape_journal:
+    class: NON-NETWORK
+    table: "AGENTS.md L47"
+    configs:
+      settings.yaml: {class: NON-NETWORK, case: landscape_journal}
+  large_scale_test:
+    class: NON-NETWORK
+    table: "AGENTS.md L50"
+    configs:
+      settings.yaml: {class: NON-NETWORK, case: large_scale_test}
+  llm_ordered_chain:
+    class: NON-NETWORK
+    table: "not in AGENTS.md; examples/README.md L153 and its README (own ChaosLLM on 8199)"
+    configs:
+      settings.yaml: {class: NON-NETWORK, covered_by: llm_ordered_chain}
+    launchers:
+      run.sh: {class: NON-NETWORK, case: llm_ordered_chain}
+  llm_source:
+    class: NETWORK
+    table: "AGENTS.md L235 (OpenRouter)"
+    configs:
+      settings.yaml: {class: NETWORK, note: "LLM source, public OpenRouter API"}
+  multi_flow:
+    class: NON-NETWORK
+    table: "AGENTS.md L48"
+    configs:
+      settings.yaml: {class: NON-NETWORK, case: multi_flow}
+  multi_query_assessment:
+    class: NETWORK
+    table: "AGENTS.md L250 (Azure)"
+    configs:
+      settings.yaml: {class: NETWORK, note: "Azure OpenAI"}
+  multi_source_queue:
+    class: NON-NETWORK
+    table: "AGENTS.md L49"
+    configs:
+      settings.yaml: {class: NON-NETWORK, case: multi_source_queue}
+  multi_worker:
+    class: NON-NETWORK
+    table: "AGENTS.md L303"
+    configs:
+      settings.yaml: {class: NON-NETWORK, covered_by: multi_worker}
+    launchers:
+      run.sh: {class: NON-NETWORK, case: multi_worker}
+  multi_worker_showcase:
+    class: NON-NETWORK
+    table: "AGENTS.md L304 (NOT for the dogfood gate, L296-L298)"
+    configs:
+      settings.yaml: {class: NON-NETWORK, covered_by: multi_worker_showcase}
+    launchers:
+      run.sh: {class: NON-NETWORK, case: multi_worker_showcase}
+      outcome_stats.sh: {class: NON-NETWORK, covered_by: multi_worker_showcase, note: "helper called by run.sh"}
+  openrouter_multi_query_assessment:
+    class: NETWORK
+    table: "AGENTS.md L238 (OpenRouter)"
+    configs:
+      settings.yaml: {class: NETWORK}
+      settings_journal.yaml: {class: NETWORK}
+      settings_overflow.yaml: {class: NETWORK}
+      settings_stress.yaml: {class: NETWORK}
+  openrouter_sentiment:
+    class: NETWORK
+    table: "AGENTS.md L236 (OpenRouter)"
+    configs:
+      settings.yaml: {class: NETWORK}
+      settings_pooled.yaml: {class: NETWORK}
+  pdf_rasterize:
+    class: NON-NETWORK
+    table: "AGENTS.md L53, L73"
+    configs:
+      settings.yaml: {class: NON-NETWORK, covered_by: pdf_rasterize}
+    launchers:
+      run.sh: {class: NON-NETWORK, case: pdf_rasterize}
+  power_automate:
+    class: NETWORK
+    table: "not in AGENTS.md; examples/README.md L133"
+    configs:
+      settings.yaml: {class: NETWORK, note: "Power Automate HTTP trigger source and sink (AGENTS.md L257)"}
+  rate_limited_llm:
+    class: NON-NETWORK
+    table: "AGENTS.md L160 (shared ChaosLLM on 8199)"
+    configs:
+      settings.yaml: {class: NON-NETWORK, case: rate_limited_llm}
+  reference_join:
+    class: NON-NETWORK
+    table: "AGENTS.md L44, L81, L83-L84"
+    configs:
+      settings.yaml: {class: NON-NETWORK, case: reference_join}
+      settings_nested.yaml: {class: NON-NETWORK, case: reference_join.nested}
+      settings_missing_product.yaml: {class: NON-NETWORK, case: reference_join.missing_product}
+      settings_multi.yaml: {class: NON-NETWORK, case: reference_join.multi}
+      settings_chained.yaml: {class: NON-NETWORK, case: reference_join.chained}
+  reference_join_chain:
+    class: NON-NETWORK
+    table: "AGENTS.md L46, L82"
+    configs:
+      settings.yaml: {class: NON-NETWORK, case: reference_join_chain}
+  reference_join_fork_llm:
+    class: NON-NETWORK
+    table: "AGENTS.md L164 (own ChaosLLM on 8201/8202)"
+    configs:
+      settings.yaml: {class: NON-NETWORK, covered_by: reference_join_fork_llm}
+    launchers:
+      run.sh: {class: NON-NETWORK, case: reference_join_fork_llm}
+  replay_verify:
+    class: NON-NETWORK
+    table: "AGENTS.md L190 (own page server on 8204)"
+    configs:
+      settings.yaml: {class: NON-NETWORK, covered_by: replay_verify}
+    launchers:
+      run.sh: {class: NON-NETWORK, case: replay_verify}
+  report_assemble:
+    class: NON-NETWORK
+    table: "AGENTS.md L31"
+    configs:
+      settings.yaml: {class: NON-NETWORK, case: report_assemble}
+  retention_purge:
+    class: NON-NETWORK
+    table: "AGENTS.md L51"
+    configs:
+      settings.yaml: {class: NON-NETWORK, case: retention_purge}
+  row_union_ab_experiment:
+    class: NON-NETWORK
+    table: "AGENTS.md L41, L74; README sections 2 and 5 for the two configs the table does not name"
+    configs:
+      settings.yaml: {class: NON-NETWORK, case: row_union_ab_experiment}
+      settings_paired_preference.yaml: {class: NON-NETWORK, case: row_union_ab_experiment.paired_preference}
+      settings_identity_branches.yaml: {class: NON-NETWORK, case: row_union_ab_experiment.identity_branches}
+      settings_screened.yaml: {class: NON-NETWORK, case: row_union_ab_experiment.screened}
+      settings_screened_at_settlement.yaml: {class: NON-NETWORK, case: row_union_ab_experiment.screened_at_settlement}
+  schema_contracts_demo:
+    class: NON-NETWORK
+    table: "AGENTS.md L54"
+    configs:
+      settings.yaml: {class: NON-NETWORK, case: schema_contracts_demo}
+  schema_contracts_llm_assessment:
+    class: NETWORK
+    table: "AGENTS.md L239 (OpenRouter)"
+    configs:
+      settings.yaml: {class: NETWORK}
+  scope_collector:
+    class: NON-NETWORK
+    table: "AGENTS.md L55, L76-L77"
+    configs:
+      settings.yaml: {class: NON-NETWORK, case: scope_collector}
+      settings_best_effort.yaml: {class: NON-NETWORK, case: scope_collector.best_effort}
+  statistical_batch_plugins:
+    class: NON-NETWORK
+    table: "AGENTS.md L32"
+    configs:
+      settings_classifier_metrics.yaml: {class: NON-NETWORK, case: statistical_batch_plugins.classifier_metrics}
+      settings_data_quality_report.yaml: {class: NON-NETWORK, case: statistical_batch_plugins.data_quality_report}
+      settings_distribution_profile.yaml: {class: NON-NETWORK, case: statistical_batch_plugins.distribution_profile}
+      settings_drift_compare.yaml: {class: NON-NETWORK, case: statistical_batch_plugins.drift_compare}
+      settings_effect_size.yaml: {class: NON-NETWORK, case: statistical_batch_plugins.effect_size}
+      settings_experiment_compare.yaml: {class: NON-NETWORK, case: statistical_batch_plugins.experiment_compare}
+      settings_outlier_annotator.yaml: {class: NON-NETWORK, case: statistical_batch_plugins.outlier_annotator}
+      settings_paired_preference.yaml: {class: NON-NETWORK, case: statistical_batch_plugins.paired_preference}
+      settings_threshold_summary.yaml: {class: NON-NETWORK, case: statistical_batch_plugins.threshold_summary}
+      settings_top_k.yaml: {class: NON-NETWORK, case: statistical_batch_plugins.top_k}
+  template_lookups:
+    class: NETWORK
+    table: "AGENTS.md L237 (OpenRouter)"
+    configs:
+      settings.yaml: {class: NETWORK}
+  textract_inline:
+    class: NETWORK
+    table: "AGENTS.md L263 (AWS, billable)"
+    note: "no committed settings; prepare script generates them from operator documents"
+  threshold_gate:
+    class: NON-NETWORK
+    table: "AGENTS.md L56"
+    configs:
+      settings.yaml: {class: NON-NETWORK, case: threshold_gate}
+  threshold_gate_container:
+    class: CONTAINER
+    table: "AGENTS.md L119 (Container-only)"
+    configs:
+      settings.yaml: {class: CONTAINER, case: threshold_gate_container, note: "/app/pipeline paths; Docker only"}
+  transform_pipeline:
+    class: NON-NETWORK
+    table: "AGENTS.md L43"
+    configs:
+      settings.yaml: {class: NON-NETWORK, case: transform_pipeline}
+
+# ---------------------------------------------------------------------------
+# Cases. Statuses: exit 0 = completed, exit 1 = completed_with_failures
+# (PARTIAL), exit 2 = failed.
+
+cases:
+  # ---- Standalone (AGENTS.md "Standalone", run pattern L58-L61) -------------
+  - id: audit_export
+    example: audit_export
+    command: elspeth run --settings examples/audit_export/settings.yaml --execute
+    expect_exit: [0]
+    configs: [examples/audit_export/settings.yaml]
+    expectation_source: "AGENTS.md L27: 8 rows"
+    audit:
+      - {db: examples/audit_export/runs/audit.db, runs: 1, status: [completed], source_rows: 8}
+
+  - id: batch_aggregation
+    example: batch_aggregation
+    command: elspeth run --settings examples/batch_aggregation/settings.yaml --execute
+    expect_exit: [0]
+    configs: [examples/batch_aggregation/settings.yaml]
+    expectation_source: "AGENTS.md L28: 15 rows"
+    audit:
+      - {db: examples/batch_aggregation/runs/audit.db, runs: 1, status: [completed], source_rows: 15}
+
+  - id: batch_error_routing
+    example: batch_error_routing
+    command: elspeth run --settings examples/batch_error_routing/settings.yaml --execute
+    expect_exit: [1]
+    configs: [examples/batch_error_routing/settings.yaml]
+    expectation_source: "AGENTS.md L29, L86: 12 rows, PARTIAL/exit 1, 3 rows to failed_batches, 3 totals"
+    audit:
+      - db: examples/batch_error_routing/runs/audit.db
+        runs: 1
+        status: [completed_with_failures]
+        source_rows: 12
+        sinks: {failed_batches: 3, totals: 3}
+
+  - id: batch_error_routing.discard
+    example: batch_error_routing
+    command: elspeth run --settings examples/batch_error_routing/settings_discard.yaml --execute
+    expect_exit: [1]
+    configs: [examples/batch_error_routing/settings_discard.yaml]
+    expectation_source: "AGENTS.md L29, L87: 12 rows, PARTIAL/exit 1, the 3 rows recorded as quarantined and written nowhere, 3 totals"
+    audit:
+      - db: examples/batch_error_routing/runs/audit_discard.db
+        runs: 1
+        status: [completed_with_failures]
+        source_rows: 12
+        sinks: {totals: 3}
+
+  - id: batch_error_routing.declared
+    example: batch_error_routing
+    command: elspeth run --settings examples/batch_error_routing/settings_declared.yaml --execute
+    expect_exit: [1]
+    configs: [examples/batch_error_routing/settings_declared.yaml]
+    expectation_source: "AGENTS.md L29, L88: 12 rows, PARTIAL/exit 1, the bad value routed on its own row before the batch, 4 totals"
+    audit:
+      - db: examples/batch_error_routing/runs/audit_declared.db
+        runs: 1
+        status: [completed_with_failures]
+        source_rows: 12
+        sinks: {totals: 4, failed_rows: 1, failed_batches: 0}
+
+  - id: batch_rank_passthrough
+    example: batch_rank_passthrough
+    command: elspeth run --settings examples/batch_rank_passthrough/settings.yaml --execute
+    expect_exit: [0]
+    configs: [examples/batch_rank_passthrough/settings.yaml]
+    expectation_source: "AGENTS.md L30: 12 rows, 7 shortlist + 5 remaining, 12 tokens, 0 parent links"
+    audit:
+      - db: examples/batch_rank_passthrough/runs/audit.db
+        runs: 1
+        status: [completed]
+        source_rows: 12
+        sinks: {shortlist: 7, remaining: 5}
+        sql:
+          - name: tokens_and_parent_links
+            query: "SELECT (SELECT COUNT(*) FROM tokens WHERE run_id=:run_id), (SELECT COUNT(*) FROM token_parents WHERE run_id=:run_id)"
+            expect: [[12, 0]]
+
+  - id: batch_rank_passthrough.transform
+    example: batch_rank_passthrough
+    command: elspeth run --settings examples/batch_rank_passthrough/settings_transform.yaml --execute
+    expect_exit: [0]
+    configs: [examples/batch_rank_passthrough/settings_transform.yaml]
+    expectation_source: "AGENTS.md L30: 12 rows, 7 shortlist + 5 remaining, 24 tokens, 12 parent links"
+    audit:
+      - db: examples/batch_rank_passthrough/runs/audit_transform.db
+        runs: 1
+        status: [completed]
+        source_rows: 12
+        sinks: {shortlist: 7, remaining: 5}
+        sql:
+          - name: tokens_and_parent_links
+            query: "SELECT (SELECT COUNT(*) FROM tokens WHERE run_id=:run_id), (SELECT COUNT(*) FROM token_parents WHERE run_id=:run_id)"
+            expect: [[24, 12]]
+
+  - id: report_assemble
+    example: report_assemble
+    command: elspeth run --settings examples/report_assemble/settings.yaml --execute
+    expect_exit: [0]
+    configs: [examples/report_assemble/settings.yaml]
+    expectation_source: "AGENTS.md L31: 5 rows, 3 reports"
+    audit:
+      - {db: examples/report_assemble/runs/audit.db, runs: 1, status: [completed], source_rows: 5, sinks: {output: 3}}
+
+  - {id: statistical_batch_plugins.classifier_metrics, example: statistical_batch_plugins, command: "elspeth run --settings examples/statistical_batch_plugins/settings_classifier_metrics.yaml --execute", expect_exit: [0], configs: [examples/statistical_batch_plugins/settings_classifier_metrics.yaml], expectation_source: "AGENTS.md L32: 8 rows each", audit: [{db: examples/statistical_batch_plugins/runs/classifier_metrics.db, runs: 1, status: [completed], source_rows: 8}]}
+  - {id: statistical_batch_plugins.data_quality_report, example: statistical_batch_plugins, command: "elspeth run --settings examples/statistical_batch_plugins/settings_data_quality_report.yaml --execute", expect_exit: [0], configs: [examples/statistical_batch_plugins/settings_data_quality_report.yaml], expectation_source: "AGENTS.md L32: 8 rows each", audit: [{db: examples/statistical_batch_plugins/runs/data_quality_report.db, runs: 1, status: [completed], source_rows: 8}]}
+  - {id: statistical_batch_plugins.distribution_profile, example: statistical_batch_plugins, command: "elspeth run --settings examples/statistical_batch_plugins/settings_distribution_profile.yaml --execute", expect_exit: [0], configs: [examples/statistical_batch_plugins/settings_distribution_profile.yaml], expectation_source: "AGENTS.md L32: 8 rows each", audit: [{db: examples/statistical_batch_plugins/runs/distribution_profile.db, runs: 1, status: [completed], source_rows: 8}]}
+  - {id: statistical_batch_plugins.drift_compare, example: statistical_batch_plugins, command: "elspeth run --settings examples/statistical_batch_plugins/settings_drift_compare.yaml --execute", expect_exit: [0], configs: [examples/statistical_batch_plugins/settings_drift_compare.yaml], expectation_source: "AGENTS.md L32: 8 rows each", audit: [{db: examples/statistical_batch_plugins/runs/drift_compare.db, runs: 1, status: [completed], source_rows: 8}]}
+  - {id: statistical_batch_plugins.effect_size, example: statistical_batch_plugins, command: "elspeth run --settings examples/statistical_batch_plugins/settings_effect_size.yaml --execute", expect_exit: [0], configs: [examples/statistical_batch_plugins/settings_effect_size.yaml], expectation_source: "AGENTS.md L32: 8 rows each", audit: [{db: examples/statistical_batch_plugins/runs/effect_size.db, runs: 1, status: [completed], source_rows: 8}]}
+  - {id: statistical_batch_plugins.experiment_compare, example: statistical_batch_plugins, command: "elspeth run --settings examples/statistical_batch_plugins/settings_experiment_compare.yaml --execute", expect_exit: [0], configs: [examples/statistical_batch_plugins/settings_experiment_compare.yaml], expectation_source: "AGENTS.md L32: 8 rows each", audit: [{db: examples/statistical_batch_plugins/runs/experiment_compare.db, runs: 1, status: [completed], source_rows: 8}]}
+  - {id: statistical_batch_plugins.outlier_annotator, example: statistical_batch_plugins, command: "elspeth run --settings examples/statistical_batch_plugins/settings_outlier_annotator.yaml --execute", expect_exit: [0], configs: [examples/statistical_batch_plugins/settings_outlier_annotator.yaml], expectation_source: "AGENTS.md L32: 8 rows each", audit: [{db: examples/statistical_batch_plugins/runs/outlier_annotator.db, runs: 1, status: [completed], source_rows: 8}]}
+  - {id: statistical_batch_plugins.paired_preference, example: statistical_batch_plugins, command: "elspeth run --settings examples/statistical_batch_plugins/settings_paired_preference.yaml --execute", expect_exit: [0], configs: [examples/statistical_batch_plugins/settings_paired_preference.yaml], expectation_source: "AGENTS.md L32: 8 rows each", audit: [{db: examples/statistical_batch_plugins/runs/paired_preference.db, runs: 1, status: [completed], source_rows: 8}]}
+  - {id: statistical_batch_plugins.threshold_summary, example: statistical_batch_plugins, command: "elspeth run --settings examples/statistical_batch_plugins/settings_threshold_summary.yaml --execute", expect_exit: [0], configs: [examples/statistical_batch_plugins/settings_threshold_summary.yaml], expectation_source: "AGENTS.md L32: 8 rows each", audit: [{db: examples/statistical_batch_plugins/runs/threshold_summary.db, runs: 1, status: [completed], source_rows: 8}]}
+  - {id: statistical_batch_plugins.top_k, example: statistical_batch_plugins, command: "elspeth run --settings examples/statistical_batch_plugins/settings_top_k.yaml --execute", expect_exit: [0], configs: [examples/statistical_batch_plugins/settings_top_k.yaml], expectation_source: "AGENTS.md L32: 8 rows each", audit: [{db: examples/statistical_batch_plugins/runs/top_k.db, runs: 1, status: [completed], source_rows: 8}]}
+
+  - id: boolean_routing
+    example: boolean_routing
+    command: elspeth run --settings examples/boolean_routing/settings.yaml --execute
+    expect_exit: [0]
+    configs: [examples/boolean_routing/settings.yaml]
+    expectation_source: "AGENTS.md L33: 10 rows"
+    audit:
+      - {db: examples/boolean_routing/runs/audit.db, runs: 1, status: [completed], source_rows: 10}
+
+  - id: checkpoint_resume
+    example: checkpoint_resume
+    command: elspeth run --settings examples/checkpoint_resume/settings.yaml --execute
+    expect_exit: [0]
+    configs: [examples/checkpoint_resume/settings.yaml]
+    expectation_source: "AGENTS.md L34: 20 rows (clean run; resume after interruption is not exercised)"
+    audit:
+      - {db: examples/checkpoint_resume/runs/audit.db, runs: 1, status: [completed], source_rows: 20}
+
+  - id: database_sink
+    example: database_sink
+    command: ./examples/database_sink/run.sh
+    expect_exit: [0]
+    configs: [examples/database_sink/settings.yaml]
+    expectation_source: "AGENTS.md L35: run via run.sh; 8 rows, 4 to the DB"
+    audit:
+      - {db: examples/database_sink/runs/audit.db, runs: 1, status: [completed], source_rows: 8, sinks: {high_value_db: 4}}
+
+  - id: deaggregation
+    example: deaggregation
+    command: elspeth run --settings examples/deaggregation/settings.yaml --execute
+    expect_exit: [0]
+    configs: [examples/deaggregation/settings.yaml]
+    expectation_source: "AGENTS.md L36: 6 rows, 6 -> 11 output"
+    audit:
+      - {db: examples/deaggregation/runs/audit.db, runs: 1, status: [completed], source_rows: 6, sinks: {output: 11}}
+
+  - id: deep_routing
+    example: deep_routing
+    command: elspeth run --settings examples/deep_routing/settings.yaml --execute
+    expect_exit: [1]
+    configs: [examples/deep_routing/settings.yaml]
+    expectation_source: "AGENTS.md L37, L71: 20 rows, PARTIAL/exit 1, 2 blocked rows quarantined"
+    audit:
+      - {db: examples/deep_routing/runs/audit.db, runs: 1, status: [completed_with_failures], source_rows: 20, sinks: {quarantine: 2}}
+
+  - id: error_routing
+    example: error_routing
+    command: elspeth run --settings examples/error_routing/settings.yaml --execute
+    expect_exit: [1]
+    configs: [examples/error_routing/settings.yaml]
+    expectation_source: "AGENTS.md L38, L72: 17 rows, PARTIAL/exit 1, 4 blocked rows quarantined"
+    audit:
+      - {db: examples/error_routing/runs/audit.db, runs: 1, status: [completed_with_failures], source_rows: 17, sinks: {quarantine: 4}}
+
+  - id: explicit_routing
+    example: explicit_routing
+    command: elspeth run --settings examples/explicit_routing/settings.yaml --execute
+    expect_exit: [0]
+    configs: [examples/explicit_routing/settings.yaml]
+    expectation_source: "AGENTS.md L39: 10 rows"
+    audit:
+      - {db: examples/explicit_routing/runs/audit.db, runs: 1, status: [completed], source_rows: 10}
+
+  - id: fork_coalesce
+    example: fork_coalesce
+    command: elspeth run --settings examples/fork_coalesce/settings.yaml --execute
+    expect_exit: [0]
+    configs: [examples/fork_coalesce/settings.yaml]
+    expectation_source: "AGENTS.md L40: 5 rows each"
+    audit:
+      - {db: examples/fork_coalesce/runs/audit.db, runs: 1, status: [completed], source_rows: 5, sinks: {output: 5}}
+
+  - id: fork_coalesce.per_branch
+    example: fork_coalesce
+    command: elspeth run --settings examples/fork_coalesce/settings_per_branch.yaml --execute
+    expect_exit: [0]
+    configs: [examples/fork_coalesce/settings_per_branch.yaml]
+    expectation_source: "AGENTS.md L40: 5 rows each"
+    audit:
+      - {db: examples/fork_coalesce/runs/audit.db, runs: 1, status: [completed], source_rows: 5, sinks: {output: 5}}
+
+  - id: fork_coalesce.union_last_wins
+    example: fork_coalesce
+    command: elspeth run --settings examples/fork_coalesce/settings_union_last_wins.yaml --execute
+    expect_exit: [0]
+    configs: [examples/fork_coalesce/settings_union_last_wins.yaml]
+    expectation_source: "AGENTS.md L40: 5 rows; last_wins resolves the collision to path_b"
+    audit:
+      - db: examples/fork_coalesce/runs/union_last_wins.db
+        runs: 1
+        status: [completed]
+        source_rows: 5
+        sinks: {output: 5}
+        sql:
+          - name: collision_winners
+            query: "SELECT DISTINCT json_extract(context_after_json, '$.union_field_origins.description') FROM node_states WHERE run_id=:run_id AND json_extract(context_after_json, '$.union_field_collisions') IS NOT NULL"
+            expect: [["path_b"]]
+
+  - id: fork_coalesce.union_first_wins
+    example: fork_coalesce
+    command: elspeth run --settings examples/fork_coalesce/settings_union_first_wins.yaml --execute
+    expect_exit: [0]
+    configs: [examples/fork_coalesce/settings_union_first_wins.yaml]
+    expectation_source: "AGENTS.md L40: 5 rows; first_wins resolves the collision to path_a"
+    audit:
+      - db: examples/fork_coalesce/runs/union_first_wins.db
+        runs: 1
+        status: [completed]
+        source_rows: 5
+        sinks: {output: 5}
+        sql:
+          - name: collision_winners
+            query: "SELECT DISTINCT json_extract(context_after_json, '$.union_field_origins.description') FROM node_states WHERE run_id=:run_id AND json_extract(context_after_json, '$.union_field_collisions') IS NOT NULL"
+            expect: [["path_a"]]
+
+  - id: fork_coalesce.union_fail
+    example: fork_coalesce
+    command: elspeth run --settings examples/fork_coalesce/settings_union_fail.yaml --execute
+    expect_exit: [2]
+    configs: [examples/fork_coalesce/settings_union_fail.yaml]
+    expectation_source: "AGENTS.md L40, L75: FAILED/exit 2, every row's group fails union_field_collision (collision record on each FAILED hold: 5 groups x 2 branch holds = 10, derived)"
+    audit:
+      - db: examples/fork_coalesce/runs/union_fail.db
+        runs: 1
+        status: [failed]
+        source_rows: 5
+        sinks: {output: 0}
+        sql:
+          - name: coalesce_hold_failures
+            query: "SELECT status, json_extract(error_json, '$.failure_reason'), COUNT(*) FROM node_states WHERE run_id=:run_id AND node_id LIKE 'coalesce_%' GROUP BY 1, 2"
+            expect: [["failed", "union_field_collision", 10]]
+
+  - id: row_union_ab_experiment
+    example: row_union_ab_experiment
+    command: elspeth run --settings examples/row_union_ab_experiment/settings.yaml --execute
+    expect_exit: [0]
+    configs: [examples/row_union_ab_experiment/settings.yaml]
+    expectation_source: "AGENTS.md L41: 8 rows (16 unioned, 1 comparison row)"
+    audit:
+      - {db: examples/row_union_ab_experiment/runs/audit.db, runs: 1, status: [completed], source_rows: 8, sinks: {output: 1}}
+
+  - id: row_union_ab_experiment.paired_preference
+    example: row_union_ab_experiment
+    command: elspeth run --settings examples/row_union_ab_experiment/settings_paired_preference.yaml --execute
+    expect_exit: [0]
+    configs: [examples/row_union_ab_experiment/settings_paired_preference.yaml]
+    expectation_source: "not in the AGENTS.md table; row_union_ab_experiment/README.md section 2 (exit code not stated; default COMPLETED/0)"
+    audit:
+      - {db: examples/row_union_ab_experiment/runs/paired_preference.db, runs: 1, status: [completed]}
+
+  - id: row_union_ab_experiment.identity_branches
+    example: row_union_ab_experiment
+    command: elspeth run --settings examples/row_union_ab_experiment/settings_identity_branches.yaml --execute
+    expect_exit: [0]
+    configs: [examples/row_union_ab_experiment/settings_identity_branches.yaml]
+    expectation_source: "not in the AGENTS.md table; row_union_ab_experiment/README.md section 5 (exit code not stated; default COMPLETED/0)"
+    audit:
+      - {db: examples/row_union_ab_experiment/runs/identity_branches.db, runs: 1, status: [completed]}
+
+  - id: row_union_ab_experiment.screened
+    example: row_union_ab_experiment
+    command: elspeth run --settings examples/row_union_ab_experiment/settings_screened.yaml --execute
+    expect_exit: [0]
+    configs: [examples/row_union_ab_experiment/settings_screened.yaml]
+    expectation_source: "AGENTS.md L41: SUCCESS, 3 tickets screened out before forking"
+    audit:
+      - {db: examples/row_union_ab_experiment/runs/screened.db, runs: 1, status: [completed], source_rows: 8, sinks: {screened_out: 3}}
+
+  - id: row_union_ab_experiment.screened_at_settlement
+    example: row_union_ab_experiment
+    command: elspeth run --settings examples/row_union_ab_experiment/settings_screened_at_settlement.yaml --execute
+    expect_exit: [1]
+    configs: [examples/row_union_ab_experiment/settings_screened_at_settlement.yaml]
+    expectation_source: "AGENTS.md L41, L74: PARTIAL/exit 1"
+    audit:
+      - {db: examples/row_union_ab_experiment/runs/settlement.db, runs: 1, status: [completed_with_failures], source_rows: 8}
+
+  - id: json_explode
+    example: json_explode
+    command: elspeth run --settings examples/json_explode/settings.yaml --execute
+    expect_exit: [0]
+    configs: [examples/json_explode/settings.yaml]
+    expectation_source: "AGENTS.md L42: 3 rows, 3 -> 6 output"
+    audit:
+      - {db: examples/json_explode/runs/audit.db, runs: 1, status: [completed], source_rows: 3, sinks: {output: 6}}
+
+  - id: transform_pipeline
+    example: transform_pipeline
+    command: elspeth run --settings examples/transform_pipeline/settings.yaml --execute
+    expect_exit: [0]
+    configs: [examples/transform_pipeline/settings.yaml]
+    expectation_source: "AGENTS.md L43: 5 rows"
+    audit:
+      - {db: examples/transform_pipeline/runs/audit.db, runs: 1, status: [completed], source_rows: 5}
+
+  - id: reference_join
+    example: reference_join
+    command: elspeth run --settings examples/reference_join/settings.yaml --execute
+    expect_exit: [0]
+    configs: [examples/reference_join/settings.yaml]
+    expectation_source: "AGENTS.md L44: 5 rows"
+    audit:
+      - {db: examples/reference_join/runs/audit.db, runs: 1, status: [completed], source_rows: 5}
+
+  - id: reference_join.nested
+    example: reference_join
+    command: elspeth run --settings examples/reference_join/settings_nested.yaml --execute
+    expect_exit: [0]
+    configs: [examples/reference_join/settings_nested.yaml]
+    expectation_source: "AGENTS.md L44: 5 rows"
+    audit:
+      - {db: examples/reference_join/runs/audit_nested.db, runs: 1, status: [completed], source_rows: 5}
+
+  - id: reference_join.missing_product
+    example: reference_join
+    command: elspeth run --settings examples/reference_join/settings_missing_product.yaml --execute
+    expect_exit: [1]
+    configs: [examples/reference_join/settings_missing_product.yaml]
+    expectation_source: "AGENTS.md L44, L81: 3 rows, PARTIAL/exit 1, 1 missing product quarantined"
+    audit:
+      - {db: examples/reference_join/runs/audit_missing.db, runs: 1, status: [completed_with_failures], source_rows: 3, sinks: {quarantine: 1}}
+
+  - id: reference_join.multi
+    example: reference_join
+    command: elspeth run --settings examples/reference_join/settings_multi.yaml --execute
+    expect_exit: [1]
+    configs: [examples/reference_join/settings_multi.yaml]
+    expectation_source: "AGENTS.md L44, L83: 5 rows, PARTIAL/exit 1, 4 enriched + 1 original row quarantined"
+    audit:
+      - {db: examples/reference_join/runs/multi_audit.db, runs: 1, status: [completed_with_failures], source_rows: 5, sinks: {output: 4, quarantine: 1}}
+
+  - id: reference_join.chained
+    example: reference_join
+    command: elspeth run --settings examples/reference_join/settings_chained.yaml --execute
+    expect_exit: [1]
+    configs: [examples/reference_join/settings_chained.yaml]
+    expectation_source: "AGENTS.md L44, L84: 4 rows, PARTIAL/exit 1, 3 enriched + 1 original row quarantined"
+    audit:
+      - {db: examples/reference_join/runs/chained_audit.db, runs: 1, status: [completed_with_failures], source_rows: 4, sinks: {output: 3, quarantine: 1}}
+
+  - id: file_inject
+    example: file_inject
+    command: elspeth run --settings examples/file_inject/settings.yaml --execute
+    expect_exit: [0]
+    configs: [examples/file_inject/settings.yaml]
+    expectation_source: "AGENTS.md L45: 4 rows, COMPLETED/exit 0"
+    audit:
+      - {db: examples/file_inject/runs/audit.db, runs: 1, status: [completed], source_rows: 4}
+
+  - id: file_inject.all
+    example: file_inject
+    command: elspeth run --settings examples/file_inject/settings_all.yaml --execute
+    expect_exit: [0]
+    configs: [examples/file_inject/settings_all.yaml]
+    expectation_source: "AGENTS.md L45: 4 rows, COMPLETED/exit 0"
+    audit:
+      - {db: examples/file_inject/runs/audit_all.db, runs: 1, status: [completed], source_rows: 4}
+
+  - id: file_inject.miss
+    example: file_inject
+    command: elspeth run --settings examples/file_inject/settings_miss.yaml --execute
+    expect_exit: [1]
+    configs: [examples/file_inject/settings_miss.yaml]
+    expectation_source: "AGENTS.md L45, L85: 3 rows, PARTIAL/exit 1, 2 written + 1 to unmatched"
+    audit:
+      - {db: examples/file_inject/runs/audit_miss.db, runs: 1, status: [completed_with_failures], source_rows: 3, sinks: {output: 2, unmatched: 1}}
+
+  - id: reference_join_chain
+    example: reference_join_chain
+    command: elspeth run --settings examples/reference_join_chain/settings.yaml --execute
+    expect_exit: [1]
+    configs: [examples/reference_join_chain/settings.yaml]
+    expectation_source: "AGENTS.md L46, L82: 5 rows, PARTIAL/exit 1, 3 enriched + 2 quarantined"
+    audit:
+      - {db: examples/reference_join_chain/runs/audit.db, runs: 1, status: [completed_with_failures], source_rows: 5, sinks: {output: 3, quarantine: 2}}
+
+  - id: landscape_journal
+    example: landscape_journal
+    command: elspeth run --settings examples/landscape_journal/settings.yaml --execute
+    expect_exit: [0]
+    configs: [examples/landscape_journal/settings.yaml]
+    expectation_source: "AGENTS.md L47: 2 rows"
+    audit:
+      - {db: examples/landscape_journal/runs/audit.db, runs: 1, status: [completed], source_rows: 2}
+
+  - id: multi_flow
+    example: multi_flow
+    command: elspeth run --settings examples/multi_flow/settings.yaml --execute
+    expect_exit: [0]
+    configs: [examples/multi_flow/settings.yaml]
+    expectation_source: "AGENTS.md L48: 4 rows"
+    audit:
+      - {db: examples/multi_flow/runs/audit.db, runs: 1, status: [completed], source_rows: 4}
+
+  - id: multi_source_queue
+    example: multi_source_queue
+    command: elspeth run --settings examples/multi_source_queue/settings.yaml --execute
+    expect_exit: [0]
+    configs: [examples/multi_source_queue/settings.yaml]
+    expectation_source: "AGENTS.md L49: 3 rows"
+    audit:
+      - {db: examples/multi_source_queue/runs/audit.db, runs: 1, status: [completed], source_rows: 3}
+
+  - id: large_scale_test
+    example: large_scale_test
+    command: elspeth run --settings examples/large_scale_test/settings.yaml --execute
+    expect_exit: [0]
+    configs: [examples/large_scale_test/settings.yaml]
+    expectation_source: "AGENTS.md L50: 10,000 rows (observed ~4 min locally)"
+    audit:
+      - {db: examples/large_scale_test/runs/audit.db, runs: 1, status: [completed], source_rows: 10000}
+
+  - id: retention_purge
+    example: retention_purge
+    command: elspeth run --settings examples/retention_purge/settings.yaml --execute
+    expect_exit: [0]
+    configs: [examples/retention_purge/settings.yaml]
+    expectation_source: "AGENTS.md L51: 5 rows"
+    audit:
+      - {db: examples/retention_purge/runs/audit.db, runs: 1, status: [completed], source_rows: 5}
+
+  - id: blob_transforms
+    example: blob_transforms
+    command: ./examples/blob_transforms/run.sh
+    generated_inputs:
+      generator: examples/blob_transforms/run.sh
+      paths:
+        - examples/blob_transforms/input/csv_blob_manifest.csv
+        - examples/blob_transforms/input/json_blob_manifest.csv
+        - examples/blob_transforms/input/text_blob_manifest.csv
+    expect_exit: [0]
+    configs:
+      - examples/blob_transforms/settings_expand_csv_blobs.yaml
+      - examples/blob_transforms/settings_expand_json_blobs.yaml
+      - examples/blob_transforms/settings_expand_text_blobs.yaml
+      - examples/blob_transforms/settings_expand_inline_csv.yaml
+      - examples/blob_transforms/settings_expand_inline_json.yaml
+    expectation_source: "AGENTS.md L52: five offline configs, all COMPLETED/exit 0, 2 -> 200 / 3 / 5 / 5 / 3"
+    log_markers: [{text: "OK: ", count: 5}]
+    audit:
+      - {label: csv_blobs, db: examples/blob_transforms/runs/offline_audit.db, runs: 1, status: [completed], source_rows: 2, sinks: {output: 200}}
+      - {label: json_blobs, db: examples/blob_transforms/runs/json_blob_audit.db, runs: 1, status: [completed], source_rows: 2, sinks: {output: 3}}
+      - {label: text_blobs, db: examples/blob_transforms/runs/text_blob_audit.db, runs: 1, status: [completed], source_rows: 2, sinks: {output: 5}}
+      - {label: inline_csv, db: examples/blob_transforms/runs/inline_csv_audit.db, runs: 1, status: [completed], source_rows: 2, sinks: {output: 5}}
+      - {label: inline_json, db: examples/blob_transforms/runs/inline_json_audit.db, runs: 1, status: [completed], source_rows: 2, sinks: {output: 3}}
+
+  - id: pdf_rasterize
+    example: pdf_rasterize
+    command: ./examples/pdf_rasterize/run.sh
+    generated_inputs:
+      generator: examples/pdf_rasterize/run.sh
+      paths:
+        - examples/pdf_rasterize/input/pdf_manifest.csv
+    expect_exit: [1]
+    configs: [examples/pdf_rasterize/settings.yaml]
+    expectation_source: "AGENTS.md L53, L73: 2 documents, PARTIAL/exit 1, 1 quarantined, 3 page rows"
+    audit:
+      - {db: examples/pdf_rasterize/runs/audit.db, runs: 1, status: [completed_with_failures], source_rows: 2, sinks: {pages: 3, quarantine: 1}}
+
+  - id: schema_contracts_demo
+    example: schema_contracts_demo
+    command: elspeth run --settings examples/schema_contracts_demo/settings.yaml --execute
+    expect_exit: [0]
+    configs: [examples/schema_contracts_demo/settings.yaml]
+    expectation_source: "AGENTS.md L54: 5 rows"
+    audit:
+      - {db: examples/schema_contracts_demo/runs/audit.db, runs: 1, status: [completed], source_rows: 5}
+
+  - id: scope_collector
+    example: scope_collector
+    command: elspeth run --settings examples/scope_collector/settings.yaml --execute
+    expect_exit: [1]
+    configs: [examples/scope_collector/settings.yaml]
+    expectation_source: "AGENTS.md L55, L76: 3 docs, PARTIAL/exit 1, 2 output rows"
+    audit:
+      - {db: examples/scope_collector/runs/require_all.db, runs: 1, status: [completed_with_failures], source_rows: 3, sinks: {out: 2}}
+
+  - id: scope_collector.best_effort
+    example: scope_collector
+    command: elspeth run --settings examples/scope_collector/settings_best_effort.yaml --execute
+    expect_exit: [1]
+    configs: [examples/scope_collector/settings_best_effort.yaml]
+    expectation_source: "AGENTS.md L55, L77: 3 docs, PARTIAL/exit 1, 3 output rows"
+    audit:
+      - {db: examples/scope_collector/runs/best_effort.db, runs: 1, status: [completed_with_failures], source_rows: 3, sinks: {out: 3}}
+
+  - id: threshold_gate
+    example: threshold_gate
+    command: elspeth run --settings examples/threshold_gate/settings.yaml --execute
+    expect_exit: [0]
+    configs: [examples/threshold_gate/settings.yaml]
+    expectation_source: "AGENTS.md L56: 8 rows"
+    audit:
+      - {db: examples/threshold_gate/runs/audit.db, runs: 1, status: [completed], source_rows: 8}
+
+  - id: threshold_gate_container
+    example: threshold_gate_container
+    command: "true"
+    expect_exit: [0]
+    configs: []
+    expectation_source: "AGENTS.md L119"
+    skip: "container-only: /app/pipeline paths, runs only inside the Docker image"
+
+  # ---- 0.6.0 multi-worker (AGENTS.md L279-L304) -----------------------------
+  - id: concurrent_scheduler
+    example: concurrent_scheduler
+    command: elspeth run --settings examples/concurrent_scheduler/settings.yaml --execute
+    expect_exit: [0]
+    configs: [examples/concurrent_scheduler/settings.yaml]
+    expectation_source: "AGENTS.md L302: 6 rows (2x3 CSV rows)"
+    audit:
+      - {db: examples/concurrent_scheduler/runs/audit.db, runs: 1, status: [completed], source_rows: 6}
+
+  - id: multi_worker
+    example: multi_worker
+    command: ./examples/multi_worker/run.sh
+    expect_exit: [0]
+    ports: [8199]
+    configs: [examples/multi_worker/settings.yaml]
+    expectation_source: "AGENTS.md L303: 120 work units, self-verifying (>=2 workers shared rows)"
+    log_markers: ["PASS: leader + "]
+    audit:
+      - {db: examples/multi_worker/runs/audit.db, runs: 1, status: [completed], source_rows: 1}
+
+  - id: multi_worker_showcase
+    example: multi_worker_showcase
+    command: WORKERS=3 ./examples/multi_worker_showcase/run.sh
+    expect_exit: [0]
+    ports: [8199]
+    configs: [examples/multi_worker_showcase/settings.yaml]
+    expectation_source: "AGENTS.md L293, L304: 200 work units, 4-way, asserts shared work (NOT for the dogfood gate, L296)"
+    log_markers: ["PASS: "]
+    audit:
+      - {db: examples/multi_worker_showcase/runs/audit.db, runs: 1, status: [completed], source_rows: 10}
+
+  # ---- ChaosLLM (AGENTS.md L121-L166) --------------------------------------
+  - id: chaosllm_sentiment
+    example: chaosllm_sentiment
+    command: ./examples/chaosllm_sentiment/run.sh
+    expect_exit: [0, 1]
+    ports: [8199]
+    configs: [examples/chaosllm_sentiment/settings.yaml]
+    expectation_source: "AGENTS.md L159: 10 rows, fault injection (stochastic: conservation, L97-L100); README L34 names run.sh"
+    audit:
+      - {db: examples/chaosllm_sentiment/runs/audit.db, runs: 1, status: [completed, completed_with_failures], source_rows: 10, conservation: true}
+
+  - id: rate_limited_llm
+    example: rate_limited_llm
+    command: elspeth run --settings examples/rate_limited_llm/settings.yaml --execute
+    server: {command: "chaosllm serve --port 8199 --preset=realistic --workers=1 --no-burst", port: 8199}
+    fingerprint_key: true
+    expect_exit: [0, 1]
+    ports: [8199]
+    configs: [examples/rate_limited_llm/settings.yaml]
+    expectation_source: "AGENTS.md L134-L139, L160: 8 rows against a realistic-preset ChaosLLM (stochastic: conservation)"
+    audit:
+      - {db: examples/rate_limited_llm/runs/audit.db, runs: 1, status: [completed, completed_with_failures], source_rows: 8, conservation: true}
+
+  - id: chaosllm_endurance
+    example: chaosllm_endurance
+    command: CHAOSLLM_ENDURANCE_ROWS=20 CHAOSLLM_ENDURANCE_INPUT_PATH=examples/chaosllm_endurance/input.20.csv ./examples/chaosllm_endurance/run.sh
+    generated_inputs:
+      generator: examples/chaosllm_endurance/run.sh
+      paths:
+        - examples/chaosllm_endurance/input.20.csv
+    expect_exit: [0, 1]
+    ports: [8199]
+    configs: [examples/chaosllm_endurance/settings.yaml]
+    expectation_source: "AGENTS.md L143-L149: bounded 20-row smoke; L91: 1 stochastic (conservation)"
+    audit:
+      - {db: examples/chaosllm_endurance/runs/audit.db, runs: 1, status: [completed, completed_with_failures], source_rows: 20, conservation: true}
+
+  - id: join_refused
+    example: join_refused
+    command: ./examples/join_refused/run.sh
+    expect_exit: [0]
+    ports: [8199]
+    configs: [examples/join_refused/settings.yaml, examples/join_refused/settings_mismatched.yaml]
+    expectation_source: "AGENTS.md L162: SUCCESS/exit 0; the refusal is asserted inside run.sh on its reason"
+    log_markers: ["VERIFIED: the run admitted 2 workers and refused 1"]
+
+  - id: reference_join_fork_llm
+    example: reference_join_fork_llm
+    command: ./examples/reference_join_fork_llm/run.sh
+    expect_exit: [0]
+    ports: [8201, 8202]
+    configs: [examples/reference_join_fork_llm/settings.yaml]
+    expectation_source: "AGENTS.md L164: 5 rows, SUCCESS/exit 0"
+    audit:
+      - {db: examples/reference_join_fork_llm/runs/audit.db, runs: 1, status: [completed], source_rows: 5}
+
+  - id: ab_llm_experiment
+    example: ab_llm_experiment
+    command: ./examples/ab_llm_experiment/run.sh
+    expect_exit: [0]
+    ports: [8199]
+    configs:
+      - examples/ab_llm_experiment/settings.yaml
+      - examples/ab_llm_experiment/settings_models.yaml
+      - examples/ab_llm_experiment/settings_arm_loss.yaml
+    expectation_source: "AGENTS.md L165, L78: runs all three configs and self-verifies each; 8 + 8 + 24 cases"
+    log_markers: [{text: "VERIFIED: ", count: 3}]
+    audit:
+      - {label: prompt, db: examples/ab_llm_experiment/runs/audit.db, runs: 1, status: [completed], source_rows: 8}
+      - {label: models, db: examples/ab_llm_experiment/runs/audit_models.db, runs: 1, status: [completed], source_rows: 8}
+      - {label: arm_loss, db: examples/ab_llm_experiment/runs/audit_arm_loss.db, runs: 1, status: [completed_with_failures], source_rows: 24}
+
+  - id: document_review_panel
+    example: document_review_panel
+    command: ./examples/document_review_panel/run.sh
+    expect_exit: [0]
+    ports: [8199]
+    configs:
+      - examples/document_review_panel/settings.yaml
+      - examples/document_review_panel/settings_incomplete.yaml
+      - examples/document_review_panel/settings_run_as_row.yaml
+    expectation_source: "AGENTS.md L166, L79-L80: self-verifies all three configs; clean COMPLETED, the other two PARTIAL"
+    log_markers: [{text: "VERIFIED: ", count: 3}]
+    audit:
+      - {label: clean, db: examples/document_review_panel/runs/clean.db, runs: 1, status: [completed]}
+      - {label: incomplete, db: examples/document_review_panel/runs/incomplete.db, runs: 1, status: [completed_with_failures]}
+      - {label: run_as_row, db: examples/document_review_panel/runs/run_as_row.db, runs: 1, status: [completed_with_failures]}
+
+  - id: llm_ordered_chain
+    example: llm_ordered_chain
+    command: ./examples/llm_ordered_chain/run.sh
+    expect_exit: [0]
+    ports: [8199]
+    configs: [examples/llm_ordered_chain/settings.yaml]
+    expectation_source: "not in the AGENTS.md table; llm_ordered_chain/README.md + run.sh (asserts PARTIAL/exit 1 internally, then verify.py)"
+    audit:
+      - {db: examples/llm_ordered_chain/runs/audit.db, runs: 1, status: [completed_with_failures]}
+
+  # ---- ChaosWeb (AGENTS.md L168-L180) --------------------------------------
+  - id: chaosweb
+    example: chaosweb
+    command: elspeth run --settings examples/chaosweb/settings.yaml --execute
+    server: {command: "chaosweb serve --port 8200 --preset=realistic --workers=1", port: 8200}
+    expect_exit: [0, 1]
+    ports: [8200]
+    configs: [examples/chaosweb/settings.yaml]
+    expectation_source: "AGENTS.md L168-L180, L90: 10 rows, stochastic (conservation)"
+    audit:
+      - {db: examples/chaosweb/runs/audit.db, runs: 1, status: [completed, completed_with_failures], source_rows: 10, conservation: true}
+
+  # ---- Replay / verify and fixed web search (own fixture servers; AGENTS.md L182-L212) -----------
+  - id: replay_verify
+    example: replay_verify
+    command: ./examples/replay_verify/run.sh
+    expect_exit: [0]
+    ports: [8204]
+    configs: [examples/replay_verify/settings.yaml]
+    expectation_source: "AGENTS.md L182-L190: exit 0, live -> replay -> verify, 3 rows per run, negative arms asserted inside"
+    log_markers: ["VERIFIED: live -> replay"]
+    audit:
+      - {db: examples/replay_verify/runs/audit.db, mode: live, status: [completed], source_rows: 3}
+
+  - id: fixed_web_search.directory
+    example: fixed_web_search
+    command: ./examples/fixed_web_search/run_fixture.sh
+    expect_exit: [0]
+    ports: [8213]
+    configs: [examples/fixed_web_search/settings_fixture.yaml]
+    expectation_source: "AGENTS.md L194-L197: three requests and output rows, offline replay, live verification"
+    log_markers: ["verified_rows=3", "verified_replay_without_network="]
+
+  - id: fixed_web_search.registry
+    example: fixed_web_search
+    command: ./examples/fixed_web_search/run_fixture.sh registry
+    expect_exit: [0]
+    ports: [8213]
+    configs: [examples/fixed_web_search/settings_fixture_registry.yaml]
+    expectation_source: "fixed_web_search/README.md L15-L18 (variant not in the AGENTS.md table); launcher self-verifies"
+    log_markers: ["verified_rows=3", "verified_replay_without_network="]
+
+  - id: fixed_web_search.form
+    example: fixed_web_search
+    command: ./examples/fixed_web_search/run_fixture.sh form
+    expect_exit: [0]
+    ports: [8213]
+    configs: [examples/fixed_web_search/settings_fixture_form.yaml]
+    expectation_source: "fixed_web_search/README.md L15-L18 (variant not in the AGENTS.md table); launcher self-verifies"
+    log_markers: ["verified_rows=3", "verified_replay_without_network="]
+
+  - id: fixed_web_search.multipart
+    example: fixed_web_search
+    command: ./examples/fixed_web_search/run_fixture.sh multipart
+    generated_inputs:
+      generator: examples/fixed_web_search/run_fixture.sh
+      paths:
+        - examples/fixed_web_search/runs_multipart/input.jsonl
+    expect_exit: [0]
+    ports: [8213]
+    configs: [examples/fixed_web_search/settings_fixture_multipart.yaml]
+    expectation_source: "fixed_web_search/README.md L15-L18 (variant not in the AGENTS.md table); launcher self-verifies"
+    log_markers: ["verified_rows=", "verified_replay_without_network="]
+
+  - id: fixed_web_search.pagination
+    example: fixed_web_search
+    command: ./examples/fixed_web_search/run_fixture.sh pagination
+    expect_exit: [0]
+    ports: [8213]
+    configs: [examples/fixed_web_search/settings_fixture_pagination.yaml]
+    expectation_source: "fixed_web_search/README.md L31 (variant not in the AGENTS.md table); launcher self-verifies"
+    log_markers: ["verified_rows=3", "verified_replay_without_network="]
+
+  - id: fixed_web_search.detail
+    example: fixed_web_search
+    command: ./examples/fixed_web_search/run_detail_fixture.sh
+    expect_exit: [0]
+    ports: [8215]
+    configs: [examples/fixed_web_search/settings_fixture_detail.yaml]
+    expectation_source: "AGENTS.md L210-L212: zero/one/multiple candidates, lineage, offline replay, live verify"
+    log_markers: ["live: 3 search requests, 3 detail requests", "replay: 6 calls without network"]
+
+  # ---- Chroma RAG (embedded; AGENTS.md L214-L222) ----------------------------
+  - id: chroma_rag
+    example: chroma_rag
+    command: ./examples/chroma_rag/run.sh
+    expect_exit: [0]
+    configs: [examples/chroma_rag/settings.yaml]
+    requires: &chroma_requires
+      python_modules: [chromadb]
+      home_ro: [.cache/chroma/onnx_models/all-MiniLM-L6-v2]
+      files:
+        - ~/.cache/chroma/onnx_models/all-MiniLM-L6-v2/onnx/model.onnx
+        - ~/.cache/chroma/onnx_models/all-MiniLM-L6-v2/onnx/config.json
+        - ~/.cache/chroma/onnx_models/all-MiniLM-L6-v2/onnx/tokenizer.json
+        - ~/.cache/chroma/onnx_models/all-MiniLM-L6-v2/onnx/tokenizer_config.json
+        - ~/.cache/chroma/onnx_models/all-MiniLM-L6-v2/onnx/special_tokens_map.json
+        - ~/.cache/chroma/onnx_models/all-MiniLM-L6-v2/onnx/vocab.txt
+    expectation_source: "AGENTS.md L220: 8 rows"
+    audit:
+      - {db: examples/chroma_rag/runs/audit.db, runs: 1, status: [completed], source_rows: 8}
+
+  - id: chroma_rag_indexed
+    example: chroma_rag_indexed
+    command: elspeth run --settings examples/chroma_rag_indexed/query_pipeline.yaml --execute
+    expect_exit: [0]
+    configs: [examples/chroma_rag_indexed/index_pipeline.yaml, examples/chroma_rag_indexed/query_pipeline.yaml]
+    requires: *chroma_requires
+    expectation_source: "AGENTS.md L221: 10 index + 5 query rows (index runs as the declared dependency)"
+    audit:
+      - {label: index, db: examples/chroma_rag_indexed/runs/audit.db, runs: 2, run_index: 0, status: [completed], source_rows: 10}
+      - {label: query, db: examples/chroma_rag_indexed/runs/audit.db, runs: 2, run_index: 1, status: [completed], source_rows: 5}

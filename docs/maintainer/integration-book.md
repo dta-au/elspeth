@@ -35,9 +35,9 @@ Update that ref when the integration branch changes.
    disagreements (see below).
 3. [CONTRIBUTING.md § Whole-tree gates](../../CONTRIBUTING.md#whole-tree-gates-and-conventions-you-will-hit),
    before you write code.
-4. The headers of the three canonical scripts:
+4. The headers of the four canonical scripts:
    `scripts/worktree-cleanup.sh`, `scripts/branch-safety-check.sh`,
-   `scripts/full-suite-gate.sh`.
+   `scripts/full-suite-gate.sh`, `scripts/examples-gate.sh`.
 5. When you fan out lanes: the `lane-manager` skill
    (`.claude/skills/lane-manager/`) for verifying and merging lanes, and the
    `orchestrator` skill (`.claude/skills/orchestrator/`) for surviving quota

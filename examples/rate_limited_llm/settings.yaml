@@ -9,7 +9,7 @@
 # Uses ChaosLLM so no real API key is needed.
 #
 # Prerequisites: Start ChaosLLM server first:
-#   chaosllm serve --port 8199 --preset=realistic
+#   chaosllm serve --port 8199 --preset=realistic --workers=1 --no-burst
 
 sources:
   primary:
