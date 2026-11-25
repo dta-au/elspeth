@@ -8,10 +8,15 @@ The full history is in the repository's releases and commit history.
 
 ---
 
-## Unreleased (0.8.18 integration branch)
+## 0.8.18 - 2026-11-26
 
-Work in progress on the 0.8.18 integration branch. This section grows as
-changes land and is not a release.
+Canonical form v2 for new runs, worker coordination and recovery fixes in the
+engine and the web server, a credential check on prompt files and each model
+message, and Web Composer request-size and validation fixes. The session
+epoch stays at 79 and the Landscape epoch at 51, so 0.8.17 session and
+Landscape stores open unchanged. Runs started under 0.8.17 cannot be
+continued after the upgrade; see the upgrade notes. The dated entry does not
+establish qualification, a published tag or an image.
 
 ### Upgrade notes
 
@@ -254,6 +259,13 @@ changes land and is not a release.
 - The `rate_limited_llm` example's ChaosLLM command passes `--no-burst`.
 - `scripts/examples-gate.sh` runs every offline example in a sandbox without
   network access (it needs bubblewrap) and checks each documented result.
+
+### Publication and acceptance
+
+Automatic image publication from main remains held. The 0.8.18 tag and
+container publication follow successful required checks and the protected
+merge. Operator signing, live-provider acceptance and deployment remain
+separate steps.
 
 ---
 
