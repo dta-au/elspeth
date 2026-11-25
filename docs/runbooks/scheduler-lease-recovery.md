@@ -691,8 +691,8 @@ read its exit code and the ledger:
   abandoned in-flight work without emitting (the lease-lost discipline). Its
   identity is spent; re-admit a fresh one if you want the capacity back.
 
-(For completeness: `FollowerSeatDeadError` is **exit 2** — leader seat died
-mid-drain, run incomplete, resume required; SIGINT is **exit 3**; a Tier-1
+(For completeness: `FollowerSeatDeadError` is **exit 2** — no live leader
+seat while the run is still running, resume required; SIGINT is **exit 3**; a Tier-1
 audit-integrity / framework error is **exit 4**.)
 
 ### Attach a follower (`elspeth join`)

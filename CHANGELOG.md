@@ -25,7 +25,7 @@ changes land and is not a release.
 - **Changed:** when `elspeth join` departs cleanly it names the run status it
   read: `run ended with status failed`, for example, where it always said
   `run completed`. The JSON `departed` event gains a `run_status` field; its
-  existing fields are unchanged.
+  existing field names are kept, and its `message` text changes as described.
   Exit 0 still means only that the follower departed cleanly, for any terminal
   status, so a script that needs the run's outcome should read `run_status`.
 - **Changed (design change):** a pipeline that previously passed composer

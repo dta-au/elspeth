@@ -37,9 +37,11 @@ drain until one of four stop conditions:
 
 ``seat_dead``
     The heartbeat's coordination snapshot shows no live leader (or the thread
-    latched ``coordination_lost_event``).  The follower finishes or abandons
-    the current claim, takes no new claims after the grace period, then exits
-    with a message naming ``elspeth resume``.
+    latched ``coordination_lost_event``).  The follower rereads the run: a
+    terminal run is a clean departure, as for ``run_terminal``.  A run that is
+    still RUNNING means the leader is gone mid-run; the follower finishes or
+    abandons the current claim, takes no new claims, then exits with a message
+    naming ``elspeth resume``.
 
 ``SIGINT``
     Standard :exc:`KeyboardInterrupt` propagated from ``claim_ready``.
@@ -153,7 +155,7 @@ class FollowerWorkSource(Protocol):
 
 
 class _SeatDeadError(Exception):
-    """Internal signal: leader seat expired; follower should exit after grace."""
+    """Internal signal: no live leader seat; the follower rereads the run before choosing its exit."""
 
     def __init__(self, worker_id: str, run_id: str) -> None:
         super().__init__(f"Follower {worker_id!r} detected no live leader for run {run_id!r}; run can be taken over via `elspeth resume`")

@@ -4428,8 +4428,10 @@ def join(
     pipeline config-hash compatibility.  Settings are REQUIRED — a missing or
     divergent settings file results in an admission refusal.
 
-    On clean departure (run completed) exits 0.  On refusal exits 1 with an
-    actionable message.  On SIGINT or leader-seat loss exits 3.
+    Exits 0 on a clean departure after the run reaches any terminal status,
+    including failed or interrupted; the departure message names the status.
+    On refusal exits 1 with an actionable message.  With no live leader while
+    the run is still running exits 2.  On SIGINT or eviction exits 3.
 
     Examples:
 
