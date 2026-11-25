@@ -38,7 +38,7 @@ import sys
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, cast
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 import yaml
 
@@ -94,6 +94,8 @@ def _list_of(node: Any, expected: type, label: str) -> None:
 
 GENERATED_INPUT_SUFFIXES = frozenset({".csv", ".jsonl", ".json"})
 _ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*", re.S)
+# Shell syntax beyond one simple command: a command holding any of these is not resolved word by word.
+SHELL_METACHARACTERS = re.compile(r"[;&|$<>()`\n\r]")
 _PATH_VARIABLE_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
 
 
@@ -145,6 +147,8 @@ def _validate_generated_inputs(case: dict[str, Any], label: str) -> None:
     for raw in block["paths"]:
         if Path(raw).suffix not in GENERATED_INPUT_SUFFIXES:
             raise DataError(f"{label}.generated_inputs: {raw!r} is not one of {sorted(GENERATED_INPUT_SUFFIXES)}")
+    if SHELL_METACHARACTERS.search(case["command"]):
+        raise DataError(f"{label}.command: a case with generated inputs runs one launcher, with no shell syntax")
     words = [word for word in _command_words(case["command"], label) if not _ASSIGNMENT_RE.fullmatch(word)]
     if not words or os.path.normpath(words[0]) != block["generator"]:
         raise DataError(f"{label}.generated_inputs.generator: {block['generator']!r} is not the case's own launcher")
@@ -201,11 +205,14 @@ _GIT_ENV = {"GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1", "PATH"
 
 
 def generated_input_refusals(tree: Path, case: dict[str, Any], scratch: Path) -> list[str]:
-    """Before the run: the generator is in the export, and each declared input is gitignored and absent."""
+    """Before the run: the generator is in the export, and each declared input is gitignored and absent.
+
+    The export is the tracked content (git archive), so a file present in it before the run is tracked.
+    """
     block = case["generated_inputs"]
     refusals = []
     generator = block["generator"]
-    if not (tree / generator).is_file() or gitignored(tree, generator, scratch):
+    if not (tree / generator).is_file():
         refusals.append(f"generated inputs: generator {generator} is not a tracked file of the export")
     for raw in block["paths"]:
         if os.path.lexists(tree / raw):
@@ -236,6 +243,37 @@ def _input_values(path: Path) -> list[str]:
     return list(_strings(json.loads(text)))
 
 
+def _generated_value_problems(value: str, root: Path, real_root: str) -> list[str]:
+    """Why one value of a generated input names something off the case copy, if it does.
+
+    Every value is resolved as a path from the copy (a relative one too, through any link the
+    launcher made); a file: URI by its path. A URL host must be loopback, and a control character
+    straight after a URL's authority (which URL parsers drop) fails it.
+    """
+    problems = []
+    for match in URL_RE.finditer(value):
+        host = _url_host(match.group(0))
+        if host not in LOOPBACK_HOSTS:
+            problems.append(f"remote URL host {host}")
+        following = value[match.end() : match.end() + 1]
+        if following and (ord(following) < 0x20 or following == "\x7f"):
+            problems.append(f"control character after URL {match.group(0)!r}")
+    target = value
+    if value[:5].lower() == "file:":
+        try:
+            parts = urlsplit(value)
+        except ValueError:
+            return [*problems, f"unparseable file URI {value!r}"]
+        if parts.netloc not in ("", "localhost"):
+            problems.append(f"file URI host {parts.netloc!r}")
+        target = unquote(parts.path)
+    if "\x00" in target:
+        return [*problems, "NUL in a value"]
+    if target and not _within(os.path.realpath(os.path.join(root, target)), real_root):
+        problems.append(f"path {target!r} outside the case copy")
+    return problems
+
+
 def generated_input_failures(root: Path, case: dict[str, Any]) -> tuple[list[str], list[str]]:
     """After the run: each declared input exists inside the copy and names nothing off the copy.
 
@@ -258,18 +296,7 @@ def generated_input_failures(root: Path, case: dict[str, Any]) -> tuple[list[str
         except (OSError, UnicodeDecodeError, ValueError, csv.Error) as error:
             failures.append(f"generated input {raw}: unreadable ({type(error).__name__})")
             continue
-        bad = []
-        for value in values:
-            for match in URL_RE.finditer(value):
-                host = _url_host(match.group(0))
-                if host not in LOOPBACK_HOSTS:
-                    bad.append(f"remote URL host {host}")
-            target = value[len("file://") :] if value.startswith("file://") else value
-            if "\n" in target or not target:
-                continue
-            names_a_path = os.path.isabs(target) or os.path.normpath(target).split(os.sep)[0] == ".."
-            if names_a_path and not _within(os.path.realpath(root / target), real_root):
-                bad.append(f"path {target} outside the case copy")
+        bad = [problem for value in values for problem in _generated_value_problems(value, root, real_root)]
         if bad:
             failures.append(f"generated input {raw}: {'; '.join(dict.fromkeys(bad))}")
         else:
@@ -368,7 +395,7 @@ def load_cases(path: Path) -> dict[str, Any]:
                 server_words = shlex.split(server_command)
             except ValueError as error:
                 raise DataError(f"{label}.server: invalid command: {error}") from error
-            if re.search(r"[;&|$<>()`\n\r]", server_command) or server_words[:2] not in (["chaosllm", "serve"], ["chaosweb", "serve"]):
+            if SHELL_METACHARACTERS.search(server_command) or server_words[:2] not in (["chaosllm", "serve"], ["chaosweb", "serve"]):
                 raise DataError(f"{label}.server: unsupported fixture server")
         if "requires" in case:
             requires = _mapping(case["requires"], {"python_modules", "files", "home_ro"}, f"{label}.requires")
@@ -704,7 +731,12 @@ def _source_paths(doc: dict[str, Any]) -> list[str]:
 
 
 def network_findings(
-    tree: Path, config: Path, *, environment: dict[str, str] | None = None, deferred: frozenset[str] = frozenset()
+    tree: Path,
+    config: Path,
+    *,
+    environment: dict[str, str] | None = None,
+    deferred: frozenset[str] = frozenset(),
+    compound_command: bool = False,
 ) -> list[str]:
     """Reasons a config would reach beyond loopback. Empty list = offline by construction.
 
@@ -748,6 +780,9 @@ def network_findings(
         if key == "vault_url":
             add("vault_url", "secret store URL")
     for raw in _source_paths(doc):
+        if compound_command and "${" in raw:
+            add(raw, "path variable in a case command with shell syntax: not resolved")
+            continue
         raw = resolve_source_path(raw, environment or {})
         if raw in deferred:
             # Inspected after the run instead (generated_input_findings). Deferring the text guard is
@@ -1011,8 +1046,9 @@ def cmd_preflight(args: argparse.Namespace) -> int:
             if not gen_refusals:
                 deferred = frozenset(generated_inputs_of(case))
     environment = case_environment(case)
+    compound = bool(SHELL_METACHARACTERS.search(case["command"]))
     for cfg in case["configs"]:
-        for finding in network_findings(tree, tree / cfg, environment=environment, deferred=deferred):
+        for finding in network_findings(tree, tree / cfg, environment=environment, deferred=deferred, compound_command=compound):
             refusals.append(f"offline guard: {finding}")
     requires = case.get("requires") or {}
     for module in requires.get("python_modules", []):

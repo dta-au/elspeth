@@ -1667,6 +1667,11 @@ def _inspect(tmp_path: Path, name: str, content: str | None) -> tuple[list[str],
         ("generated.csv", "id,path\n1,file://{outside}\n", "outside the case copy"),
         ("generated.csv", "id,path\n1,../../../outside.txt\n", "outside the case copy"),
         ("generated.jsonl", "{not json\n", "unreadable"),
+        ("generated.json", '{"v": "file://localhost/etc/passwd"}', "outside the case copy"),
+        ("generated.json", '{"v": "file:/etc/passwd"}', "outside the case copy"),
+        ("generated.json", '{"v": "file://elsewhere.example/x"}', "file URI host 'elsewhere.example'"),
+        ("generated.json", '{"v": "/outside/name\\nsuffix"}', "outside the case copy"),
+        ("generated.json", '{"v": "http://127.0.0.1\\t@outside.example/x"}', "control character after URL"),
         ("generated.csv", None, "not a file inside the case copy"),
     ],
 )
@@ -1731,5 +1736,56 @@ def test_gate_runs_a_generated_input_case_and_inspects_it_after(tmp_path: Path, 
     summary = (log_dir / "summary.txt").read_text()
     # The gate handed preflight this run's self-test proof (else NOTRUN), and check read the written input.
     assert f"{verdict} demo" in summary, (summary, result.stderr)
+    expected = "0" if verdict == "PASS" else "1"
+    assert result.returncode == int(expected), (result.stdout, result.stderr)
+    assert (log_dir / "overall.exit").read_text().strip() == expected
     if verdict == "FAIL":
         assert "remote URL host example.com" in summary, summary
+
+
+def test_generated_input_relative_path_through_a_link_out_of_the_copy_fails(tmp_path: Path) -> None:
+    # The launcher may make a link inside the copy after preflight; a relative value through it is resolved.
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("host file")
+    root = tmp_path / "root"
+    (root / "examples/demo").mkdir(parents=True)
+    (root / "examples/demo/link").symlink_to(outside)
+    failures, _ = _inspect(tmp_path, "generated.csv", "id,path\n1,examples/demo/link/secret.txt\n")
+    assert any("outside the case copy" in failure for failure in failures), failures
+    (root / "examples/demo/link").unlink()
+    (root / "examples/demo/link").mkdir()
+    failures, _ = _inspect(tmp_path, "generated.csv", "id,path\n1,examples/demo/link/secret.txt\n")
+    assert failures == []
+
+
+def test_generated_input_case_command_is_one_launcher(tmp_path: Path) -> None:
+    tree, cases = _generated_fixture(
+        tmp_path,
+        command="DEMO_INPUT=examples/demo/generated.csv ./examples/demo/run.sh && DEMO_INPUT=examples/demo/other.csv ./examples/demo/run.sh",
+    )
+    assert _validate(tree, cases) == 2
+
+
+def test_path_variable_in_a_compound_command_is_not_resolved(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    tree, cases = _fixture(tmp_path)
+    (tree / "examples/demo/settings.yaml").write_text(
+        "source: {plugin: csv, options: {path: '${DEMO_INPUT:-examples/demo/input.csv}'}}\nsinks: []\n"
+    )
+    data = yaml.safe_load(cases.read_text())
+    for command, refused in [
+        ("./examples/demo/run.sh", False),
+        ("./examples/demo/run.sh && DEMO_INPUT=elsewhere.csv ./examples/demo/run.sh", True),
+    ]:
+        data["cases"][0]["command"] = command
+        cases.write_text(yaml.safe_dump(data))
+        code = examples_gate.main(["preflight", "--cases", str(cases), "--tree", str(tree), "--case", "demo"])
+        out = capsys.readouterr().out
+        assert code == (1 if refused else 0), out
+        assert ("path variable in a case command with shell syntax" in out) is refused, out
+
+
+def test_a_tracked_generator_matching_an_ignore_rule_is_accepted(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    tree, cases = _generated_fixture(tmp_path)
+    (tree / "examples/demo/.gitignore").write_text("generated.csv\n*.sh\n")
+    assert _preflight(tmp_path, tree, cases) == 0, capsys.readouterr().out
