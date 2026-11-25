@@ -376,7 +376,14 @@ def test_real_owned_completion_and_status(tmp_path, mode):
 
 @pytest.mark.parametrize(
     "mode",
-    ["wrong-nonce", "wrong-pid", "partial-hello", "no-handshake", pytest.param("peer-flood", marks=pytest.mark.timing_sensitive)],
+    [
+        "wrong-nonce",
+        "wrong-pid",
+        "partial-hello",
+        "no-handshake",
+        pytest.param("peer-flood", marks=pytest.mark.timing_sensitive),
+        pytest.param("peer-flood-stalled", marks=pytest.mark.timing_sensitive),
+    ],
 )
 def test_authentication_and_partial_startup_fail_closed(tmp_path, mode):
     process = launch(tmp_path, mode)
@@ -385,6 +392,13 @@ def test_authentication_and_partial_startup_fail_closed(tmp_path, mode):
     assert receipt["returncode"] == -signal.SIGKILL
     assert receipt["failed"] and receipt["reaped"] and not receipt["completed"]
     assert not (tmp_path / "authenticated").exists()
+    if mode in ("peer-flood", "peer-flood-stalled"):
+        # The child saw the owner close accept attempt PEER_LIMIT + 1 while the first PEER_LIMIT
+        # stayed open. Stalled, the owner is set to resume a second before its startup deadline.
+        # The probe holds the owner's clock short of that deadline until the witness exists,
+        # because each loop checks the deadline before it selects: an accept still queued at the
+        # deadline would never run, and a slow host would kill the child before its checks.
+        assert (tmp_path / "peer-limit-refused").exists()
 
 
 @pytest.mark.parametrize(
