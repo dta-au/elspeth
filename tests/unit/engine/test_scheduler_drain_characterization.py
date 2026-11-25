@@ -1132,7 +1132,8 @@ def test_tier_1_processing_error_leaves_the_drain_as_itself_after_a_coordination
     post-error claim heartbeat or a check inside processing finds it. The
     error keeps its own cause, context and suppression flag, the coordination
     signal is noted on it, no mark_* disposition is written for the claim, the
-    claim's durable image is unchanged, and a staged group loss is cleared.
+    claim row and its scheduler events are unchanged, and a staged group loss
+    is cleared.
     """
     processor, spy, setup, clock = _build(lease_owner=LEADER_OWNER)
     work_item_id, token = _enqueue_ready(setup, spy, clock, sequence=0)
@@ -1211,10 +1212,18 @@ def test_lease_loss_after_an_ordinary_processing_error_abandons_the_claim() -> N
 def test_failure_bookkeeping_refused_by_the_membership_fence(kind: str, processing_error_kind: str, link: str) -> None:
     """A membership refusal of the failure bookkeeping supersedes an ordinary processing error, never a Tier-1 one.
 
-    Either way the claim's durable image is unchanged.
+    Either way the claim row and its scheduler events are unchanged, and a
+    group loss staged for the claim's own lineage is taken into the refused
+    bookkeeping call and no longer staged.
     """
     processor, spy, setup, clock = _build(lease_owner=LEADER_OWNER)
-    work_item_id, _token = _enqueue_ready(setup, spy, clock, sequence=0)
+    work_item_id, token = _enqueue_ready(
+        setup,
+        spy,
+        clock,
+        sequence=0,
+        lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-merge", member_key="left"),),
+    )
     lower_level_error = OSError("connection reset")
     processing_error: Exception = (
         AuditIntegrityError("claimed token's ledger row disagrees with the work item")
@@ -1224,11 +1233,15 @@ def test_failure_bookkeeping_refused_by_the_membership_fence(kind: str, processi
     refusal = _coordination_signal(kind, work_item_id=work_item_id, run_id=setup.run_id)
     claim_images: list[tuple[dict[str, Any], tuple[dict[str, Any], ...], tuple[dict[str, Any], ...]]] = []
 
+    delivered_losses: list[tuple[GroupLossSpec, ...]] = []
+
     def fail_processing(**_kwargs: Any) -> tuple[RowResult, list[Any]]:
+        _stage_group_loss(processor, token)
         claim_images.append(_durable_claim_image(setup, work_item_id))
         _raise_linked(processing_error, lower_level_error, link)
 
-    def refuse_failure_bookkeeping(**_kwargs: Any) -> None:
+    def refuse_failure_bookkeeping(**kwargs: Any) -> None:
+        delivered_losses.append(tuple(kwargs["group_losses"]))
         raise refusal
 
     spy.calls.clear()
@@ -1253,6 +1266,9 @@ def test_failure_bookkeeping_refused_by_the_membership_fence(kind: str, processi
         assert refusal.__context__ is processing_error
     assert len(claim_images) == 1
     assert _durable_claim_image(setup, work_item_id)[:2] == claim_images[0][:2]
+    assert len(delivered_losses) == 1
+    assert [(loss.group_id, loss.member_key, loss.token_id) for loss in delivered_losses[0]] == [("fg-merge", "left", token.token_id)]
+    assert processor._pending_group_losses == []
 
 
 @pytest.mark.parametrize("surviving_peer", [False, True], ids=["leader-only", "with-follower-peer"])
