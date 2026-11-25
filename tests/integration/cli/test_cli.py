@@ -784,9 +784,8 @@ class TestJoinCommand:
         )
 
         assert result.exit_code == 1
-        combined = result.output
-        # The refusal message should mention hash or mismatch.
-        assert "hash" in combined.lower() or "mismatch" in combined.lower() or "config" in combined.lower()
+        # examples/join_refused/run.sh asserts this exact reason text, so it is pinned exactly here.
+        assert "does not match the run's config_hash" in result.output
 
     def test_join_refused_no_live_leader(self, tmp_path: Path) -> None:
         """join exits 1 and names elspeth resume when the leader seat is dead."""

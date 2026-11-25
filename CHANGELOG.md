@@ -24,7 +24,8 @@ changes land and is not a release.
   script that read exit 4 from `elspeth join` as an eviction should check for 3.
 - **Changed:** when `elspeth join` departs cleanly it names the run status it
   read: `run ended with status failed`, for example, where it always said
-  `run completed`. The JSON `departed` event also carries a `run_status` field.
+  `run completed`. The JSON `departed` event gains a `run_status` field; its
+  existing fields are unchanged.
   Exit 0 still means only that the follower departed cleanly, for any terminal
   status, so a script that needs the run's outcome should read `run_status`.
 - **Changed (design change):** a pipeline that previously passed composer
