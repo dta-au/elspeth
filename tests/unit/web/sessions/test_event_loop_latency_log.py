@@ -29,7 +29,7 @@ from tests.unit.web.sessions.test_composer_settled_log_pointer import _Recording
 
 
 class _LateStallingComposer(_LoopStallingComposer):
-    """Stalls after a renewal finishes, so no renewal is in flight."""
+    """Stalls after a renewal finishes, so normally no renewal is in flight."""
 
     def __init__(self, renewal_finished: asyncio.Event) -> None:
         super().__init__()
@@ -37,10 +37,11 @@ class _LateStallingComposer(_LoopStallingComposer):
 
     async def compose(self, *args, **kwargs):
         await self.renewal_finished.wait()
-        # Let the parent renewal loop observe the finished attempt and arm its next tick. This is
-        # ordered by timer deadline, not by elapsed time: the loop joins its attempt with a 0.01 s
-        # poll armed before the attempt finished, asyncio fires due timers in deadline order even
-        # on a starved loop, and the loop re-arms its tick without awaiting anything else first.
+        # Let the parent renewal loop observe the finished attempt and arm its next tick. The loop
+        # joins its attempt with a 0.01 s poll armed before the attempt finished, asyncio fires due
+        # timers in deadline order, and the loop re-arms its tick without awaiting anything else
+        # first, so the tick is armed before this 50 ms sleep ends. That tick (1 s) fires first only
+        # if the process is paused for about 0.95 s between the loop re-arming and this task running.
         await asyncio.sleep(0.05)
         return await super().compose(*args, **kwargs)
 
@@ -95,8 +96,8 @@ async def test_a_renewal_in_flight_across_a_blocked_loop_logs_one_slow_attempt_t
     """The other ordering: the block lands while a renewal is already running.
 
     Its SQL finishes in its thread during the block, so the attempt renews on
-    time but is only observed afterwards: it is logged as slow, with an on-time
-    start and the block inside its duration, and not as a late, failed start.
+    time but is only observed afterwards: it is logged as slow and renewed, with
+    the block inside its duration, and not as a late, failed start.
     """
     renewals = _RecordingLog()
     monkeypatch.setattr(lifecycle, "slog", renewals)
@@ -114,8 +115,8 @@ async def test_a_renewal_in_flight_across_a_blocked_loop_logs_one_slow_attempt_t
         if calls == 2:
             began_before_the_block.append(not stall_started.is_set())
             loop.call_soon_threadsafe(renewal_in_flight.set)
-            # This hold only makes the SQL itself run during the block, as in the CI failure;
-            # the asserted shape comes from the composer's wait above (it holds without this hold too).
+            # This hold keeps the SQL from finishing before the composer blocks the loop; without it,
+            # a starved loop could observe the finished SQL first and log a late start instead.
             assert stall_started.wait(10), "the composer never blocked the loop"
         return real_renew(self, context, lease_seconds=lease_seconds)
 
@@ -125,7 +126,8 @@ async def test_a_renewal_in_flight_across_a_blocked_loop_logs_one_slow_attempt_t
     )
     slow = [fields for level, fields in renewals.named("session_operation.renewal_slow") if fields["session_id"] == str(record.session_id)]
     in_flight = [fields for fields in slow if fields["outcome"] == "renewed"]
-    # The renewal's SQL began before the composer blocked the loop (by the events' order, not by a clock).
+    # The second renewal entered the repository before the composer blocked the loop; its SQL runs
+    # only once the block has begun (the hold above).
     assert began_before_the_block == [True]
     assert len(in_flight) == 1, slow
     assert _STALL_SECONDS == 4.5

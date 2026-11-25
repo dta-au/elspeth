@@ -78,7 +78,7 @@ def _lease_registry_notes(registry: Any) -> list[str]:
 
 
 @asynccontextmanager
-async def _preserve_setup_failure(failures: list[BaseException]) -> AsyncIterator[None]:
+async def _preserve_first_failure(failures: list[BaseException]) -> AsyncIterator[None]:
     try:
         yield
     except BaseException as closing:
@@ -203,11 +203,17 @@ class _HeldRun:
         """Make the next heartbeat fail, as it does when the store that stalled the write stalls it too.
 
         The heartbeat renews through the lease-upkeep authority, so that is the
-        one stopped; ``renewals_refused`` counts the heartbeats it refused.
+        one stopped; ``renewals_refused`` counts the refusals of this run's own
+        lease, whatever else renews through the same authority.
         """
+        registry = self.app.state.execution_service.execution_lease_release_registry
+        (obligation,) = tuple(registry._pending.values())
+        run_context = obligation.context
+        assert run_context is not None
 
-        def renewal_stalled(*_args: Any, **_kwargs: Any) -> Any:
-            self.renewals_refused += 1
+        def renewal_stalled(context: Any, *_args: Any, **_kwargs: Any) -> Any:
+            if context == run_context:
+                self.renewals_refused += 1
             raise RuntimeError("the test stopped lease renewal")
 
         upkeep = lease_upkeep_authority(self.app.state.session_service.session_operation_authority)
@@ -336,8 +342,8 @@ async def _run_with_a_held_write(
     app.state.auth_provider.create_user("testuser", "testpass123", display_name="Test User")
     wire_test_pipeline_user_authority(app, identity_id="testuser", engine=app.state.session_engine)
 
-    setup_failures: list[BaseException] = []
-    async with _preserve_setup_failure(setup_failures), AsyncExitStack() as app_lifetime:
+    scenario_failures: list[BaseException] = []
+    async with _preserve_first_failure(scenario_failures), AsyncExitStack() as app_lifetime:
         await app_lifetime.enter_async_context(LifespanManager(app))
         client = await app_lifetime.enter_async_context(AsyncClient(transport=ASGITransport(app=app), base_url="http://test"))
         login = await client.post("/api/auth/login", json={"username": "testuser", "password": "testpass123"})
@@ -462,7 +468,6 @@ async def _run_with_a_held_write(
             real_begin(reason, signal_target=signal_target)
 
         monkeypatch.setattr(app.state.process_recovery, "_begin", begin)
-        lease_registry = app.state.execution_service.execution_lease_release_registry
         real_record_failure = lease_registry.record_failure
 
         def record_failure(original: BaseException) -> None:
@@ -482,7 +487,7 @@ async def _run_with_a_held_write(
             note = f"held-write setup failed with {type(raised).__name__}: {raised}"
             _SCENARIO_NOTES.append(note)
             raised.add_note("\n".join([note, *_lease_registry_notes(lease_registry)]))
-            setup_failures.append(raised)
+            scenario_failures.append(raised)
             run.drop_the_unreleased_lease_obligation()
             run.release.set()
             raise
@@ -494,6 +499,7 @@ async def _run_with_a_held_write(
             )
             _SCENARIO_NOTES.append(f"the test body had already ended with {type(raised).__name__}: {raised} at {where}")
             raised.add_note("\n".join(_lease_registry_notes(lease_registry)))
+            scenario_failures.append(raised)
             run.drop_the_unreleased_lease_obligation()
             raise
         else:
