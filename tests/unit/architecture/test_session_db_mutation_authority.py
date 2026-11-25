@@ -6046,7 +6046,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="cdb73b156f37ffa7",
         ordinal=1,
         authority=None,
-        line=655,
+        line=1267,
         connection_escape=False,
     ),
 )
