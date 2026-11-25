@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import logging
 import threading
 from collections.abc import Callable
 from concurrent.futures import Future
@@ -194,6 +195,83 @@ def test_audit_errors_propagate_and_capacity_recovers() -> None:
             await asyncio.wait_for(async_workers.shutdown_async_workers(), timeout=5)
 
     asyncio.run(scenario())
+
+
+def test_abandoned_audit_failure_is_logged_once_with_original(caplog: pytest.LogCaptureFixture) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    original = RuntimeError("audit persistence failed")
+
+    def failed_audit() -> None:
+        started.set()
+        assert release.wait(5)
+        raise original
+
+    async def scenario() -> None:
+        task = asyncio.create_task(async_workers.run_auth_audit_in_worker(failed_audit))
+        try:
+            await _wait_until(started.is_set)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            release.set()
+            await _wait_until(lambda: _audit_outstanding() == 0)
+            await asyncio.sleep(0)
+        finally:
+            release.set()
+            await asyncio.wait_for(async_workers.shutdown_async_workers(), timeout=5)
+
+    with caplog.at_level(logging.ERROR, logger=async_workers.__name__):
+        asyncio.run(scenario())
+    records = [record for record in caplog.records if record.message == "Abandoned auth audit failed"]
+    assert len(records) == 1
+    assert records[0].exc_info is not None
+    assert records[0].exc_info[1] is original
+
+
+def test_successful_abandoned_audit_emits_no_error(caplog: pytest.LogCaptureFixture) -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    def audit() -> None:
+        started.set()
+        assert release.wait(5)
+
+    async def scenario() -> None:
+        task = asyncio.create_task(async_workers.run_auth_audit_in_worker(audit))
+        try:
+            await _wait_until(started.is_set)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            release.set()
+            await _wait_until(lambda: _audit_outstanding() == 0)
+            await asyncio.sleep(0)
+        finally:
+            release.set()
+            await asyncio.wait_for(async_workers.shutdown_async_workers(), timeout=5)
+
+    with caplog.at_level(logging.ERROR, logger=async_workers.__name__):
+        asyncio.run(scenario())
+    assert not caplog.records
+
+
+def test_abandoned_ordinary_failure_emits_no_error(caplog: pytest.LogCaptureFixture) -> None:
+    concurrent_future: Future[None] = Future()
+    assert concurrent_future.set_running_or_notify_cancel()
+
+    async def scenario() -> None:
+        task = asyncio.create_task(async_workers._await_worker_future(concurrent_future, cancel_queued=True))
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        concurrent_future.set_exception(RuntimeError("ordinary work failed"))
+        await asyncio.sleep(0)
+
+    with caplog.at_level(logging.ERROR, logger=async_workers.__name__):
+        asyncio.run(scenario())
+    assert not caplog.records
 
 
 def test_completed_failure_is_observed_when_cancellation_wins_waiter_race() -> None:

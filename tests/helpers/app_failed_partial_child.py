@@ -148,8 +148,10 @@ async def run_partial_claimed_control(tmp_path: Path, monkeypatch: pytest.Monkey
         assert private_futures[0].done()
         os.write(1, b"ACTUAL_PARTIAL_PRIVATE_AND_GENERATION_JOINED\n")
         assert len(joins) == 1 and joins[0] is services[0]
+        done, _pending = await asyncio.wait({startup}, timeout=5)
+        assert done, "startup did not finish within 5 s"
         with pytest.raises(BaseException) as caught:
-            await asyncio.wait_for(startup, 5)
+            await startup
         leaves = _leaves(caught.value)
         assert any(leaf is constructor_original for leaf in leaves)
         assert any(leaf is callback_original for leaf in leaves)
