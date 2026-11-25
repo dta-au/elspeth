@@ -99,7 +99,6 @@ from typing import TYPE_CHECKING, Protocol
 
 from sqlalchemy.exc import OperationalError
 
-import elspeth.contracts.errors as contract_errors
 from elspeth.contracts.coordination import (
     DEFAULT_RUN_HEARTBEAT_SECONDS,
     DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
@@ -108,6 +107,7 @@ from elspeth.contracts.coordination import (
 from elspeth.contracts.enums import RunStatus
 from elspeth.contracts.errors import AuditIntegrityError, FollowerSeatDeadError, RunMembershipLostError, RunWorkerEvictedError
 from elspeth.contracts.plugin_context import PluginContext
+from elspeth.engine._tier_1_chain import tier_1_error_in_chain
 from elspeth.engine.orchestrator.heartbeat import RunHeartbeatThread
 
 if TYPE_CHECKING:
@@ -162,27 +162,6 @@ class _SeatDeadError(Exception):
         super().__init__(f"Follower {worker_id!r} detected no live leader for run {run_id!r}; run can be taken over via `elspeth resume`")
         self.worker_id = worker_id
         self.run_id = run_id
-
-
-def _tier_1_error_in_chain(error: BaseException) -> BaseException | None:
-    """Return a Tier-1 error from ``error``'s cause and context chain, or None.
-
-    When processing fails and the membership-fenced failure bookkeeping is then
-    refused, the drain re-raises the refusal with the processing error only as
-    its context, so a Tier-1 error can arrive inside a membership loss. Each
-    exception is walked once, so a chain that loops back on itself still ends.
-    """
-    seen: set[int] = set()
-    pending: list[BaseException] = [error]
-    while pending:
-        current = pending.pop()
-        if id(current) in seen:
-            continue
-        seen.add(id(current))
-        if isinstance(current, contract_errors.TIER_1_ERRORS):
-            return current
-        pending.extend(linked for linked in (current.__cause__, current.__context__) if linked is not None)
-    return None
 
 
 class FollowerProcessor:
@@ -427,7 +406,7 @@ class FollowerProcessor:
 
     def _tier_1_error_noting_membership_loss(self, membership_loss: BaseException) -> BaseException | None:
         """Return a Tier-1 error from the membership loss's chain, noted with the loss, or None."""
-        tier_1_error = _tier_1_error_in_chain(membership_loss)
+        tier_1_error = tier_1_error_in_chain(membership_loss)
         if tier_1_error is not None:
             tier_1_error.add_note(
                 f"follower {self._token.worker_id!r} lost its run membership while this error was propagating: "

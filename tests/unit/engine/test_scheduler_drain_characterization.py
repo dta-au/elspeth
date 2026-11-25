@@ -44,7 +44,7 @@ from __future__ import annotations
 import ast
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, NoReturn, cast
 from unittest.mock import patch
 
 import pytest
@@ -53,7 +53,14 @@ from sqlalchemy import delete, insert, select
 from elspeth.contracts import RowResult, TokenInfo
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.enums import FrameKind, TerminalOutcome, TerminalPath
-from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError, RunMembershipLostError, SchedulerLeaseLostError
+from elspeth.contracts.errors import (
+    AuditIntegrityError,
+    OrchestrationInvariantError,
+    RunLeadershipLostError,
+    RunMembershipLostError,
+    RunWorkerEvictedError,
+    SchedulerLeaseLostError,
+)
 from elspeth.contracts.events import EngineSpanCompleted, EngineSpanName, EngineSpanStatus
 from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.plugin_context import PluginContext
@@ -1065,6 +1072,203 @@ def test_handled_scheduler_lease_loss_marks_row_span_error() -> None:
     assert events[0].name is EngineSpanName.ROW
     assert events[0].status is EngineSpanStatus.ERROR
     assert events[0].exception_type == "SchedulerLeaseLostError"
+
+
+def _coordination_signal(kind: str, *, work_item_id: str, run_id: str) -> Exception:
+    if kind == "lease":
+        return SchedulerLeaseLostError(work_item_id=work_item_id, lease_owner=LEADER_OWNER, run_id=run_id)
+    if kind == "eviction":
+        return RunWorkerEvictedError(worker_id=LEADER_OWNER, run_id=run_id, reason="claim re-probe found the member departed")
+    if kind == "membership":
+        return RunMembershipLostError(run_id=run_id, worker_id=LEADER_OWNER, verb="heartbeat_lease")
+    return RunLeadershipLostError(run_id=run_id, worker_id=LEADER_OWNER, leader_epoch=1, verb="heartbeat_lease")
+
+
+def _raise(error: BaseException) -> NoReturn:
+    raise error
+
+
+def _raise_linked(error: Exception, lower_level_error: OSError, link: str) -> NoReturn:
+    """Raise ``error`` linked to ``lower_level_error`` as an explicit cause, an implicit context, or from None."""
+    if link == "cause":
+        raise error from lower_level_error
+    try:
+        _raise(lower_level_error)
+    except OSError:
+        if link == "from-none":
+            raise error from None
+        _raise(error)
+
+
+def _expected_links(lower_level_error: OSError, link: str) -> tuple[BaseException | None, BaseException | None, bool]:
+    """``(__cause__, __context__, __suppress_context__)`` as ``_raise_linked`` leaves them."""
+    if link == "cause":
+        return (lower_level_error, None, True)
+    if link == "from-none":
+        return (None, lower_level_error, True)
+    return (None, lower_level_error, False)
+
+
+def _stage_group_loss(processor: RowProcessor, token: TokenInfo) -> None:
+    processor._pending_group_losses.append(
+        GroupLossSpec(
+            closer_name="merge",
+            group_id="fg-merge",
+            member_key="left",
+            token_id=token.token_id,
+            reason="staged before the processing error",
+        )
+    )
+
+
+@pytest.mark.parametrize("link", ["cause", "context", "from-none"])
+@pytest.mark.parametrize("arrives", ["post-error-heartbeat", "inside-processing"])
+@pytest.mark.parametrize("kind", ["lease", "eviction", "membership", "leadership"])
+def test_tier_1_processing_error_leaves_the_drain_as_itself_after_a_coordination_signal(kind: str, arrives: str, link: str) -> None:
+    """A Tier-1 error raised while processing a claimed token leaves the drain as itself.
+
+    It does so when the claim's lease, the worker's membership or the run's
+    leadership is found lost while that error is propagating, whether the
+    post-error claim heartbeat or a check inside processing finds it. The
+    error keeps its own cause, context and suppression flag, the coordination
+    signal is noted on it, no mark_* disposition is written for the claim, the
+    claim row and its scheduler events are unchanged, and a staged group loss
+    is cleared.
+    """
+    processor, spy, setup, clock = _build(lease_owner=LEADER_OWNER)
+    work_item_id, token = _enqueue_ready(setup, spy, clock, sequence=0)
+    lower_level_error = OSError("connection reset")
+    tier_1_error = AuditIntegrityError("claimed token's ledger row disagrees with the work item")
+    signal = _coordination_signal(kind, work_item_id=work_item_id, run_id=setup.run_id)
+    claim_images: list[tuple[dict[str, Any], tuple[dict[str, Any], ...], tuple[dict[str, Any], ...]]] = []
+
+    def fail_with_tier_1(**_kwargs: Any) -> tuple[RowResult, list[Any]]:
+        _stage_group_loss(processor, token)
+        claim_images.append(_durable_claim_image(setup, work_item_id))
+        try:
+            _raise_linked(tier_1_error, lower_level_error, link)
+        except AuditIntegrityError:
+            if arrives == "inside-processing":
+                _raise(signal)
+            raise
+
+    def post_error_heartbeat() -> None:
+        if arrives == "post-error-heartbeat":
+            _raise(signal)
+
+    spy.calls.clear()
+    with (
+        patch.object(processor, "_process_single_token", new=fail_with_tier_1),
+        patch.object(processor._scheduler_drain, "heartbeat_active_claim", new=post_error_heartbeat),
+        pytest.raises(AuditIntegrityError) as exc_info,
+    ):
+        processor._drain_scheduler_claims(ctx=_ctx(setup), pending_items={}, recover_pending_sinks=False)
+
+    assert exc_info.value is tier_1_error
+    links = (tier_1_error.__cause__, tier_1_error.__context__, tier_1_error.__suppress_context__)
+    expected = _expected_links(lower_level_error, link)
+    assert links[0] is expected[0]
+    assert links[1] is expected[1]
+    assert links[2] is expected[2]
+    signal_notes = [note for note in tier_1_error.__notes__ if f": {type(signal).__name__}: " in note]
+    assert len(signal_notes) == 1
+    verbs = spy.verbs()
+    assert "mark_failed" not in verbs
+    assert "mark_terminal" not in verbs
+    assert "mark_pending_sink" not in verbs
+    assert len(claim_images) == 1
+    assert _durable_claim_image(setup, work_item_id)[:2] == claim_images[0][:2]
+    assert processor._pending_group_losses == []
+
+
+def test_lease_loss_after_an_ordinary_processing_error_abandons_the_claim() -> None:
+    """An ordinary processing error followed by lease loss abandons the claim and returns."""
+    processor, spy, setup, clock = _build(lease_owner=LEADER_OWNER)
+    work_item_id, _token = _enqueue_ready(setup, spy, clock, sequence=0)
+
+    def fail_with_plugin_error(**_kwargs: Any) -> tuple[RowResult, list[Any]]:
+        raise ValueError("plugin failure")
+
+    def lose_lease() -> None:
+        raise SchedulerLeaseLostError(work_item_id=work_item_id, lease_owner=LEADER_OWNER, run_id=setup.run_id)
+
+    spy.calls.clear()
+    with (
+        patch.object(processor, "_process_single_token", new=fail_with_plugin_error),
+        patch.object(processor._scheduler_drain, "heartbeat_active_claim", new=lose_lease),
+    ):
+        results = processor._drain_scheduler_claims(ctx=_ctx(setup), pending_items={}, recover_pending_sinks=False)
+
+    assert results == []
+    verbs = spy.verbs()
+    assert "mark_failed" not in verbs
+    assert "mark_terminal" not in verbs
+    assert "mark_pending_sink" not in verbs
+
+
+@pytest.mark.parametrize("link", ["cause", "context", "from-none"])
+@pytest.mark.parametrize("processing_error_kind", ["tier-1", "ordinary"])
+@pytest.mark.parametrize("kind", ["eviction", "membership"])
+def test_failure_bookkeeping_refused_by_the_membership_fence(kind: str, processing_error_kind: str, link: str) -> None:
+    """A membership refusal of the failure bookkeeping supersedes an ordinary processing error, never a Tier-1 one.
+
+    Either way the claim row and its scheduler events are unchanged, and a
+    group loss staged for the claim's own lineage is taken into the refused
+    bookkeeping call and no longer staged.
+    """
+    processor, spy, setup, clock = _build(lease_owner=LEADER_OWNER)
+    work_item_id, token = _enqueue_ready(
+        setup,
+        spy,
+        clock,
+        sequence=0,
+        lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-merge", member_key="left"),),
+    )
+    lower_level_error = OSError("connection reset")
+    processing_error: Exception = (
+        AuditIntegrityError("claimed token's ledger row disagrees with the work item")
+        if processing_error_kind == "tier-1"
+        else ValueError("plugin failure")
+    )
+    refusal = _coordination_signal(kind, work_item_id=work_item_id, run_id=setup.run_id)
+    claim_images: list[tuple[dict[str, Any], tuple[dict[str, Any], ...], tuple[dict[str, Any], ...]]] = []
+
+    delivered_losses: list[tuple[GroupLossSpec, ...]] = []
+
+    def fail_processing(**_kwargs: Any) -> tuple[RowResult, list[Any]]:
+        _stage_group_loss(processor, token)
+        claim_images.append(_durable_claim_image(setup, work_item_id))
+        _raise_linked(processing_error, lower_level_error, link)
+
+    def refuse_failure_bookkeeping(**kwargs: Any) -> None:
+        delivered_losses.append(tuple(kwargs["group_losses"]))
+        raise refusal
+
+    spy.calls.clear()
+    with (
+        patch.object(processor, "_process_single_token", new=fail_processing),
+        patch.object(processor._scheduler_drain, "heartbeat_active_claim", new=lambda: None),
+        patch.object(spy, "mark_failed", new=refuse_failure_bookkeeping),
+        pytest.raises(type(processing_error) if processing_error_kind == "tier-1" else type(refusal)) as exc_info,
+    ):
+        processor._drain_scheduler_claims(ctx=_ctx(setup), pending_items={}, recover_pending_sinks=False)
+
+    if processing_error_kind == "tier-1":
+        assert exc_info.value is processing_error
+        links = (processing_error.__cause__, processing_error.__context__, processing_error.__suppress_context__)
+        expected = _expected_links(lower_level_error, link)
+        assert links[0] is expected[0]
+        assert links[1] is expected[1]
+        assert links[2] is expected[2]
+        assert len([note for note in processing_error.__notes__ if f": {type(refusal).__name__}: " in note]) == 1
+    else:
+        assert exc_info.value is refusal
+        assert refusal.__context__ is processing_error
+    assert len(claim_images) == 1
+    assert _durable_claim_image(setup, work_item_id)[:2] == claim_images[0][:2]
+    assert len(delivered_losses) == 1
+    assert [(loss.group_id, loss.member_key, loss.token_id) for loss in delivered_losses[0]] == [("fg-merge", "left", token.token_id)]
+    assert processor._pending_group_losses == []
 
 
 @pytest.mark.parametrize("surviving_peer", [False, True], ids=["leader-only", "with-follower-peer"])
