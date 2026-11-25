@@ -53,7 +53,14 @@ from sqlalchemy import delete, insert, select
 from elspeth.contracts import RowResult, TokenInfo
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.enums import FrameKind, TerminalOutcome, TerminalPath
-from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError, RunMembershipLostError, SchedulerLeaseLostError
+from elspeth.contracts.errors import (
+    AuditIntegrityError,
+    OrchestrationInvariantError,
+    RunLeadershipLostError,
+    RunMembershipLostError,
+    RunWorkerEvictedError,
+    SchedulerLeaseLostError,
+)
 from elspeth.contracts.events import EngineSpanCompleted, EngineSpanName, EngineSpanStatus
 from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.plugin_context import PluginContext
@@ -1065,6 +1072,92 @@ def test_handled_scheduler_lease_loss_marks_row_span_error() -> None:
     assert events[0].name is EngineSpanName.ROW
     assert events[0].status is EngineSpanStatus.ERROR
     assert events[0].exception_type == "SchedulerLeaseLostError"
+
+
+def _coordination_signal(kind: str, *, work_item_id: str, run_id: str) -> Exception:
+    if kind == "lease":
+        return SchedulerLeaseLostError(work_item_id=work_item_id, lease_owner=LEADER_OWNER, run_id=run_id)
+    if kind == "eviction":
+        return RunWorkerEvictedError(worker_id=LEADER_OWNER, run_id=run_id, reason="claim re-probe found the member departed")
+    if kind == "membership":
+        return RunMembershipLostError(run_id=run_id, worker_id=LEADER_OWNER, verb="heartbeat_lease")
+    return RunLeadershipLostError(run_id=run_id, worker_id=LEADER_OWNER, leader_epoch=1, verb="heartbeat_lease")
+
+
+@pytest.mark.parametrize("arrives", ["post-error-heartbeat", "inside-processing"])
+@pytest.mark.parametrize("kind", ["lease", "eviction", "membership", "leadership"])
+def test_tier_1_processing_error_leaves_the_drain_as_itself_after_a_coordination_signal(kind: str, arrives: str) -> None:
+    """A Tier-1 error raised while processing a claimed token leaves the drain as itself.
+
+    It does so when the claim's lease, the worker's membership or the run's
+    leadership is found lost while that error is propagating, whether the
+    post-error claim heartbeat or a check inside processing finds it. The
+    error keeps its own cause, the coordination signal is noted on it, no
+    mark_* disposition is written for the claim, and staged losses are cleared.
+    """
+    processor, spy, setup, clock = _build(lease_owner=LEADER_OWNER)
+    work_item_id, _token = _enqueue_ready(setup, spy, clock, sequence=0)
+    lower_level_error = OSError("connection reset")
+    tier_1_error = AuditIntegrityError("claimed token's ledger row disagrees with the work item")
+    signal = _coordination_signal(kind, work_item_id=work_item_id, run_id=setup.run_id)
+
+    def raise_signal() -> None:
+        raise signal
+
+    def fail_with_tier_1(**_kwargs: Any) -> tuple[RowResult, list[Any]]:
+        try:
+            raise tier_1_error from lower_level_error
+        except AuditIntegrityError:
+            if arrives == "inside-processing":
+                raise_signal()
+            raise
+
+    def post_error_heartbeat() -> None:
+        if arrives == "post-error-heartbeat":
+            raise_signal()
+
+    spy.calls.clear()
+    with (
+        patch.object(processor, "_process_single_token", new=fail_with_tier_1),
+        patch.object(processor._scheduler_drain, "heartbeat_active_claim", new=post_error_heartbeat),
+        pytest.raises(AuditIntegrityError) as exc_info,
+    ):
+        processor._drain_scheduler_claims(ctx=_ctx(setup), pending_items={}, recover_pending_sinks=False)
+
+    assert exc_info.value is tier_1_error
+    assert (tier_1_error.__cause__, tier_1_error.__context__, tier_1_error.__suppress_context__) == (lower_level_error, None, True)
+    signal_notes = [note for note in tier_1_error.__notes__ if f": {type(signal).__name__}: " in note]
+    assert len(signal_notes) == 1
+    verbs = spy.verbs()
+    assert "mark_failed" not in verbs
+    assert "mark_terminal" not in verbs
+    assert "mark_pending_sink" not in verbs
+    assert processor._pending_group_losses == []
+
+
+def test_lease_loss_after_an_ordinary_processing_error_abandons_the_claim() -> None:
+    """An ordinary processing error followed by lease loss abandons the claim and returns."""
+    processor, spy, setup, clock = _build(lease_owner=LEADER_OWNER)
+    work_item_id, _token = _enqueue_ready(setup, spy, clock, sequence=0)
+
+    def fail_with_plugin_error(**_kwargs: Any) -> tuple[RowResult, list[Any]]:
+        raise ValueError("plugin failure")
+
+    def lose_lease() -> None:
+        raise SchedulerLeaseLostError(work_item_id=work_item_id, lease_owner=LEADER_OWNER, run_id=setup.run_id)
+
+    spy.calls.clear()
+    with (
+        patch.object(processor, "_process_single_token", new=fail_with_plugin_error),
+        patch.object(processor._scheduler_drain, "heartbeat_active_claim", new=lose_lease),
+    ):
+        results = processor._drain_scheduler_claims(ctx=_ctx(setup), pending_items={}, recover_pending_sinks=False)
+
+    assert results == []
+    verbs = spy.verbs()
+    assert "mark_failed" not in verbs
+    assert "mark_terminal" not in verbs
+    assert "mark_pending_sink" not in verbs
 
 
 @pytest.mark.parametrize("surviving_peer", [False, True], ids=["leader-only", "with-follower-peer"])
