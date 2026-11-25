@@ -16,6 +16,12 @@ Subcommands
   preflight  --cases F --tree T --case ID  offline guard + prerequisites for one case
   check      --cases F --root R --case ID --exit N --log L --evidence E
                                            verdict line for one finished case
+  reset-audit --cases F --root R --case ID  remove a stale audit database from a case copy
+  classify   --server-marker F --exit-file F --sandbox-rc N   the case's exit code, or why there is none
+  totals / overall                         the summary's totals line and the run's overall exit
+  socket-walk [--allow DIR]... [--shared-count N] -- BWRAP_ARGS
+                                           refuse bind sources outside the allowed roots, mount
+                                           points, sockets and FIFOs beneath a bind
 
 Exit codes: 0 = ok/PASS, 1 = FAIL/refused, 2 = usage or data-file error.
 """
@@ -89,10 +95,16 @@ def _list_of(node: Any, expected: type, label: str) -> None:
         raise DataError(f"{label}: expected a list of {expected.__name__}")
 
 
+# Directories the gate itself makes beside the case directories.
+RESERVED_CASE_IDS = frozenset({"outside", "self-test"})
+
+
 def _relative_home_path(raw: str, label: str) -> Path:
     path = Path(raw)
     if path.is_absolute() or path == Path(".") or "," in raw or any(part in {"..", ""} for part in path.parts):
         raise DataError(f"{label}: expected a HOME-relative path")
+    if len(path.parts) < 2 or path.parts[0] != ".cache":
+        raise DataError(f"{label}: {raw} is not under ~/.cache")
     return path
 
 
@@ -233,8 +245,8 @@ def load_cases(path: Path) -> dict[str, Any]:
         for key in ("id", "example", "command", "expect_exit", "configs", "expectation_source"):
             if key not in case:
                 raise DataError(f"case {case.get('id')!r}: missing {key!r}")
-        if not re.fullmatch(r"[A-Za-z0-9_.-]+", case["id"]):
-            raise DataError(f"case id {case['id']!r} is not filename-safe")
+        if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", case["id"]) or case["id"] in RESERVED_CASE_IDS:
+            raise DataError(f"case id {case['id']!r} is not filename-safe or is reserved")
     for name, entry in data["examples"].items():
         if entry.get("class") not in CLASSES:
             raise DataError(f"example {name!r}: class {entry.get('class')!r} not in {sorted(CLASSES)}")
@@ -316,6 +328,8 @@ BWRAP_OPTION_ARITY = {
     "--remount-ro": 1,
     "--unshare-net": 0,
     "--unshare-pid": 0,
+    "--unshare-ipc": 0,
+    "--new-session": 0,
     "--die-with-parent": 0,
 }
 BIND_OPTIONS = frozenset({"--bind", "--ro-bind", "--ro-bind-try"})
@@ -339,8 +353,26 @@ def bind_sources(bwrap_args: list[str]) -> list[tuple[str, bool]]:
 
 
 # Bind sources always allowed (system trees); the gate adds the venv, the case base and the
-# declared home caches with --allow. Nothing is ever bound from these, at any depth.
-SYSTEM_BIND_ROOTS = ("/usr", "/etc", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32")
+# home cache root with --allow. Of /etc, only the listed entries, each exactly.
+SYSTEM_BIND_ROOTS = ("/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32")
+ETC_BIND_SOURCES = tuple(
+    f"/etc/{entry}"
+    for entry in (
+        "passwd",
+        "group",
+        "nsswitch.conf",
+        "hosts",
+        "resolv.conf",
+        "ld.so.cache",
+        "localtime",
+        "protocols",
+        "services",
+        "mime.types",
+        "alternatives",
+        "ssl/certs",
+        "ssl/openssl.cnf",
+    )
+)
 NEVER_BOUND = ("/proc", "/sys", "/dev")
 
 
@@ -363,6 +395,14 @@ def bind_source_refusal(source: str, allowed_roots: list[str]) -> str | None:
             return "the host root"
         if any(_within(path, never) for never in NEVER_BOUND):
             return f"{path} is a kernel or device tree"
+    if _within(lexical, "/etc"):
+        # An exact listed entry; it is judged by its own path, so a directory entry may not
+        # resolve out of itself.
+        if lexical not in ETC_BIND_SOURCES:
+            return "not one of the listed /etc entries"
+        if os.path.isdir(real) and real != lexical:
+            return f"resolves to {real}, outside the listed /etc entry"
+        return None
     roots = [root for root in (*SYSTEM_BIND_ROOTS, *allowed_roots) if root.rstrip("/")]
     if not any(_within(lexical, root) for root in roots):
         return "outside the allowed bind roots"
@@ -394,7 +434,7 @@ def mounts_beneath(source: str, points: list[str]) -> list[str]:
 
 
 def sockets_under(source: Path) -> tuple[list[str], int]:
-    """Socket files under a bound source, and how many directories this user cannot search.
+    """Socket files and FIFOs under a bound source, and how many directories this user cannot search.
 
     A directory that cannot be listed is a finding unless this user also cannot search it:
     nothing beneath an unsearchable directory is reachable by name. A mount point beneath the
@@ -427,6 +467,8 @@ def sockets_under(source: Path) -> tuple[list[str], int]:
                             continue
                         if stat.S_ISSOCK(mode):
                             findings.append(f"socket {entry.path}")
+                        elif stat.S_ISFIFO(mode):
+                            findings.append(f"fifo {entry.path}")
         except OSError as error:
             if os.access(directory, os.X_OK):
                 findings.append(f"unlistable directory {directory}: {error.strerror}")
