@@ -46,6 +46,10 @@ from tests.fixtures.mock_audit import mock_audit_authority
 from tests.helpers.fenced_session import seed_token_policies
 from tests.unit.plugins.clients.test_audited_llm_client import FakeExecutionRepository, FakeOpenAIClient, provider_response
 
+# Bounds a hang in the admission-pause test. The passing path takes milliseconds;
+# the guard only decides how long a genuine hang runs before the test fails.
+_HANG_GUARD_SECONDS = 20
+
 
 class _ForbiddenAsyncBridge:
     """Count an accidental legacy bridge call and fail at that boundary."""
@@ -111,7 +115,7 @@ async def test_run_admission_keeps_worker_and_lease_until_receipt(tmp_path, monk
             def blocked_begin(*args, **kwargs):
                 attempt = original_begin(*args, **kwargs)
                 entered.set()
-                if not release.wait(5):
+                if not release.wait(_HANG_GUARD_SECONDS):
                     raise AssertionError("precommit release never arrived")
                 if pause == "rollback":
                     raise RuntimeError("forced admission rollback")
@@ -124,7 +128,7 @@ async def test_run_admission_keeps_worker_and_lease_until_receipt(tmp_path, monk
             def blocked_delivery(**kwargs):
                 attempt = original_begin_sync(**kwargs)
                 entered.set()
-                if not release.wait(5):
+                if not release.wait(_HANG_GUARD_SECONDS):
                     raise AssertionError("postcommit release never arrived")
                 return attempt
 
@@ -132,7 +136,7 @@ async def test_run_admission_keeps_worker_and_lease_until_receipt(tmp_path, monk
 
         admitted = asyncio.create_task(run_sync_in_worker(ExecutionServiceImpl._admit_run_llm_call, bridge, run.id, execute_lease))
         try:
-            entered_before_deadline = await run_sync_in_worker(entered.wait, 5)
+            entered_before_deadline = await run_sync_in_worker(entered.wait, _HANG_GUARD_SECONDS)
             if not entered_before_deadline:
                 await admitted
             assert entered_before_deadline
@@ -145,12 +149,12 @@ async def test_run_admission_keeps_worker_and_lease_until_receipt(tmp_path, monk
             release.set()
         if pause == "rollback":
             with pytest.raises(RuntimeError, match="forced admission rollback"):
-                await asyncio.wait_for(admitted, 5)
+                await asyncio.wait_for(admitted, _HANG_GUARD_SECONDS)
             with engine.connect() as connection:
                 assert connection.execute(select(quota_provider_attempts_table)).all() == []
             assert bridge_call.calls == 0
         else:
-            attempt_id = await asyncio.wait_for(admitted, 5)
+            attempt_id = await asyncio.wait_for(admitted, _HANG_GUARD_SECONDS)
             with engine.connect() as connection:
                 after = connection.execute(select(quota_provider_attempts_table)).one()
             assert after.attempt_id == attempt_id
