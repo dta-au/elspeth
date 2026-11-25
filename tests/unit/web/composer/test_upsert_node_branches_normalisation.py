@@ -48,9 +48,9 @@ from typing import Any
 
 import pytest
 
+from elspeth.web import credential_scan
 from elspeth.web.composer.state import NodeSpec, queue_node_contract_error
 from elspeth.web.composer.tools.transforms import _UpsertNodeArgumentsModel
-from elspeth.web.credential_guard import CredentialMaterialRefused
 from tests.unit.web.composer.test_tools import (
     _empty_state,
     _mock_catalog,
@@ -161,15 +161,24 @@ class TestBranchesSurviveTheUpsertAsNamedBranches:
         )
         assert dict(node.branches) == _BRANCH_MAP
 
-    def test_public_dispatch_refuses_a_dict_subclass_before_normalisation(self) -> None:
-        state = _empty_state()
+    def test_public_dispatch_counts_a_dict_subclass_as_a_scan_skip_and_stores_owned_branches(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The credential scan cannot traverse a dict subclass: a counted skip (best effort), not a
+        # refusal. Normalisation then stores the branches as an owned read-only mapping.
+        skips: list[dict[str, str]] = []
 
-        with pytest.raises(CredentialMaterialRefused) as caught:
-            execute_tool("upsert_node", _coalesce_arguments(_PlainDictSubclass(_BRANCH_MAP)), state, _mock_catalog())
+        class _Recorder:
+            def add(self, value: int, attributes: dict[str, str]) -> None:
+                skips.append(dict(attributes))
 
-        assert caught.value.surface == "composer_tool_arguments"
-        assert caught.value.finding.category == "unsupported_value"
-        assert state.nodes == ()
+        monkeypatch.setattr(credential_scan, "_CREDENTIAL_SCAN_SKIPPED_COUNTER", _Recorder())
+
+        result = execute_tool("upsert_node", _coalesce_arguments(_PlainDictSubclass(_BRANCH_MAP)), _empty_state(), _mock_catalog())
+
+        assert skips == [{"surface": "composer_tool_arguments", "reason": "unsupported_value"}]
+        assert result.success is True
+        node = next(candidate for candidate in result.updated_state.nodes if candidate.id == "joined")
+        assert type(node.branches) is MappingProxyType
+        assert dict(node.branches) == _BRANCH_MAP
 
     def test_sequence_branches_persist_as_a_tuple(self) -> None:
         result = execute_tool(

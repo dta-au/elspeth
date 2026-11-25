@@ -1156,11 +1156,16 @@ class RunMembershipLostError(Exception):
 class RunWorkerEvictedError(Exception):
     """Raised when a worker observes membership loss or leader-seat deposition.
 
-    Latched from the heartbeat CAS miss (slice-4 thread) or raised directly
-    when a membership-fenced verb (``claim_ready`` / ``claim_pending_sink`` /
-    ``enqueue_ready`` / ``heartbeat_lease``, slice 4) refuses with zero rows.
-    The worker abandons in-flight processing without emitting; a returning
-    process mints a fresh worker identity and re-admits.
+    Latched from the heartbeat CAS miss (slice-4 thread); raised by the claim
+    re-probes (``claim_ready_row`` and ``claim_pending_sink``) when a claim
+    statement matches zero rows and the worker is no longer an active member;
+    raised by the claimed-child enqueue's membership precheck, which runs
+    before its insert; and raised by the follower when a
+    membership-fenced verb's :class:`RunMembershipLostError` reaches it while
+    the run is still running. The membership fence that opens every
+    membership-fenced transaction refuses with :class:`RunMembershipLostError`
+    instead (ADR-030 D4). The worker abandons in-flight processing without
+    emitting; a returning process mints a fresh worker identity and re-admits.
 
     Attributes:
         worker_id: The evicted/departed worker identity.
@@ -1169,11 +1174,13 @@ class RunWorkerEvictedError(Exception):
             that observation forward (the heartbeat latch distinguishes "the
             membership fence refused the beat" from "the seat was taken by
             another leader"); ``None`` when it did not, in which case the
-            message is unchanged. All four membership-fenced raise sites pass
-            ``None``, for two different reasons: two probe a boolean
-            ``active_worker_fence_clause`` EXISTS and hold no status to
-            report, while the other two read ``run_workers.status`` to branch
-            on and do not carry the observed value forward. ``None`` therefore
+            message is unchanged. The follower's conversion passes the verb the
+            membership fence refused. The three claim re-probes and the enqueue
+            precheck pass ``None``, for two different reasons: two of them (one
+            claim re-probe and the enqueue precheck) probe a boolean
+            ``active_worker_fence_clause`` EXISTS and hold no status to report,
+            while the other two read ``run_workers.status`` to branch on and do
+            not carry the observed value forward. ``None`` therefore
             asserts only that no observation was supplied — never that none
             was available.
     """

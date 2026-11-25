@@ -66,6 +66,7 @@ from elspeth.web.credential_guard import (
     require_no_credential_material_in_llm_metadata,
     require_no_credential_material_in_tool_wire,
 )
+from elspeth.web.credential_scan import CredentialScanSurface
 
 _COMPOSER_LLM_SEED_PARAM: Final[str] = "seed"
 
@@ -79,7 +80,7 @@ class _MalformedLLMResponseError(ComposerServiceError):
         *,
         provider_metadata: _AdmittedLLMProviderMetadata,
         text_received: bool = False,
-        credential_surface: str = "composer_provider_response",
+        credential_surface: CredentialScanSurface = "composer_provider_response",
     ) -> None:
         provider_metadata = _require_no_credential_material_in_completion_fields(
             content=None,
@@ -140,7 +141,7 @@ def _capture_composer_llm_completion_fields(
     response: Any,
     *,
     pricing_model: str | None = None,
-    credential_surface: str = "composer_provider_response",
+    credential_surface: CredentialScanSurface = "composer_provider_response",
     require_tool_calls_field: bool = True,
 ) -> tuple[_AdmittedAssistantMessage, tuple[Any, ...], _AdmittedLLMProviderMetadata]:
     """Read the response/message surface once, before validating its tool batch."""
@@ -246,7 +247,7 @@ def _admit_captured_composer_llm_completion(
 def _require_no_credential_material_in_completion(
     completion: _AdmittedLLMCompletion,
     *,
-    surface: str,
+    surface: CredentialScanSurface,
 ) -> _AdmittedLLMCompletion:
     """Reject all persisted or replayed text metadata in an owned completion."""
     metadata = _require_no_credential_material_in_completion_fields(
@@ -263,7 +264,7 @@ def _require_no_credential_material_in_completion_fields(
     content: str | None,
     tool_calls: Sequence[tuple[str, str]],
     provider_metadata: _AdmittedLLMProviderMetadata,
-    surface: str,
+    surface: CredentialScanSurface,
     thinking_replay_required: bool | None = None,
 ) -> _AdmittedLLMProviderMetadata:
     """Guard the normalized provider fields that can be audited or replayed."""
@@ -539,14 +540,19 @@ async def _litellm_acompletion(
             credential_messages.append(message)
     if prepared_advisor_content is not None:
         credential_messages = scan_prepared_advisor_content(credential_messages, prepared_advisor_content, role=prompt_guard_role)
-    require_no_credential_material(
-        credential_messages,
-        surface="composer_provider_request",
-        # 2 MiB covers a maximum-size runtime YAML import (524,288 characters,
-        # MAX_RUNTIME_YAML_IMPORT_CHARS) at 4 UTF-8 bytes per character. A
-        # longer string is refused unscanned (traversal_limit), never skipped.
-        max_string_bytes=2 * 1024 * 1024,
-    )
+    # One traversal per message: the list itself is never one tree, so its
+    # length cannot reach the width limit, and a limit inside one message
+    # skips only that message (counted, best effort) while the others are
+    # still scanned. Every message is scanned, whatever its role or trust.
+    for credential_message in credential_messages:
+        require_no_credential_material(
+            credential_message,
+            surface="composer_provider_request",
+            # 2 MiB covers a maximum-size runtime YAML import (524,288 characters,
+            # MAX_RUNTIME_YAML_IMPORT_CHARS) at 4 UTF-8 bytes per character. A
+            # longer string ends that message's scan as a counted skip, not a refusal.
+            max_string_bytes=2 * 1024 * 1024,
+        )
     await enforce_prompt_guard(
         mount=prompt_guard_mount,
         mode=prompt_guard_mode,

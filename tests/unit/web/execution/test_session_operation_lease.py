@@ -4620,13 +4620,14 @@ def test_execution_lease_ast_clones_ignore_foreign_parent_metadata(scanner: str)
     original_metadata = shared_context.__dict__.copy()
     try:
         unrelated = ast.parse("foreign" + ".value" * 500)
-        if scanner == "landscape":
-            attach_landscape_parents(unrelated)
-            foreign_parent = shared_context._landscape_parent
-        else:
-            attach_inventory_parents(unrelated)
-            foreign_parent = shared_context._inventory_parent
-        assert isinstance(foreign_parent, ast.Name) and foreign_parent.id == "foreign"
+        attach, attribute = (
+            (attach_landscape_parents, "_landscape_parent") if scanner == "landscape" else (attach_inventory_parents, "_inventory_parent")
+        )
+        attach(unrelated)
+        # The helper leaves CPython's shared context nodes alone, so plant the foreign link directly.
+        assert attribute not in vars(shared_context)
+        foreign_parent = next(node for node in ast.walk(unrelated) if isinstance(node, ast.Name) and node.id == "foreign")
+        vars(shared_context)[attribute] = foreign_parent
         assert any(node is shared_context for node in ast.walk(recovery))
         clone = copy_ast_fields(recovery)
         assert isinstance(clone, ast.AsyncFunctionDef)

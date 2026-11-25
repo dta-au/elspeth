@@ -7075,6 +7075,9 @@ def _parent_node(node: ast.AST) -> ast.AST:
 def _attach_parents(tree: ast.AST) -> None:
     for parent in ast.walk(tree):
         for child in ast.iter_child_nodes(parent):
+            # CPython shares one Load/Store/Del instance across every parsed tree; a parent link there leaks.
+            if isinstance(child, ast.expr_context):
+                continue
             child._inventory_parent = parent  # type: ignore[attr-defined]
 
 

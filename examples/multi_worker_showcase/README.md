@@ -81,9 +81,9 @@ The example's start barrier makes the worker-sharing demonstration deterministic
 
 | Code | Meaning |
 |------|---------|
-| `0`  | Clean departure — follower worked until the run ended normally |
+| `0`  | Clean departure — the follower left after the run reached a terminal status. This does not mean the run succeeded: the departure message names the status (`run ended with status failed`, for example) |
 | `1`  | JoinRefusedError — admission refused (config-hash mismatch, no live leader, or run not RUNNING) |
-| `2`  | FollowerSeatDeadError — leader died mid-drain; run `elspeth resume <run_id>` |
+| `2`  | FollowerSeatDeadError — no live leader while the run is still running; run `elspeth resume <run_id>` |
 | `3`  | SIGINT / RunWorkerEvictedError |
 | `4`  | Framework / Tier-1 error |
 

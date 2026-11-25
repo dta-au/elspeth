@@ -37,9 +37,11 @@ drain until one of four stop conditions:
 
 ``seat_dead``
     The heartbeat's coordination snapshot shows no live leader (or the thread
-    latched ``coordination_lost_event``).  The follower finishes or abandons
-    the current claim, takes no new claims after the grace period, then exits
-    with a message naming ``elspeth resume``.
+    latched ``coordination_lost_event``).  The follower rereads the run: a
+    terminal run is a clean departure, as for ``run_terminal``.  A run that is
+    still RUNNING means the leader is gone mid-run; the follower finishes or
+    abandons the current claim, takes no new claims, then exits with a message
+    naming ``elspeth resume``.
 
 ``SIGINT``
     Standard :exc:`KeyboardInterrupt` propagated from ``claim_ready``.
@@ -97,12 +99,14 @@ from typing import TYPE_CHECKING, Protocol
 
 from sqlalchemy.exc import OperationalError
 
+import elspeth.contracts.errors as contract_errors
 from elspeth.contracts.coordination import (
     DEFAULT_RUN_HEARTBEAT_SECONDS,
     DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
     WorkerMembershipToken,
 )
-from elspeth.contracts.errors import AuditIntegrityError, FollowerSeatDeadError, RunWorkerEvictedError
+from elspeth.contracts.enums import RunStatus
+from elspeth.contracts.errors import AuditIntegrityError, FollowerSeatDeadError, RunMembershipLostError, RunWorkerEvictedError
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.engine.orchestrator.heartbeat import RunHeartbeatThread
 
@@ -152,12 +156,33 @@ class FollowerWorkSource(Protocol):
 
 
 class _SeatDeadError(Exception):
-    """Internal signal: leader seat expired; follower should exit after grace."""
+    """Internal signal: no live leader seat; the follower rereads the run before choosing its exit."""
 
     def __init__(self, worker_id: str, run_id: str) -> None:
         super().__init__(f"Follower {worker_id!r} detected no live leader for run {run_id!r}; run can be taken over via `elspeth resume`")
         self.worker_id = worker_id
         self.run_id = run_id
+
+
+def _tier_1_error_in_chain(error: BaseException) -> BaseException | None:
+    """Return a Tier-1 error from ``error``'s cause and context chain, or None.
+
+    When processing fails and the membership-fenced failure bookkeeping is then
+    refused, the drain re-raises the refusal with the processing error only as
+    its context, so a Tier-1 error can arrive inside a membership loss. Each
+    exception is walked once, so a chain that loops back on itself still ends.
+    """
+    seen: set[int] = set()
+    pending: list[BaseException] = [error]
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, contract_errors.TIER_1_ERRORS):
+            return current
+        pending.extend(linked for linked in (current.__cause__, current.__context__) if linked is not None)
+    return None
 
 
 class FollowerProcessor:
@@ -231,15 +256,20 @@ class FollowerProcessor:
         self._clock = clock if clock is not None else DEFAULT_CLOCK
         self._span_factory = span_factory if span_factory is not None else SpanFactory()
         self._trace_started_at = trace_started_at
+        # The terminal status the last _run_is_terminal() read; None until a
+        # terminal read, and None when the run row was absent.
+        self._observed_terminal_status: RunStatus | None = None
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def run(self, ctx: PluginContext) -> None:
+    def run(self, ctx: PluginContext) -> RunStatus | None:
         """Start the heartbeat thread and drive the follower drain loop.
 
-        Returns normally when the run is terminal (depart + exit 0 semantics).
+        Returns normally when the run is terminal (depart + exit 0 semantics),
+        with the terminal run status the follower read, or ``None`` when the
+        run row was absent.
         Raises :class:`RunWorkerEvictedError` when the heartbeat thread detects
         eviction.  Propagates :class:`KeyboardInterrupt` after a clean depart.
 
@@ -250,8 +280,10 @@ class FollowerProcessor:
             and return.
 
         ``seat_dead``
-            Leader seat expired (heartbeat snapshot or direct poll).  Finish or
-            abandon the current claim, take no new claims, depart, return.
+            No live leader seat (heartbeat snapshot or direct poll).  If the run
+            is terminal (the leader released its seat after finalizing), depart
+            and return.  Otherwise depart and raise
+            :class:`FollowerSeatDeadError`.
 
         ``evicted``
             Heartbeat thread latched coordination-lost.  Caller receives
@@ -267,16 +299,15 @@ class FollowerProcessor:
         if self._trace_started_at is None:
             # Direct test construction predates telemetry-backed spans. The
             # production builder always supplies the durable run start below.
-            self._run_bound(ctx)
-            return
+            return self._run_bound(ctx)
 
         # Followers do not fabricate a leader/run parent. The scope binds the
         # joined run's durable trace identity so follower row spans are honest
         # roots in the same trace even though they execute in another process.
         with self._span_factory.trace_scope(self._token.run_id, self._trace_started_at):
-            self._run_bound(ctx)
+            return self._run_bound(ctx)
 
-    def _run_bound(self, ctx: PluginContext) -> None:
+    def _run_bound(self, ctx: PluginContext) -> RunStatus | None:
         """Drive the follower while any production trace scope is active."""
         heartbeat = RunHeartbeatThread(
             self._run_coordination,
@@ -286,24 +317,59 @@ class FollowerProcessor:
         )
         heartbeat.start()
         terminal_exit = False
+        # A Tier-1 error found inside a membership loss, and its own cause,
+        # context and suppression flag as the processing raised it.
+        tier_1_error: BaseException | None = None
+        tier_1_links: tuple[BaseException | None, BaseException | None, bool] = (None, None, False)
         try:
             self._drain_loop(ctx, heartbeat)
-        except RunWorkerEvictedError:
-            # The membership fence can raise mid-drain-pass when the leader's
+        except RunMembershipLostError as exc:
+            # A drain pass can lose membership mid-pass when the leader's
             # complete_run departed our run_workers row in the SAME txn that
             # stamped the run terminal (finalize-departure, design case a).
-            # The top-of-loop discrimination only covers the heartbeat-latch
-            # path; recheck run status here before reporting a true eviction.
+            # Every membership-fenced verb the drain reaches (claim_ready, the
+            # node-state and disposition writes, heartbeat_lease) refuses with
+            # RunMembershipLostError; the in-verb CAS re-probes raise
+            # RunWorkerEvictedError (the arm below). The top-of-loop
+            # discrimination only covers the heartbeat-latch path; recheck run
+            # status here before reporting a true eviction.
+            #
+            # A Tier-1 error the processing raised before the refusal leaves
+            # as itself, whatever the run's status (CLI exit 4).
+            tier_1_error = self._tier_1_error_noting_membership_loss(exc)
+            if tier_1_error is not None:
+                tier_1_links = (tier_1_error.__cause__, tier_1_error.__context__, tier_1_error.__suppress_context__)
+                raise tier_1_error from exc
             if self._run_is_terminal():
                 logger.info(
-                    "follower %r: eviction raised mid-drain but run %r is terminal (finalize-departure) — exiting cleanly",
+                    "follower %r: membership lost, run %r is terminal — exiting cleanly",
                     self._token.worker_id,
                     self._token.run_id,
                 )
                 terminal_exit = True
-                return
+                return self._observed_terminal_status
             # True eviction: leader's housekeeping sweep evicted us while the
-            # run is still RUNNING (design case b). Propagate (CLI exit 3).
+            # run is still RUNNING (design case b). Report it as the eviction
+            # it is (CLI exit 3), whichever fence observed it.
+            raise RunWorkerEvictedError(
+                worker_id=self._token.worker_id,
+                run_id=self._token.run_id,
+                reason=f"membership fence refused verb {exc.verb!r}",
+            ) from exc
+        except RunWorkerEvictedError as exc:
+            # The claim re-probe's eviction: discriminated as the arm above.
+            tier_1_error = self._tier_1_error_noting_membership_loss(exc)
+            if tier_1_error is not None:
+                tier_1_links = (tier_1_error.__cause__, tier_1_error.__context__, tier_1_error.__suppress_context__)
+                raise tier_1_error from exc
+            if self._run_is_terminal():
+                logger.info(
+                    "follower %r: membership lost, run %r is terminal — exiting cleanly",
+                    self._token.worker_id,
+                    self._token.run_id,
+                )
+                terminal_exit = True
+                return self._observed_terminal_status
             raise
         except KeyboardInterrupt:
             logger.info(
@@ -313,8 +379,20 @@ class FollowerProcessor:
             )
             raise
         except _SeatDeadError:
-            # The leader seat expired while we were draining. Depart cleanly,
-            # then raise FollowerSeatDeadError so the CLI can surface the
+            # No live leader seat. A leader that finished the run releases its
+            # seat after finalizing, so a follower that read RUNNING before the
+            # finish can find the seat gone with the run already terminal:
+            # recheck the run before reporting a dead leader.
+            if self._run_is_terminal():
+                logger.info(
+                    "follower %r: no live leader seat, run %r is terminal — exiting cleanly",
+                    self._token.worker_id,
+                    self._token.run_id,
+                )
+                terminal_exit = True
+                return self._observed_terminal_status
+            # The seat is gone while the run is still RUNNING. Depart, then
+            # raise FollowerSeatDeadError so the CLI can surface the
             # "use elspeth resume" guidance and exit with a distinct code
             # (design §B.1 step 5).
             raise FollowerSeatDeadError(
@@ -324,7 +402,14 @@ class FollowerProcessor:
         else:
             # Clean terminal exit.
             terminal_exit = True
+            return self._observed_terminal_status
         finally:
+            if tier_1_error is not None:
+                # Raising it from the membership loss rewrote these links.
+                # Restored here, the Tier-1 error leaves with its chain as the
+                # processing raised it, and a cleanup failure below that
+                # supersedes it still carries it, chain and all, as context.
+                tier_1_error.__cause__, tier_1_error.__context__, tier_1_error.__suppress_context__ = tier_1_links
             try:
                 if terminal_exit:
                     heartbeat.stop(final_beat=False)
@@ -339,6 +424,16 @@ class FollowerProcessor:
                     self._best_effort_depart()
                 finally:
                     heartbeat.raise_fatal_failure()
+
+    def _tier_1_error_noting_membership_loss(self, membership_loss: BaseException) -> BaseException | None:
+        """Return a Tier-1 error from the membership loss's chain, noted with the loss, or None."""
+        tier_1_error = _tier_1_error_in_chain(membership_loss)
+        if tier_1_error is not None:
+            tier_1_error.add_note(
+                f"follower {self._token.worker_id!r} lost its run membership while this error was propagating: "
+                f"{type(membership_loss).__name__}: {membership_loss}"
+            )
+        return tier_1_error
 
     # ------------------------------------------------------------------
     # Internal
@@ -398,7 +493,7 @@ class FollowerProcessor:
             if heartbeat.coordination_lost:
                 if self._run_is_terminal():
                     logger.info(
-                        "follower %r: heartbeat latch set + run %r is terminal (finalize-departure) — exiting cleanly",
+                        "follower %r: heartbeat latch set, run %r is terminal — exiting cleanly",
                         worker_id,
                         run_id,
                     )
@@ -451,14 +546,16 @@ class FollowerProcessor:
             self._wait_fn(self._idle_poll_seconds)
 
     def _run_is_terminal(self) -> bool:
-        """Return True when the run's status is no longer RUNNING."""
-        from elspeth.contracts.enums import RunStatus
-
+        """Return True when the run's status is no longer RUNNING, recording the status read."""
         run = self._factory.run_lifecycle.get_run(self._token.run_id)
         if run is None:
-            # Run disappeared — treat as terminal.
+            # Run disappeared — treat as terminal, with no status to report.
+            self._observed_terminal_status = None
             return True
-        return run.status != RunStatus.RUNNING
+        if run.status == RunStatus.RUNNING:
+            return False
+        self._observed_terminal_status = run.status
+        return True
 
     def _best_effort_depart(self) -> None:
         """Call depart_worker, recording operational DB failures during teardown.

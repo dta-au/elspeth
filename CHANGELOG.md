@@ -15,6 +15,19 @@ changes land and is not a release.
 
 ### Upgrade notes
 
+- **Changed:** `elspeth join` exits 0 when the leader finishes the run while
+  the follower is still working. Before this release it could exit 4, or exit
+  2 with "The run is incomplete", although the run had finished. Exit 2 now
+  means there is no live leader while the run is still running. A follower
+  that loses its run membership while the run is still running now exits 3,
+  the eviction code in the exit-code table, where it previously exited 4. A
+  script that read exit 4 from `elspeth join` as an eviction should check for 3.
+- **Changed:** when `elspeth join` departs cleanly it names the run status it
+  read: `run ended with status failed`, for example, where it always said
+  `run completed`. The JSON `departed` event gains a `run_status` field; its
+  existing field names are kept, and its `message` text changes as described.
+  Exit 0 still means only that the follower departed cleanly, for any terminal
+  status, so a script that needs the run's outcome should read `run_status`.
 - **Changed (design change):** a pipeline that previously passed composer
   validation with only a "Contract check skipped" warning, but then failed
   when the run started, now fails composer validation. No pipeline that could

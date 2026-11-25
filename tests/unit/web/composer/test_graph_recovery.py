@@ -133,12 +133,12 @@ def test_unsaveable_current_draft_does_not_taint_independent_checkpoint() -> Non
         {"connection_string": "literal-connection-material"},
     ],
 )
-def test_checkpoint_literal_credentials_are_refused_locally(options: dict[str, str]) -> None:
+def test_checkpoint_literal_option_values_do_not_block_recovery(options: dict[str, str]) -> None:
+    # Recovery restores the session's own graph; credential admission ran when the text arrived.
     state = replace(_empty_state(), nodes=(_draft_node(options=options),))
     result = qualify_editable_checkpoint(state)
-    assert not result.eligible
-    assert result.reason_codes == ("checkpoint_credential_material",)
-    assert "literal" not in repr(result)
+    assert result.eligible
+    assert result.reason_codes == ()
 
 
 def test_checkpoint_managed_reference_needs_no_secret_resolution() -> None:

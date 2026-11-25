@@ -1,7 +1,7 @@
 {
   "src/elspeth/web/async_workers.py": {
     "protected_exports": [],
-    "sha256": "2b648afef0f4d7c0b0715cd27a86c4f86af0a042d1bb2e229d676d016b9a91d8"
+    "sha256": "ea0d06c9c7950b9572bda98eb4f734d82b8f8513ba25545780b4b728e83a8fcc"
   },
   "src/elspeth/web/coordination/composer_operation_authority.py": {
     "protected_exports": [],

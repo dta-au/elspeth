@@ -197,7 +197,7 @@ from elspeth.web.composer.strict_transport import (
 from elspeth.web.composer.tools import ToolResult, is_blob_store_only_mutation_tool
 from elspeth.web.composer.tools.generation import MalformedSourceProofClaim, ProofUnavailable
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
-from elspeth.web.credential_guard import require_no_credential_material, require_no_credential_material_in_state
+from elspeth.web.credential_guard import require_no_credential_material
 from elspeth.web.execution.completion_gates import (
     CompletionGateFacts,
 )
@@ -1348,17 +1348,6 @@ class ComposerServiceImpl:
                 raise ValueError("composer custody requires COMPOSE session authority")
             if session_id is None or session_operation_context.fence.session_id != session_id:
                 raise AuditIntegrityError("Composer session authority targets a different session")
-
-        env_ref_names = (
-            frozenset(item.name for item in self._secret_service.list_refs(user_id))
-            if self._secret_service is not None and user_id is not None
-            else frozenset()
-        )
-        require_no_credential_material_in_state(
-            state,
-            surface="composer_state_before_provider",
-            env_ref_names=env_ref_names,
-        )
 
         await self._chargeable_admission.require(session_operation_context)
         with composer_quota_scope(self._require_sessions_service(), session_operation_context), prompt_guard_user_scope(message):
@@ -3722,6 +3711,28 @@ class ComposerServiceImpl:
                 # compose is refused before the loop when there is no session
                 # to persist to. Reaching this line means neither happened.
                 raise InvariantError("plugin crash on a tool turn that was neither persisted nor rolled back") from crash.cause
+            if dispatch.credential_refusal is not None:
+                # The dispatcher's credential scan refused a call. P3 recorded
+                # it as a value-free ARG_ERROR and stopped the batch; P4 has now
+                # published the turn, so the earlier calls' rows and state are
+                # durable. The refusal leaves with this request's LLM calls,
+                # as the wire scan's refusal does. A failed unwind publication
+                # is a Tier-1 integrity fault and takes primacy.
+                refusal = dispatch.credential_refusal
+                if persist.unwind_audit_failed:
+                    raise AuditIntegrityError(
+                        "Credential refusal audit row could not be persisted",
+                        failed_turn=failed_turn,
+                    ) from refusal
+                if not persisted_tool_call_turn:
+                    raise InvariantError("credential refusal on a tool turn that was neither persisted nor rolled back") from refusal
+                attach_llm_calls(refusal, recorder)
+                if pending_checkpoint_failures:
+                    raise refusal from BaseExceptionGroup(
+                        "Credential refusal retained checkpoint failures",
+                        pending_checkpoint_failures,
+                    )
+                raise refusal
             if dispatch.advisor_failure is not None:
                 # The advisor boundary deliberately preserves unclassified
                 # controlled-code faults instead of laundering them into a

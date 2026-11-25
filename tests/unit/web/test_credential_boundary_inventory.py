@@ -597,23 +597,18 @@ def test_common_tool_owners_hold_the_guard_for_new_tools_automatically() -> None
             assert all(required_call not in calls for calls in _scoped_calls(mutant).values())
 
 
+# Whole-state scans run only where a graph arrives from outside the session: a YAML
+# import and a fork of another user's library entry. A session's own saved graph is
+# not scanned again when it is read, validated, executed, approved, published or
+# disclosed; its bytes reach a provider only through the provider request scan.
 _STATE_GUARD_DISPOSITIONS = {
-    "src/elspeth/web/composer/tool_batch.py:run_tool_batch._do_dispatch": "provider_serialization",
-    "src/elspeth/composer_mcp/server.py:_dispatch_tool": "mcp_dispatch",
-    "src/elspeth/web/composer/graph_recovery.py:qualify_editable_checkpoint": "recovery_checkpoint",
-    "src/elspeth/web/composer/service.py:ComposerServiceImpl.compose": "provider_serialization",
-    "src/elspeth/web/composer/tools/sessions.py:_execute_get_pipeline_state": "provider_disclosure",
-    "src/elspeth/web/execution/service.py:ExecutionServiceImpl._execute_locked": "execution",
-    "src/elspeth/web/execution/service.py:ExecutionServiceImpl.compile_approval_binding": "approval_binding",
-    "src/elspeth/web/execution/service.py:ExecutionServiceImpl.validate_state": "validation",
     "src/elspeth/web/sessions/routes/composer/state.py:seed_state_from_runtime_yaml": "yaml_persistence",
     "src/elspeth/web/sessions/routes/workflow/library.py:create_library_router.fork_entry": "library_fork",
-    "src/elspeth/web/sessions/routes/workflow/library.py:create_library_router.publish_entry": "library_publication",
 }
 _STATE_MATERIALIZATION_DISPOSITIONS = {
-    # Diff publishes baseline component ids/names and resolved warning messages;
-    # the loaded state receives the same guard as request-start provider state.
-    "src/elspeth/web/composer/tool_batch.py:run_tool_batch._do_dispatch.state_from_record": "direct_state_guard",
+    # Diff publishes baseline component ids/names and resolved warning messages in a
+    # tool result, which reaches the provider only through the provider request scan.
+    "src/elspeth/web/composer/tool_batch.py:run_tool_batch._do_dispatch.state_from_record": "provider_guard_downstream",
     # The nominal committed witness is checked against this session/fence;
     # materialization compares authored hashes and effects, not a new input.
     "src/elspeth/web/composer/turn_effects.py:TurnEvidence.accept_checkpoint.state_from_record": "committed_checkpoint_comparison",
@@ -628,11 +623,11 @@ _STATE_MATERIALIZATION_DISPOSITIONS = {
     "src/elspeth/web/audit_readiness/service.py:ReadinessService.compute_snapshot._state_from_record": "read_only_diagnostics",
     "src/elspeth/web/composer/tutorial_service.py:_require_tutorial_launch_readiness.state_from_record": "validation_guard_downstream",
     "src/elspeth/web/execution/routes.py:create_execution_router.validate_session_pipeline.state_from_record": "validation_guard_downstream",
-    "src/elspeth/web/execution/service.py:ExecutionServiceImpl._execute_locked.state_from_record": "direct_state_guard",
+    "src/elspeth/web/execution/service.py:ExecutionServiceImpl._execute_locked.state_from_record": "own_state_not_rescanned",
     "src/elspeth/web/execution/service.py:ExecutionServiceImpl._run_pipeline.state_from_record": "prompt_file_approval_guard",
     "src/elspeth/web/execution/service.py:ExecutionServiceImpl._approval_inputs_from_frozen.state_from_record": "prompt_file_approval_guard",
-    "src/elspeth/web/execution/service.py:ExecutionServiceImpl.compile_approval_binding.state_from_record": "direct_state_guard",
-    "src/elspeth/web/execution/service.py:ExecutionServiceImpl.validate.state_from_record": "direct_state_guard_downstream",
+    "src/elspeth/web/execution/service.py:ExecutionServiceImpl.compile_approval_binding.state_from_record": "own_state_not_rescanned",
+    "src/elspeth/web/execution/service.py:ExecutionServiceImpl.validate.state_from_record": "own_state_not_rescanned",
     "src/elspeth/web/sessions/converters.py:pipeline_dict_from_record.state_from_record": "serialization_helper",
     "src/elspeth/web/sessions/composer_turn.py:_run_composer_turn._state_from_record": "provider_guard_downstream",
     "src/elspeth/web/sessions/service.py:SessionServiceImpl._read_pipeline_settlement_replay.state_from_record": "proposal_internal",
@@ -649,7 +644,8 @@ _STATE_MATERIALIZATION_DISPOSITIONS = {
     "src/elspeth/web/sessions/routes/composer/state.py:seed_state_from_runtime_yaml.composition_state_from_runtime_yaml": "direct_state_guard",
     "src/elspeth/web/sessions/routes/workflow/inspect.py:create_workflow_inspect_router.inspect_workflow_state.state_from_record": "authenticated_state_response",
     "src/elspeth/web/sessions/routes/workflow/library.py:create_library_router.fork_entry.composition_state_from_runtime_yaml": "direct_state_guard",
-    "src/elspeth/web/sessions/routes/workflow/library.py:create_library_router.publish_entry.state_from_record": "direct_state_guard",
+    # Another user's copy is scanned where it arrives: the fork (fork_entry) and its seed.
+    "src/elspeth/web/sessions/routes/workflow/library.py:create_library_router.publish_entry.state_from_record": "consumer_scanned_at_fork",
     "src/elspeth/web/sessions/service.py:SessionServiceImpl.resolve_interpretation_event._sync.state_from_record": "interpretation_internal",
     "src/elspeth/web/sessions/service.py:SessionServiceImpl._settle_pipeline_composition_proposal._sync.state_from_record": "proposal_internal",
     "src/elspeth/web/shareable_reviews/service.py:ShareableReviewService.mark_ready_for_review.state_from_record": "validation_guard_downstream",

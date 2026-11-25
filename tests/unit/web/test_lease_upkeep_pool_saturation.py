@@ -7,9 +7,10 @@ renewal and release check out from.
 from __future__ import annotations
 
 import asyncio
+import sys
 import threading
 from collections.abc import AsyncIterator, Callable, Iterator
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from uuid import UUID
@@ -146,8 +147,14 @@ async def test_renewal_and_release_reach_the_database_with_main_session_pool_exh
             finally:
                 holder.close()
         finally:
-            with suppress(async_workers.AsyncWorkerAdmissionTimeoutError):
+            body_error = sys.exception()
+            try:
                 await asyncio.wait_for(lease.close(), timeout=30)
+            except async_workers.AsyncWorkerAdmissionTimeoutError as exc:
+                if body_error is not None:
+                    body_error.add_note(f"Lease cleanup admission timed out: {exc}")
+                else:
+                    raise
     finally:
         try:
             await asyncio.wait_for(async_workers.shutdown_async_workers(), timeout=30)
