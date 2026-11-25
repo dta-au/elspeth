@@ -14,6 +14,7 @@ from structlog.testing import capture_logs
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.secrets import FingerprintKeyMissingError, SecretDecryptionError
 from elspeth.web.app import create_app
+from elspeth.web.async_workers import AsyncWorkerAdmissionTimeoutError
 from elspeth.web.config import WebSettings
 from elspeth.web.required_executor import RequiredGenerationUnavailable
 from elspeth.web.sessions.composer_operation_errors import project_composer_operation_error, request_cancelled_error
@@ -44,6 +45,7 @@ def parity_app(tmp_path: Path):
     [
         pytest.param(AuditIntegrityError("PRIVATE exception marker"), id="audit-integrity"),
         pytest.param(RequiredGenerationUnavailable("PRIVATE generation detail"), id="generation-unavailable"),
+        pytest.param(AsyncWorkerAdmissionTimeoutError("PRIVATE admission detail"), id="worker-admission-timeout"),
         pytest.param(HTTPException(status_code=400, detail="No user message to recompose"), id="string-no-user"),
         pytest.param(HTTPException(status_code=404, detail="State not found"), id="string-state-missing"),
         pytest.param(HTTPException(status_code=504, detail="Pipeline commit timed out"), id="string-settlement-timeout"),

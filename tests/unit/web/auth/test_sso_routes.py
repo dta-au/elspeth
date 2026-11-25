@@ -20,9 +20,13 @@ out of the token row.
 
 from __future__ import annotations
 
+import asyncio
 import threading
+from collections.abc import AsyncIterator
+from contextlib import ExitStack, asynccontextmanager
 from dataclasses import dataclass
 from http.cookies import SimpleCookie
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
@@ -31,11 +35,14 @@ import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient, Response
 from pydantic import SecretBytes
-from sqlalchemy import insert
+from sqlalchemy import func, insert, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.errors import FrameworkBugError
+from elspeth.web import async_workers
+from elspeth.web.app import create_app
+from elspeth.web.async_workers import AsyncWorkerAdmissionTimeoutError
 from elspeth.web.auth.id_token import JWKSTokenValidator
 from elspeth.web.auth.models import IdentityClaims
 from elspeth.web.auth.providers import _mechanics
@@ -48,10 +55,11 @@ from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 from elspeth.web.middleware.request_id import RequestIdMiddleware
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import identities_table
+from elspeth.web.sessions.models import identities_table, sso_handoffs_table
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.sso_handoff_repository import SsoHandoffRepository
 from tests.fixtures.auth_sessions import TestSessionFamilies
+from tests.fixtures.process_watchdog import OwnedTestProcessWatchdog
 from tests.helpers.fake_idp import FakeIdP
 from tests.unit.web.auth.conftest import saturated_worker_pool
 
@@ -689,3 +697,172 @@ class TestCompleteShape:
         async with _client(_app(sso=_runtime(idp, _Substrate(_engine())))) as client:
             response = await client.post("/api/auth/sso/complete", json=body)
         assert response.status_code == 422
+
+
+# ==========================================================================
+# The callback when its refusal audit cannot be admitted.
+# ==========================================================================
+
+
+def _production_admission_handlers(tmp_path: Path) -> dict[type[Exception], Any]:
+    """The application's own handlers for the admission refusal and ``OSError``.
+
+    This file's harness mounts the auth router alone, so the app-level
+    handlers that decide the wire status of an exception the route lets
+    propagate are absent. They are taken from a real ``create_app`` rather
+    than restated, so the status asserted below is the one production gives.
+    """
+    settings = WebSettings(
+        data_dir=tmp_path,
+        composer_max_composition_turns=15,
+        composer_context_max_prompt_tokens=200_000,
+        composer_max_discovery_turns=10,
+        composer_timeout_seconds=85.0,
+        composer_rate_limit_per_minute=10,
+        composer_boot_probe_enabled=False,
+        shareable_link_signing_key=SecretBytes(b"\x00" * 32),
+    )
+    with ExitStack() as cleanup:
+        app = create_app(settings, process_watchdog_factory=OwnedTestProcessWatchdog)
+        cleanup.callback(app.state._auth_audit_finalizer)
+        cleanup.callback(app.state._session_engine_finalizer)
+        cleanup.callback(app.state.readiness_probe_runner.close)
+        # Whatever the application registers for these two classes, and
+        # nothing it does not: without the exact-class handler the refusal
+        # falls through to ``OSError``'s, as it did before that handler existed.
+        return {cls: handler for cls, handler in app.exception_handlers.items() if cls in (AsyncWorkerAdmissionTimeoutError, OSError)}
+
+
+def _audit_outstanding() -> int:
+    with async_workers._AUTH_AUDIT_WORKERS.lock:
+        return async_workers._AUTH_AUDIT_WORKERS.outstanding
+
+
+@asynccontextmanager
+async def _saturated_auth_audit_pool() -> AsyncIterator[None]:
+    """Hold every admission slot of the reserved auth-audit pool for the block.
+
+    The same shape as ``saturated_worker_pool``: real submissions blocked on
+    an event, so the next audit goes through the real admission wait and is
+    refused for real. The release is unconditional; the pool is process-wide.
+    """
+    released = threading.Event()
+    fillers = [
+        asyncio.create_task(async_workers.run_auth_audit_in_worker(released.wait))
+        for _ in range(async_workers.AUTH_AUDIT_ADMISSION_CAPACITY)
+    ]
+    try:
+        async with asyncio.timeout(5):
+            while _audit_outstanding() < async_workers.AUTH_AUDIT_ADMISSION_CAPACITY:
+                await asyncio.sleep(0.01)
+        yield
+    finally:
+        released.set()
+        await asyncio.gather(*fillers)
+
+
+def _handoff_rows(engine: Engine) -> int:
+    with engine.connect() as conn:
+        return conn.execute(select(func.count()).select_from(sso_handoffs_table)).scalar_one()
+
+
+class TestCallbackRefusalAuditNotAdmitted:
+    """The callback's refusal audit is refused, so the route answers 503 and claims nothing.
+
+    ``sso_callback`` audits a failed walk through the reserved auth-audit
+    pool and lets a refusal of that write propagate rather than claim an
+    audited refusal it could not record. The application answers that
+    propagated refusal with 503 ``database_unavailable``. A retryable status
+    is only honest if nothing on this side was spent before the refusal: the
+    walk lives in the transaction cookie, which the refused response leaves
+    in place, and no identity, login row, handoff or token exists.
+
+    Each refused call costs the shipped ``ADMISSION_WAIT_SECONDS`` per pool.
+    """
+
+    _REQUEST_ID = "sso-callback-refusal-1"
+
+    def _expected_body(self) -> dict[str, str]:
+        return {
+            "detail": "Database is currently unavailable. Please retry in a moment.",
+            "error_type": "database_unavailable",
+            "request_id": self._REQUEST_ID,
+        }
+
+    def _app(self, tmp_path: Path, idp: FakeIdP, substrate: _Substrate, recorder: _RecordingRecorder) -> FastAPI:
+        app = _app(sso=_runtime(idp, substrate), recorder=recorder)
+        for cls, handler in _production_admission_handlers(tmp_path).items():
+            app.add_exception_handler(cls, handler)
+        return app
+
+    @pytest.mark.asyncio
+    async def test_an_idp_error_with_its_audit_refused_is_503_and_a_retry_is_audited(self, tmp_path: Path, idp: FakeIdP) -> None:
+        """Before the code: the IdP's own error, with the auth-audit pool full."""
+        substrate = _Substrate(_engine())
+        recorder = _RecordingRecorder()
+        async with _client(self._app(tmp_path, idp, substrate, recorder)) as client:
+            started = await _start(client)
+            _present_cookie(client, started.cookie_value)
+            params = {"error": "access_denied", "state": started.state}
+            async with _saturated_auth_audit_pool():
+                refused = await client.get("/api/auth/sso/callback", params=params, headers={"X-Request-ID": self._REQUEST_ID})
+            rows_after_refusal = list(recorder.rows)
+            handoffs_after_refusal = _handoff_rows(substrate.engine)
+            # The pool has drained; the same browser retries the same callback.
+            retried = await client.get("/api/auth/sso/callback", params=params)
+
+        assert refused.status_code == 503, refused.text
+        assert refused.json() == self._expected_body()
+        assert "set-cookie" not in refused.headers, "the refused response must leave the walk's cookie in place"
+        assert rows_after_refusal == [], "nothing was audited, so nothing may be claimed"
+        assert handoffs_after_refusal == 0
+        assert substrate.identities == {}
+
+        assert retried.status_code == 302
+        (row,) = recorder.of("auth_failure")
+        assert (row["failure_stage"], row["exception_class"]) == ("sso_callback", "SsoIdpError")
+        assert _fragment_params(retried.headers["location"]) == {"error": [row["failure_category"]]}
+        assert _handoff_rows(substrate.engine) == 0
+
+    @pytest.mark.asyncio
+    async def test_a_redeemed_code_with_both_pools_full_is_503_and_its_retry_fails_cleanly(self, tmp_path: Path, idp: FakeIdP) -> None:
+        """After the code: the token exchange succeeds, then both pools refuse.
+
+        The shared pool refuses ``finish_login`` before the upsert, which the
+        service turns into ``AuthProviderUnavailable``; the auth-audit pool
+        then refuses that refusal's audit. The IdP has spent the code, so a
+        retry of the same callback is refused by the IdP and audited, and
+        still mints nothing.
+        """
+        substrate = _Substrate(_engine())
+        recorder = _RecordingRecorder()
+        async with _client(self._app(tmp_path, idp, substrate, recorder)) as client:
+            started = await _start(client)
+            _present_cookie(client, started.cookie_value)
+            code = idp.authorize(nonce=started.nonce, subject="ada")
+            params = {"code": code, "state": started.state}
+            async with saturated_worker_pool(), _saturated_auth_audit_pool():
+                refused = await client.get("/api/auth/sso/callback", params=params, headers={"X-Request-ID": self._REQUEST_ID})
+            code_redeemed_by_the_refused_call = idp.codes[code].redeemed
+            rows_after_refusal = list(recorder.rows)
+            handoffs_after_refusal = _handoff_rows(substrate.engine)
+            identities_after_refusal = dict(substrate.identities)
+            retried = await client.get("/api/auth/sso/callback", params=params)
+
+        assert code_redeemed_by_the_refused_call, "the refusal must land after the token exchange for this case"
+        assert refused.status_code == 503, refused.text
+        assert refused.json() == self._expected_body()
+        assert "set-cookie" not in refused.headers, "the refused response must leave the walk's cookie in place"
+        assert rows_after_refusal == [], "nothing was audited, so nothing may be claimed"
+        assert handoffs_after_refusal == 0
+        assert identities_after_refusal == {}
+
+        assert retried.status_code == 302
+        (row,) = recorder.of("auth_failure")
+        assert (row["failure_stage"], row["exception_class"]) == ("sso_callback", "SsoTokenExchangeFailed")
+        assert _fragment_params(retried.headers["location"]) == {"error": [row["failure_category"]]}
+        # Across both attempts: no identity, no login row, no handoff, no token.
+        assert substrate.identities == {}
+        assert recorder.of("login_success") == []
+        assert recorder.of("token_issued") == []
+        assert _handoff_rows(substrate.engine) == 0

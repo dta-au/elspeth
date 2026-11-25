@@ -22,7 +22,7 @@ TURN = "src/elspeth/web/sessions/composer_turn.py"
 # the direct constructor statement. No tail or source coordinates authorize it.
 REVIEWED_GRAMMARS = {
     "ComposerAsyncWorker.__init__": "f8ed684df4246dcca92a117aa0be13419bac368a73b5440a24356ac0fb87df3b",
-    "ComposerAsyncWorker._job": "ebe08f000b83f6477d3035666cce0d85aaf8f85290c8bdceebf4a91b6bc21ab2",
+    "ComposerAsyncWorker._job": "4c85b90fa2ff8974753ae8359226a9fba7648eca3b53b800437f31cb69814da1",
     "ComposerAsyncWorker._run_started": "3bac6518c02e38c7556a14d4b2db4d98d07fe26f623486fd93d158f8af13804f",
     "ComposerAsyncWorker._run_started_under_lease": "daf38d630a65beb59e65af3a81a44ee074492814371c532a285113ad897c2b68",
     "_create_app": "6eca125420e774652afecd25703c81295644f2291220ae77eaf78501aeee16dd",
