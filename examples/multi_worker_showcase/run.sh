@@ -204,10 +204,9 @@ else
     WORKER_FAILED=1
 fi
 echo "Leader exited ($LEADER_EXIT)."
-if [ "$LEADER_EXIT" -ne 0 ]; then
-    for pid in "${FOLLOWER_PIDS[@]}"; do
-        kill -0 "$pid" 2>/dev/null && kill "$pid" 2>/dev/null || true
-    done
+if [ "$LEADER_EXIT" -ne 0 ] && [ ${#FOLLOWER_PIDS[@]} -gt 0 ]; then
+    # Bounded: TERM, then KILL, so a follower that cannot stop never hangs the wait below.
+    stop_children "${FOLLOWER_PIDS[@]}"
 fi
 if [ ${#FOLLOWER_PIDS[@]} -gt 0 ]; then
     for pid in "${FOLLOWER_PIDS[@]}"; do
