@@ -50,6 +50,7 @@ from elspeth.contracts.composer_llm_audit import (
 from elspeth.contracts.composer_provider_context import PrivateProviderContext
 from elspeth.contracts.credential_material import CREDENTIAL_PATTERN_SPECS, find_credential_material
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.provider_rejection import ReasonSource
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.core.canonical import canonical_json, stable_hash
@@ -816,6 +817,7 @@ def build_llm_call_record(
     response_metadata: _AdmittedLLMProviderMetadata | None = None,
     error_class: str | None = None,
     error_message: str | None = None,
+    rejection_reason_source: ReasonSource | None = None,
     max_completion_tokens_requested: int | None = None,
     planner_policy_hash: str | None = None,
     planner_call_ordinal: int | None = None,
@@ -909,6 +911,7 @@ def build_llm_call_record(
         finished_at=started_at + timedelta(microseconds=elapsed_ns // 1_000),
         error_class=error_class,
         error_message=_safe_llm_error_message(error_message),
+        rejection_reason_source=rejection_reason_source,
         private_failure=capture_failure_facts(failure) if failure is not None else None,
         private_request=private_request,
         temperature=temperature,

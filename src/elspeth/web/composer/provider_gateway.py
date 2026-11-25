@@ -27,6 +27,7 @@ from elspeth.contracts.prompt_guard import (
     validate_prompt_guard_thinking_parts,
     validate_prompt_guard_tool_argument_parts,
 )
+from elspeth.contracts.provider_rejection import ReasonSource
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.plugins.transforms.llm.model_catalog import OPENROUTER_LITELLM_PREFIX
 from elspeth.web.composer._compose_loop_carriers import (
@@ -48,7 +49,7 @@ from elspeth.web.composer.private_diagnostic_facts import bind_received_response
 from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused, build_prompt_guard_mount, enforce_prompt_guard
 from elspeth.web.composer.protocol import ComposerServiceError, ComposerSettings
 from elspeth.web.composer.provider_context import capture_provider_context
-from elspeth.web.composer.provider_errors import classify_provider_failure, is_context_length_rejection
+from elspeth.web.composer.provider_errors import classify_provider_failure, request_size_rejection, size_rejection_code
 from elspeth.web.composer.provider_quota import (
     ProviderCallCustody,
     provider_call_scope,
@@ -621,7 +622,9 @@ class ProviderGateway:
         prompt_guard_thinking_parts: tuple[PromptGuardThinkingParts | None, ...] | None = None,
     ) -> _AdmittedLLMCompletion:
         """Call LiteLLM and return only the admitted, owned completion."""
+        from litellm.exceptions import APIError as LiteLLMAPIError
         from litellm.exceptions import BadRequestError as LiteLLMBadRequestError
+        from litellm.exceptions import RateLimitError as LiteLLMRateLimitError
 
         try:
             kwargs = build_composer_loop_request_kwargs(
@@ -644,6 +647,27 @@ class ProviderGateway:
                 **kwargs,
             )
         except LiteLLMBadRequestError as exc:
+            raise _BadRequestLLMError(
+                f"LLM request rejected ({type(exc).__name__})",
+                provider_detail=str(exc) or None,
+                provider_status_code=exc.status_code,
+            ) from exc
+        except LiteLLMAPIError as exc:
+            # A request too large for the provider or a proxy in front of it
+            # (HTTP 413) is a rejected request, not an outage.
+            if size_rejection_code(exc) != "request_too_large":
+                raise
+            raise _BadRequestLLMError(
+                f"LLM request rejected ({type(exc).__name__})",
+                provider_detail=str(exc) or None,
+                provider_status_code=exc.status_code,
+            ) from exc
+        except LiteLLMRateLimitError as exc:
+            # LiteLLM reports some HTTP 413s as a rate limit. The classifier
+            # recognises them from the typed exception chain; any other rate
+            # limit propagates unchanged.
+            if size_rejection_code(exc) != "request_too_large":
+                raise
             raise _BadRequestLLMError(
                 f"LLM request rejected ({type(exc).__name__})",
                 provider_detail=str(exc) or None,
@@ -678,7 +702,9 @@ class ProviderGateway:
         prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
     ) -> Any:
         """Call the LLM for non-tool text generation."""
+        from litellm.exceptions import APIError as LiteLLMAPIError
         from litellm.exceptions import BadRequestError as LiteLLMBadRequestError
+        from litellm.exceptions import RateLimitError as LiteLLMRateLimitError
 
         try:
             kwargs = build_composer_loop_request_kwargs(
@@ -700,6 +726,27 @@ class ProviderGateway:
                 **kwargs,
             )
         except LiteLLMBadRequestError as exc:
+            raise _BadRequestLLMError(
+                f"LLM request rejected ({type(exc).__name__})",
+                provider_detail=str(exc) or None,
+                provider_status_code=exc.status_code,
+            ) from exc
+        except LiteLLMAPIError as exc:
+            # A request too large for the provider or a proxy in front of it
+            # (HTTP 413) is a rejected request, not an outage.
+            if size_rejection_code(exc) != "request_too_large":
+                raise
+            raise _BadRequestLLMError(
+                f"LLM request rejected ({type(exc).__name__})",
+                provider_detail=str(exc) or None,
+                provider_status_code=exc.status_code,
+            ) from exc
+        except LiteLLMRateLimitError as exc:
+            # LiteLLM reports some HTTP 413s as a rate limit. The classifier
+            # recognises them from the typed exception chain; any other rate
+            # limit propagates unchanged.
+            if size_rejection_code(exc) != "request_too_large":
+                raise
             raise _BadRequestLLMError(
                 f"LLM request rejected ({type(exc).__name__})",
                 provider_detail=str(exc) or None,
@@ -787,6 +834,7 @@ class ProviderGateway:
         response_metadata: _AdmittedLLMProviderMetadata | None = None
         error_class: str | None = None
         error_message: str | None = None
+        rejection_reason_source: ReasonSource | None = None
         failure_to_capture: Exception | None = None
         recovery_batch: _AdmittedToolBatch | None = None
         try:
@@ -891,8 +939,11 @@ class ProviderGateway:
             cause = exc.__cause__
             status = ComposerLLMCallStatus.BAD_REQUEST_ERROR
             error_class = type(cause).__name__ if cause is not None else type(exc).__name__
-            # A recognised context-limit rejection is recorded by its closed reason, never by provider text.
-            error_message = "context_length_exceeded" if is_context_length_rejection(cause) else error_class
+            # A recognised size rejection is recorded by its closed reason, never by
+            # provider text, with what recognised it.
+            size_rejection = request_size_rejection(cause)
+            error_message = error_class if size_rejection is None else size_rejection.reason_code
+            rejection_reason_source = None if size_rejection is None else size_rejection.reason_source
             attach_llm_calls(exc, recorder)
             raise
         except CredentialMaterialRefused as exc:
@@ -930,6 +981,7 @@ class ProviderGateway:
                             response_metadata=response_metadata,
                             error_class=error_class,
                             error_message=error_message,
+                            rejection_reason_source=rejection_reason_source,
                             provider_custody=provider_custody,
                             failure=failure_to_capture,
                             private_request=private_request,
@@ -998,6 +1050,7 @@ class ProviderGateway:
         response_metadata: _AdmittedLLMProviderMetadata | None = None
         error_class: str | None = None
         error_message: str | None = None
+        rejection_reason_source: ReasonSource | None = None
         failure_to_capture: Exception | None = None
         try:
             if any(parts is not None for parts in evidence.content_parts):
@@ -1078,8 +1131,11 @@ class ProviderGateway:
             cause = exc.__cause__
             status = ComposerLLMCallStatus.BAD_REQUEST_ERROR
             error_class = type(cause).__name__ if cause is not None else type(exc).__name__
-            # A recognised context-limit rejection is recorded by its closed reason, never by provider text.
-            error_message = "context_length_exceeded" if is_context_length_rejection(cause) else error_class
+            # A recognised size rejection is recorded by its closed reason, never by
+            # provider text, with what recognised it.
+            size_rejection = request_size_rejection(cause)
+            error_message = error_class if size_rejection is None else size_rejection.reason_code
+            rejection_reason_source = None if size_rejection is None else size_rejection.reason_source
             attach_llm_calls(exc, recorder)
             raise
         except CredentialMaterialRefused as exc:
@@ -1117,6 +1173,7 @@ class ProviderGateway:
                             response_metadata=response_metadata,
                             error_class=error_class,
                             error_message=error_message,
+                            rejection_reason_source=rejection_reason_source,
                             provider_custody=provider_custody,
                             failure=failure_to_capture,
                             private_request=private_request,

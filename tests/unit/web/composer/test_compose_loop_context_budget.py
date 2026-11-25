@@ -8,6 +8,7 @@ call record that describes it.
 from __future__ import annotations
 
 import json
+import math
 import time
 from copy import deepcopy
 from dataclasses import replace
@@ -25,7 +26,7 @@ from elspeth.web.composer import context_budget_history
 from elspeth.web.composer import service as composer_service
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
 from elspeth.web.composer.audit import BufferingRecorder
-from elspeth.web.composer.context_budget import CONTEXT_BUDGET_TOOL_RESULT_STUB
+from elspeth.web.composer.context_budget import CONTEXT_BUDGET_MEASURED_MARGIN, CONTEXT_BUDGET_TOOL_RESULT_STUB
 from elspeth.web.composer.context_budget_apply import (
     CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES,
     message_bytes,
@@ -1081,6 +1082,8 @@ async def test_the_reply_stage_request_quotes_every_tool_result_of_the_turn_in_f
 
     selected, tools, record = await _prepare_reply(service, llm_messages)
 
+    assert record.surface == "reply"
+    assert unshed_record.surface == "reply"
     assert record.stubbed_tool_call_ids == ()
     assert record.estimated_tokens_after == record.estimated_tokens_before
     assert record.estimated_tokens_before > service._context_budget_policy.shed_above * cap
@@ -1199,10 +1202,21 @@ async def test_compose_anchor_without_authored_metadata_is_priced_no_lower_than_
     assert budget is not None
     assert budget.estimated_tokens_after >= 100_000
     assert budget.anchor_status == "authored_evidence_unavailable"
-    # The provider counted the first request denser than the policy rate; its density is the rate used.
+    # The provider counted the first request denser than the policy rate, so the byte arm is
+    # priced at that measured density less the margin. That prices it above the anchor's own
+    # count plus the few new bytes at one token each, so the anchored arm is the lower one.
+    # Pin history: until the measured rate (0.8.18) this was the byte arm ("authored_prefix",
+    # at the anchor's plain density, 1.0 < rate < 3.0).
+    first = result.llm_calls[0].context_budget
+    assert first is not None
     assert budget.authored_refuted is True
-    assert budget.pricing_mode == "authored_prefix"
-    assert 1.0 < float(budget.bytes_per_token) < 3.0
+    assert budget.anchor_prompt_tokens == 100_000
+    byte_arm = math.ceil(budget.decision_wire_bytes / (first.request_wire_bytes / 100_000 * CONTEXT_BUDGET_MEASURED_MARGIN))
+    anchored_arm = 100_000 + budget.decision_wire_bytes - budget.anchor_shared_bytes
+    assert anchored_arm < byte_arm
+    assert budget.estimated_tokens_after == anchored_arm
+    assert budget.pricing_mode == "anchored"
+    assert budget.bytes_per_token == repr(1.0)
 
 
 @pytest.mark.asyncio

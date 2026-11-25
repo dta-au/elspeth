@@ -42,11 +42,11 @@ from elspeth.contracts.composer_interpretation import (
 )
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.composer_progress import (
-    CONTEXT_BUDGET_PROVIDER_REFUSAL_DETAIL,
     CONTEXT_BUDGET_REFUSAL_DETAIL,
     ComposerProgressEvent,
     ComposerProgressReason,
     ComposerProgressSink,
+    context_budget_provider_refusal_detail,
 )
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.freeze import deep_thaw
@@ -3100,7 +3100,8 @@ PLANNER_POLICY_DETAIL_CODES: Final[frozenset[str]] = frozenset(
 # The planner codes that mean "this request cannot be fitted to the context
 # budget". ``CONTEXT_BUDGET_EXHAUSTED`` is the budgeter's own refusal of a
 # request over the byte maximum, or (detail code ``context_ceiling_provider``)
-# the gateway's rejection of a sent request as over the model's context limit;
+# the provider's rejection of a sent request as too large, for the model's
+# context limit or as a request (HTTP 413);
 # ``REQUEST_BYTES_EXHAUSTED`` is the final byte guard behind it.
 _FREEFORM_PLANNER_CONTEXT_BUDGET_CODES: Final[frozenset[str]] = frozenset({"CONTEXT_BUDGET_EXHAUSTED", "REQUEST_BYTES_EXHAUSTED"})
 # ``failure_code -> (http_status, safe static detail)``. The detail text is
@@ -3229,10 +3230,11 @@ async def _handle_planner_failure(
     """
     failure_code = _freeform_planner_failure_code(exc)
     status_code, detail = _FREEFORM_PLANNER_FAILURE_HTTP[failure_code]
-    if failure_code == CONTEXT_BUDGET_FAILURE_CODE and "context_ceiling_provider" in exc.detail_codes:
-        # The gateway's own rejection is reported as the gateway's, not as ELSPETH's
-        # budget: the compose loop's sentence for the same ceiling (ComposerConvergenceError).
-        detail = CONTEXT_BUDGET_PROVIDER_REFUSAL_DETAIL
+    if failure_code == CONTEXT_BUDGET_FAILURE_CODE and exc.provider_size_reason is not None:
+        # The gateway's own rejection (detail code ``context_ceiling_provider``) is
+        # reported as the gateway's, not as ELSPETH's budget, chosen by its typed
+        # reason: the compose loop's sentence for the same ceiling (ComposerConvergenceError).
+        detail = context_budget_provider_refusal_detail(exc.provider_size_reason)
     envelope: dict[str, object] = {
         "_kind": "planner_failure_disposition",
         "surface": "freeform",

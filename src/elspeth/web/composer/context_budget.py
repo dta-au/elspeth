@@ -20,12 +20,21 @@ from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.web.composer.invariants import InvariantError
 
 CONTEXT_BUDGET_FALLBACK_BYTES_PER_TOKEN: Final[float] = 3.0
+# A measured density (a same-model call's sent wire bytes over the provider's
+# count) prices bytes at this share of itself. The provider reports one count
+# for the whole request, so retained content denser than the request's mix
+# would be under-counted at the plain average; the margin covers that spread.
+CONTEXT_BUDGET_MEASURED_MARGIN: Final[float] = 0.90
+# Densities outside this band are implausible and are never used.
+CONTEXT_BUDGET_MIN_MEASURED_BYTES_PER_TOKEN: Final[float] = 1.0
+CONTEXT_BUDGET_MAX_MEASURED_BYTES_PER_TOKEN: Final[float] = 8.0
 # Every size in this module is WIRE bytes: the canonical JSON of the request
 # body's ``{messages, tools}`` as sent, so content, tool-call arguments,
 # replayed thinking blocks and tool definitions all count.
 # A same-exchange provider count
-# can price unchanged protected messages; without one, only authored bytes get the fallback rate.
-# Release always uses the byte yardstick, independently of anchor availability.
+# can price unchanged protected messages; without one, every byte pays the byte rate.
+# Release uses the byte rate alone, never the anchor arm, so an anchor arriving
+# or being lost (as at every turn boundary) never changes what is released.
 CONTEXT_BUDGET_TOOL_RESULT_STUB: Final[str] = "[Result omitted by ELSPETH to fit the context budget. Call the tool again if you need it.]"
 
 
@@ -103,12 +112,15 @@ class ContextBudgetPolicy:
                 # (``on_over_estimate="send"``); a record's ``over_estimate`` says which happened.
                 # v4: every byte is priced at ``fallback_bytes_per_token``, or at the anchor's
                 # measured density when that is denser; no byte is priced at one token.
-                "schema": "composer.context-budget.v4",
+                # v5: a measured same-model density, less the margin, replaces the fallback
+                # rate for admission AND release, in both directions; the anchor arm is unchanged.
+                "schema": "composer.context-budget.v5",
                 "max_prompt_tokens": self.max_prompt_tokens,
                 "max_request_bytes": self.max_request_bytes,
                 "shed_above": repr(self.shed_above),
                 "shed_to": repr(self.shed_to),
                 "fallback_bytes_per_token": repr(self.fallback_bytes_per_token),
+                "measured_margin": repr(CONTEXT_BUDGET_MEASURED_MARGIN),
             }
         )
 
@@ -197,6 +209,7 @@ def decide_context_budget(
     anchor_status: ContextBudgetAnchorStatus = "no_previous_call",
     authored_bytes: int = 0,
     on_over_estimate: Literal["refuse", "send"] = "refuse",
+    measured_bytes_per_token: float | None = None,
 ) -> ContextBudgetDecision:
     """Decide which segments to shed from one request, or refuse.
 
@@ -218,16 +231,27 @@ def decide_context_budget(
     included. One measure serves both ceilings. It is what the gateway's body
     cap sees, so ``max_request_bytes`` bounds it directly; and it counts
     everything the model reads (content, tool-call arguments, thinking
-    blocks, tool definitions). The byte arm prices EVERY byte at
-    ``fallback_bytes_per_token``; when a plausible anchor shows this
-    conversation's content is denser than that, the anchor's measured density
-    replaces it (``pricing.authored_refuted`` records that it did). The other
-    arm pays the anchor's ENTIRE reported count plus one token for every
-    non-shared byte. The smaller arm is used. ``authored_bytes`` and
-    ``anchor_authored_bytes`` are still validated and recorded; they no longer
-    change the price. A first call whose content is denser than the fallback
-    rate is under-counted: that delays shedding and cannot refuse anything; the
-    provider judges its own limit.
+    blocks, tool definitions). The byte arm prices EVERY byte at the byte
+    rate: ``measured_bytes_per_token`` times ``CONTEXT_BUDGET_MEASURED_MARGIN``
+    when the caller has a measured density for this model, otherwise
+    ``fallback_bytes_per_token``; when a plausible anchor shows this request's
+    content is denser still, the anchor's density replaces it for admission.
+    ``pricing.authored_refuted`` records that the byte arm did not use the
+    fallback rate. The other arm pays the anchor's ENTIRE reported count plus
+    one token for every non-shared byte. The smaller arm is used.
+    ``authored_bytes`` and ``anchor_authored_bytes`` are still validated and
+    recorded; they no longer change the price. Content denser than the rate
+    used is under-counted: that delays shedding and cannot refuse anything; the
+    provider judges its own limit, and callers resend once with every earlier
+    turn left out when it rejects a request as too large.
+
+    ``measured_bytes_per_token`` is a density measured on an earlier call of
+    the same model and tool dialect: the wire bytes it sent over the
+    provider's prompt count. Callers take it from the newest such successful
+    call, of this exchange or stored in the session, so it survives the turn
+    boundary where no live anchor exists yet. It must lie within
+    ``CONTEXT_BUDGET_MIN_MEASURED_BYTES_PER_TOKEN`` and
+    ``CONTEXT_BUDGET_MAX_MEASURED_BYTES_PER_TOKEN``.
     Shared bytes must belong only to unchanged protected messages/tools;
     no segment saving may overlap them. This deliberately gives no token
     credit for content removed from the anchor. It assumes provider accounting
@@ -263,16 +287,28 @@ def decide_context_budget(
         raise ValueError("anchor authored bytes must fit the anchor request")
     if type(authored_bytes) is not int or not 0 <= authored_bytes <= request_bytes - savings:
         raise ValueError("authored bytes must exclude every sheddable byte")
+    if measured_bytes_per_token is not None and (
+        type(measured_bytes_per_token) is not float
+        or not CONTEXT_BUDGET_MIN_MEASURED_BYTES_PER_TOKEN <= measured_bytes_per_token <= CONTEXT_BUDGET_MAX_MEASURED_BYTES_PER_TOKEN
+    ):
+        raise ValueError("measured bytes per token must be a float within the plausible band")
     high = policy.shed_above * policy.max_prompt_tokens
     low = policy.shed_to * policy.max_prompt_tokens
 
     # When the protected prefix makes the low mark unreachable, shed only
     # to the high mark. If even that is unreachable, exhaust the segments
     # before judging the hard ceilings. Current requests are never segments.
-    rate = policy.fallback_bytes_per_token
+    # One byte rate serves admission and release, so the same request is
+    # judged alike on every call of the session.
+    byte_rate = (
+        measured_bytes_per_token * CONTEXT_BUDGET_MEASURED_MARGIN
+        if measured_bytes_per_token is not None
+        else policy.fallback_bytes_per_token
+    )
+    rate = byte_rate
     if anchor_tokens is not None and anchor_tokens <= anchor_wire_bytes <= 8 * anchor_tokens:
         rate = min(rate, anchor_wire_bytes / anchor_tokens)
-    authored_refuted = rate < policy.fallback_bytes_per_token
+    authored_refuted = rate != policy.fallback_bytes_per_token
 
     def byte_arm(size: int) -> int:
         return math.ceil(size / rate)
@@ -295,9 +331,9 @@ def decide_context_budget(
     target = high if tokens(request_bytes - savings) > low else low
 
     def fits_low(size: int) -> bool:
-        # Priced at the policy rate alone, never the anchor's: an anchor arriving or
+        # Priced at the byte rate alone, never the anchor's: an anchor arriving or
         # being lost must not release what was shed.
-        return math.ceil(size / policy.fallback_bytes_per_token) <= low and size <= policy.max_request_bytes
+        return math.ceil(size / byte_rate) <= low and size <= policy.max_request_bytes
 
     tokens_before = tokens(request_bytes)
 
@@ -309,7 +345,7 @@ def decide_context_budget(
     # every call once a session had crossed the high mark, pinning the request
     # at the low mark and changing the sent prefix each time. Held keys are
     # never restored. A released segment is restored, not exempt: release is
-    # priced at the policy rate and ``over`` at the anchor's, so a request can
+    # priced at the byte rate and ``over`` at the anchor's, so a request can
     # be released yet still over the high mark, and then a released segment
     # is as eligible to be shed again as one never shed.
     released = fits_low(request_bytes)

@@ -31,6 +31,13 @@ describe("safe request rejection admission", () => {
     expect(isSafeRequestRejection({ ...contextLimit, reason_source: "provider_prose" })).toBe(false);
   });
 
+  it("admits a request-too-large rejection only from an HTTP status", () => {
+    const tooLarge = { ...rejection, reason_code: "request_too_large", reason_source: "http_status" };
+    expect(isSafeRequestRejection(tooLarge)).toBe(true);
+    expect(isSafeRequestRejection({ ...tooLarge, reason_source: "http_response" })).toBe(false);
+    expect(isSafeRequestRejection({ ...rejection, reason_source: "http_status" })).toBe(false);
+  });
+
   it("distinguishes absent and unrecognized reasons without accepting raw prose", () => {
     expect(isSafeRequestRejection({ ...rejection, reason_code: null, reason_disposition: "absent" })).toBe(true);
     expect(isSafeRequestRejection({ ...rejection, reason_code: null, reason_disposition: "unrecognized" })).toBe(true);

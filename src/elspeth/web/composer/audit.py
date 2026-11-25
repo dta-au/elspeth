@@ -468,6 +468,7 @@ _LLM_CALL_PUBLIC_AUDIT_FIELDS: Final[tuple[str, ...]] = (
     "strict_tool_count",
     "request_byte_split",
     "context_budget",
+    "rejection_reason_source",
 )
 
 

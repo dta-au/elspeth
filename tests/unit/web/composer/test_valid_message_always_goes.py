@@ -54,6 +54,10 @@ from tests.unit.web.composer.test_tools import execute_tool as _execute_tool
 _SETTING = 200_000
 # A setting the fixed part of any request is over, at today's pricing and at one token per three bytes alike.
 _SMALL_SETTING = 20_000
+# An operator's explicit request byte maximum. The derived default (8 bytes per token of the
+# setting, 160,000 B here) would refuse these requests: they cannot fit 20,000 tokens at any
+# plausible density. Tests of the estimate alone set this so only the estimate is judged.
+_OPERATOR_BYTE_MAXIMUM = 960 * 1024
 _GENEROUS_SETTING = 10_000_000
 _MESSAGE = "Add a step that flags records with a missing amount."
 
@@ -249,7 +253,7 @@ async def test_history_goes_to_zero_before_anything_protected_and_protected_cont
     # Instrument guard: the reference carries all four history rows.
     assert [m["content"] for m in reference_messages[2:6]] == [row["content"] for row in _history()]
 
-    service, session_id = _service(_SMALL_SETTING)
+    service, session_id = _service(_SMALL_SETTING, composer_planner_max_request_bytes=_OPERATOR_BYTE_MAXIMUM)
     provider = _RecordingProvider(_make_llm_response(content="Done."))
     result = await _compose(service, session_id, provider, history=_history())
 
@@ -274,7 +278,7 @@ async def test_history_goes_to_zero_before_anything_protected_and_protected_cont
 
 @pytest.mark.asyncio
 async def test_an_over_estimate_send_is_recorded_on_its_call() -> None:
-    service, session_id = _service(_SMALL_SETTING)
+    service, session_id = _service(_SMALL_SETTING, composer_planner_max_request_bytes=_OPERATOR_BYTE_MAXIMUM)
     provider = _RecordingProvider(_make_llm_response(content="Done."))
 
     result = await _compose(service, session_id, provider)
@@ -290,6 +294,62 @@ async def test_an_over_estimate_send_is_recorded_on_its_call() -> None:
     assert stored["max_prompt_tokens"] == _SMALL_SETTING
     # The whole call record carries it into the audit envelope.
     assert call.to_dict()["context_budget"]["over_estimate"] is True
+
+
+@pytest.mark.asyncio
+async def test_must_go_content_over_960_kib_that_fits_the_setting_goes() -> None:
+    # The graph and the turn's latest tool result are must-go: nothing of them is left out. Over
+    # the former fixed 960 KiB maximum they were refused on bytes although a 1,000,000-token
+    # setting takes them at any plausible density.
+    rows = {f"rows_{part}": f"result row {part} " * 13_000 for part in "abc"}
+    service, session_id = _service(1_000_000)
+    provider = _RecordingProvider(_tool_turn("call-1"), _make_llm_response(content="Done."))
+
+    result = await _compose(service, session_id, provider, state=large_graph_state(), tool_data={"call-1": rows})
+
+    assert len(provider.requests) == len(result.llm_calls) == 2
+    second = provider.requests[1]
+    assert _wire_bytes(second) > 960 * 1024
+    latest = second["messages"][-1]
+    assert latest["role"] == "tool" and all(text in latest["content"] for text in rows.values())
+    assert len(_node_ids(_state_context(second["messages"]))) == 25
+
+
+@pytest.mark.asyncio
+async def test_a_request_over_960_kib_that_fits_the_setting_goes() -> None:
+    # A 1,000,000-token setting: the request is well under it at any plausible density, but over
+    # the former fixed 960 KiB maximum, under which every earlier turn was left out although the
+    # model could take the request whole.
+    prose = " Each record names its source and amount." * 5_000
+    history = [
+        _user(0, "Please read the CSV file." + prose),
+        _assistant("The source is set." + prose),
+        _user(2, "Now add a filter." + prose),
+    ]
+    service, session_id = _service(1_000_000)
+    provider = _RecordingProvider(_make_llm_response(content="Done."))
+
+    result = await _compose(service, session_id, provider, state=large_graph_state(), history=history)
+
+    (request,) = provider.requests
+    assert _wire_bytes(request) > 960 * 1024
+    assert sum(1 for message in request["messages"] if prose in message["content"]) == 3
+    (call,) = result.llm_calls
+    assert call.context_budget is not None and call.context_budget.shed_history_indices == ()
+
+
+@pytest.mark.asyncio
+async def test_the_derived_byte_maximum_refuses_only_a_request_that_cannot_fit_the_setting() -> None:
+    # Without an explicit maximum it is 8 bytes per token of the setting. This request is over
+    # that with nothing left to leave out, so it cannot fit at any plausible density: nothing is sent.
+    service, session_id = _service(_SMALL_SETTING)
+    assert service._context_budget_policy.max_request_bytes == _SMALL_SETTING * 8
+    provider = _RecordingProvider(_make_llm_response(content="Done."))
+
+    with pytest.raises(ComposerConvergenceError):
+        await _compose(service, session_id, provider)
+
+    assert provider.requests == []
 
 
 @pytest.mark.asyncio

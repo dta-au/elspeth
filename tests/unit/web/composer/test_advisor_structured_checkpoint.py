@@ -526,8 +526,12 @@ async def test_conformance_counts_only_physical_dispatch_after_quota_admission(
         first_valid = None if scenario == "blocked-first" else scenario != "blocked-retry"
         assert facts["first_attempt_schema_valid"] is first_valid
         assert facts["first_attempt_accepted"] is first_valid
-    if scenario in {"blocked-first", "blocked-retry"}:
+    if scenario == "blocked-first":
         assert verdict.failure_class == "unavailable"
+        assert record["note_present"] is None
+    elif scenario == "blocked-retry":
+        # The retry never reached the provider, so the malformed reply that did stays the outcome.
+        assert verdict.failure_class == "malformed"
         assert record["note_present"] is None
     else:
         assert verdict.ok and not verdict.blocking

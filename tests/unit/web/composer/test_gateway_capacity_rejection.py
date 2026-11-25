@@ -184,6 +184,22 @@ async def test_a_capacity_rejection_within_the_estimate_with_nothing_to_leave_ou
     assert call.status is ComposerLLMCallStatus.BAD_REQUEST_ERROR
     assert call.error_class == "ContextWindowExceededError"
     assert call.error_message == "context_length_exceeded"
+    assert call.rejection_reason_source == "sdk_class"
+
+
+@pytest.mark.asyncio
+async def test_a_rejection_recognised_by_its_wording_says_so_on_its_call_record() -> None:
+    service, session_id = _service(_GENEROUS_SETTING)
+    provider = _ScriptedProvider(_other_rejection("GatewayError - AnthropicException - prompt is too long: 251000 tokens > 200000 maximum"))
+
+    with pytest.raises(ComposerConvergenceError) as exc_info:
+        await _compose(service, session_id, provider)
+
+    (call,) = exc_info.value.llm_calls
+    assert call.error_message == "context_length_exceeded"
+    # Every wording-driven size rejection is visible in the audit as one.
+    assert call.rejection_reason_source == "message_pattern"
+    assert call.to_dict()["rejection_reason_source"] == "message_pattern"
 
 
 @pytest.mark.asyncio
