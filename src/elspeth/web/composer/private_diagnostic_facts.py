@@ -25,7 +25,7 @@ def safe_failure_text(value: object, limit: int) -> str | None:
             return None
     except UnicodeError:
         return None
-    return REDACTED_CREDENTIAL_TEXT if find_credential_material(value) is not None else value
+    return REDACTED_CREDENTIAL_TEXT if find_credential_material(value, purpose="conservative") is not None else value
 
 
 def capture_failure_facts(exc: BaseException) -> PrivateFailureFacts:
@@ -66,7 +66,9 @@ def capture_failure_facts(exc: BaseException) -> PrivateFailureFacts:
                 safe = safe_failure_text(argument, 2048)
                 # Filter the whole bounded original before fitting any text.
                 disposition = (
-                    "unavailable" if safe is None else ("filtered" if find_credential_material(argument) is not None else "retained")
+                    "unavailable"
+                    if safe is None
+                    else ("filtered" if find_credential_material(argument, purpose="conservative") is not None else "retained")
                 )
                 slot: dict[str, JsonValue] = {"disposition": disposition, "text": None}
                 arguments.append(slot)

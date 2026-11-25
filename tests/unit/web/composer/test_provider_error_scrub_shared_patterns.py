@@ -342,7 +342,7 @@ def test_short_header_dotted_token_preserves_base_redaction(length: int, wrapper
 def test_database_url_password_is_whole_redacted(scheme: str, special: str) -> None:
     password = "first" + special + "last"
     message = scheme + "://" + "user:" + password + "@db.example.test/data"
-    finding = find_credential_material(message)
+    finding = find_credential_material(message, purpose="conservative")
     assert finding is not None and finding.category == "credential_url"
     stored = _stored_error(message)
     leaked = password in stored

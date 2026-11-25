@@ -376,7 +376,10 @@ async def test_control_a_credential_in_a_small_graph_is_refused_before_any_provi
         await _compose(service, session_id, provider, state=CompositionState.from_dict(state_data))
 
     assert provider.requests == []
-    assert exc_info.value.finding.category == "credential_field"
+    # The held graph is not re-scanned at turn start; the provider request scan
+    # refuses the token in the bytes it would send, before any provider call.
+    assert exc_info.value.surface == "composer_provider_request"
+    assert exc_info.value.finding.category == "token_shape"
 
 
 # --- A latest-round discovery result at its real size -------------------------------------------------

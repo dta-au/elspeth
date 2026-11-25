@@ -5,6 +5,12 @@ declared credential fields, a closed set of credential token shapes, private
 keys, and credentials embedded in HTTP URLs.  It does not decode arbitrary
 base64, hex, compressed, encrypted, or cross-field content and is not a
 general-purpose DLP system.
+
+Every scan names its purpose. ``admission`` refuses content at an authoring or
+model-output boundary and uses the narrower pattern set. ``conservative``
+hides or protects content (audit scrubbing, redaction, withholding, engine
+evidence checks) and keeps the wider set, so what those consumers hide does
+not change when admission narrows.
 """
 
 from __future__ import annotations
@@ -19,7 +25,10 @@ from urllib.parse import ParseResult, parse_qs, urlparse
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.contracts.url import SENSITIVE_PARAMS
 
-CREDENTIAL_DETECTOR_VERSION: Final[str] = "1"
+CREDENTIAL_DETECTOR_VERSION: Final[str] = "2"
+# Versions a stored finding may carry. Version 2 only removes or narrows
+# admission patterns, so a value version 1 admitted, version 2 admits too.
+KNOWN_CREDENTIAL_DETECTOR_VERSIONS: Final[frozenset[str]] = frozenset({"1", "2"})
 REDACTED_CREDENTIAL_TEXT: Final[str] = "<redacted-secret>"
 CREDENTIAL_REFUSAL_DETAIL: Final[str] = (
     "This control content appears to contain a credential. Store the value through the secret service and use a secret reference."
@@ -35,6 +44,10 @@ CredentialCategory = Literal[
     "unsupported_value",
 ]
 CredentialLocation = Literal["root", "mapping_key", "mapping_value", "sequence_item", "traversal_boundary"]
+CredentialScanPurpose = Literal["admission", "conservative"]
+# Which traversal limit stopped a scan. Set exactly when the category is
+# ``traversal_limit``; everything after a limit goes unscanned.
+CredentialScanBound = Literal["depth", "nodes", "width", "string_bytes", "reference_bytes"]
 
 SECRET_FIELD_NAMES: Final[frozenset[str]] = frozenset(
     {
@@ -82,7 +95,10 @@ _SECRET_REFERENCE_NAME_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
 _SECRET_REFERENCE_NAME_MAX_BYTES = 256
 _URL_PARSE_ERROR: Final[Literal["invalid-url"]] = "invalid-url"
 
-CREDENTIAL_PATTERN_SPECS: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
+# The conservative set: redaction, audit scrubbing, withholding and engine
+# evidence checks. Its names, patterns and order are fixed, because callers
+# substitute each pattern in turn.
+CONSERVATIVE_PATTERN_SPECS: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
     ("aws_access_key", re.compile(r"AKIA[0-9A-Z]{16}")),
     ("bearer_token", re.compile(r"Bearer\s+[A-Za-z0-9._-]{20,}", re.IGNORECASE)),
     ("anthropic_key", re.compile(r"sk-ant-[A-Za-z0-9_-]{40,}")),
@@ -111,8 +127,53 @@ CREDENTIAL_PATTERN_SPECS: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
         ),
     ),
 )
+# The admission set: the conservative set without the keyword-assignment
+# pattern, and with the password pair only where it is a connection-string
+# pair, not prose: at the start of the value or after a ``;`` (ADO.NET and
+# ODBC), ``&`` or ``?`` (JDBC and other URL query strings).
+_ADMISSION_CONNECTION_PASSWORD: Final[re.Pattern[str]] = re.compile(r"(?:^|[;&?])\s*(?:password|pwd)=[^;\s]+", re.IGNORECASE)
+# libpq keyword/value connection strings separate pairs with whitespace. A
+# whitespace-led ``password=`` pair counts only when the same value also holds
+# another libpq connection keyword as a ``key=value`` pair.
+_LIBPQ_CONNECTION_KEYWORDS: Final[tuple[str, ...]] = (
+    "host",
+    "hostaddr",
+    "port",
+    "dbname",
+    "user",
+    "sslmode",
+    "connect_timeout",
+    "application_name",
+    "options",
+    "service",
+    "target_session_attrs",
+)
+_ADMISSION_LIBPQ_PASSWORD: Final[re.Pattern[str]] = re.compile(
+    r"\A(?=(?:[\s\S]*\s)?(?:" + "|".join(_LIBPQ_CONNECTION_KEYWORDS) + r")=\S)(?=(?:[\s\S]*\s)?password=\S)",
+    re.IGNORECASE,
+)
+ADMISSION_PATTERN_SPECS: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
+    *(
+        (name, _ADMISSION_CONNECTION_PASSWORD if name == "connection_password" else pattern)
+        for name, pattern in CONSERVATIVE_PATTERN_SPECS
+        if name != "credential_assignment"
+    ),
+    ("libpq_password", _ADMISSION_LIBPQ_PASSWORD),
+)
+
+
+def _pattern_specs(purpose: CredentialScanPurpose) -> tuple[tuple[str, re.Pattern[str]], ...]:
+    """Return the token pattern set for one scan purpose."""
+    if purpose == "admission":
+        return ADMISSION_PATTERN_SPECS
+    return CONSERVATIVE_PATTERN_SPECS
+
+
 _PRIVATE_KEY_PATTERN = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
 _HTTP_URL_CANDIDATE_RE = re.compile(r"https?://[^\s'\"<>]+", re.IGNORECASE)
+# Userinfo in http(s) text the URL parser rejects: the parsed path's
+# ``username is not None`` rule, applied to the raw text.
+_UNPARSED_URL_USERINFO_RE = re.compile(r"https?://[^\s/?#@]*@", re.IGNORECASE)
 _CREDENTIAL_URL_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
     re.compile(r"postgres(?:ql)?://[^:/\s]+:[^@/\s]+@"),
     re.compile(r"mysql://[^:/\s]+:[^@/\s]+@"),  # secret-scan: allow-this-line
@@ -139,6 +200,11 @@ class CredentialMaterialFinding:
     category: CredentialCategory
     location: CredentialLocation
     detector_version: str = CREDENTIAL_DETECTOR_VERSION
+    bound: CredentialScanBound | None = None
+
+    def __post_init__(self) -> None:
+        if (self.bound is None) == (self.category == "traversal_limit"):
+            raise ValueError("A credential finding names a bound exactly when it is a traversal limit")
 
 
 DEFAULT_CREDENTIAL_TRAVERSAL_POLICY: Final[CredentialTraversalPolicy] = CredentialTraversalPolicy()
@@ -159,6 +225,8 @@ def is_secret_field(field_name: str, additional_fields: Collection[str] = frozen
 def find_credential_material(
     value: Any,
     policy: CredentialTraversalPolicy = DEFAULT_CREDENTIAL_TRAVERSAL_POLICY,
+    *,
+    purpose: CredentialScanPurpose,
 ) -> CredentialMaterialFinding | None:
     """Return the first value-free credential finding in a bounded tree.
 
@@ -166,13 +234,14 @@ def find_credential_material(
     Exact managed-reference markers and declared exact environment references
     are allowed only as complete values under credential fields.
     """
-    state = _TraversalState(policy=policy, active_ids=set())
+    state = _TraversalState(policy=policy, purpose=purpose, active_ids=set())
     return _find(value, state=state, depth=0, location="root", credential_parent=False)
 
 
 @dataclass(slots=True)
 class _TraversalState:
     policy: CredentialTraversalPolicy
+    purpose: CredentialScanPurpose
     active_ids: set[int]
     nodes: int = 0
 
@@ -186,25 +255,27 @@ def _find(
     credential_parent: bool,
 ) -> CredentialMaterialFinding | None:
     state.nodes += 1
-    if depth > state.policy.max_depth or state.nodes > state.policy.max_nodes:
-        return CredentialMaterialFinding("traversal_limit", "traversal_boundary")
+    if depth > state.policy.max_depth:
+        return _limit("depth")
+    if state.nodes > state.policy.max_nodes:
+        return _limit("nodes")
     if credential_parent:
         if _is_empty(value):
             return None
-        reference_finding = _allowed_reference_finding(value, state.policy)
+        reference_finding = _allowed_reference_finding(value, state.policy, purpose=state.purpose)
         if reference_finding is not False:
             return reference_finding
         return CredentialMaterialFinding("credential_field", location)
     if type(value) is str:
         if len(value.encode("utf-8", errors="replace")) > state.policy.max_string_bytes:
-            return CredentialMaterialFinding("traversal_limit", "traversal_boundary")
-        category = _classify_string(value)
+            return _limit("string_bytes")
+        category = _classify_string(value, purpose=state.purpose)
         return CredentialMaterialFinding(category, location) if category is not None else None
     if value is None or type(value) in (bool, int, float):
         return None
     if type(value) in (dict, MappingProxyType):
         if len(value) > state.policy.max_width:
-            return CredentialMaterialFinding("traversal_limit", "traversal_boundary")
+            return _limit("width")
         object_id = id(value)
         if object_id in state.active_ids:
             return CredentialMaterialFinding("unsupported_value", "traversal_boundary")
@@ -214,8 +285,8 @@ def _find(
                 if type(key) is not str:
                     return CredentialMaterialFinding("unsupported_value", "mapping_key")
                 if len(key.encode("utf-8", errors="replace")) > state.policy.max_string_bytes:
-                    return CredentialMaterialFinding("traversal_limit", "traversal_boundary")
-                key_category = _classify_string(key)
+                    return _limit("string_bytes")
+                key_category = _classify_string(key, purpose=state.purpose)
                 if key_category is not None:
                     return CredentialMaterialFinding(key_category, "mapping_key")
                 finding = _find(
@@ -232,7 +303,7 @@ def _find(
         return None
     if type(value) in (list, tuple):
         if len(value) > state.policy.max_width:
-            return CredentialMaterialFinding("traversal_limit", "traversal_boundary")
+            return _limit("width")
         object_id = id(value)
         if object_id in state.active_ids:
             return CredentialMaterialFinding("unsupported_value", "traversal_boundary")
@@ -254,6 +325,21 @@ def _find(
     return CredentialMaterialFinding("unsupported_value", location)
 
 
+# A match refuses; a traversal limit or an unsupported value does not.
+CREDENTIAL_MATCH_CATEGORIES: Final[frozenset[CredentialCategory]] = frozenset(
+    {"credential_field", "token_shape", "private_key", "credential_url", "sensitive_url_parameter"}
+)
+
+
+def is_credential_match(finding: CredentialMaterialFinding) -> bool:
+    """Return whether a finding is a match (refusal), not a skipped scan."""
+    return finding.category in CREDENTIAL_MATCH_CATEGORIES
+
+
+def _limit(bound: CredentialScanBound) -> CredentialMaterialFinding:
+    return CredentialMaterialFinding("traversal_limit", "traversal_boundary", bound=bound)
+
+
 def _is_empty(value: Any) -> bool:
     if value is None or (type(value) is str and value == ""):
         return True
@@ -263,6 +349,8 @@ def _is_empty(value: Any) -> bool:
 def _allowed_reference_finding(
     value: Any,
     policy: CredentialTraversalPolicy,
+    *,
+    purpose: CredentialScanPurpose,
 ) -> CredentialMaterialFinding | None | Literal[False]:
     if type(value) in (dict, MappingProxyType) and set(value) in ({"secret_ref"}, {"secret_ref", "secret_scope"}):
         ref = value["secret_ref"]
@@ -270,9 +358,13 @@ def _allowed_reference_finding(
         if type(ref) is not str or not ref or (scope is not None and scope not in ("user", "server", "org")):
             return False
         ref_size = len(ref.encode("utf-8", errors="replace"))
-        if ref_size > min(policy.max_string_bytes, _SECRET_REFERENCE_NAME_MAX_BYTES):
-            return CredentialMaterialFinding("traversal_limit", "traversal_boundary")
-        category = _classify_string(ref)
+        if ref_size > policy.max_string_bytes:
+            return _limit("reference_bytes")
+        if ref_size > _SECRET_REFERENCE_NAME_MAX_BYTES:
+            # Longer than any reference name: not a reference, so the
+            # credential field holds a literal.
+            return False
+        category = _classify_string(ref, purpose=purpose)
         if category is not None:
             return CredentialMaterialFinding(category, "mapping_value")
         if _SECRET_REFERENCE_NAME_PATTERN.fullmatch(ref) is None:
@@ -284,20 +376,20 @@ def _allowed_reference_finding(
     if match is None or match.group(1) not in policy.env_ref_names:
         return False
     if len(value.encode("utf-8", errors="replace")) > policy.max_string_bytes:
-        return CredentialMaterialFinding("traversal_limit", "traversal_boundary")
+        return _limit("reference_bytes")
     return None
 
 
-def _classify_string(value: str) -> CredentialCategory | None:
+def _classify_string(value: str, *, purpose: CredentialScanPurpose) -> CredentialCategory | None:
     if _PRIVATE_KEY_PATTERN.search(value):
         return "private_key"
     if any(pattern.search(value) for pattern in _CREDENTIAL_URL_PATTERNS):
         return "credential_url"
     for candidate in _http_url_candidates(value):
-        category = _classify_http_url(candidate)
+        category = _classify_http_url(candidate, purpose=purpose)
         if category is not None:
             return category
-    if any(pattern.search(value) for _name, pattern in CREDENTIAL_PATTERN_SPECS):
+    if any(pattern.search(value) for _name, pattern in _pattern_specs(purpose)):
         return "token_shape"
     return None
 
@@ -314,22 +406,35 @@ def _http_url_candidates(value: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(standalone + embedded))
 
 
-def _classify_http_url(value: str) -> CredentialCategory | None:
+def _classify_http_url(value: str, *, purpose: CredentialScanPurpose) -> CredentialCategory | None:
     parsed = _parse_url(value)
     if parsed == _URL_PARSE_ERROR:
-        return "unsupported_value"
+        if purpose == "conservative":
+            # Conservative consumers keep hiding the whole value.
+            return "unsupported_value"
+        # Admission: text the URL parser rejects still gets the userinfo and
+        # query/fragment parameter checks on its raw text, and the string's
+        # remaining checks still run.
+        if _UNPARSED_URL_USERINFO_RE.search(value):
+            return "credential_url"
+        encoded_parts = tuple(value.partition(separator)[2] for separator in ("?", "#") if separator in value)
+        return _classify_url_parameters(encoded_parts, purpose=purpose)
     assert type(parsed) is ParseResult
     if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
         return None
     if parsed.username is not None or parsed.password is not None:
         return "credential_url"
-    for encoded in (parsed.query, parsed.fragment):
+    return _classify_url_parameters((parsed.query, parsed.fragment), purpose=purpose)
+
+
+def _classify_url_parameters(encoded_parts: tuple[str, ...], *, purpose: CredentialScanPurpose) -> CredentialCategory | None:
+    for encoded in encoded_parts:
         # parse_qs performs the boundary's single percent-decoding pass.
         params = parse_qs(encoded, keep_blank_values=True)
         for key, values in params.items():
             if _base_param_name(key.lower()) in SENSITIVE_PARAMS:
                 return "sensitive_url_parameter"
-            if any(_classify_decoded_url_value(item) is not None for item in values):
+            if any(_classify_decoded_url_value(item, purpose=purpose) is not None for item in values):
                 return "sensitive_url_parameter"
     return None
 
@@ -342,13 +447,13 @@ def _parse_url(value: str) -> ParseResult | Literal["invalid-url"]:
         return _URL_PARSE_ERROR
 
 
-def _classify_decoded_url_value(value: str) -> CredentialCategory | None:
+def _classify_decoded_url_value(value: str, *, purpose: CredentialScanPurpose) -> CredentialCategory | None:
     """Classify one once-decoded query/fragment value without URL recursion."""
     if _PRIVATE_KEY_PATTERN.search(value):
         return "private_key"
     if any(pattern.search(value) for pattern in _CREDENTIAL_URL_PATTERNS):
         return "credential_url"
-    if any(pattern.search(value) for _name, pattern in CREDENTIAL_PATTERN_SPECS):
+    if any(pattern.search(value) for _name, pattern in _pattern_specs(purpose)):
         return "token_shape"
     return None
 
@@ -411,7 +516,9 @@ def _scrub_mapping(
         for item_index, (key, child) in enumerate(value.items()):
             if item_index >= 512:
                 return REDACTED_CREDENTIAL_TEXT
-            scrubbed_key = REDACTED_CREDENTIAL_TEXT if isinstance(key, str) and _classify_string(key) is not None else key
+            scrubbed_key = (
+                REDACTED_CREDENTIAL_TEXT if isinstance(key, str) and _classify_string(key, purpose="conservative") is not None else key
+            )
             result[scrubbed_key] = _scrub(
                 child,
                 parent_key=key if isinstance(key, str) else None,
@@ -499,7 +606,7 @@ def _scrub(
         return _scrub_mapping(cast(Mapping[Any, Any], value), active_ids=active_ids, depth=depth, nodes=nodes)
     if shape == "string":
         text = cast(str, value)
-        return REDACTED_CREDENTIAL_TEXT if _classify_string(text) is not None else text
+        return REDACTED_CREDENTIAL_TEXT if _classify_string(text, purpose="conservative") is not None else text
     if shape == "sequence":
         return _scrub_sequence(cast(list[Any] | tuple[Any, ...], value), active_ids=active_ids, depth=depth, nodes=nodes)
     if shape == "set":

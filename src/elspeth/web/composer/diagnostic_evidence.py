@@ -17,6 +17,7 @@ from rfc8785 import CanonicalizationError
 
 from elspeth.contracts.credential_material import (
     CREDENTIAL_DETECTOR_VERSION,
+    KNOWN_CREDENTIAL_DETECTOR_VERSIONS,
     REDACTED_CREDENTIAL_TEXT,
     CredentialTraversalPolicy,
     find_credential_material,
@@ -185,11 +186,16 @@ class ComposerDiagnosticEvidence:
             type(self.schema_version) is not str
             or self.schema_version != _SCHEMA
             or type(self.detector_version) is not str
-            or self.detector_version not in {"1"}
+            or self.detector_version not in KNOWN_CREDENTIAL_DETECTOR_VERSIONS
         ):
             raise AuditIntegrityError("Private evidence schema or detector version is invalid")
         for value in (self.session_id, self.operation_id, self.tool_call_id, self.tool_name, self.status, self.evidence_id):
-            if type(value) is not str or not value or len(value) > 512 or find_credential_material(value, _POLICY) is not None:
+            if (
+                type(value) is not str
+                or not value
+                or len(value) > 512
+                or find_credential_material(value, _POLICY, purpose="admission") is not None
+            ):
                 raise AuditIntegrityError("Private evidence correlation metadata is invalid")
         if type(self.operation_epoch) is not int or self.operation_epoch < 1:
             raise AuditIntegrityError("Private evidence operation epoch is invalid")
@@ -373,7 +379,7 @@ def _project(
         if tool_name == "patch_output_options" and path == ("patch",):
             option_fields = (*option_fields, "url")
         for key, child in value.items():
-            if find_credential_material(key, _POLICY) is not None:
+            if find_credential_material(key, _POLICY, purpose="conservative") is not None:
                 reasons.add("recognized_credential")
                 continue
             structural = field_labels or (root and tool_name == "wire_secret_ref" and key == "option_key")
@@ -385,7 +391,7 @@ def _project(
                     max_width=JSON_MAX_ITEMS,
                     max_string_bytes=JSON_MAX_TOTAL_UTF8_BYTES,
                 )
-                if find_credential_material({key: child}, policy) is None:
+                if find_credential_material({key: child}, policy, purpose="conservative") is None:
                     projected[key] = child
                 else:
                     projected[key] = REDACTED_CREDENTIAL_TEXT
@@ -408,7 +414,7 @@ def _project(
             _project(item, tool_name=tool_name, additional_fields=additional_fields, reasons=reasons, path=(*path, index))
             for index, item in enumerate(value)
         ]
-    if type(value) is str and find_credential_material(value, _POLICY) is not None:
+    if type(value) is str and find_credential_material(value, _POLICY, purpose="conservative") is not None:
         reasons.add("recognized_credential")
         return REDACTED_CREDENTIAL_TEXT
     return value
