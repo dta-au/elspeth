@@ -25,6 +25,7 @@ from uuid import UUID, uuid4
 import pytest
 from sqlalchemy import select
 from sqlalchemy.exc import InvalidRequestError, OperationalError
+from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.core.payload_store import FilesystemPayloadStore
@@ -133,7 +134,7 @@ class _UnreadBlobService:
 
 @pytest.fixture
 def engine():  # type: ignore[no-untyped-def]
-    eng = create_session_engine("sqlite:///:memory:")
+    eng = create_session_engine("sqlite:///:memory:", poolclass=StaticPool, connect_args={"check_same_thread": False})
     initialize_session_schema(eng)
     return eng
 
@@ -394,9 +395,9 @@ async def test_mark_ready_for_review_audit_failure_does_not_emit_counter(
     state_record: _StateRecord,
     session_operation_context: SessionOperationContext,
 ) -> None:
-    """Audit primacy regression: if the audit INSERT raises (we force
-    this by disposing the engine before the call so ``engine.begin()``
-    fails), the counter MUST stay at zero. The helper is placed
+    """Audit primacy regression: if the audit write raises (we force
+    this by disposing the engine before the call, which leaves it on an
+    empty in-memory database), the counter MUST stay at zero. The helper is placed
     structurally AFTER the ``engine.begin()`` block, so an exception
     out of the block skips the helper — that's the test surface for
     "counter reflects committed audit rows only".
@@ -411,10 +412,12 @@ async def test_mark_ready_for_review_audit_failure_does_not_emit_counter(
         readiness=snapshot,
     )
 
-    # Dispose the engine — subsequent ``engine.begin()`` calls fail
-    # because the underlying pool is closed. The audit INSERT raises,
-    # the ``with`` block re-raises out of mark_ready_for_review, and
-    # the helper after the block never executes.
+    # Dispose the engine. With this fixture's ``StaticPool`` in-memory
+    # database, ``dispose(close=True)`` closes the only connection and
+    # installs a fresh pool, so the next checkout opens a new, empty
+    # in-memory database. The fenced audit write's first statement then
+    # raises ``OperationalError: no such table``, which propagates out of
+    # mark_ready_for_review, and the helper after it never executes.
     session_engine_with_row.dispose(close=True)
 
     assert observed_value(telemetry.session_completed_total) == 0

@@ -630,6 +630,7 @@ class ProviderGateway:
         """Call LiteLLM and return only the admitted, owned completion."""
         from litellm.exceptions import APIError as LiteLLMAPIError
         from litellm.exceptions import BadRequestError as LiteLLMBadRequestError
+        from litellm.exceptions import RateLimitError as LiteLLMRateLimitError
 
         try:
             kwargs = build_composer_loop_request_kwargs(
@@ -660,6 +661,17 @@ class ProviderGateway:
         except LiteLLMAPIError as exc:
             # A request too large for the provider or a proxy in front of it
             # (HTTP 413) is a rejected request, not an outage.
+            if size_rejection_code(exc) != "request_too_large":
+                raise
+            raise _BadRequestLLMError(
+                f"LLM request rejected ({type(exc).__name__})",
+                provider_detail=str(exc) or None,
+                provider_status_code=exc.status_code,
+            ) from exc
+        except LiteLLMRateLimitError as exc:
+            # LiteLLM reports some HTTP 413s as a rate limit. The classifier
+            # recognises them from the typed exception chain; any other rate
+            # limit propagates unchanged.
             if size_rejection_code(exc) != "request_too_large":
                 raise
             raise _BadRequestLLMError(
@@ -698,6 +710,7 @@ class ProviderGateway:
         """Call the LLM for non-tool text generation."""
         from litellm.exceptions import APIError as LiteLLMAPIError
         from litellm.exceptions import BadRequestError as LiteLLMBadRequestError
+        from litellm.exceptions import RateLimitError as LiteLLMRateLimitError
 
         try:
             kwargs = build_composer_loop_request_kwargs(
@@ -727,6 +740,17 @@ class ProviderGateway:
         except LiteLLMAPIError as exc:
             # A request too large for the provider or a proxy in front of it
             # (HTTP 413) is a rejected request, not an outage.
+            if size_rejection_code(exc) != "request_too_large":
+                raise
+            raise _BadRequestLLMError(
+                f"LLM request rejected ({type(exc).__name__})",
+                provider_detail=str(exc) or None,
+                provider_status_code=exc.status_code,
+            ) from exc
+        except LiteLLMRateLimitError as exc:
+            # LiteLLM reports some HTTP 413s as a rate limit. The classifier
+            # recognises them from the typed exception chain; any other rate
+            # limit propagates unchanged.
             if size_rejection_code(exc) != "request_too_large":
                 raise
             raise _BadRequestLLMError(

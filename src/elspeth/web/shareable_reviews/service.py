@@ -913,7 +913,8 @@ class ShareableReviewService:
         # route holds writer authority). The facet re-proves that this is
         # still the current state in the same transaction as the insert.
         try:
-            self._session_operation_authority.mutate(
+            await run_sync_in_worker(
+                self._session_operation_authority.mutate,
                 session_operation_context,
                 lambda transaction: transaction.composer_completion.mark_ready_for_review(
                     composition_state_id=snapshot.state_id,
@@ -982,7 +983,7 @@ class ShareableReviewService:
                 reason="state_missing",
                 detail="No composition state exists for this session",
             )
-        event = self._latest_mark_ready_event(session_id=session_id, state_id=state_record.id, user_id=user_id)
+        event = await run_sync_in_worker(self._latest_mark_ready_event, session_id=session_id, state_id=state_record.id, user_id=user_id)
         if event is None:
             raise CompositionNotRunnableError(
                 reason="completion_event_missing",

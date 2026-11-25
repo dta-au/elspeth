@@ -4,11 +4,14 @@ The status is structured evidence: no provider text is read. The installed
 litellm surfaces a 413 differently per route (measured through its own
 mapping, ``exception_type``, as ``acompletion`` raises it):
 
-- OpenAI-compatible routes: ``APIError`` with ``status_code`` 413;
+- OpenAI-compatible routes: ``APIError`` with ``status_code`` 413, or a
+  ``RateLimitError`` (429) when the body does not name the error type;
 - Bedrock: ``BadRequestError`` with ``status_code`` 413;
-- Anthropic: ``BadRequestError`` with ``status_code`` 400. The 413 is not on
-  the raised exception, so it stays an ordinary rejected request: never
-  resent unchanged, but not recognised as a size rejection.
+- Anthropic: ``BadRequestError`` with ``status_code`` 400.
+
+The relabelled cases are recognised only from litellm's typed exception chain
+(``test_provider_errors.py`` pins it per route); ``exception_type`` called
+directly, as ``mapped_provider_error`` does, builds no such chain.
 
 A size rejection is not retried unchanged. While an earlier turn is still in
 the request, it is resent once with every earlier turn left out, as a
@@ -26,11 +29,13 @@ import httpx
 import litellm
 import pytest
 from litellm.exceptions import APIError as LiteLLMAPIError
+from litellm.exceptions import RateLimitError as LiteLLMRateLimitError
 from litellm.litellm_core_utils.exception_mapping_utils import exception_type
 from litellm.llms.anthropic.common_utils import AnthropicError
 from litellm.llms.base_llm.chat.transformation import BaseLLMException
 from litellm.llms.bedrock.common_utils import BedrockError
 from litellm.llms.openai.common_utils import OpenAIError
+from openai import AsyncOpenAI
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.composer_progress import (
@@ -309,6 +314,105 @@ async def test_control_another_api_error_on_the_gateway_text_path_is_not_the_rej
     monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fail)
 
     with pytest.raises(LiteLLMAPIError) as caught:
+        await _text_service(tmp_path)._provider_gateway._call_text_llm([{"role": "user", "content": "hi"}])
+
+    assert caught.value is failure
+
+
+# --- A 413 that litellm reports as a rate limit (OpenAI route) ----------------------------------
+
+
+async def _openai_route_failure(status: int, content: bytes) -> LiteLLMRateLimitError:
+    """What real ``litellm.acompletion`` raises for an OpenAI-route ``status`` over a mock transport (no network)."""
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(status, content=content, headers={"content-type": "text/plain"}))
+    ) as http_client:
+        client = AsyncOpenAI(api_key="test-key", base_url="https://example.invalid/v1", http_client=http_client, max_retries=0)
+        with pytest.raises(LiteLLMRateLimitError) as caught:
+            await litellm.acompletion(
+                model="openai/gpt-4o",
+                messages=[{"role": "user", "content": "hello"}],
+                client=client,
+                api_key="test-key",
+                num_retries=0,
+                max_retries=0,
+            )
+    return caught.value
+
+
+async def _relabelled_413() -> LiteLLMRateLimitError:
+    return await _openai_route_failure(413, b"Request too large")
+
+
+async def _genuine_429() -> LiteLLMRateLimitError:
+    return await _openai_route_failure(429, b"Rate limit reached on tokens per min (TPM)")
+
+
+@pytest.mark.asyncio
+async def test_a_413_reported_as_a_rate_limit_with_history_present_is_resent_once_with_every_earlier_turn_left_out() -> None:
+    service, session_id = _service(_GENEROUS_SETTING)
+    provider = _ScriptedProvider(await _relabelled_413(), _make_llm_response(content="Pipeline built."))
+
+    result = await _compose(service, session_id, provider, _history())
+
+    assert len(provider.requests) == 2
+    assert _history_in(provider.requests[0]) == list(_HISTORY_TEXTS)
+    assert _history_in(provider.requests[1]) == []
+    rejected, retried = result.llm_calls
+    assert rejected.status is ComposerLLMCallStatus.BAD_REQUEST_ERROR
+    assert rejected.error_message == "request_too_large"
+    assert rejected.rejection_reason_source == "http_status"
+    assert retried.status is ComposerLLMCallStatus.SUCCESS
+    assert _budget(retried).retry_after_provider_rejection is True
+
+
+@pytest.mark.asyncio
+async def test_a_413_reported_as_a_rate_limit_with_nothing_left_to_leave_out_is_the_size_refusal() -> None:
+    service, session_id = _service(_GENEROUS_SETTING)
+    provider = _ScriptedProvider(await _relabelled_413())
+
+    with pytest.raises(ComposerConvergenceError) as exc_info:
+        await _compose(service, session_id, provider)
+
+    assert len(provider.requests) == 1
+    assert exc_info.value.reason == "context_budget_exceeded"
+    assert exc_info.value.evidence["ceiling"] == "provider"
+    assert exc_info.value.evidence["provider_reason"] == "request_too_large"
+    (call,) = exc_info.value.llm_calls
+    assert call.error_message == "request_too_large"
+    assert call.to_dict()["rejection_reason_source"] == "http_status"
+
+
+@pytest.mark.asyncio
+async def test_a_413_reported_as_a_rate_limit_on_the_gateway_text_path_is_the_rejected_request_carrier(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    rejection = await _relabelled_413()
+
+    async def refuse(**_kwargs: object) -> object:
+        raise rejection
+
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", refuse)
+
+    with pytest.raises(_BadRequestLLMError) as caught:
+        await _text_service(tmp_path)._provider_gateway._call_text_llm([{"role": "user", "content": "hi"}])
+
+    assert caught.value.__cause__ is rejection
+    assert request_size_rejection(caught.value.__cause__) == _TOO_LARGE
+
+
+@pytest.mark.asyncio
+async def test_control_a_genuine_rate_limit_on_the_gateway_text_path_is_not_the_rejected_request_carrier(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    failure = await _genuine_429()
+
+    async def fail(**_kwargs: object) -> object:
+        raise failure
+
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fail)
+
+    with pytest.raises(LiteLLMRateLimitError) as caught:
         await _text_service(tmp_path)._provider_gateway._call_text_llm([{"role": "user", "content": "hi"}])
 
     assert caught.value is failure
