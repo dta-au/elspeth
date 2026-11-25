@@ -28031,10 +28031,13 @@ def test_required_work_reserve_proposal_namespace_ignores_unrelated_parent_metad
     binding_call = binder.body[-1].value
     assert _reserve_safe_canonical_plugin_bind(discovery, binding_call)
     shared_context = next(node.ctx for node in ast.walk(units[1].tree) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load))
-    original_parent = shared_context._landscape_parent
+    # The parent helper leaves CPython's shared context nodes alone, so plant the foreign link directly.
+    assert "_landscape_parent" not in vars(shared_context)
     try:
         unrelated = _parse_source("src/elspeth/unrelated_namespace_read.py", "foreign" + ".value" * 500 + "\n")
         compile(unrelated.tree, "<unexecuted unrelated namespace source>", "exec", dont_inherit=True)
+        foreign = next(node for node in ast.walk(unrelated.tree) if isinstance(node, ast.Name) and node.id == "foreign")
+        vars(shared_context)["_landscape_parent"] = foreign
         failures, receipt = helper.proposal_child_local_contracts(units)
         assert not failures, failures
         assert receipt["reserve_calls"] == baseline["reserve_calls"]
@@ -28066,4 +28069,4 @@ def test_required_work_reserve_proposal_namespace_ignores_unrelated_parent_metad
         changed_call = _reserve_node_at(changed_binder, "_bind_canonical_module_to_parent").body[-1].value
         assert not _reserve_safe_canonical_plugin_bind(changed_binder, changed_call)
     finally:
-        shared_context._landscape_parent = original_parent
+        vars(shared_context).pop("_landscape_parent", None)
