@@ -1156,10 +1156,11 @@ class RunMembershipLostError(Exception):
 class RunWorkerEvictedError(Exception):
     """Raised when a worker observes membership loss or leader-seat deposition.
 
-    Latched from the heartbeat CAS miss (slice-4 thread); raised by the
-    membership re-probes inside the claim and enqueue statements
-    (``claim_ready_row``, ``claim_pending_sink`` and the claimed-child enqueue)
-    when their statement matches zero rows; and raised by the follower when a
+    Latched from the heartbeat CAS miss (slice-4 thread); raised by the claim
+    re-probes (``claim_ready_row`` and ``claim_pending_sink``) when a claim
+    statement matches zero rows and the worker is no longer an active member;
+    raised by the claimed-child enqueue's membership precheck, which runs
+    before its insert; and raised by the follower when a
     membership-fenced verb's :class:`RunMembershipLostError` reaches it while
     the run is still running. The membership fence that opens every
     membership-fenced transaction refuses with :class:`RunMembershipLostError`
@@ -1174,11 +1175,12 @@ class RunWorkerEvictedError(Exception):
             membership fence refused the beat" from "the seat was taken by
             another leader"); ``None`` when it did not, in which case the
             message is unchanged. The follower's conversion passes the verb the
-            membership fence refused. The four in-statement re-probe sites pass
-            ``None``, for two different reasons: two probe a boolean
-            ``active_worker_fence_clause`` EXISTS and hold no status to
-            report, while the other two read ``run_workers.status`` to branch
-            on and do not carry the observed value forward. ``None`` therefore
+            membership fence refused. The three claim re-probes and the enqueue
+            precheck pass ``None``, for two different reasons: two of them (one
+            claim re-probe and the enqueue precheck) probe a boolean
+            ``active_worker_fence_clause`` EXISTS and hold no status to report,
+            while the other two read ``run_workers.status`` to branch on and do
+            not carry the observed value forward. ``None`` therefore
             asserts only that no observation was supplied — never that none
             was available.
     """

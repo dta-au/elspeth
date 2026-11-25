@@ -750,9 +750,11 @@ path and the required permission (`contracts/errors.py:830-842`,
 `cli.py:2422-2438`). See *Operator guidance §2.4* for the shared-group/umask
 setup this depends on.
 
-**Exit codes:** 0 = clean departure (run completed); 1 = admission refusal or
-setup error (`JoinRefusedError`, bad settings/DB); 2 = `FollowerSeatDeadError`
-(seat died mid-drain — resume required); 3 = `RunWorkerEvictedError` or SIGINT;
+**Exit codes:** 0 = clean departure after the run reached a terminal status (any
+terminal status, including failed or interrupted; the departure message names
+it); 1 = admission refusal or setup error (`JoinRefusedError`, bad
+settings/DB); 2 = `FollowerSeatDeadError` (no live leader while the run is still
+running — resume required); 3 = `RunWorkerEvictedError` or SIGINT;
 4 = Tier-1 audit-integrity / framework error (`cli.py:2314-2315, 2438, 2590,
 2612, 2628, 2665`).
 
