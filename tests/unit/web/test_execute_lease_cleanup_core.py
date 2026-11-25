@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from types import MethodType
@@ -47,6 +49,55 @@ class _CoreBodyReport:
     def pytest_runtest_makereport(self, item, call) -> None:
         if item is self.item and call.when == "call" and call.excinfo is not None:
             self.owner.body_original = call.excinfo.value
+
+
+# A test releases its own hold in `finally` and then joins the task it started. Once released, that
+# task finishes in well under a second (the whole module runs in about 20 s). _CLEANUP_JOIN_SECONDS is a
+# stall limit, not a progress check: a join that is slow but finishes past it is reported by name
+# instead of hanging. It does not make a stuck test terminate: a thread that never finishes still
+# blocks the executor shutdowns and fixture joins that come after it.
+_CLEANUP_JOIN_SECONDS = 30.0
+
+
+async def _bounded_cleanup_join(task: asyncio.Task[object], what: str) -> AssertionError | None:
+    """Join a test's own task after its hold is released; return a failure rather than wait forever.
+
+    On overrun the task is cancelled and waited on for another _CLEANUP_JOIN_SECONDS. The application
+    finalizer join retains cancellations until its physical work completes, so a stuck finalizer join
+    is still running when this returns; the returned failure says so.
+    """
+    done, _pending = await asyncio.wait({task}, timeout=_CLEANUP_JOIN_SECONDS)
+    if done:
+        if not task.cancelled():
+            task.exception()  # Retrieved, as gather(return_exceptions=True) did; the body asserts outcomes.
+        return None
+    task.cancel()
+    await asyncio.wait({task}, timeout=_CLEANUP_JOIN_SECONDS)
+    if task.done() and not task.cancelled():
+        task.exception()  # Retrieved, so a late finish leaves no "exception was never retrieved" log line.
+    after = "ended after cancellation" if task.done() else "was still running after cancellation"
+    return AssertionError(f"cleanup: {what} did not finish within {_CLEANUP_JOIN_SECONDS} s of its hold being released and {after}")
+
+
+def _attempt(cleanup_errors: list[BaseException], step: Callable[[], object]) -> None:
+    """Run one cleanup step, keeping its failure so the steps after it still run."""
+    try:
+        step()
+    except BaseException as original:
+        cleanup_errors.append(original)
+
+
+def _raise_body_first(body_error: BaseException | None, cleanup_errors: list[BaseException]) -> None:
+    """End a test's `finally`: the body's failure is reported first, with any cleanup failures attached.
+
+    With no cleanup failure this returns, and the body's own failure (if any) propagates unchanged.
+    """
+    if not cleanup_errors:
+        return
+    originals = ([body_error] if body_error is not None else []) + cleanup_errors
+    if len(originals) == 1:
+        raise originals[0]
+    raise BaseExceptionGroup("test body failure first, then the cleanup failures after it", originals)
 
 
 async def _observe_core_task(task: asyncio.Task[None], originals: list[BaseException]) -> bool:
@@ -448,7 +499,9 @@ async def test_bad_first_actual_completion_proof_does_not_skip_held_second_relea
     finally:
         release.set()
         cleanup_errors = []
-        await asyncio.gather(closing, return_exceptions=True)
+        join_failure = await _bounded_cleanup_join(closing, "the held lease close")
+        if join_failure is not None:
+            cleanup_errors.append(join_failure)
         # Every actual sibling cleanup is attempted even if the first fails.
         # Its bad receipt remains pending; cleanup cannot issue COMPLETE.
         try:
@@ -513,6 +566,7 @@ async def test_actual_domain_refusal_census_waits_for_held_release_callback(tmp_
 
         monkeypatch.setattr(async_workers, "_release_admission", held_counter_release)
     bridge = asyncio.create_task(async_workers.run_execution_lease_sql_finish_once(obligation.acquire_submission))
+    body_error: BaseException | None = None
     try:
         while not entered.is_set():
             await asyncio.sleep(0.001)
@@ -536,11 +590,18 @@ async def test_actual_domain_refusal_census_waits_for_held_release_callback(tmp_
         registry.observe_ready()
         assert submission.observed and obligation.retired
         assert async_workers.outstanding_admissions() == 0
+    except BaseException as original:
+        body_error = original
+        raise
     finally:
         release.set()
-        await asyncio.gather(bridge, return_exceptions=True)
-        authority.release(existing)
-        fixture.app.state.session_engine.dispose()
+        cleanup_errors: list[BaseException] = []
+        join_failure = await _bounded_cleanup_join(bridge, "the held domain-refusal bridge")
+        if join_failure is not None:
+            cleanup_errors.append(join_failure)
+        _attempt(cleanup_errors, lambda: authority.release(existing))
+        _attempt(cleanup_errors, fixture.app.state.session_engine.dispose)
+        _raise_body_first(body_error, cleanup_errors)
 
 
 @pytest.mark.asyncio
@@ -631,6 +692,7 @@ async def test_cancelled_actual_acquire_late_release_waits_for_callback_before_r
             execution_obligation=obligation,
         )
     )
+    body_error: BaseException | None = None
     try:
         while not acquire_entered.is_set():
             await asyncio.sleep(0.001)
@@ -658,11 +720,18 @@ async def test_cancelled_actual_acquire_late_release_waits_for_callback_before_r
         registry.observe_ready()
         assert obligation.retired and obligation.release_succeeded
         assert async_workers.outstanding_admissions() == 0
+    except BaseException as original:
+        body_error = original
+        raise
     finally:
         release_acquire.set()
         release_callback.set()
-        await asyncio.gather(acquiring, return_exceptions=True)
-        fixture.app.state.session_engine.dispose()
+        cleanup_errors: list[BaseException] = []
+        join_failure = await _bounded_cleanup_join(acquiring, "the cancelled lease acquire")
+        if join_failure is not None:
+            cleanup_errors.append(join_failure)
+        _attempt(cleanup_errors, fixture.app.state.session_engine.dispose)
+        _raise_body_first(body_error, cleanup_errors)
 
 
 @pytest.mark.asyncio
@@ -746,6 +815,7 @@ async def test_actual_executor_finalizer_receipt_waits_for_counter_callback_retu
     registry.owner.seal()
     fixture.app.state.process_recovery.begin_shutdown()
     joining = asyncio.create_task(async_workers.run_application_finalizer_in_worker(capability))
+    body_error: BaseException | None = None
     try:
         while not entered.is_set():
             await asyncio.sleep(0.001)
@@ -763,11 +833,18 @@ async def test_actual_executor_finalizer_receipt_waits_for_counter_callback_retu
         assert async_workers.outstanding_admissions() == 0
         registry.assert_completed()
         assert not fixture.app.state.process_recovery.watchdog.completed
+    except BaseException as original:
+        body_error = original
+        raise
     finally:
         release.set()
-        await asyncio.gather(joining, return_exceptions=True)
-        executor.shutdown(wait=True, cancel_futures=False)
-        fixture.app.state.session_engine.dispose()
+        cleanup_errors: list[BaseException] = []
+        join_failure = await _bounded_cleanup_join(joining, "the executor finalizer join")
+        if join_failure is not None:
+            cleanup_errors.append(join_failure)
+        _attempt(cleanup_errors, lambda: executor.shutdown(wait=True, cancel_futures=False))
+        _attempt(cleanup_errors, fixture.app.state.session_engine.dispose)
+        _raise_body_first(body_error, cleanup_errors)
 
 
 @pytest.mark.asyncio
@@ -883,6 +960,7 @@ async def test_actual_execute_close_joins_held_release_with_three_original_cance
     monkeypatch.setattr(SQLiteLocalSessionOperationAuthority, "_locked_transaction", held_release)
     monkeypatch.setattr(lifecycle, "_retain_cancellation", retain_original)
     closing = asyncio.create_task(lease.close())
+    body_error: BaseException | None = None
     try:
         while not entered.is_set():
             await asyncio.sleep(0.001)
@@ -916,15 +994,22 @@ async def test_actual_execute_close_joins_held_release_with_three_original_cance
             assert not fixture.app.state.process_recovery.watchdog.completed
         else:
             assert obligation.release_succeeded and obligation.retired
+    except BaseException as original:
+        body_error = original
+        raise
     finally:
         release.set()
-        await asyncio.gather(closing, return_exceptions=True)
+        cleanup_errors: list[BaseException] = []
+        join_failure = await _bounded_cleanup_join(closing, "the held execute close")
+        if join_failure is not None:
+            cleanup_errors.append(join_failure)
         monkeypatch.setattr(SQLiteLocalSessionOperationAuthority, "_locked_transaction", original_transaction)
         if sql_fails:
             # Temporary fixture cleanup uses the exact known source context;
             # it does not erase the registry's retained original/Unknown.
-            service.session_operation_authority.release(lease.context)
-        fixture.app.state.session_engine.dispose()
+            _attempt(cleanup_errors, lambda: service.session_operation_authority.release(lease.context))
+        _attempt(cleanup_errors, fixture.app.state.session_engine.dispose)
+        _raise_body_first(body_error, cleanup_errors)
 
 
 @pytest.mark.asyncio
@@ -1037,7 +1122,7 @@ async def test_subclass_sql_carrier_cannot_borrow_owned_release_dispatch(tmp_pat
 @pytest.mark.asyncio
 @pytest.mark.parametrize("sql_fails", [False, True])
 async def test_finalizer_failed_callback_exits_only_after_actual_release_and_generation_join(tmp_path, monkeypatch, sql_fails):
-    from elspeth.web.application_finalizers import ApplicationFinalizerKind
+    from elspeth.web.application_finalizers import ApplicationFinalizerCapability, ApplicationFinalizerKind
 
     fixture, registry = await _core(tmp_path)
     generation = async_workers._GENERATION_CUSTODIAN
@@ -1078,14 +1163,29 @@ async def test_finalizer_failed_callback_exits_only_after_actual_release_and_gen
         if asyncio.current_task() is joining and all(original is not earlier for earlier in delivered):
             delivered.append(original)
 
+    callback_exit_returned = threading.Event()
+    original_observe_exit = ApplicationFinalizerCapability._observe_physical_callback_failure_exit
+
+    def signal_callback_exit_returned(self, seal, reservation):
+        original_observe_exit(self, seal, reservation)
+        callback_exit_returned.set()
+
     monkeypatch.setattr(generation, "record_completed", fail_selected_observer_once)
     monkeypatch.setattr(generation.executor, "shutdown", hold_actual_generation_join)
     monkeypatch.setattr(async_workers, "_retain_cancellation", retain_delivered)
+    monkeypatch.setattr(ApplicationFinalizerCapability, "_observe_physical_callback_failure_exit", signal_callback_exit_returned)
     registry.owner.seal()
     fixture.app.state.process_recovery.begin_shutdown()
     joining = asyncio.create_task(async_workers.run_application_finalizer_in_worker(capability))
+    body_error: BaseException | None = None
     try:
-        while not generation_entered.is_set():
+        # The failed done-callback schedules the generation quarantine (which reaches the held join)
+        # before it records its own exit, so the test waits for both instead of inferring one from the other.
+        # A 30 s stall limit, not a progress check: both happen within milliseconds of the finalizer
+        # starting, so only a run that stalls for 30 s gets this failure instead of a hang.
+        deadline = time.monotonic() + 30.0
+        while not (generation_entered.is_set() and callback_exit_returned.is_set()):
+            assert time.monotonic() < deadline, "the held generation join or the failed callback's exit was never reached"
             await asyncio.sleep(0.001)
         assert observer_failed.is_set()
         assert calls == ["physical invocation"]
@@ -1109,7 +1209,7 @@ async def test_finalizer_failed_callback_exits_only_after_actual_release_and_gen
         assert not capability.physical_completion_succeeded
         from copy import copy
 
-        from elspeth.web.application_finalizers import _FINALIZER_PHYSICAL_ISSUER_SEAL, ApplicationFinalizerCapability
+        from elspeth.web.application_finalizers import _FINALIZER_PHYSICAL_ISSUER_SEAL
 
         copied = copy(capability)
         assert not copied.physical_failure_completion_known
@@ -1123,11 +1223,21 @@ async def test_finalizer_failed_callback_exits_only_after_actual_release_and_gen
         assert len(raised.value.exceptions) == len(expected)
         assert all(actual is original for actual, original in zip(raised.value.exceptions, expected, strict=True))
         assert not fixture.app.state.process_recovery.watchdog.completed
+    except BaseException as original:
+        body_error = original
+        raise
     finally:
         release_generation.set()
-        await asyncio.gather(joining, return_exceptions=True)
-        original_shutdown(wait=True, cancel_futures=False)
-        fixture.app.state.session_engine.dispose()
+        cleanup_errors: list[BaseException] = []
+        join_failure = await _bounded_cleanup_join(joining, "the failed finalizer join")
+        if join_failure is not None:
+            cleanup_errors.append(join_failure)
+        # After an overrun, do not wait on the generation's workers here: that wait would hang before
+        # the named failure is raised. A worker that never finishes is left to the fixture's teardown,
+        # which can still block on it (see the note on _CLEANUP_JOIN_SECONDS).
+        _attempt(cleanup_errors, lambda: original_shutdown(wait=join_failure is None, cancel_futures=False))
+        _attempt(cleanup_errors, fixture.app.state.session_engine.dispose)
+        _raise_body_first(body_error, cleanup_errors)
 
 
 @pytest.mark.asyncio
@@ -1162,6 +1272,7 @@ async def test_finalizer_early_release_flag_does_not_prove_held_counter_completi
     monkeypatch.setattr(async_workers, "_release_admission", held_actual_counter)
     monkeypatch.setattr(generation, "record_completed", fail_after_counter)
     joining = asyncio.create_task(async_workers.run_application_finalizer_in_worker(capability))
+    body_error: BaseException | None = None
     try:
         while not entered.is_set():
             await asyncio.sleep(0.001)
@@ -1180,10 +1291,17 @@ async def test_finalizer_early_release_flag_does_not_prove_held_counter_completi
         assert capability.physical_failure_completion_known
         assert not capability.physical_completion_succeeded
         assert async_workers.outstanding_admissions() == 0
+    except BaseException as original:
+        body_error = original
+        raise
     finally:
         release_counter.set()
-        await asyncio.gather(joining, return_exceptions=True)
-        fixture.app.state.session_engine.dispose()
+        cleanup_errors: list[BaseException] = []
+        join_failure = await _bounded_cleanup_join(joining, "the finalizer join behind the held counter")
+        if join_failure is not None:
+            cleanup_errors.append(join_failure)
+        _attempt(cleanup_errors, fixture.app.state.session_engine.dispose)
+        _raise_body_first(body_error, cleanup_errors)
 
 
 @pytest.mark.asyncio
@@ -1222,6 +1340,7 @@ async def test_finalizer_postarm_setup_failure_waits_actual_counter_and_keeps_sq
     monkeypatch.setattr(RequiredInvocationWitness, "arm", arm_then_raise)
     monkeypatch.setattr(async_workers, "_release_admission", held_counter)
     joining = asyncio.create_task(async_workers.run_application_finalizer_in_worker(capability))
+    body_error: BaseException | None = None
     try:
         while not counter_entered.is_set():
             await asyncio.sleep(0.001)
@@ -1240,7 +1359,14 @@ async def test_finalizer_postarm_setup_failure_waits_actual_counter_and_keeps_sq
         assert not capability.physical_completion_succeeded
         assert async_workers.outstanding_admissions() == 0
         assert not fixture.app.state.process_recovery.watchdog.completed
+    except BaseException as original:
+        body_error = original
+        raise
     finally:
         counter_release.set()
-        await asyncio.gather(joining, return_exceptions=True)
-        fixture.app.state.session_engine.dispose()
+        cleanup_errors: list[BaseException] = []
+        join_failure = await _bounded_cleanup_join(joining, "the post-arm finalizer join")
+        if join_failure is not None:
+            cleanup_errors.append(join_failure)
+        _attempt(cleanup_errors, fixture.app.state.session_engine.dispose)
+        _raise_body_first(body_error, cleanup_errors)

@@ -419,7 +419,8 @@ async def _reconcile_pending_landscape_runs(
     create_tables: bool,
 ) -> None:
     candidates = await session_service.list_pending_landscape_reconciliations()
-    complete_run_ids, absent_run_ids = _finalize_orphaned_landscape_runs(
+    complete_run_ids, absent_run_ids = await run_sync_in_worker(
+        _finalize_orphaned_landscape_runs,
         landscape_url,
         candidates,
         create_tables=create_tables,
@@ -2631,6 +2632,35 @@ def _create_app(
         request_id = _request_id(request)
         _handler_slog.error(
             "http_required_generation_unavailable",
+            path=request.url.path,
+            method=request.method,
+            request_id=request_id,
+            exc_class=type(exc).__name__,
+        )
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": "Database is currently unavailable. Please retry in a moment.",
+                "error_type": "database_unavailable",
+                "request_id": request_id,
+            },
+        )
+
+    # ``AsyncWorkerAdmissionTimeoutError`` is a ``TimeoutError`` and so an
+    # ``OSError``. Without this exact-class key, Starlette's MRO lookup hands
+    # it to ``handle_storage_unavailable``, which re-raises it (its errno is
+    # None) and the request ends as a 500. A full shared worker pool is a
+    # supported, retryable refusal: answer it with the same 503
+    # ``database_unavailable`` body ``project_composer_operation_error`` gives
+    # it on the composer paths. WebSocket scopes keep the previous outcome:
+    # the exception propagates unchanged.
+    @app.exception_handler(AsyncWorkerAdmissionTimeoutError)
+    async def handle_worker_admission_timeout(request: Request, exc: AsyncWorkerAdmissionTimeoutError) -> JSONResponse:
+        if request.scope["type"] != "http":
+            raise exc
+        request_id = _request_id(request)
+        _handler_slog.error(
+            "http_worker_admission_timeout",
             path=request.url.path,
             method=request.method,
             request_id=request_id,

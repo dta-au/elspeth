@@ -41,6 +41,7 @@ from uuid import UUID, uuid4
 import pytest
 import yaml
 from sqlalchemy import select, text
+from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.blobs import BlobCreator, BlobNotFoundError, BlobRecord, BlobStatus, StorageMimeType
 from elspeth.contracts.enums import CreationModality
@@ -309,7 +310,7 @@ class _FakeBlobService:
 
 @pytest.fixture
 def engine():
-    eng = create_session_engine("sqlite:///:memory:")
+    eng = create_session_engine("sqlite:///:memory:", poolclass=StaticPool, connect_args={"check_same_thread": False})
     initialize_session_schema(eng)
     return eng
 

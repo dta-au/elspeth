@@ -1091,6 +1091,9 @@ def _repo_root() -> Path:
 def _attach_parents(tree: ast.AST) -> None:
     for parent in ast.walk(tree):
         for child in ast.iter_child_nodes(parent):
+            # CPython shares one Load/Store/Del instance across every parsed tree; a parent link there leaks.
+            if isinstance(child, ast.expr_context):
+                continue
             child._landscape_parent = parent  # type: ignore[attr-defined]
 
 
@@ -4996,7 +4999,7 @@ _ADMISSION_REFUSAL_CALLER = (
 # Closed recipe: closure-bound UUID; observed terminal status; distinct running
 # and reconciliation leaders; cleanup held inside the latter's current fence.
 # Equality includes both finally releases and the durable completion ordering.
-_ADMISSION_REFUSAL_RECIPE_SHA256 = "5fa9c45dcfdd026ab4bd079bf39133958b9831267c168e8637bb20f930506297"
+_ADMISSION_REFUSAL_RECIPE_SHA256 = "1c89bb09fe38a16e5e8427f9198fa9ce82a6f14ad609fc05441516737182c15e"
 _EXACT_ESTABLISHMENT_CALLERS = {
     "acquire_reconciliation_leadership": frozenset(
         {
@@ -5871,8 +5874,8 @@ _reserve_CANCEL_ROUTE_PATH = "src/elspeth/web/sessions/routes/composer/operation
 _reserve_CANCEL_ROUTE_SHA256 = "084791796bc88481d879d0a09b7ab43e8f483c378d56cff6bc46d9e075c8a4e6"
 _reserve_CANCEL_CONSUMERS = {
     "src/elspeth/web/composer_watch_reads.py": "099b7e92f3617d5d9f39b479c1f21f229375e24e20208d294c822d7099cf6e3f",
-    "src/elspeth/web/sessions/composer_turn.py": "06da1fb618ac26fc7f46d3c83cf65bcb6ac295379d43e4910159349e3cfa201c",
-    "src/elspeth/web/sessions/composer_async_worker.py": "b5990c3971990c924f0288eefd543a607151fb7c0db5def4e9a02a36f7422a0a",
+    "src/elspeth/web/sessions/composer_turn.py": "b0a326ae16a369285d785d58bc57f6f5f1fba5b5c88f1d6201e3eefcc223ae5e",
+    "src/elspeth/web/sessions/composer_async_worker.py": "3e41f0c8f858069b715a14d4b5200d0d6a12c4076907dbe155afa16f7946d19e",
 }
 
 
@@ -28028,10 +28031,13 @@ def test_required_work_reserve_proposal_namespace_ignores_unrelated_parent_metad
     binding_call = binder.body[-1].value
     assert _reserve_safe_canonical_plugin_bind(discovery, binding_call)
     shared_context = next(node.ctx for node in ast.walk(units[1].tree) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load))
-    original_parent = shared_context._landscape_parent
+    # The parent helper leaves CPython's shared context nodes alone, so plant the foreign link directly.
+    assert "_landscape_parent" not in vars(shared_context)
     try:
         unrelated = _parse_source("src/elspeth/unrelated_namespace_read.py", "foreign" + ".value" * 500 + "\n")
         compile(unrelated.tree, "<unexecuted unrelated namespace source>", "exec", dont_inherit=True)
+        foreign = next(node for node in ast.walk(unrelated.tree) if isinstance(node, ast.Name) and node.id == "foreign")
+        vars(shared_context)["_landscape_parent"] = foreign
         failures, receipt = helper.proposal_child_local_contracts(units)
         assert not failures, failures
         assert receipt["reserve_calls"] == baseline["reserve_calls"]
@@ -28063,4 +28069,4 @@ def test_required_work_reserve_proposal_namespace_ignores_unrelated_parent_metad
         changed_call = _reserve_node_at(changed_binder, "_bind_canonical_module_to_parent").body[-1].value
         assert not _reserve_safe_canonical_plugin_bind(changed_binder, changed_call)
     finally:
-        shared_context._landscape_parent = original_parent
+        vars(shared_context).pop("_landscape_parent", None)

@@ -12,9 +12,10 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import event, select
 
-from elspeth.contracts.credential_material import DEFAULT_CREDENTIAL_TRAVERSAL_POLICY
+from elspeth.contracts.credential_material import CredentialTraversalPolicy
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.session_operation import SessionOperationContext
+from elspeth.web.composer.redaction import ATTACHMENT_CONTENT_MAX_BYTES, READ_ATTACHMENT_MAX_UTF8_BYTES
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
 from elspeth.web.composer.tools import ToolResult
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
@@ -2682,7 +2683,7 @@ class TestGetBlobContentGuards:
 
     @pytest.mark.parametrize(("character", "extra_bytes"), [("x", 1), ("é", 1), ("x", 0)], ids=["ascii-over", "utf8-over", "at-limit"])
     def test_content_inspection_size_limit_is_distinct_from_credentials(self, character: str, extra_bytes: int) -> None:
-        limit = DEFAULT_CREDENTIAL_TRAVERSAL_POLICY.max_string_bytes
+        limit = ATTACHMENT_CONTENT_MAX_BYTES
         content = character * (limit // len(character.encode("utf-8"))) + "x" * extra_bytes
         assert len(content.encode("utf-8")) == limit + extra_bytes
         self._replace_content(content)
@@ -2703,11 +2704,91 @@ class TestGetBlobContentGuards:
             assert result.data is None
             assert result.validation.errors[0].error_code == "blob_content_size_limit"
             assert f"{limit}-byte" in result.validation.errors[0].message
-            assert "inspection limit" in result.validation.errors[0].message
+            assert "limit for returned attachments" in result.validation.errors[0].message
+            assert "credential" not in result.validation.errors[0].message
         else:
             assert result.success, result
             assert result.data["content"]
             assert result.data["start_char"] == 0
+
+    def _get_whole_content(self, tool: str = "get_blob_content") -> ToolResult:
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            return execute_tool(
+                tool,
+                {"blob_id": self.blob_id},
+                _empty_state(),
+                _mock_catalog(),
+                data_dir=str(self.data_dir),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=authority,
+                session_operation_context=context,
+            )
+
+    def test_attachment_size_limit_is_its_own_setting(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The whole-attachment limit moves only with its own constant."""
+        from elspeth.contracts import credential_material
+        from elspeth.web.composer.tools import blobs as composer_blob_tools
+
+        # A smaller credential scan bound leaves an attachment at the limit readable.
+        monkeypatch.setattr(credential_material, "DEFAULT_CREDENTIAL_TRAVERSAL_POLICY", CredentialTraversalPolicy(max_string_bytes=1_024))
+        self._replace_content("x" * ATTACHMENT_CONTENT_MAX_BYTES)
+        assert self._get_whole_content().success
+        monkeypatch.undo()
+
+        # A smaller attachment limit refuses at its own bound.
+        lowered = 4_096
+        monkeypatch.setattr(composer_blob_tools, "ATTACHMENT_CONTENT_MAX_BYTES", lowered)
+        self._replace_content("x" * lowered)
+        assert self._get_whole_content().success
+        self._replace_content("x" * (lowered + 1))
+        refused = self._get_whole_content()
+        assert not refused.success
+        assert refused.validation.errors[0].error_code == "blob_content_size_limit"
+        assert f"{lowered}-byte" in refused.validation.errors[0].message
+
+    def test_an_attachment_over_the_limit_is_refused_by_both_readers(self) -> None:
+        # The read_attachment refusal says neither reader can return the file;
+        # that holds only while both readers share one limit.
+        assert READ_ATTACHMENT_MAX_UTF8_BYTES == ATTACHMENT_CONTENT_MAX_BYTES
+        self._replace_content("x" * (ATTACHMENT_CONTENT_MAX_BYTES + 1))
+        for tool in ("read_attachment", "get_blob_content"):
+            refused = self._get_whole_content(tool)
+            assert not refused.success, tool
+            assert refused.data is None
+            message = refused.validation.errors[0].message
+            assert f"{ATTACHMENT_CONTENT_MAX_BYTES}-byte limit for returned attachments" in message, tool
+            assert "credential" not in message, tool
+
+    def test_attachment_size_limit_is_declared_as_a_number(self) -> None:
+        """Neither limit is computed from the other: each is a literal in its own module."""
+        import ast
+        import inspect
+
+        from elspeth.contracts import credential_material
+        from elspeth.web.composer import redaction
+
+        def assigned_value(tree: ast.AST, name: str) -> ast.expr:
+            values = [
+                node.value
+                for node in ast.walk(tree)
+                if isinstance(node, ast.AnnAssign)
+                and isinstance(node.target, ast.Name)
+                and node.target.id == name
+                and node.value is not None
+            ]
+            assert len(values) == 1, name
+            return values[0]
+
+        attachment = assigned_value(ast.parse(inspect.getsource(redaction)), "ATTACHMENT_CONTENT_MAX_BYTES")
+        assert isinstance(attachment, ast.Constant) and type(attachment.value) is int
+        policy_class = next(
+            node
+            for node in ast.walk(ast.parse(inspect.getsource(credential_material)))
+            if isinstance(node, ast.ClassDef) and node.name == "CredentialTraversalPolicy"
+        )
+        scan_bound = assigned_value(policy_class, "max_string_bytes")
+        assert isinstance(scan_bound, ast.Constant) and type(scan_bound.value) is int
 
     @pytest.mark.parametrize(
         "content",

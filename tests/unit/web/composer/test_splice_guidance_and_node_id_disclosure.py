@@ -29,14 +29,48 @@ def _splice_node_id_schema() -> dict[str, Any]:
 
 
 def test_splice_validation_failed_resolves_to_direct_guidance() -> None:
-    assert explain_validation_code("splice_validation_failed") == (
+    explanation, suggested_fix = explain_validation_code("splice_validation_failed")
+    assert explanation == (
         "The inserted transform passed its own option checks, but the pipeline that results from inserting it fails "
-        "context-aware validation. The rejected_mutation entries that follow this one name each new error, attributed "
-        "to the component it concerns in rejected_component. Nothing was mutated.",
-        "Repair the inserted node's options against the entries that follow (for a schema_contract_violation, remove "
-        "or satisfy the fields it names), or splice at a position whose producer supplies them, then retry "
-        "splice_transform.",
+        "context-aware validation, and splice_transform requires that whole result to validate. The rejected_mutation "
+        "entries that follow this one name each error the insertion added, attributed to the component it concerns in "
+        "rejected_component. An entry that shares its error_code with an error the pipeline already had may be that "
+        "error, reworded. When no rejected_mutation entry follows, the insertion added no error: the errors were there "
+        "before the splice. Nothing was mutated."
     )
+    assert suggested_fix == (
+        "Repair each error the insertion added: fix the inserted node's options (for a schema_contract_violation, "
+        "remove or satisfy the fields it names) or splice at a position whose producer supplies those fields. Errors "
+        "that were there before the splice, reworded or not, also refuse it unless the insertion repairs them, and the "
+        "same splice is refused again until they are repaired: repair them first, or, when no node configuration is "
+        "invalid, add the step with upsert_node and use upsert_node with routing_only=true to re-point the successor's "
+        "input."
+    )
+    # The upsert_node fallback is refused while any node configuration is
+    # invalid (_post_mutation_invariant_error), so its condition is stated.
+    assert "when no node configuration is invalid, add the step with upsert_node" in suggested_fix
+    # The per-entry claim runs one way only: every added error is listed, not
+    # every listed entry is added (a standing error the splice rewords can be
+    # listed when its code is outside the complete-detail set).
+    assert "Each rejected_mutation entry that follows this one names an error the insertion added" not in explanation
+    # A splice refused only for errors the pipeline already had forwards no
+    # entry of its own, so an unconditional "retry splice_transform" would
+    # send the planner back into the same refusal.
+    assert "then retry splice_transform" not in suggested_fix
+
+
+def test_splice_description_discloses_the_whole_pipeline_validity_requirement() -> None:
+    # The handler validates the whole spliced pipeline and refuses on any error
+    # left in it, including errors standing before the splice that the
+    # insertion does not repair; the description is where the planner first
+    # learns the tool, so it states that precondition.
+    definitions = {definition["name"]: definition for definition in get_tool_definitions()}
+    description = " ".join(definitions["splice_transform"]["description"].split())
+    assert (
+        "The whole resulting pipeline must validate, or the splice is refused and nothing changes; that includes "
+        "errors that were there before the splice, unless the insertion repairs them." in description
+    )
+    assert "Errors that were there before the splice also refuse it." not in description
 
 
 def test_splice_node_id_declares_the_reserved_labels_like_set_pipeline_node_id() -> None:

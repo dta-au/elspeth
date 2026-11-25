@@ -1834,13 +1834,22 @@ async def _run_composer_turn(
             raise HTTPException(status_code=exc.http_status, detail=exc.to_payload()) from exc
         except ComposerAdmissionRefused as exc:
             observation.pending_exception_llm_calls = _llm_calls_from_exception(exc)
+            credential_refusal = exc if isinstance(exc, CredentialMaterialRefused) else None
             await _publish_progress(
                 progress_sink,
                 event=ComposerProgressEvent(
                     phase="failed",
-                    headline="This request was refused by the admission policy.",
+                    headline=(
+                        "This request was refused by the admission policy."
+                        if credential_refusal is None
+                        else credential_refusal.progress_headline
+                    ),
                     evidence=(str(exc),),
-                    likely_next="Ask an administrator to review your access and quota configuration.",
+                    likely_next=(
+                        "Ask an administrator to review your access and quota configuration."
+                        if credential_refusal is None
+                        else credential_refusal.progress_next_step
+                    ),
                     reason="admission_refused",
                 ),
             )

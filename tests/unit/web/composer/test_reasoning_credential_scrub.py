@@ -19,6 +19,9 @@ from tests.unit.web.composer._helpers import _make_llm_response
 pytest_plugins = ("tests.unit.web.test_credential_guard",)
 
 REASONING = '"password": "Client emailed the admin pass..."'
+# Visible output is refused only for a recognized pattern; the keyword assignment
+# in REASONING is withheld from reasoning but no longer refuses visible output.
+VISIBLE_CREDENTIAL = "sk-" + "v" * 30
 
 
 @pytest.mark.parametrize("surface", ["composer_provider_response", "composer_planner_response", "composer_advisor_response"])
@@ -63,7 +66,7 @@ def test_reasoning_withhold_is_value_free_and_durable(surface: str, field: str) 
         {
             "surface": surface,
             "category": "token_shape",
-            "detector_version": "1",
+            "detector_version": "2",
             "field_class": field,
         }
     ]
@@ -162,7 +165,7 @@ def test_opaque_provider_bytes_are_not_credential_text(opaque_field: str) -> Non
 def test_visible_output_still_refuses(field: str) -> None:
     from types import SimpleNamespace
 
-    response = _make_llm_response(content=REASONING if field == "content" else "ordinary")
+    response = _make_llm_response(content=VISIBLE_CREDENTIAL if field == "content" else "ordinary")
     response.choices[0].message.__dict__["reasoning_content"] = REASONING
     if field != "content":
         response.choices[0].message.tool_calls = [
@@ -170,8 +173,8 @@ def test_visible_output_still_refuses(field: str) -> None:
                 id="call_a",
                 type="function",
                 function=SimpleNamespace(
-                    name=REASONING if field == "tool_name" else "set_metadata",
-                    arguments=json.dumps({"patch": {"description": REASONING}}) if field == "tool_arguments" else "{}",
+                    name=VISIBLE_CREDENTIAL if field == "tool_name" else "set_metadata",
+                    arguments=json.dumps({"patch": {"description": VISIBLE_CREDENTIAL}}) if field == "tool_arguments" else "{}",
                 ),
             )
         ]
@@ -183,6 +186,20 @@ def test_visible_output_still_refuses(field: str) -> None:
         _require_no_credential_material_in_completion(completion, surface="composer_provider_response")
         for call in completion.tool_batch.calls:
             require_no_credential_material_in_tool_wire(call.function.name, call.function.arguments, surface="composer_provider_response")
+
+
+def test_a_keyword_assignment_is_admitted_in_visible_output_and_withheld_from_reasoning() -> None:
+    from elspeth.web.composer.provider_gateway import _require_no_credential_material_in_completion
+
+    response = _make_llm_response(content=REASONING)
+    response.choices[0].message.__dict__["reasoning_content"] = REASONING
+
+    completion = _require_no_credential_material_in_completion(
+        _admit_composer_llm_completion(response), surface="composer_provider_response"
+    )
+
+    assert completion.message.content == REASONING
+    assert completion.provider_metadata.reasoning_content is None
 
 
 class RequestInspected(Exception):

@@ -21,6 +21,7 @@ from elspeth.core.landscape.schema import run_prompt_inputs_table
 from elspeth.web.blobs import prompt_text_routes
 from elspeth.web.blobs.service import content_hash
 from elspeth.web.composer.tools._common import _options_with_default_model_choice_review, _options_with_default_prompt_template_review
+from elspeth.web.credential_guard import CredentialMaterialRefused
 from elspeth.web.execution.service import ExecutionServiceImpl, _run_prompt_input_evidence
 from elspeth.web.interpretation_state import (
     InterpretationReviewIntegrityError,
@@ -278,6 +279,56 @@ def test_oversized_text_refuses_without_approval(tmp_path) -> None:
     assert client.get(f"/api/sessions/{session_id}/blobs/{blob['id']}/content").content == b"before"
     with service._engine.connect() as conn:
         assert conn.execute(select(prompt_file_approvals_table)).all() == []
+
+
+def _save_refused_for_credential(
+    client: SyncASGITestClient, session_id: str, blob_id: str, content: str, expected: str, candidate: str, **kwargs: str
+) -> None:
+    # The app's handler renders this refusal as the fixed 422 credential payload;
+    # this harness has no app handlers, so the refusal itself is asserted.
+    with pytest.raises(CredentialMaterialRefused) as caught:
+        _save(client, session_id, blob_id, content, expected, **kwargs)
+    assert caught.value.surface == "prompt_file_text"
+    assert caught.value.finding.category == "token_shape"
+    assert caught.value.to_payload()["failure_code"] == "credential_material_rejected"
+    assert candidate not in repr(caught.value.to_payload())
+
+
+def test_save_with_a_credential_is_refused_and_writes_nothing(tmp_path) -> None:
+    app, service, _ = _make_app(tmp_path)
+    client = SyncASGITestClient(app)
+    session_id = _create_session(client)
+    blob = _upload_blob(client, session_id, b"before", "prompt.txt", "text/plain")
+    _bound(client, session_id, blob["id"], blob["content_hash"], service)
+    candidate = "sk-" + "e" * 24
+    _save_refused_for_credential(
+        client, session_id, blob["id"], f"Summarise {{{{ row.text }}}} using {candidate}.", blob["content_hash"], candidate
+    )
+    assert client.get(f"/api/sessions/{session_id}/blobs/{blob['id']}/content").content == b"before"
+    with service._engine.connect() as conn:
+        assert conn.execute(select(prompt_file_approvals_table)).all() == []
+    # The refusal released the session lease: the next save goes through.
+    assert _save(client, session_id, blob["id"], "Summarise {{ row.text }}.", blob["content_hash"]).status_code == 200
+
+
+def test_a_largest_allowed_prompt_file_is_scanned_to_its_last_byte(tmp_path) -> None:
+    # The scan bound equals the file cap, so no text the save accepts is cut short:
+    # a credential in the last bytes of a 256 KiB system prompt is still refused.
+    app, service, _ = _make_app(tmp_path)
+    client = SyncASGITestClient(app)
+    session_id = _create_session(client)
+    blob = _upload_blob(client, session_id, b"before", "prompt.txt", "text/plain")
+    marker = {"mode": "inline_content", "blob_ref": blob["id"], "sha256": blob["content_hash"]}
+    data = CompositionStateData(
+        nodes=[{"id": "first", "node_type": "transform", "plugin": "llm", "options": {"system_prompt": marker}}],
+        is_valid=True,
+    )
+    asyncio.run(service.save_composition_state(UUID(session_id), data, provenance="session_seed"))
+    candidate = "sk-" + "l" * 24
+    content = "x " * ((256 * 1024 - len(candidate)) // 2) + candidate
+    assert len(content.encode("utf-8")) <= 256 * 1024
+    _save_refused_for_credential(client, session_id, blob["id"], content, blob["content_hash"], candidate, field_path="system_prompt")
+    assert client.get(f"/api/sessions/{session_id}/blobs/{blob['id']}/content").content == b"before"
 
 
 def test_non_owner_cannot_save_or_approve(tmp_path) -> None:

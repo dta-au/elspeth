@@ -284,7 +284,7 @@ _UNPARSEABLE: dict[str, list[dict[str, Any]]] = {
     "pass_index_bool": [{"_kind": ADVISOR_CHECKPOINT_PASS_AUDIT_KIND, "pass": _stored_pass(pass_index=True)}],
     "pass_index_negative": [{"_kind": ADVISOR_CHECKPOINT_PASS_AUDIT_KIND, "pass": _stored_pass(pass_index=-1)}],
     "pass_index_string": [{"_kind": ADVISOR_CHECKPOINT_PASS_AUDIT_KIND, "pass": _stored_pass(pass_index="1")}],
-    "provider_attempts_three": [{"_kind": ADVISOR_CHECKPOINT_PASS_AUDIT_KIND, "pass": _stored_pass(provider_attempts=3)}],
+    "provider_attempts_four": [{"_kind": ADVISOR_CHECKPOINT_PASS_AUDIT_KIND, "pass": _stored_pass(provider_attempts=4)}],
     "provider_attempts_float": [{"_kind": ADVISOR_CHECKPOINT_PASS_AUDIT_KIND, "pass": _stored_pass(provider_attempts=1.0)}],
     "missing_field": [{"_kind": ADVISOR_CHECKPOINT_PASS_AUDIT_KIND, "pass": {k: v for k, v in _stored_pass().items() if k != "verdict"}}],
     "pass_not_a_mapping": [{"_kind": ADVISOR_CHECKPOINT_PASS_AUDIT_KIND, "pass": ["end", 1]}],
@@ -373,7 +373,7 @@ class TestClosedValueSets:
         ("field", "accepted", "refused"),
         [
             ("pass_index", [0, 1, 7, 10_000], [-1, True, 1.0, "1", None]),
-            ("provider_attempts", [0, 1, 2], [-1, 3, True, 1.0, "1", None]),
+            ("provider_attempts", [0, 1, 2, 3], [-1, 4, True, 1.0, "1", None]),
         ],
     )
     def test_integer_value_sets(self, field: str, accepted: list[object], refused: list[object]) -> None:

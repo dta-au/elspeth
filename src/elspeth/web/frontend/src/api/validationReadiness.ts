@@ -12,13 +12,16 @@ export function isSafeRequestRejection(value: unknown): value is SafeRequestReje
   const code = value.reason_code;
   const disposition = value.reason_disposition;
   const source = value.reason_source;
-  const known = code === "invalid_request" || code === "context_length_exceeded" || code === "unsupported_parameter";
+  const known =
+    code === "invalid_request" || code === "context_length_exceeded" || code === "unsupported_parameter" || code === "request_too_large";
   return (
     Object.keys(value).length === 7 &&
     value.category === "request_rejected" && value.exception_type === "BadRequestError" &&
     (known || code === null) &&
     (disposition === "retained" || disposition === "absent" || disposition === "unrecognized" || disposition === "unavailable") &&
-    (source === "sdk_body" || source === "http_response" || source === "sdk_class" || source === "message_pattern" || source === "unavailable") &&
+    (source === "sdk_body" || source === "http_response" || source === "sdk_class" || source === "message_pattern" ||
+      source === "http_status" || source === "unavailable") &&
+    (source === "http_status") === (code === "request_too_large") &&
     (disposition === "retained") === known && !(known && source === "unavailable") &&
     (value.diagnostic_reference === null || typeof value.diagnostic_reference === "string" &&
       /^provider-failure:[0-9a-f]{64}$/.test(value.diagnostic_reference)) && value.retryable === false

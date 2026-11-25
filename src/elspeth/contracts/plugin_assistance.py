@@ -33,7 +33,6 @@ _UNSAFE_TEXT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\bwww\.\S+", re.IGNORECASE), "raw URL"),
     (re.compile(r"(?i)\b(?:authorization|proxy-authorization)\s*:\s*\S+"), "credential"),
     (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}"), "credential"),
-    (re.compile(r"(?i)\b(?:api[_ -]?key|password|token|secret|credential|connection[_ -]?string)\s*[:=]\s*['\"]?\S+"), "credential"),
     (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "credential"),
     (re.compile(r"(?m)(?:^|\n)Traceback \(most recent call last\):"), "exception string"),
     (re.compile(r'(?m)File "[^"]+", line \d+'), "exception string"),

@@ -15,11 +15,19 @@ from openai import BadRequestError as OpenAIBadRequestError
 
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
 from elspeth.web.composer.protocol import ComposerConvergenceError
-from elspeth.web.composer.provider_errors import classify_provider_failure, is_context_length_rejection
+from elspeth.web.composer.provider_errors import classify_provider_failure, request_size_rejection
 from tests.unit.web.composer._helpers import _clean_advisor_checkpoint
 from tests.unit.web.composer.test_gateway_capacity_rejection import _GENEROUS_SETTING, _compose, _ScriptedProvider, _service
 
 _LENGTH_MESSAGE = "Input is too long for requested model."
+
+
+def is_context_length_rejection(exc: BaseException) -> bool:
+    """A size rejection for the model's context limit (not a request-size limit)."""
+    rejection = request_size_rejection(exc)
+    return rejection is not None and rejection.reason_code == "context_length_exceeded"
+
+
 _REQUEST = httpx.Request("POST", "https://gateway.invalid/model/invoke")
 
 
@@ -181,3 +189,5 @@ async def test_gateway_length_code_reaches_compose_size_branch(monkeypatch: pyte
     assert caught.value.evidence["ceiling"] == "provider"
     (call,) = caught.value.llm_calls
     assert call.error_message == "context_length_exceeded"
+    # litellm maps this Bedrock wording to its context-window class itself, and the record says so.
+    assert call.rejection_reason_source == "sdk_class"

@@ -251,7 +251,9 @@ async def test_model_turn_admits_one_snapshot_and_discards_raw_provider_objects(
         assert provider_response.usage_reads == 1
         assert message.content_reads == 1
         assert message.tool_calls_reads == 1
-        assert [field.name for field in fields(_CallModelOutcome)] == ["completion"]
+        # ``delivery`` is an owned blob-delivery record, set only for the last-chance call.
+        assert [field.name for field in fields(_CallModelOutcome)] == ["completion", "delivery"]
+        assert outcome.delivery is None
         assert not hasattr(outcome, "response")
         assert not hasattr(outcome, "assistant_message")
         assert outcome.completion.message.content == "admitted content"

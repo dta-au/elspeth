@@ -332,6 +332,23 @@ def test_stored_metadata_requires_exact_primitive_types(field: str) -> None:
         ComposerDiagnosticEvidence.from_dict(data)
 
 
+@pytest.mark.parametrize("version", ["1", "2"])
+def test_stored_evidence_from_either_detector_version_reads_back(version: str) -> None:
+    data = build({"prompt": "ordinary"}).to_dict()
+    data["detector_version"] = version
+
+    assert ComposerDiagnosticEvidence.from_dict(data).detector_version == version
+
+
+def test_new_evidence_carries_detector_version_two_and_unknown_versions_are_refused() -> None:
+    data = build({"prompt": "ordinary"}).to_dict()
+    assert data["detector_version"] == "2"
+
+    data["detector_version"] = "3"
+    with pytest.raises(AuditIntegrityError):
+        ComposerDiagnosticEvidence.from_dict(data)
+
+
 def test_valid_reference_in_plugin_declared_slot_is_retained() -> None:
     arguments = {"plugin": "database", "options": {"url": {"secret_ref": "database_connection", "secret_scope": "org"}}}
     assert json.loads(build(arguments, tool="set_output").arguments.content) == arguments

@@ -25,10 +25,10 @@ from typing import Literal
 from pydantic_core import PydanticCustomError
 
 from elspeth.contracts.credential_material import (
-    CREDENTIAL_PATTERN_SPECS,
+    CONSERVATIVE_PATTERN_SPECS,
     CREDENTIAL_REFUSAL_DETAIL,
-    find_credential_material,
 )
+from elspeth.web.credential_scan import scan_best_effort
 
 # Major Unicode categories that produce visible glyphs.  A string composed
 # entirely of characters outside these categories (whitespace, control chars,
@@ -138,8 +138,8 @@ _PII_WARNING_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 
 
 def reject_credential_material(value: object) -> None:
-    """Reject a bounded control value with the shared fixed Pydantic error."""
-    if find_credential_material(value) is not None:
+    """Reject a request value that matches a known credential pattern, with the shared fixed Pydantic error."""
+    if scan_best_effort(value, surface="web_request_validation") is not None:
         raise PydanticCustomError("credential_material_rejected", CREDENTIAL_REFUSAL_DETAIL)
 
 
@@ -178,7 +178,7 @@ def _redact_sensitive_content(value: str, *, pii_shapes: Literal["all", "email_s
     """
 
     redacted = value
-    for name, pattern in CREDENTIAL_PATTERN_SPECS:
+    for name, pattern in CONSERVATIVE_PATTERN_SPECS:
         redacted = pattern.sub(f"<redacted-sensitive:{name}>", redacted)
 
     def _card_replacement(match: re.Match[str]) -> str:

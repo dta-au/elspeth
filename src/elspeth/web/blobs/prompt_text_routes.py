@@ -30,6 +30,7 @@ from elspeth.web.blobs.routes import _get_owned_blob, _verify_session_and_get_bl
 from elspeth.web.blobs.service import content_hash
 from elspeth.web.coordination.contracts import SessionOperationKind
 from elspeth.web.coordination.lifecycle import SessionOperationLease
+from elspeth.web.credential_guard import require_no_credential_material
 from elspeth.web.interpretation_state import parse_interpretation_requirements, prompt_review_draft_from_options
 from elspeth.web.sessions.models import composition_states_table, interpretation_events_table
 from elspeth.web.sessions.pending_interpretation import (
@@ -138,6 +139,10 @@ def create_prompt_text_router() -> APIRouter:
                 raise _prompt_save_refusal(422, "prompt_file_not_text", "Enter valid UTF-8 text.") from exc
             if len(new_bytes) > _MAX_PROMPT_FILE_BYTES:
                 raise _prompt_save_refusal(413, "prompt_file_too_large", "Keep this prompt file at or below 256 KiB.")
+            # Best effort, on arrival: user-typed text is refused when it matches a
+            # credential format. The bound equals the file cap above, so every text
+            # that reaches here is scanned whole; a scan limit never refuses a save.
+            require_no_credential_material(body.content, surface="prompt_file_text", max_string_bytes=_MAX_PROMPT_FILE_BYTES)
             old_bytes = await blob_service.read_blob_content(blob_id, session_operation_context=lease.context)
             try:
                 old_bytes.decode("utf-8")

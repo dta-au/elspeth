@@ -20,6 +20,7 @@ from elspeth.contracts.credential_material import CredentialMaterialFinding
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata, FrameworkBugError
 from elspeth.contracts.secrets import FingerprintKeyMissingError, SecretDecryptionError
 from elspeth.web.app import create_app
+from elspeth.web.async_workers import AsyncWorkerAdmissionTimeoutError
 from elspeth.web.config import WebSettings
 from elspeth.web.coordination.contracts import FenceLossReason, SessionOperationFenceLost
 from elspeth.web.coordination.repository import SessionOperationConflictError
@@ -670,6 +671,7 @@ async def test_every_composer_error_envelope_carries_a_request_id(tmp_path: Path
         (AuditAccessLogWriteError, AuditAccessLogWriteError("x")),
         (RunAlreadyActiveError, RunAlreadyActiveError("x")),
         (RequiredGenerationUnavailable, RequiredGenerationUnavailable("private generation detail")),
+        (AsyncWorkerAdmissionTimeoutError, AsyncWorkerAdmissionTimeoutError("private admission detail")),
         (FingerprintKeyMissingError, FingerprintKeyMissingError("x")),
         (SecretDecryptionError, SecretDecryptionError("x")),
         (
@@ -702,6 +704,10 @@ async def test_every_composer_error_envelope_carries_a_request_id(tmp_path: Path
             assert response.status_code == 503
             assert body["error_type"] == "database_unavailable"
             assert "private generation detail" not in response.body.decode()
+        if exc_type is AsyncWorkerAdmissionTimeoutError:
+            assert response.status_code == 503
+            assert body["error_type"] == "database_unavailable"
+            assert "private admission detail" not in response.body.decode()
 
 
 @pytest.mark.asyncio

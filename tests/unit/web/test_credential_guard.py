@@ -4,15 +4,21 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
 
+from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.session_operation import SessionOperationKind
-from elspeth.web.composer import provider_gateway
+from elspeth.web import credential_scan
+from elspeth.web.composer import advisor_context, provider_gateway
+from elspeth.web.composer.audit import BufferingRecorder
+from elspeth.web.composer.prompt_guard import prompt_guard_user_scope
 from elspeth.web.composer.provider_gateway import ProviderGateway
 from elspeth.web.composer.provider_quota import ProviderCallCustody, ProviderInvocationFamily, ProviderInvocationOwner
+from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.credential_guard import (
     CredentialMaterialRefused,
@@ -37,9 +43,9 @@ from tests.helpers.session_fences import ensure_session_fence
 from tests.unit.web.composer._helpers import _composer_service_with_session, _make_llm_response, _make_settings, _mock_catalog
 
 
-@pytest.fixture
-def provider_custody() -> Iterator[ProviderCallCustody]:
-    """Reach credential admission with real fenced custody and no SDK dispatch."""
+@contextmanager
+def _fenced_provider_owner() -> Iterator[tuple[ComposerServiceImpl, ProviderInvocationOwner, RequiredWorkCoordinator]]:
+    """A composer and a provider owner on its own fenced session, with real required-work accounting."""
     composer, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
     assert composer._sessions_service is not None
     sessions = cast(SessionServiceImpl, composer._sessions_service)
@@ -55,15 +61,22 @@ def provider_custody() -> Iterator[ProviderCallCustody]:
         RequiredWorkAuthority(RequiredAuthorityKind.SYNCHRONOUS_COMPOSE, context, invocation_id=str(uuid4()))
     )
     binding = RequiredWorkBinding(coordinator, 0, 0, RequiredWorkRole.TURN)
-    custody = ProviderInvocationOwner(service=sessions, required_work=binding).mint(ProviderInvocationFamily.PRIMARY)
     try:
-        yield custody
-        assert custody.attempt is None
-        assert custody.call is None
+        yield composer, ProviderInvocationOwner(service=sessions, required_work=binding), coordinator
         coordinator.assert_completed()
     finally:
         authority.release(context)
         sessions._engine.dispose()
+
+
+@pytest.fixture
+def provider_custody() -> Iterator[ProviderCallCustody]:
+    """Reach credential admission with real fenced custody and no SDK dispatch."""
+    with _fenced_provider_owner() as (_composer, owner, _coordinator):
+        custody = owner.mint(ProviderInvocationFamily.PRIMARY)
+        yield custody
+        assert custody.attempt is None
+        assert custody.call is None
 
 
 def _field_mapper_node(mapping: dict[str, str]) -> dict[str, Any]:
@@ -194,7 +207,7 @@ def test_field_mapper_domain_does_not_allow_credentials_or_unknown_shapes(change
     else:
         node["options"]["mapping"]["customer_key"] = {
             "token": "sk-" + "a" * 24,
-            "private_key": "-----BEGIN PRIVATE KEY-----",
+            "private_key": "-----BEGIN PRIVATE KEY-----",  # secret-scan: allow-this-line
             "url": "https://synthetic:password@example.test",
         }[change]
     with pytest.raises(CredentialMaterialRefused):
@@ -226,10 +239,28 @@ def test_field_mapper_projection_is_bounded_before_config_validation(monkeypatch
     def forbidden_validation(*_args: object, **_kwargs: object) -> object:
         raise AssertionError("unbounded options reached plugin validation")
 
+    skips: list[dict[str, str]] = []
+
+    class _Recorder:
+        def add(self, value: int, attributes: dict[str, str]) -> None:
+            skips.append(dict(attributes))
+
     monkeypatch.setattr(FieldMapperConfig, "model_validate", forbidden_validation)
-    for mapping in ({f"customer_{index}_key": "field" for index in range(513)}, {"customer_key": "x" * 262_145}):
-        with pytest.raises(CredentialMaterialRefused):
-            require_no_credential_material_for_tool("upsert_node", _field_mapper_node(mapping), surface="test")
+    monkeypatch.setattr(credential_scan, "_CREDENTIAL_SCAN_SKIPPED_COUNTER", _Recorder())
+    # Plugin validation is never reached for an over-bound candidate. A mapping wider
+    # than the scan is a counted skip (best effort).
+    wide = {f"customer_{index}_key": "field" for index in range(513)}
+    require_no_credential_material_for_tool("upsert_node", _field_mapper_node(wide), surface="composer_tool_arguments")
+    assert skips == [{"surface": "composer_tool_arguments", "reason": "width"}]
+
+    # An over-long label leaves the options unprojected, so the ordinary walk reads
+    # the credential-named key with a literal value as a match.
+    with pytest.raises(CredentialMaterialRefused) as caught:
+        require_no_credential_material_for_tool(
+            "upsert_node", _field_mapper_node({"customer_key": "x" * 262_145}), surface="composer_tool_arguments"
+        )
+    assert caught.value.finding.category == "credential_field"
+    assert skips == [{"surface": "composer_tool_arguments", "reason": "width"}]
 
 
 @pytest.mark.asyncio
@@ -321,7 +352,7 @@ def test_structured_refusal_contains_only_closed_evidence() -> None:
         ),
         "category": "token_shape",
         "surface": "test_surface",
-        "detector_version": "1",
+        "detector_version": "2",
     }
     assert candidate not in repr(caught.value)
     assert candidate not in repr(payload)
@@ -334,6 +365,7 @@ def test_structured_refusal_contains_only_closed_evidence() -> None:
         "composer_planner_response",
         "composer_advisor_response",
         "composer_provider_thinking",
+        "composer_tool_arguments",
         "composer_tool_batch",
         "composer_tool_wire",
         "composer_recovery_reply",
@@ -351,13 +383,14 @@ def test_model_output_refusal_identifies_model_and_keeps_evidence_closed(surface
         "Otherwise, retry your request."
     )
     assert str(caught.value) == detail
+    assert caught.value.from_model_output
     assert caught.value.to_payload() == {
         "error_type": "credential_material_rejected",
         "failure_code": "credential_material_rejected",
         "detail": detail,
         "category": "token_shape",
         "surface": surface,
-        "detector_version": "1",
+        "detector_version": "2",
     }
     assert candidate not in repr(caught.value)
     assert candidate not in repr(caught.value.to_payload())
@@ -367,13 +400,11 @@ def test_model_output_refusal_identifies_model_and_keeps_evidence_closed(surface
     "surface",
     [
         "composer_provider_request",
-        "composer_state_before_provider",
         "composer_yaml_import",
         "web_message_ingress",
         "web_fork_message_ingress",
         "session_title",
         "blob_filename",
-        "composer_tool_arguments",
         "composer_advisor_complete_content",
         "composer_mcp_tool_arguments",
         "composer_prompt_guard_request",
@@ -386,6 +417,7 @@ def test_non_model_output_surfaces_keep_original_refusal_copy(surface: str) -> N
 
     detail = "This control content appears to contain a credential. Store the value through the secret service and use a secret reference."
     assert str(caught.value) == detail
+    assert not caught.value.from_model_output
     assert caught.value.to_payload()["detail"] == detail
 
 
@@ -581,12 +613,9 @@ async def test_provider_request_is_refused_before_transport(monkeypatch: pytest.
         # except the credential, fits under the cap: it is scanned, and the
         # trailing credential is found.
         pytest.param("\U00010400" * (524_288 - 27) + "sk-" + "a" * 24, "token_shape", id="max_import_of_4_byte_chars"),
-        # Past the 2 MiB cap the string is refused unscanned, never skipped:
-        # the cap bounds work, it does not exempt content.
-        pytest.param(" " * (2 * 1024 * 1024 + 1), "traversal_limit", id="over_2MiB_cap"),
     ],
 )
-async def test_provider_request_scans_large_messages_and_refuses_over_cap(
+async def test_provider_request_scans_large_messages_under_the_cap(
     monkeypatch: pytest.MonkeyPatch, provider_custody: ProviderCallCustody, content: str, category: str
 ) -> None:
     transport_calls: list[dict[str, Any]] = []
@@ -614,6 +643,145 @@ async def test_provider_request_scans_large_messages_and_refuses_over_cap(
 
 
 @pytest.mark.asyncio
+async def test_provider_request_over_the_cap_is_a_counted_skip_not_a_refusal(
+    monkeypatch: pytest.MonkeyPatch, provider_custody: ProviderCallCustody
+) -> None:
+    # Past the 2 MiB cap the scan stops (best effort): the request is not refused for
+    # credentials and continues to the next control, here the prompt guard.
+    skips: list[dict[str, str]] = []
+
+    class _Recorder:
+        def add(self, value: int, attributes: dict[str, str]) -> None:
+            skips.append(dict(attributes))
+
+    async def transport(**kwargs: Any) -> object:
+        raise AssertionError("request reached transport")
+
+    import litellm
+
+    from elspeth.web.composer.prompt_guard import PromptGuardRefused
+
+    monkeypatch.setattr(litellm, "acompletion", transport)
+    monkeypatch.setattr(credential_scan, "_CREDENTIAL_SCAN_SKIPPED_COUNTER", _Recorder())
+    with pytest.raises(PromptGuardRefused):
+        await provider_gateway._litellm_acompletion(
+            provider_custody=provider_custody,
+            model="openai/test-model",
+            prompt_guard_mount=None,
+            prompt_guard_mode="required",
+            prompt_guard_role="composer",
+            messages=[{"role": "user", "content": " " * (2 * 1024 * 1024 + 1)}],
+        )
+
+    assert skips == [{"surface": "composer_provider_request", "reason": "string_bytes"}]
+
+
+class _SkipRecorder:
+    def __init__(self) -> None:
+        self.skips: list[dict[str, str]] = []
+
+    def add(self, value: int, attributes: dict[str, str]) -> None:
+        assert value == 1
+        self.skips.append(dict(attributes))
+
+
+def _long_conversation(count: int) -> list[dict[str, Any]]:
+    return [{"role": "user" if index % 2 == 0 else "assistant", "content": f"turn {index}"} for index in range(count)]
+
+
+async def _refuse_transport(**kwargs: Any) -> object:
+    raise AssertionError("request reached transport")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "last_message",
+    [
+        pytest.param({"role": "user", "content": "sk-" + "a" * 24}, id="user_message"),
+        pytest.param({"role": "assistant", "content": "sk-" + "a" * 24}, id="assistant_message"),
+    ],
+)
+async def test_provider_request_scans_every_message_of_a_long_request(
+    monkeypatch: pytest.MonkeyPatch, provider_custody: ProviderCallCustody, last_message: dict[str, Any]
+) -> None:
+    # Message 600 of 600. Scanned as one tree, the 600-item list stopped at the
+    # width limit (512) before any message was read, so this went unscanned.
+    import litellm
+
+    monkeypatch.setattr(litellm, "acompletion", _refuse_transport)
+    recorder = _SkipRecorder()
+    monkeypatch.setattr(credential_scan, "_CREDENTIAL_SCAN_SKIPPED_COUNTER", recorder)
+    with pytest.raises(CredentialMaterialRefused) as caught:
+        await provider_gateway._litellm_acompletion(
+            provider_custody=provider_custody,
+            model="openai/test-model",
+            prompt_guard_mount=None,
+            prompt_guard_mode="required",
+            prompt_guard_role="composer",
+            messages=[*_long_conversation(599), last_message],
+        )
+
+    assert caught.value.surface == "composer_provider_request"
+    assert caught.value.finding.category == "token_shape"
+    assert recorder.skips == []
+
+
+@pytest.mark.asyncio
+async def test_provider_request_with_many_messages_is_scanned_without_a_skip(
+    monkeypatch: pytest.MonkeyPatch, provider_custody: ProviderCallCustody
+) -> None:
+    # A request of more than 512 messages is not a traversal limit: it is
+    # accepted by the credential scan and goes on to the next control.
+    import litellm
+
+    from elspeth.web.composer.prompt_guard import PromptGuardRefused
+
+    monkeypatch.setattr(litellm, "acompletion", _refuse_transport)
+    recorder = _SkipRecorder()
+    monkeypatch.setattr(credential_scan, "_CREDENTIAL_SCAN_SKIPPED_COUNTER", recorder)
+    with pytest.raises(PromptGuardRefused):
+        await provider_gateway._litellm_acompletion(
+            provider_custody=provider_custody,
+            model="openai/test-model",
+            prompt_guard_mount=None,
+            prompt_guard_mode="required",
+            prompt_guard_role="composer",
+            messages=_long_conversation(600),
+        )
+
+    assert recorder.skips == []
+
+
+@pytest.mark.asyncio
+async def test_provider_request_keeps_scanning_the_messages_after_a_skipped_one(
+    monkeypatch: pytest.MonkeyPatch, provider_custody: ProviderCallCustody
+) -> None:
+    # A limit inside one message skips that message only (counted); a
+    # credential in a later message is still refused.
+    import litellm
+
+    monkeypatch.setattr(litellm, "acompletion", _refuse_transport)
+    recorder = _SkipRecorder()
+    monkeypatch.setattr(credential_scan, "_CREDENTIAL_SCAN_SKIPPED_COUNTER", recorder)
+    with pytest.raises(CredentialMaterialRefused) as caught:
+        await provider_gateway._litellm_acompletion(
+            provider_custody=provider_custody,
+            model="openai/test-model",
+            prompt_guard_mount=None,
+            prompt_guard_mode="required",
+            prompt_guard_role="composer",
+            messages=[
+                {"role": "user", "content": " " * (2 * 1024 * 1024 + 1)},
+                {"role": "assistant", "content": "noted"},
+                {"role": "user", "content": "sk-" + "a" * 24},
+            ],
+        )
+
+    assert caught.value.finding.category == "token_shape"
+    assert recorder.skips == [{"surface": "composer_provider_request", "reason": "string_bytes"}]
+
+
+@pytest.mark.asyncio
 async def test_serialized_state_credential_is_refused_before_provider_transport(
     monkeypatch: pytest.MonkeyPatch, provider_custody: ProviderCallCustody
 ) -> None:
@@ -633,7 +801,7 @@ async def test_serialized_state_credential_is_refused_before_provider_transport(
             prompt_guard_mount=None,
             prompt_guard_mode="required",
             prompt_guard_role="composer",
-            messages=[{"role": "user", "content": '{"password":"low-entropy-secret"}'}],
+            messages=[{"role": "user", "content": json.dumps({"password": "sk-" + "s" * 30})}],
         )
 
     assert transport_calls == []
@@ -703,6 +871,92 @@ async def test_text_provider_reasoning_keeps_visible_reply(monkeypatch: pytest.M
 
     admitted = await gateway._call_text_llm([{"role": "user", "content": "ordinary"}])
     assert admitted.choices[0].message.content == "ordinary"
+
+
+_REQUEST_CANDIDATE = "sk-" + "r" * 24
+
+
+async def _credential_request_on(
+    path: str,
+    composer: ComposerServiceImpl,
+    owner: ProviderInvocationOwner,
+    recorder: BufferingRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if path == "advisor":
+        # The advisor masks token shapes in its own arguments before building the
+        # request, so a credential reaches its outgoing scan only through content
+        # that masking does not cover. Turn the masking off to put one there.
+        monkeypatch.setattr(advisor_context, "_redact_sensitive_content", lambda text: text)
+        await composer._advisor_checkpoint._call_advisor_with_audit(
+            {"trigger": "reactive", "problem_summary": _REQUEST_CANDIDATE, "recent_errors": [], "attempted_actions": []},
+            recorder=recorder,
+            provider_owner=owner,
+        )
+        return
+    custody = owner.mint(ProviderInvocationFamily.PRIMARY)
+    messages = [{"role": "user", "content": _REQUEST_CANDIDATE}]
+    try:
+        if path == "tools":
+            await composer._provider_gateway._call_llm_with_audit(messages, [], timeout=5.0, recorder=recorder, provider_custody=custody)
+        else:
+            await composer._provider_gateway._call_text_llm_with_audit(messages, timeout=5.0, recorder=recorder, provider_custody=custody)
+    finally:
+        # Nothing was admitted: the refusal comes before the attempt is begun.
+        assert custody.attempt is None
+        assert custody.call is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["tools", "text", "advisor"])
+async def test_a_refused_outgoing_request_writes_no_call_record(monkeypatch: pytest.MonkeyPatch, path: str) -> None:
+    # The outgoing-request scan runs before provider admission, so a refusal
+    # there sends nothing, charges nothing and leaves no call record.
+    import litellm
+
+    monkeypatch.setattr(litellm, "acompletion", _refuse_transport)
+    recorder = BufferingRecorder()
+    with _fenced_provider_owner() as (composer, owner, _coordinator), pytest.raises(CredentialMaterialRefused) as caught:
+        await _credential_request_on(path, composer, owner, recorder, monkeypatch)
+
+    # The advisor's user content is scanned whole, as prepared, before the per-message scan.
+    assert caught.value.surface == ("composer_advisor_complete_content" if path == "advisor" else "composer_provider_request")
+    assert recorder.llm_calls == ()
+    assert _REQUEST_CANDIDATE not in repr(caught.value.to_payload())
+
+
+@pytest.mark.asyncio
+async def test_a_refused_provider_response_is_recorded_as_a_malformed_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Control for the test above: a response refusal follows a real dispatch,
+    # so its call is recorded, as a malformed response.
+    import litellm
+
+    candidate = "sk-" + "p" * 24
+
+    async def transport(**kwargs: Any) -> object:
+        return litellm.ModelResponse(
+            model=kwargs["model"],
+            choices=[{"message": {"role": "assistant", "content": f"provider repeated {candidate}", "tool_calls": None}}],
+            usage={"prompt_tokens": 4, "completion_tokens": 3, "total_tokens": 7},
+        )
+
+    monkeypatch.setattr(litellm, "acompletion", transport)
+    recorder = BufferingRecorder()
+    with _fenced_provider_owner() as (composer, owner, _coordinator):
+        custody = owner.mint(ProviderInvocationFamily.PRIMARY)
+        with prompt_guard_user_scope("Reply."), pytest.raises(CredentialMaterialRefused) as caught:
+            await composer._provider_gateway._call_llm_with_audit(
+                [{"role": "user", "content": "Reply."}],
+                [],
+                timeout=5.0,
+                recorder=recorder,
+                provider_custody=custody,
+            )
+        assert custody.attempt is None
+
+    assert caught.value.surface == "composer_provider_response"
+    assert [call.status for call in recorder.llm_calls] == [ComposerLLMCallStatus.MALFORMED_RESPONSE]
+    assert [call.error_message for call in recorder.llm_calls] == ["credential_material_rejected"]
 
 
 def test_pipeline_data_and_sink_modules_do_not_import_control_plane_guard() -> None:

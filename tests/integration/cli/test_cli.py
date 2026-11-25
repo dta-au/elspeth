@@ -644,6 +644,34 @@ def _make_minimal_settings(tmp_path: Path, *, config_hash_override: str | None =
     return settings_path
 
 
+def _seed_joinable_completed_pipeline_run(tmp_path: Path) -> tuple[Path, str]:
+    """Run a real pipeline, then reopen it as RUNNING under a live leader seat so join admits a follower.
+
+    The real run registers the graph, sources and edges that join checks.
+    """
+    from sqlalchemy import select, update
+
+    from elspeth.cli import app
+    from elspeth.core.landscape import LandscapeDB
+    from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
+    from elspeth.core.landscape.schema import runs_table
+
+    settings_path = _make_minimal_settings(tmp_path)
+    initial = runner.invoke(app, ["run", "--settings", str(settings_path), "--execute"])
+    assert initial.exit_code == 0, initial.output
+    db = LandscapeDB.from_url(f"sqlite:///{tmp_path / 'landscape.db'}", create_tables=False)
+    try:
+        with db.engine.begin() as conn:
+            run_id = conn.execute(select(runs_table.c.run_id)).scalar_one()
+            conn.execute(update(runs_table).where(runs_table.c.run_id == run_id).values(status="running", completed_at=None))
+        RunCoordinationRepository(db.engine).acquire_run_leadership(
+            run_id=run_id, worker_id=f"worker:{run_id}:leaderabc123", window_seconds=3600
+        )
+    finally:
+        db.close()
+    return settings_path, run_id
+
+
 def _seed_running_run(
     tmp_path: Path,
     *,
@@ -756,9 +784,8 @@ class TestJoinCommand:
         )
 
         assert result.exit_code == 1
-        combined = result.output
-        # The refusal message should mention hash or mismatch.
-        assert "hash" in combined.lower() or "mismatch" in combined.lower() or "config" in combined.lower()
+        # examples/join_refused/run.sh asserts this exact reason text, so it is pinned exactly here.
+        assert "does not match the run's config_hash" in result.output
 
     def test_join_refused_no_live_leader(self, tmp_path: Path) -> None:
         """join exits 1 and names elspeth resume when the leader seat is dead."""
@@ -797,28 +824,7 @@ class TestJoinCommand:
 
         from elspeth.cli import app
 
-        settings_path = _make_minimal_settings(tmp_path)
-
-        # A real run registers the graph, sources and edges join checks; it is
-        # then put back to RUNNING under a live leader seat so admission succeeds.
-        from sqlalchemy import select, update
-
-        from elspeth.core.landscape import LandscapeDB
-        from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
-        from elspeth.core.landscape.schema import runs_table
-
-        initial = runner.invoke(app, ["run", "--settings", str(settings_path), "--execute"])
-        assert initial.exit_code == 0, initial.output
-        db = LandscapeDB.from_url(f"sqlite:///{tmp_path / 'landscape.db'}", create_tables=False)
-        try:
-            with db.engine.begin() as conn:
-                run_id = conn.execute(select(runs_table.c.run_id)).scalar_one()
-                conn.execute(update(runs_table).where(runs_table.c.run_id == run_id).values(status="running", completed_at=None))
-            RunCoordinationRepository(db.engine).acquire_run_leadership(
-                run_id=run_id, worker_id=f"worker:{run_id}:leaderabc123", window_seconds=3600
-            )
-        finally:
-            db.close()
+        settings_path, run_id = _seed_joinable_completed_pipeline_run(tmp_path)
 
         # Stub build_follower_processor to return a no-op spec'd mock so the
         # drain loop exits immediately.  This tests: admission → worker_id minted
@@ -843,6 +849,50 @@ class TestJoinCommand:
         combined = result.output
         # Should mention the run was joined and departed cleanly.
         assert run_id in combined
+
+    @pytest.mark.parametrize(
+        "status_value",
+        ["completed", "completed_with_failures", "failed", "empty", "interrupted", None],
+        ids=lambda value: value or "run_absent",
+    )
+    def test_join_departure_names_the_terminal_status_the_follower_read(self, tmp_path: Path, status_value: str | None) -> None:
+        """join's clean departure reports the run status the follower read, never "completed" for a failed run.
+
+        Exit code 0 is unchanged for every terminal status: it reports the
+        follower's clean departure, not the run's outcome.
+        """
+        from unittest.mock import create_autospec, patch
+
+        from elspeth.cli import app
+        from elspeth.contracts.enums import RunStatus
+        from elspeth.engine.orchestrator.follower import FollowerProcessor
+
+        settings_path, run_id = _seed_joinable_completed_pipeline_run(tmp_path)
+        expected = (
+            f"run ended with status {status_value}, departed cleanly"
+            if status_value is not None
+            else "run is no longer recorded, departed cleanly"
+        )
+
+        for output_format in ("console", "json"):
+            mock_follower = create_autospec(FollowerProcessor, instance=True)
+            mock_follower.run.return_value = RunStatus(status_value) if status_value is not None else None
+            # Each join mints a new worker under the same live leader seat.
+            with patch("elspeth.engine.orchestrator.follower.build_follower_processor", return_value=mock_follower):
+                result = runner.invoke(app, ["join", run_id, "--settings", str(settings_path), "--format", output_format])
+
+            assert result.exit_code == 0, f"{output_format}: exit {result.exit_code}\n{result.output}"
+            if output_format == "console":
+                # The sentence a person reads is the deliverable: it names the status the follower read.
+                assert expected in result.output
+            else:
+                events = [json.loads(line) for line in result.output.splitlines() if line.startswith("{")]
+                departed = [event for event in events if event["event"] == "departed"]
+                assert len(departed) == 1, result.output
+                # Scripts read the typed status; the message is for people and only has to be present.
+                assert departed[0]["run_status"] == status_value
+                assert type(departed[0]["message"]) is str and departed[0]["message"]
+                assert departed[0]["run_id"] == run_id
 
     def test_join_startup_failure_departs_admitted_worker_and_cleans_plugins(self, tmp_path: Path) -> None:
         """Partial follower startup cleans only plugins whose on_start completed."""

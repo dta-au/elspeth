@@ -730,6 +730,7 @@ def _canonical_base_suffix_segments(suffix: str, *, allow_request_rejection: boo
             ("invalid_request", "retained"),
             ("context_length_exceeded", "retained"),
             ("unsupported_parameter", "retained"),
+            ("request_too_large", "retained"),
             (None, "absent"),
             (None, "unrecognized"),
             (None, "unavailable"),
@@ -738,7 +739,9 @@ def _canonical_base_suffix_segments(suffix: str, *, allow_request_rejection: boo
             rejection = SafeRequestRejection(
                 reason_code=reason_code,
                 reason_disposition=disposition,
-                reason_source="sdk_body" if reason_code is not None else "unavailable",
+                reason_source=(
+                    "unavailable" if reason_code is None else "http_status" if reason_code == "request_too_large" else "sdk_body"
+                ),
             )
             for base in (rejection.public_detail, rejection.handoff_detail):
                 tail = rejection_notice.removeprefix(base)

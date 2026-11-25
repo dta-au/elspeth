@@ -990,7 +990,7 @@ async def test_internal_completion_control_metadata_refuses_atomically_before_an
             {
                 "surface": "composer_provider_response",
                 "category": "token_shape",
-                "detector_version": "1",
+                "detector_version": "2",
                 "field_class": credential_field,
             }
         ]

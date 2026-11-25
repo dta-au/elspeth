@@ -443,8 +443,7 @@ When the request or attachment inventory supplies an expected hash, pass it as
 The ordinary guard still inspects all content as untrusted. Check file size with
 `list_blobs` or `get_blob_metadata` when needed. If only the complete response
 envelope cannot fit, use `get_blob_content` for selected pages instead. Both
-readers require the entire original file to pass credential inspection; paging
-does not bypass a whole-input inspection refusal.
+readers refuse a file over the same size limit; paging does not get around it.
 Use `inspect_source` for tabular structure rather than reading every data row.
 
 <!-- taught:begin tool-data read_attachment data.blob_id; tool-data read_attachment data.filename; tool-data read_attachment data.mime_type; tool-data read_attachment data.content; tool-data read_attachment data.truncated; tool-data read_attachment data.size_bytes; tool-data read_attachment data.content_hash; tool-data read_attachment data.total_chars; tool-data read_attachment data.start_char; tool-data read_attachment data.end_char; tool-data read_attachment data.next_offset_chars; tool-data read_attachment data.created_by; tool-data read_attachment data.creation_modality -->
@@ -527,12 +526,17 @@ the proposal as validated. Where changes await approval (a result carried
 response; several in one response are refused whole. Where the user's request
 takes several changes, make them one proposal at a time: send the first change
 alone, then tell the user what follows; send each next change after the one
-before it is accepted. A pipeline between changes does not have to validate: a
-change that leaves errors is still recorded as a proposal, and the errors clear
-with the last change. The rule to continue from each saved batch within the
-same request applies only where changes apply directly. `create_blob` is not a
-composition change and is not refused for this reason: create a prompt file
-first, then send the one call.
+before it is accepted. A pipeline between narrow changes does not have to
+validate: a narrow change that leaves errors is still recorded as a proposal,
+and the errors clear with the last change. A `set_pipeline` or
+`splice_transform` must leave the whole pipeline valid, or it is refused with
+no proposal; for a `splice_transform`, that includes errors that were there
+before it, unless the insertion repairs them. Some other changes also refuse
+an invalid node configuration anywhere in the pipeline, even one already
+there. The rule to continue from each saved batch within the same request
+applies only where changes apply directly. `create_blob` is not a composition
+change and is not refused for this reason: create a prompt file first, then
+send the one call.
 Do not call `request_interpretation_review` for rows inside a proposal that is
 still pending: the call is refused because the saved pipeline does not hold
 them yet, and their cards are raised when the user accepts the proposal.

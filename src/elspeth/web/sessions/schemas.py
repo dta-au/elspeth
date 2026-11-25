@@ -232,7 +232,7 @@ class AdvisorEndReviewPassResponse(_StrictResponse):
     - ``verdict``: ``clean``, ``flagged``, ``unavailable``,
       ``request_rejected`` or ``malformed``.
     - ``source``: ``prescan`` or ``model``.
-    - ``provider_attempts``: provider calls made for the pass (0, 1 or 2).
+    - ``provider_attempts``: provider calls made for the pass (0, 1, 2 or 3).
     - ``publication_verdict``: ``ADMIT``, ``WITHHOLD`` or null.
     """
 
@@ -240,7 +240,7 @@ class AdvisorEndReviewPassResponse(_StrictResponse):
     pass_index: int = Field(ge=0)
     verdict: Literal["clean", "flagged", "unavailable", "request_rejected", "malformed"]
     source: Literal["prescan", "model"]
-    provider_attempts: int = Field(ge=0, le=2)
+    provider_attempts: int = Field(ge=0, le=3)
     publication_verdict: Literal["ADMIT", "WITHHOLD"] | None
 
 

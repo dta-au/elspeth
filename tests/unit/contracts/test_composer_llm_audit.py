@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import inspect
 from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 
@@ -400,3 +401,117 @@ def test_recorder_protocol_runtime_check() -> None:
     rec: ComposerLLMCallRecorder = _StubRecorder()
     rec.record_llm_call(_make_call())
     rec.resolve_session("abc")
+
+
+def _size_rejected(**overrides: object) -> ComposerLLMCall:
+    values: dict[str, object] = {
+        "status": ComposerLLMCallStatus.BAD_REQUEST_ERROR,
+        "error_class": "BadRequestError",
+        "error_message": "context_length_exceeded",
+        "rejection_reason_source": "message_pattern",
+    }
+    values.update(overrides)
+    return _make_call(**values)
+
+
+@pytest.mark.parametrize(
+    ("error_message", "source"),
+    [
+        ("context_length_exceeded", "sdk_body"),
+        ("context_length_exceeded", "http_response"),
+        ("context_length_exceeded", "sdk_class"),
+        ("context_length_exceeded", "message_pattern"),
+        ("request_too_large", "http_status"),
+    ],
+)
+def test_a_size_rejection_records_what_recognised_it(error_message: str, source: str) -> None:
+    call = _size_rejected(error_message=error_message, rejection_reason_source=source)
+    assert call.to_dict()["rejection_reason_source"] == source
+
+
+def test_a_call_that_was_not_a_size_rejection_records_no_reason_source() -> None:
+    assert _make_call().to_dict()["rejection_reason_source"] is None
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"rejection_reason_source": "provider_prose"}, "rejection_reason_source must be one of"),
+        ({"rejection_reason_source": "unavailable"}, "rejection_reason_source must be one of"),
+        (
+            {"status": ComposerLLMCallStatus.API_ERROR},
+            "rejection_reason_source is recorded only on a rejected request",
+        ),
+        ({"error_message": "BadRequestError"}, "rejection_reason_source is recorded only on a size rejection"),
+        ({"error_message": "request_too_large"}, "a request-too-large rejection is recognised only from its HTTP status"),
+        ({"rejection_reason_source": "http_status"}, "a request-too-large rejection is recognised only from its HTTP status"),
+    ],
+)
+def test_a_reason_source_that_does_not_describe_the_recorded_rejection_is_refused(overrides: dict[str, object], message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        _size_rejected(**overrides)
+
+
+def test_every_reason_source_but_unavailable_can_describe_a_size_rejection() -> None:
+    from typing import get_args
+
+    from elspeth.contracts.composer_llm_audit import _SIZE_REJECTION_SOURCES
+    from elspeth.contracts.provider_rejection import ReasonSource
+
+    assert set(get_args(ReasonSource)) - _SIZE_REJECTION_SOURCES == {"unavailable"}
+
+
+def _budget_record(
+    *, request_wire_bytes: int = 30, surface: Any = None, density_source: Any = None, measured_bytes_per_token: Any = None
+) -> ComposerContextBudgetRecord:
+    return ComposerContextBudgetRecord(
+        policy_hash="h",
+        bytes_per_token="3.0",
+        estimated_tokens_before=10,
+        estimated_tokens_after=10,
+        request_wire_bytes=request_wire_bytes,
+        shed_history_indices=(),
+        stubbed_tool_call_ids=(),
+        shed_hatch_event_indices=(),
+        surface=surface,
+        density_source=density_source,
+        measured_bytes_per_token=measured_bytes_per_token,
+    )
+
+
+@pytest.mark.parametrize("surface", ["compose_loop", "reply", "planner", "hatch"])
+@pytest.mark.parametrize(("density_source", "measured"), [("live_call", "4.4"), ("stored_call", "2.5"), ("fallback", None)])
+def test_a_budget_record_names_its_surface_and_the_density_it_was_priced_from(
+    surface: str, density_source: str, measured: str | None
+) -> None:
+    record = _budget_record(surface=surface, density_source=density_source, measured_bytes_per_token=measured)
+    raw = record.to_dict()
+    assert raw["surface"] == surface
+    assert raw["density_source"] == density_source
+    if measured is None:
+        assert "measured_bytes_per_token" not in raw
+    else:
+        assert raw["measured_bytes_per_token"] == measured
+
+
+def test_a_budget_record_written_without_them_keeps_its_shape() -> None:
+    # Absence means unknown, never a value: an older record serialises as it did.
+    raw = _budget_record().to_dict()
+    assert not {"surface", "density_source", "measured_bytes_per_token"} & set(raw)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"surface": "advisor"}, "invalid surface"),
+        ({"density_source": "guess"}, "invalid density_source"),
+        ({"density_source": "fallback", "measured_bytes_per_token": "4.4"}, "a measured density is recorded exactly when one was used"),
+        ({"density_source": "live_call"}, "a measured density is recorded exactly when one was used"),
+        ({"measured_bytes_per_token": "4.4"}, "a measured density is recorded exactly when one was used"),
+        ({"density_source": "live_call", "measured_bytes_per_token": "nan"}, "measured_bytes_per_token must be a positive finite rate"),
+        ({"density_source": "live_call", "measured_bytes_per_token": "0.0"}, "measured_bytes_per_token must be a positive finite rate"),
+    ],
+)
+def test_a_density_record_that_does_not_describe_its_pricing_is_refused(overrides: dict[str, object], message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        _budget_record(**overrides)

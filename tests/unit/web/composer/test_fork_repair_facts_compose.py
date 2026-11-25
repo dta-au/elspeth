@@ -42,7 +42,9 @@ from tests.unit.web.composer.test_compose_loop_llm_audit import _make_llm_respon
 from tests.unit.web.composer.test_tools import _mock_catalog, execute_tool
 from tests.unit.web.sessions.test_blob_proposal_accept import _save_composition_state
 
-_REQUEST_BYTE_CEILING = 960 * 1024  # 983,040: WebSettings.composer_planner_max_request_bytes default
+# 983,040: the request byte maximum's fixed default until it was derived from the token cap
+# (0.8.18). Set explicitly here, so the repair facts are still held to that size.
+_REQUEST_BYTE_CEILING = 960 * 1024
 _GENEROUS_TOKENS = 50_000_000
 _STEPS = 25
 _PROMPT_ROWS = 170  # about 20 KB of prompt per step: a 25-step graph of about 510 KB
@@ -67,8 +69,7 @@ async def test_the_second_request_after_an_edit_that_leaves_the_error_fits_under
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(AdvisorCheckpointOwner, "_run_advisor_checkpoint", _clean_advisor_checkpoint, raising=True)
-    settings = _make_settings(composer_context_max_prompt_tokens=_GENEROUS_TOKENS)
-    assert settings.composer_planner_max_request_bytes == _REQUEST_BYTE_CEILING
+    settings = _make_settings(composer_context_max_prompt_tokens=_GENEROUS_TOKENS, composer_planner_max_request_bytes=_REQUEST_BYTE_CEILING)
     service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=settings)
     state = chain(steps=_STEPS, shared=_STEPS, llm_count=_STEPS, prompt_rows=_PROMPT_ROWS)
     assert {entry.error_code for entry in state.validate().errors} >= {"duplicate_connection_consumer"}

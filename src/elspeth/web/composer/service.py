@@ -47,7 +47,7 @@ from elspeth.contracts.composer_llm_audit import (
     ComposerLLMCall,
     ComposerLLMRequestByteSplit,
 )
-from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressSink
+from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressSink, ProviderSizeReason
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.prompt_guard import (
@@ -109,6 +109,7 @@ from elspeth.web.composer.context_budget import (
 from elspeth.web.composer.context_budget_apply import (
     CONTEXT_BUDGET_OMISSION_ALLOWANCE_BYTES,
     first_history_shed_of_turn,
+    held_after_provider_rejection,
     largest_component,
     latest_round_trip_start,
     message_wire_split,
@@ -167,7 +168,7 @@ from elspeth.web.composer.provider_config import (
     infer_provider_from_model_name,
     infer_provider_from_unprefixed_model_name,
 )
-from elspeth.web.composer.provider_errors import classify_provider_failure, is_context_length_rejection
+from elspeth.web.composer.provider_errors import classify_provider_failure, provider_size_reason, request_size_rejection
 from elspeth.web.composer.provider_gateway import (
     ProviderGateway,
     _BadRequestLLMError,
@@ -196,7 +197,7 @@ from elspeth.web.composer.strict_transport import (
 from elspeth.web.composer.tools import ToolResult, is_blob_store_only_mutation_tool
 from elspeth.web.composer.tools.generation import MalformedSourceProofClaim, ProofUnavailable
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
-from elspeth.web.credential_guard import require_no_credential_material, require_no_credential_material_in_state
+from elspeth.web.credential_guard import require_no_credential_material
 from elspeth.web.execution.completion_gates import (
     CompletionGateFacts,
 )
@@ -655,21 +656,6 @@ def _sheddable_message_positions(frame: _ContextBudgetFrame) -> set[int]:
     return {
         _CONTEXT_BUDGET_HISTORY_START + position for position, (_chat_index, kind) in enumerate(frame.history_entries) if kind is not None
     }
-
-
-def _history_held_after_provider_rejection(calls: Sequence[ComposerLLMCall]) -> frozenset[str]:
-    """History keys a retry after a provider's context-limit rejection left out earlier in this turn.
-
-    The provider has judged the request with them too large, so they stay out
-    for the rest of the turn whatever the estimate says. ``calls`` are this
-    turn's calls only; a later turn follows the ordinary release rule.
-    """
-    return frozenset(
-        f"history:{chat_index}"
-        for call in calls
-        if call.context_budget is not None and call.context_budget.retry_after_provider_rejection is True
-        for chat_index in call.context_budget.shed_history_indices
-    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1363,17 +1349,6 @@ class ComposerServiceImpl:
             if session_id is None or session_operation_context.fence.session_id != session_id:
                 raise AuditIntegrityError("Composer session authority targets a different session")
 
-        env_ref_names = (
-            frozenset(item.name for item in self._secret_service.list_refs(user_id))
-            if self._secret_service is not None and user_id is not None
-            else frozenset()
-        )
-        require_no_credential_material_in_state(
-            state,
-            surface="composer_state_before_provider",
-            env_ref_names=env_ref_names,
-        )
-
         await self._chargeable_admission.require(session_operation_context)
         with composer_quota_scope(self._require_sessions_service(), session_operation_context), prompt_guard_user_scope(message):
             turn_budget = self._timeout_seconds if budget_seconds is None else budget_seconds
@@ -1817,6 +1792,7 @@ class ComposerServiceImpl:
         # this fixed allowance: their savings are charged entirely per byte.
         authored_bytes = escaped_bytes(SYSTEM_PROMPT) + (message_wire_split([], sent_tools).tools_bytes or 0)
         authored_bytes += protected_reference_bytes(sent_messages, excluded_positions=frozenset({0, *sheddable_positions}))
+        measured = frame.history.measured_rate(calls=recorder.llm_calls, model=self._model, dialect=self._planner_dialect)
         try:
             decision = decide_context_budget(
                 policy=self._context_budget_policy,
@@ -1833,10 +1809,11 @@ class ComposerServiceImpl:
                 previously_shed=previously_shed_keys(frame.history, recorder.llm_calls),
                 held=(frame.history.shed_history_after(recorder.llm_calls) if reply_stage else frozenset())
                 | (frozenset(segment_positions) if shed_all_history else frozenset())
-                | _history_held_after_provider_rejection(recorder.llm_calls),
+                | held_after_provider_rejection(recorder.llm_calls),
                 # A message under the byte maximum always goes: the estimate
                 # decides what is left out, the provider judges its own limit.
                 on_over_estimate="send",
+                measured_bytes_per_token=None if measured is None else measured.bytes_per_token,
             )
         except ContextBudgetRefusal as refusal:
             raise self._context_budget_refusal(
@@ -1876,6 +1853,9 @@ class ComposerServiceImpl:
             decision_wire_bytes=decision.request_bytes_before,
             decision_wire_bytes_after=decision.request_bytes_after,
             retry_after_provider_rejection=True if shed_all_history else None,
+            surface="reply" if reply_stage else "compose_loop",
+            density_source="fallback" if measured is None else measured.source,
+            measured_bytes_per_token=None if measured is None else repr(measured.bytes_per_token),
         )
         if not shed:
             return messages, record, decision.bytes_per_token_used
@@ -1939,13 +1919,16 @@ class ComposerServiceImpl:
         budget_record: ComposerContextBudgetRecord,
         component_bytes: Mapping[str, int],
         scope: _ContextBudgetRefusalScope,
+        provider_reason: ProviderSizeReason,
     ) -> ComposerConvergenceError:
-        """Build the refusal for a sent request the provider rejected as over the model's context limit.
+        """Build the refusal for a sent request the provider rejected as too large.
 
         The same refusal shape as the pre-dispatch one, with ``provider`` as
         the ceiling: the request was under ELSPETH's own maximum and was sent;
-        the limit that refused it is the gateway's or the model's. The sizes
-        are those of the request that was sent, from its own budget record.
+        the limit that refused it is the gateway's or the model's (over the
+        context limit), or the provider's or a proxy's (HTTP 413), as
+        ``provider_reason`` says. The sizes are those of the request that was
+        sent, from its own budget record.
         """
         return ComposerConvergenceError.capture(
             max_turns=scope.composition_turns_used + scope.discovery_turns_used,
@@ -1957,6 +1940,8 @@ class ComposerServiceImpl:
             reason="context_budget_exceeded",
             evidence={
                 "ceiling": "provider",
+                # The typed reason the user's text is chosen by.
+                "provider_reason": provider_reason,
                 "estimated_tokens": budget_record.estimated_tokens_after,
                 "request_bytes": budget_record.request_wire_bytes,
                 "max_prompt_tokens": self._context_budget_policy.max_prompt_tokens,
@@ -1983,6 +1968,7 @@ class ComposerServiceImpl:
         budget_frame: _ContextBudgetFrame,
         provider_owner: ProviderInvocationOwner | None = None,
         turn_evidence: TurnEvidence | None = None,
+        last_chance: bool = False,
     ) -> _CallModelOutcome:
         """Phase P1 of the compose loop — one LLM call with cap enforcement.
 
@@ -2004,6 +1990,12 @@ class ComposerServiceImpl:
         on this call can report it (R2-F9). It is ``None`` on the first loop
         iteration and whenever the loop runs without a session, because no
         turn has been persisted yet.
+
+        ``last_chance`` is the B-4D-3 call made once the composition budget is
+        spent: the same fit, send and size resend, but the caller enforces the
+        cap and confirms the delivery itself, so the carrier returns the
+        delivery instead. No tool runs again on a resend; the round's changes
+        are already saved.
         """
         await emit_progress(progress, model_call_progress_event(message))
         # Set for the one retry after a provider's context-limit rejection.
@@ -2038,7 +2030,8 @@ class ComposerServiceImpl:
                     context_budget=budget_record,
                 )
             except _BadRequestLLMError as rejection:
-                if not is_context_length_rejection(rejection.__cause__):
+                size_reason = provider_size_reason(rejection.__cause__)
+                if size_reason is None:
                     # Not recognised as a size rejection, so not called one. That the
                     # request went out above the estimate is carried for the user.
                     rejection.sent_over_estimate = budget_record.over_estimate is True
@@ -2080,8 +2073,11 @@ class ComposerServiceImpl:
                         failed_turn=failed_turn,
                         recorder=recorder,
                     ),
+                    size_reason,
                 ) from rejection
             break
+        if last_chance:
+            return _CallModelOutcome(completion=completion, delivery=delivery)
         assistant_tool_calls = completion.tool_batch.calls
         self._enforce_tool_call_cap(
             assistant_tool_calls=assistant_tool_calls,
@@ -2607,45 +2603,94 @@ class ComposerServiceImpl:
                             session_operation_context=session_operation_context,
                         )
                     else:
-                        await emit_progress(
-                            progress,
-                            ComposerProgressEvent(
-                                phase="calling_model",
-                                headline="I'm asking the model to prepare your reply.",
-                                evidence=("Review cards are staged; the model is preparing an explanation without changing the pipeline.",),
-                                likely_next="ELSPETH will save the reply and show the current review and validation status.",
-                            ),
-                        )
-                        # After the stage's announcement, so the notice is the latest progress during the call.
-                        if first_history_shed_of_turn(reply_budget_record, recorder.llm_calls):
-                            await emit_progress(progress, context_reduced_progress_event())
-                        try:
-                            completion = await self._provider_gateway._call_llm_with_audit(
-                                selected_reply_messages,
-                                selected_reply_tools,
-                                timeout=remaining,
-                                recorder=recorder,
-                                provider_custody=self._new_primary_custody(provider_owner),
-                                context_budget=reply_budget_record,
+                        reply_completion: _AdmittedLLMCompletion | None = None
+                        reply_timeout = remaining
+                        # Set for the one resend after a provider's context-limit rejection.
+                        reply_resent = False
+                        while True:
+                            await emit_progress(
+                                progress,
+                                ComposerProgressEvent(
+                                    phase="calling_model",
+                                    headline="I'm asking the model to prepare your reply.",
+                                    evidence=(
+                                        "Review cards are staged; the model is preparing an explanation without changing the pipeline.",
+                                    ),
+                                    likely_next="ELSPETH will save the reply and show the current review and validation status.",
+                                ),
                             )
-                        except provider_failures:
-                            # The call audit retains the failure; a trusted notice
-                            # below reports the unavailable reply to the user.
-                            reply = None
-                        else:
+                            # After the stage's announcement, so the notice is the latest progress during the call.
+                            if first_history_shed_of_turn(reply_budget_record, recorder.llm_calls):
+                                await emit_progress(progress, context_reduced_progress_event())
+                            try:
+                                reply_completion = await self._provider_gateway._call_llm_with_audit(
+                                    selected_reply_messages,
+                                    selected_reply_tools,
+                                    timeout=reply_timeout,
+                                    recorder=recorder,
+                                    provider_custody=self._new_primary_custody(provider_owner),
+                                    context_budget=reply_budget_record,
+                                )
+                            except _BadRequestLLMError as rejection:
+                                unshed_history = any(
+                                    kind is not None and chat_index not in reply_budget_record.shed_history_indices
+                                    for chat_index, kind in budget_frame.history_entries
+                                )
+                                reply_timeout = deadline - asyncio.get_event_loop().time()
+                                if (
+                                    reply_resent
+                                    or not unshed_history
+                                    or request_size_rejection(rejection.__cause__) is None
+                                    or reply_timeout <= 0
+                                ):
+                                    # The call audit retains the failure; a trusted
+                                    # notice below reports the unavailable reply.
+                                    break
+                                # The provider judged the reply request too large while an
+                                # earlier turn was still in it: leave out every earlier turn
+                                # and send once more. Only smaller than the request already
+                                # admitted, so the budget cannot refuse it.
+                                reply_resent = True
+                                (
+                                    selected_reply_messages,
+                                    selected_reply_tools,
+                                    reply_delivery,
+                                    reply_budget_record,
+                                ) = await self._prepare_primary_delivery(
+                                    messages=llm_messages,
+                                    tools=recovery_tool_definitions(self._planner_dialect),
+                                    recorder=recorder,
+                                    turn_evidence=turn_evidence,
+                                    budget_frame=budget_frame,
+                                    state=state,
+                                    initial_version=initial_version,
+                                    composition_turns_used=composition_turns_used,
+                                    discovery_turns_used=discovery_turns_used,
+                                    failed_turn=failed_turn,
+                                    progress=None,
+                                    reply_stage=True,
+                                    shed_all_history=True,
+                                )
+                                continue
+                            except provider_failures:
+                                # The call audit retains the failure; a trusted notice
+                                # below reports the unavailable reply to the user.
+                                break
+                            break
+                        if reply_completion is not None:
                             recovery_result = self._terminal_recovery_result(
-                                completion, state, recorder, prior_tools_persisted=persisted_tool_call_turn
+                                reply_completion, state, recorder, prior_tools_persisted=persisted_tool_call_turn
                             )
                             if recovery_result is not None:
                                 return _ClassifyOutcome(action="return", result=recovery_result)
-                            reply = completion.message
+                            reply = reply_completion.message
                             if _reply_only_protocol_echo(
                                 reply.content or "",
                                 history_has_tool_protocol=any(row["role"] == "tool" or "tool_calls" in row for row in llm_messages),
                                 user_message=message,
                             ):
                                 reply = None
-                            if reply is not None and not completion.tool_batch.calls and reply_delivery is not None:
+                            if reply is not None and not reply_completion.tool_batch.calls and reply_delivery is not None:
                                 turn_evidence.confirm_delivery(reply_delivery, recorder.llm_calls)
                 advisor_gate = None
                 if reply is not None:
@@ -2803,36 +2848,30 @@ class ComposerServiceImpl:
             new_composition_turns_used = composition_turns_used + 1
             if new_composition_turns_used >= self._max_composition_turns:
                 # B-4D-3 fix: give the LLM one last chance to see the
-                # tool results and produce a text response.
-                await emit_progress(progress, model_call_progress_event(message))
-                selected_final_messages, selected_final_tools, final_delivery, final_budget_record = await self._prepare_primary_delivery(
-                    messages=llm_messages,
+                # tool results and produce a text response. A size rejection
+                # is resent once with the earlier turns left out, as on every
+                # other compose-loop call.
+                last_chance_call = await self._call_model_turn(
+                    llm_messages=llm_messages,
                     tools=tools,
-                    recorder=recorder,
-                    turn_evidence=turn_evidence,
-                    budget_frame=budget_frame,
                     state=state,
                     initial_version=initial_version,
-                    composition_turns_used=new_composition_turns_used,
-                    discovery_turns_used=discovery_turns_used,
-                    failed_turn=failed_turn,
-                    progress=progress,
-                )
-                completion = await self._call_llm_before_deadline(
-                    selected_final_messages,
-                    selected_final_tools,
-                    state,
-                    initial_version,
-                    deadline,
+                    deadline=deadline,
                     recorder=recorder,
+                    progress=progress,
+                    message=message,
                     # The relevant counter has already been charged; a timeout
                     # on the terminal call must report that same total.
                     composition_turns_used=new_composition_turns_used,
                     discovery_turns_used=discovery_turns_used,
                     failed_turn=failed_turn,
+                    budget_frame=budget_frame,
                     provider_owner=provider_owner,
-                    context_budget=final_budget_record,
+                    turn_evidence=turn_evidence,
+                    last_chance=True,
                 )
+                completion = last_chance_call.completion
+                final_delivery = last_chance_call.delivery
                 recovery_result = self._terminal_recovery_result(
                     completion, state, recorder, prior_tools_persisted=persisted_tool_call_turn
                 )
@@ -3672,6 +3711,28 @@ class ComposerServiceImpl:
                 # compose is refused before the loop when there is no session
                 # to persist to. Reaching this line means neither happened.
                 raise InvariantError("plugin crash on a tool turn that was neither persisted nor rolled back") from crash.cause
+            if dispatch.credential_refusal is not None:
+                # The dispatcher's credential scan refused a call. P3 recorded
+                # it as a value-free ARG_ERROR and stopped the batch; P4 has now
+                # published the turn, so the earlier calls' rows and state are
+                # durable. The refusal leaves with this request's LLM calls,
+                # as the wire scan's refusal does. A failed unwind publication
+                # is a Tier-1 integrity fault and takes primacy.
+                refusal = dispatch.credential_refusal
+                if persist.unwind_audit_failed:
+                    raise AuditIntegrityError(
+                        "Credential refusal audit row could not be persisted",
+                        failed_turn=failed_turn,
+                    ) from refusal
+                if not persisted_tool_call_turn:
+                    raise InvariantError("credential refusal on a tool turn that was neither persisted nor rolled back") from refusal
+                attach_llm_calls(refusal, recorder)
+                if pending_checkpoint_failures:
+                    raise refusal from BaseExceptionGroup(
+                        "Credential refusal retained checkpoint failures",
+                        pending_checkpoint_failures,
+                    )
+                raise refusal
             if dispatch.advisor_failure is not None:
                 # The advisor boundary deliberately preserves unclassified
                 # controlled-code faults instead of laundering them into a

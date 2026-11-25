@@ -84,7 +84,6 @@ from elspeth.web.composer.tools import execute_tool as _strict_execute_tool
 from elspeth.web.composer.turn_effects import AdvisorPublicationReview, TurnEvidence
 from elspeth.web.composer.withheld_replies import COMPOSER_WITHHELD_REPLY_KIND
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
-from elspeth.web.credential_guard import CredentialMaterialRefused
 from elspeth.web.execution.preflight import runtime_preflight_settings_hash
 from elspeth.web.execution.schemas import (
     ValidationCheck,
@@ -1273,7 +1272,9 @@ def test_freeform_planner_context_present_but_invalid_authorship_marker_crashes(
 
 class TestComposerTextOnlyResponse:
     @pytest.mark.asyncio
-    async def test_state_credentials_are_refused_before_prompt_serialization_or_provider(self) -> None:
+    async def test_held_state_is_not_rescanned_before_the_provider(self) -> None:
+        # The graph is the session's own data: a literal option value in it does not stop the
+        # turn before the provider. Credential admission runs where text arrives.
         service, session_id = _composer_service_with_session(_mock_catalog(), _make_settings())
         state = CompositionState(
             source=SourceSpec(
@@ -1289,16 +1290,12 @@ class TestComposerTextOnlyResponse:
             version=1,
         )
 
-        with (
-            patch("elspeth.web.composer.service.build_messages") as build,
-            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as provider,
-            pytest.raises(CredentialMaterialRefused) as caught,
-        ):
-            await service.compose("Review this pipeline", [], state, session_id=session_id)
+        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as provider:
+            provider.return_value = _make_llm_response(content="Here is a review of the pipeline.")
+            result = await service.compose("Review this pipeline", [], state, session_id=session_id)
 
-        assert caught.value.surface == "composer_state_before_provider"
-        build.assert_not_called()
-        provider.assert_not_awaited()
+        assert isinstance(result, ComposerResult)
+        assert provider.await_count == 1
 
     @pytest.mark.asyncio
     async def test_non_build_text_only_returns_immediately(self) -> None:

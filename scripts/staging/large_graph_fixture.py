@@ -32,7 +32,7 @@ Two presets:
 ``--queries-per-llm-step`` and ``--total-prompt-bytes`` build graphs near the
 server's limits on purpose. The manifest reports ``state_scan_values_at_import``
 (values the server's whole-state credential scan visits for the graph as the
-YAML import scans it, measured with that scan; the server refuses over 4,096)
+YAML import scans it, measured with that scan; past 4,096 the scan stops and the import goes ahead)
 and the server's per-file and aggregate caps on file-held text.
 
 The output directory holds ``pipeline.yaml`` (the import document),
@@ -709,7 +709,7 @@ def scan_values_of_state(state: CompositionState) -> int:
     tree = credential_material_tool_arguments_projection("set_pipeline", state.to_dict())
 
     def fits(limit: int) -> bool:
-        finding = find_credential_material(tree, CredentialTraversalPolicy(max_nodes=limit))
+        finding = find_credential_material(tree, CredentialTraversalPolicy(max_nodes=limit), purpose="admission")
         if finding is None:
             return True
         if finding.category == "traversal_limit" and limit < SCAN_CEILING:

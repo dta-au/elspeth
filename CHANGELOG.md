@@ -15,11 +15,62 @@ changes land and is not a release.
 
 ### Upgrade notes
 
+- **Changed:** `elspeth join` exits 0 when the leader finishes the run while
+  the follower is still working. Before this release it could exit 4, or exit
+  2 with "The run is incomplete", although the run had finished. Exit 2 now
+  means there is no live leader while the run is still running. A follower
+  that loses its run membership while the run is still running now exits 3,
+  the eviction code in the exit-code table, where it previously exited 4. A
+  script that read exit 4 from `elspeth join` as an eviction should check for 3.
+- **Changed:** when `elspeth join` departs cleanly it names the run status it
+  read: `run ended with status failed`, for example, where it always said
+  `run completed`. The JSON `departed` event gains a `run_status` field; its
+  existing field names are kept, and its `message` text changes as described.
+  Exit 0 still means only that the follower departed cleanly, for any terminal
+  status, so a script that needs the run's outcome should read `run_status`.
 - **Changed (design change):** a pipeline that previously passed composer
   validation with only a "Contract check skipped" warning, but then failed
   when the run started, now fails composer validation. No pipeline that could
   run before is refused. Only pipelines the runtime was already refusing at
   run start are now refused earlier, at validation.
+- **Changed:** when `ELSPETH_WEB__COMPOSER_PLANNER_MAX_REQUEST_BYTES` is not
+  set, the Composer's request byte maximum is now derived from
+  `ELSPETH_WEB__COMPOSER_CONTEXT_MAX_PROMPT_TOKENS` (8 bytes per token:
+  1,600,000 bytes for a 200,000-token limit) instead of the fixed 983,040.
+  An explicit value is used as set. If a proxy in front of your model gateway
+  limits request bodies (nginx's default is 1 MiB), set the byte maximum
+  below that limit.
+- **Changed:** a request that a provider or proxy refuses with HTTP 413 is
+  now a size rejection: it is sent once more with earlier turns left out and
+  is never resent unchanged. This includes a 413 that the client library
+  reports under another status: a 429 rate limit on the OpenAI route, or a
+  400 on the direct Anthropic route. A 429 or 400 without an underlying 413
+  is handled as before.
+- **Changed:** a request a provider or proxy refuses as too large is now
+  reported as too large, without a Retry button; an administrator can raise
+  that limit.
+- **Changed:** the Composer's context budget now prices a request at the
+  bytes per token measured on the newest successful call to the same model
+  and tool dialect (a call earlier in the same turn first, otherwise the
+  session's stored calls), less a 10% margin, and at 3.0 when there is no
+  such call. Before, it used 3.0. In both, the rate is lowered to the density
+  the provider counted on an earlier call in the same turn, when that is
+  lower. A recognised size
+  rejection (over the context limit, or HTTP 413) is now resent once with
+  earlier turns left out for planner, optional reply, advisor review and
+  last-composition requests too, not only the compose loop. If the resend is
+  rejected again, a compose-loop or planner turn is refused as too large,
+  the reply is reported unavailable as before, and the review is recorded as
+  a rejected request.
+- **Added:** each Composer call's audit record now says what recognised a
+  size rejection: a structured code, the HTTP status, the client library's
+  context-window exception (which it can assign from the provider's message)
+  or a fixed provider wording. Each context-budget record names the call it
+  was made for (compose loop, reply, planner or escape hatch) and where the
+  bytes-per-token density it was priced at came from. Advisor review calls
+  have no context-budget record, so they carry neither. Records written
+  before this release carry none of these fields; their absence means
+  unknown.
 - **Changed:** when a provider call fails, the composer's main loop and planner
   decide whether a retry's wait plus 5 s still fits before the deadline (the
   request's, or the planner's own time limit when that is earlier), and retry

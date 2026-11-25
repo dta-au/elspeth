@@ -93,6 +93,10 @@ _DEFAULT_COMPOSER_TRANSPORT_HEADROOM_SECONDS = 30.0
 # (elspeth-f159d2394b) fires only when the configured turn budget is not
 # realistically reachable, not on ordinary variance.
 _COMPOSER_PLANNING_SECONDS_PER_TURN = 15.0
+# The sparsest plausible provider count, in request bytes per prompt token.
+# It is the context budget's upper bound for a measured density
+# (CONTEXT_BUDGET_MAX_MEASURED_BYTES_PER_TOKEN); a test keeps the two equal.
+COMPOSER_REQUEST_BYTES_PER_PROMPT_TOKEN = 8
 
 _slog = structlog.get_logger(__name__)
 # Mechanical link to core retention default: if
@@ -389,12 +393,15 @@ class WebSettings(BaseModel):
     composer_context_shed_above: float = Field(default=0.85, strict=True, gt=0, le=1)
     composer_context_shed_to: float = Field(default=0.60, strict=True, gt=0, lt=1)
     composer_timeout_seconds: float = Field(..., gt=0)
-    # Canonical full-pipeline planner budgets. These are independent of the
-    # ordinary incremental compose loop because the planner accounts for exact
-    # request bytes, physical provider attempts, requested completion tokens,
-    # and post-call provider cost.
+    # Canonical full-pipeline planner budgets: physical provider attempts,
+    # requested completion tokens and post-call provider cost are the
+    # planner's own. The request byte maximum bounds the exact bytes of every
+    # compose-loop and planner request, and refuses one only when it is still
+    # over it with no earlier turn left to leave out.
     composer_planner_max_provider_calls: int = Field(default=75, strict=True, ge=1)
-    composer_planner_max_request_bytes: int = Field(default=960 * 1024, strict=True, ge=1)
+    # Derived from the token cap when not set (see
+    # ``_derive_composer_planner_max_request_bytes``), so there is no fixed default.
+    composer_planner_max_request_bytes: int = Field(..., strict=True, ge=1)
     composer_planner_max_completion_tokens: int = Field(default=16_384, strict=True, ge=1)
     composer_planner_max_cumulative_provider_cost: Decimal = Field(default=Decimal("5.00"), ge=0)
     composer_planner_repair_budget: int = Field(default=2, strict=True, ge=0)
@@ -1320,6 +1327,30 @@ class WebSettings(BaseModel):
         if max_backend_timeout_seconds <= 0:
             raise ValueError("composer_transport_headroom_seconds must be less than composer_transport_idle_ceiling_seconds")
         return self
+
+    @model_validator(mode="before")
+    @classmethod
+    def _derive_composer_planner_max_request_bytes(cls, data: object) -> object:
+        """Default the request byte maximum to the largest request the token cap could take.
+
+        At most ``COMPOSER_REQUEST_BYTES_PER_PROMPT_TOKEN`` bytes per token is
+        the sparsest plausible provider count, so a request larger than that
+        many bytes per token of the cap cannot fit it. A smaller fixed default
+        refused requests the model could take. An explicit value is kept.
+
+        A missing or invalid cap fails on its own field. The check below
+        accepts what the strict field accepts (an int or int subclass other
+        than bool, at least 1), so every cap that validates gets a derived
+        maximum. Otherwise the byte maximum gets a placeholder that never
+        reaches a model, and the error does not also ask for a byte maximum
+        the operator need not set.
+        """
+        if not isinstance(data, Mapping) or "composer_planner_max_request_bytes" in data:
+            return data
+        tokens = data["composer_context_max_prompt_tokens"] if "composer_context_max_prompt_tokens" in data else None
+        if isinstance(tokens, int) and not isinstance(tokens, bool) and tokens >= 1:
+            return {**data, "composer_planner_max_request_bytes": int(tokens) * COMPOSER_REQUEST_BYTES_PER_PROMPT_TOKEN}
+        return {**data, "composer_planner_max_request_bytes": 1}
 
     @model_validator(mode="after")
     def _validate_composer_context_shed_marks(self) -> WebSettings:

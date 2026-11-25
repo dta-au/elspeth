@@ -27,6 +27,7 @@ from elspeth.contracts.prompt_guard import (
     validate_prompt_guard_thinking_parts,
     validate_prompt_guard_tool_argument_parts,
 )
+from elspeth.contracts.provider_rejection import ReasonSource
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.plugins.transforms.llm.model_catalog import OPENROUTER_LITELLM_PREFIX
 from elspeth.web.composer._compose_loop_carriers import (
@@ -48,7 +49,7 @@ from elspeth.web.composer.private_diagnostic_facts import bind_received_response
 from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused, build_prompt_guard_mount, enforce_prompt_guard
 from elspeth.web.composer.protocol import ComposerServiceError, ComposerSettings
 from elspeth.web.composer.provider_context import capture_provider_context
-from elspeth.web.composer.provider_errors import classify_provider_failure, is_context_length_rejection
+from elspeth.web.composer.provider_errors import classify_provider_failure, request_size_rejection, size_rejection_code
 from elspeth.web.composer.provider_quota import (
     ProviderCallCustody,
     provider_call_scope,
@@ -65,6 +66,7 @@ from elspeth.web.credential_guard import (
     require_no_credential_material_in_llm_metadata,
     require_no_credential_material_in_tool_wire,
 )
+from elspeth.web.credential_scan import CredentialScanSurface
 
 _COMPOSER_LLM_SEED_PARAM: Final[str] = "seed"
 
@@ -78,7 +80,7 @@ class _MalformedLLMResponseError(ComposerServiceError):
         *,
         provider_metadata: _AdmittedLLMProviderMetadata,
         text_received: bool = False,
-        credential_surface: str = "composer_provider_response",
+        credential_surface: CredentialScanSurface = "composer_provider_response",
     ) -> None:
         provider_metadata = _require_no_credential_material_in_completion_fields(
             content=None,
@@ -139,7 +141,7 @@ def _capture_composer_llm_completion_fields(
     response: Any,
     *,
     pricing_model: str | None = None,
-    credential_surface: str = "composer_provider_response",
+    credential_surface: CredentialScanSurface = "composer_provider_response",
     require_tool_calls_field: bool = True,
 ) -> tuple[_AdmittedAssistantMessage, tuple[Any, ...], _AdmittedLLMProviderMetadata]:
     """Read the response/message surface once, before validating its tool batch."""
@@ -245,7 +247,7 @@ def _admit_captured_composer_llm_completion(
 def _require_no_credential_material_in_completion(
     completion: _AdmittedLLMCompletion,
     *,
-    surface: str,
+    surface: CredentialScanSurface,
 ) -> _AdmittedLLMCompletion:
     """Reject all persisted or replayed text metadata in an owned completion."""
     metadata = _require_no_credential_material_in_completion_fields(
@@ -262,7 +264,7 @@ def _require_no_credential_material_in_completion_fields(
     content: str | None,
     tool_calls: Sequence[tuple[str, str]],
     provider_metadata: _AdmittedLLMProviderMetadata,
-    surface: str,
+    surface: CredentialScanSurface,
     thinking_replay_required: bool | None = None,
 ) -> _AdmittedLLMProviderMetadata:
     """Guard the normalized provider fields that can be audited or replayed."""
@@ -538,14 +540,19 @@ async def _litellm_acompletion(
             credential_messages.append(message)
     if prepared_advisor_content is not None:
         credential_messages = scan_prepared_advisor_content(credential_messages, prepared_advisor_content, role=prompt_guard_role)
-    require_no_credential_material(
-        credential_messages,
-        surface="composer_provider_request",
-        # 2 MiB covers a maximum-size runtime YAML import (524,288 characters,
-        # MAX_RUNTIME_YAML_IMPORT_CHARS) at 4 UTF-8 bytes per character. A
-        # longer string is refused unscanned (traversal_limit), never skipped.
-        max_string_bytes=2 * 1024 * 1024,
-    )
+    # One traversal per message: the list itself is never one tree, so its
+    # length cannot reach the width limit, and a limit inside one message
+    # skips only that message (counted, best effort) while the others are
+    # still scanned. Every message is scanned, whatever its role or trust.
+    for credential_message in credential_messages:
+        require_no_credential_material(
+            credential_message,
+            surface="composer_provider_request",
+            # 2 MiB covers a maximum-size runtime YAML import (524,288 characters,
+            # MAX_RUNTIME_YAML_IMPORT_CHARS) at 4 UTF-8 bytes per character. A
+            # longer string ends that message's scan as a counted skip, not a refusal.
+            max_string_bytes=2 * 1024 * 1024,
+        )
     await enforce_prompt_guard(
         mount=prompt_guard_mount,
         mode=prompt_guard_mode,
@@ -621,7 +628,9 @@ class ProviderGateway:
         prompt_guard_thinking_parts: tuple[PromptGuardThinkingParts | None, ...] | None = None,
     ) -> _AdmittedLLMCompletion:
         """Call LiteLLM and return only the admitted, owned completion."""
+        from litellm.exceptions import APIError as LiteLLMAPIError
         from litellm.exceptions import BadRequestError as LiteLLMBadRequestError
+        from litellm.exceptions import RateLimitError as LiteLLMRateLimitError
 
         try:
             kwargs = build_composer_loop_request_kwargs(
@@ -644,6 +653,27 @@ class ProviderGateway:
                 **kwargs,
             )
         except LiteLLMBadRequestError as exc:
+            raise _BadRequestLLMError(
+                f"LLM request rejected ({type(exc).__name__})",
+                provider_detail=str(exc) or None,
+                provider_status_code=exc.status_code,
+            ) from exc
+        except LiteLLMAPIError as exc:
+            # A request too large for the provider or a proxy in front of it
+            # (HTTP 413) is a rejected request, not an outage.
+            if size_rejection_code(exc) != "request_too_large":
+                raise
+            raise _BadRequestLLMError(
+                f"LLM request rejected ({type(exc).__name__})",
+                provider_detail=str(exc) or None,
+                provider_status_code=exc.status_code,
+            ) from exc
+        except LiteLLMRateLimitError as exc:
+            # LiteLLM reports some HTTP 413s as a rate limit. The classifier
+            # recognises them from the typed exception chain; any other rate
+            # limit propagates unchanged.
+            if size_rejection_code(exc) != "request_too_large":
+                raise
             raise _BadRequestLLMError(
                 f"LLM request rejected ({type(exc).__name__})",
                 provider_detail=str(exc) or None,
@@ -678,7 +708,9 @@ class ProviderGateway:
         prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
     ) -> Any:
         """Call the LLM for non-tool text generation."""
+        from litellm.exceptions import APIError as LiteLLMAPIError
         from litellm.exceptions import BadRequestError as LiteLLMBadRequestError
+        from litellm.exceptions import RateLimitError as LiteLLMRateLimitError
 
         try:
             kwargs = build_composer_loop_request_kwargs(
@@ -700,6 +732,27 @@ class ProviderGateway:
                 **kwargs,
             )
         except LiteLLMBadRequestError as exc:
+            raise _BadRequestLLMError(
+                f"LLM request rejected ({type(exc).__name__})",
+                provider_detail=str(exc) or None,
+                provider_status_code=exc.status_code,
+            ) from exc
+        except LiteLLMAPIError as exc:
+            # A request too large for the provider or a proxy in front of it
+            # (HTTP 413) is a rejected request, not an outage.
+            if size_rejection_code(exc) != "request_too_large":
+                raise
+            raise _BadRequestLLMError(
+                f"LLM request rejected ({type(exc).__name__})",
+                provider_detail=str(exc) or None,
+                provider_status_code=exc.status_code,
+            ) from exc
+        except LiteLLMRateLimitError as exc:
+            # LiteLLM reports some HTTP 413s as a rate limit. The classifier
+            # recognises them from the typed exception chain; any other rate
+            # limit propagates unchanged.
+            if size_rejection_code(exc) != "request_too_large":
+                raise
             raise _BadRequestLLMError(
                 f"LLM request rejected ({type(exc).__name__})",
                 provider_detail=str(exc) or None,
@@ -787,6 +840,7 @@ class ProviderGateway:
         response_metadata: _AdmittedLLMProviderMetadata | None = None
         error_class: str | None = None
         error_message: str | None = None
+        rejection_reason_source: ReasonSource | None = None
         failure_to_capture: Exception | None = None
         recovery_batch: _AdmittedToolBatch | None = None
         try:
@@ -891,8 +945,11 @@ class ProviderGateway:
             cause = exc.__cause__
             status = ComposerLLMCallStatus.BAD_REQUEST_ERROR
             error_class = type(cause).__name__ if cause is not None else type(exc).__name__
-            # A recognised context-limit rejection is recorded by its closed reason, never by provider text.
-            error_message = "context_length_exceeded" if is_context_length_rejection(cause) else error_class
+            # A recognised size rejection is recorded by its closed reason, never by
+            # provider text, with what recognised it.
+            size_rejection = request_size_rejection(cause)
+            error_message = error_class if size_rejection is None else size_rejection.reason_code
+            rejection_reason_source = None if size_rejection is None else size_rejection.reason_source
             attach_llm_calls(exc, recorder)
             raise
         except CredentialMaterialRefused as exc:
@@ -930,6 +987,7 @@ class ProviderGateway:
                             response_metadata=response_metadata,
                             error_class=error_class,
                             error_message=error_message,
+                            rejection_reason_source=rejection_reason_source,
                             provider_custody=provider_custody,
                             failure=failure_to_capture,
                             private_request=private_request,
@@ -998,6 +1056,7 @@ class ProviderGateway:
         response_metadata: _AdmittedLLMProviderMetadata | None = None
         error_class: str | None = None
         error_message: str | None = None
+        rejection_reason_source: ReasonSource | None = None
         failure_to_capture: Exception | None = None
         try:
             if any(parts is not None for parts in evidence.content_parts):
@@ -1078,8 +1137,11 @@ class ProviderGateway:
             cause = exc.__cause__
             status = ComposerLLMCallStatus.BAD_REQUEST_ERROR
             error_class = type(cause).__name__ if cause is not None else type(exc).__name__
-            # A recognised context-limit rejection is recorded by its closed reason, never by provider text.
-            error_message = "context_length_exceeded" if is_context_length_rejection(cause) else error_class
+            # A recognised size rejection is recorded by its closed reason, never by
+            # provider text, with what recognised it.
+            size_rejection = request_size_rejection(cause)
+            error_message = error_class if size_rejection is None else size_rejection.reason_code
+            rejection_reason_source = None if size_rejection is None else size_rejection.reason_source
             attach_llm_calls(exc, recorder)
             raise
         except CredentialMaterialRefused as exc:
@@ -1117,6 +1179,7 @@ class ProviderGateway:
                             response_metadata=response_metadata,
                             error_class=error_class,
                             error_message=error_message,
+                            rejection_reason_source=rejection_reason_source,
                             provider_custody=provider_custody,
                             failure=failure_to_capture,
                             private_request=private_request,

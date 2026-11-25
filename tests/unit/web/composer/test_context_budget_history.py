@@ -125,8 +125,8 @@ def test_shed_set_comes_from_newest_call_with_non_null_context_budget() -> None:
     rows = [
         _audit_row(1, _call(shed=[0])),
         _audit_row(2, _call(shed=[0, 2, 5])),
-        _audit_row(3, _call(status="error", shed=None)),
-        _audit_row(4, _call(status="error", total_bytes=None, shed=_NO_KEY)),
+        _audit_row(3, _call(status="api_error", shed=None)),
+        _audit_row(4, _call(status="api_error", total_bytes=None, shed=_NO_KEY)),
     ]
     history = ContextBudgetHistory.from_records(rows)
     # Rows 3/4 carry a null or absent budget; the newest non-null one is row 2.
@@ -134,7 +134,7 @@ def test_shed_set_comes_from_newest_call_with_non_null_context_budget() -> None:
 
 
 def test_newest_non_null_budget_is_a_failed_call() -> None:
-    rows = [_audit_row(1, _call(shed=[0])), _audit_row(2, _call(status="error", total_bytes=None, shed=[1]))]
+    rows = [_audit_row(1, _call(shed=[0])), _audit_row(2, _call(status="api_error", total_bytes=None, shed=[1]))]
     history = ContextBudgetHistory.from_records(rows)
     assert history.previously_shed_history == frozenset({"history:1"})
 
@@ -153,6 +153,9 @@ def test_absent_context_budget_key_means_no_shedding_recorded() -> None:
         {**_call(), "context_budget": _budget([], True)},
         {**_call(), "prompt_tokens": "1"},
         {**_call(), "status": 7},
+        # Only the recorded status vocabulary is a call outcome.
+        {**_call(), "status": "future_status"},
+        {**_call(), "status": "SUCCESS"},
         {**_call(), "model_requested": ""},
         {**_call(), "model_requested": 7},
         {**_call(), "context_budget": "x"},
@@ -182,7 +185,8 @@ def test_envelope_without_call_mapping_raises() -> None:
 def test_envelopes_of_another_kind_or_none_are_not_call_audits() -> None:
     row = _audit_row(1, _call(total_bytes=4000))
     other = replace(row, tool_calls=[{"_kind": "audit", "invocation": {}}, {"legacy": True}])
-    assert ContextBudgetHistory.from_records([row, other]) == ContextBudgetHistory.empty()
+    assert ContextBudgetHistory.from_records([other]) == ContextBudgetHistory.empty()
+    assert ContextBudgetHistory.from_records([row, other]) == ContextBudgetHistory.from_records([row])
 
 
 def test_a_real_stored_call_envelope_gives_its_shed_state() -> None:

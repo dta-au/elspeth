@@ -249,7 +249,7 @@ UPDATE token_work_items 1 11
                 "statements": (501, 79),
                 "commits": (67, 13),
                 "core.canonical.canonical_json": (20, 14),
-                "core.canonical.stable_hash": (16, 14),
+                "core.canonical.stable_hash": (16, 13),
                 "contracts.hashing.canonical_json": (92, 45),
                 "contracts.hashing.stable_hash": (29, 15),
             },
@@ -319,7 +319,7 @@ UPDATE token_work_items 1 11
                 "statements": (528, 263),
                 "commits": (70, 45),
                 "core.canonical.canonical_json": (24, 36),
-                "core.canonical.stable_hash": (20, 21),
+                "core.canonical.stable_hash": (20, 20),
                 "contracts.hashing.canonical_json": (100, 75),
                 "contracts.hashing.stable_hash": (33, 22),
             },
@@ -668,6 +668,26 @@ def _assert_measurement(shape: str, dialect: str, measured: Mapping[int, tuple[C
 def test_sqlite_row_cost_pins(shape: str, tmp_path: Path) -> None:
     measured = _measure(shape, tmp_path, None)
     _assert_measurement(shape, "sqlite", measured)
+
+
+# Statement counts differ by dialect (session pragmas on SQLite, SET on PostgreSQL); the
+# hash and commit counters count engine work that does not depend on the database.
+_DIALECT_INDEPENDENT_COUNTERS = tuple(name for name in _COUNTERS if name != "statements")
+
+
+@pytest.mark.parametrize("shape", ("linear", "fork"))
+def test_dialect_independent_counter_pins_agree_across_dialects(shape: str) -> None:
+    """A re-pin of a hash or commit counter must move the SQLite and PostgreSQL tables together.
+
+    The PostgreSQL pins run only under the testcontainer selection, so this check is what
+    keeps a SQLite-only re-pin from landing green.
+    """
+    projected: dict[str, dict[str, object]] = {}
+    for dialect in ("sqlite", "postgres"):
+        counters = _PINS[dialect][shape]["counters"]
+        assert isinstance(counters, dict), (dialect, shape)
+        projected[dialect] = {name: counters[name] for name in _DIALECT_INDEPENDENT_COUNTERS}
+    assert projected["sqlite"] == projected["postgres"], f"{shape}: move both dialect tables by the measured amount"
 
 
 @pytest.fixture(scope="module")

@@ -35,7 +35,7 @@ from elspeth.contracts.blobs_inline import (
     ContentEncoding,
     is_widened_blob_ref,
 )
-from elspeth.contracts.credential_material import find_credential_material
+from elspeth.contracts.credential_material import find_credential_material, is_credential_match
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, SourceSpec
@@ -314,8 +314,10 @@ def collect_sink_paths(state: CompositionState, *, data_dir: str | Path, session
                 continue
             # The import binds this value after the recipient's YAML
             # credential guard has run, and refuses a credential-shaped one;
-            # recording it would make every import of the link fail.
-            if find_credential_material(relative_path) is not None:
+            # recording it would make every import of the link fail. This
+            # mirrors that guard's match rule; it is not a scan of its own.
+            finding = find_credential_material(relative_path, purpose="admission")
+            if finding is not None and is_credential_match(finding):
                 continue
             found.append(SinkPathEntry(output.name, cast(SinkPathOption, option), folder, relative_path))
     return tuple(sorted(found, key=lambda entry: (entry.output, entry.option)))
