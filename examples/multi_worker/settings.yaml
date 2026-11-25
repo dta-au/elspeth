@@ -14,12 +14,20 @@ transforms:
 - name: explode
   plugin: json_explode
   input: exploded
-  on_success: llm_input
+  on_success: barrier_input
   on_error: quarantine
   options:
     array_field: items
     output_field: text
     include_index: true
+    schema:
+      mode: observed
+- name: start_barrier
+  plugin: demonstration_start_barrier
+  input: barrier_input
+  on_success: llm_input
+  on_error: quarantine
+  options:
     schema:
       mode: observed
 - name: llm_0

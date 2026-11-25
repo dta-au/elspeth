@@ -36,9 +36,15 @@ CHAOS_PID=""
 LEADER_PID=""
 FOLLOWER_PIDS=()
 WORKERS="${WORKERS:-3}"
+BARRIER_DIR=""
 
 if [[ ! "$WORKERS" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERROR: WORKERS must be a positive integer." >&2
+    exit 2
+fi
+
+export PYTHONPATH="$PROJECT_ROOT/src:$PROJECT_ROOT/elspeth-lints/src:$PROJECT_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+if ! .venv/bin/python examples/multi_worker/start_barrier.py --check-fanout examples/multi_worker_showcase/input/input.jsonl "$WORKERS"; then
     exit 2
 fi
 
@@ -51,17 +57,23 @@ cleanup() {
     if [ ${#FOLLOWER_PIDS[@]} -gt 0 ]; then
         for pid in "${FOLLOWER_PIDS[@]}"; do
             kill -0 "$pid" 2>/dev/null && kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
         done
     fi
     [ -n "$LEADER_PID" ] && kill -0 "$LEADER_PID" 2>/dev/null && kill "$LEADER_PID" 2>/dev/null || true
+    [ -n "$LEADER_PID" ] && wait "$LEADER_PID" 2>/dev/null || true
     if [ -n "$CHAOS_PID" ] && kill -0 "$CHAOS_PID" 2>/dev/null; then
         echo ""
         echo "Stopping ChaosLLM server (PID $CHAOS_PID)..."
         kill "$CHAOS_PID" 2>/dev/null || true
         wait "$CHAOS_PID" 2>/dev/null || true
     fi
+    [ -n "$BARRIER_DIR" ] && rm -rf "$BARRIER_DIR"
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+# SIGKILL cannot run the EXIT trap; an interrupted host may leave this directory.
 
 # Clean previous run artifacts
 rm -f examples/multi_worker_showcase/runs/audit.db \
@@ -70,6 +82,10 @@ rm -f examples/multi_worker_showcase/runs/audit.db \
 rm -f examples/multi_worker_showcase/output/results.json \
       examples/multi_worker_showcase/output/quarantined.json
 mkdir -p examples/multi_worker_showcase/runs examples/multi_worker_showcase/output
+BARRIER_DIR="$(mktemp -d "$PROJECT_ROOT/examples/multi_worker_showcase/runs/start-barrier.XXXXXX")"
+export ELSPETH_DEMO_BARRIER_DIR="$BARRIER_DIR"
+export ELSPETH_DEMO_BARRIER_WORKERS="$((WORKERS + 1))"
+export ELSPETH_DEMO_BARRIER_DB="$PROJECT_ROOT/$DB"
 
 echo "=== multi_worker_showcase — self-verifying 4-worker swarm (200 outcomes) ==="
 echo "    leader + $WORKERS follower(s) = $((WORKERS+1))-way pack"
@@ -97,7 +113,7 @@ fi
 
 # --- Launch LEADER (background) ---
 echo "Launching leader: elspeth run --execute ..."
-.venv/bin/elspeth run --settings "$PIPELINE_CONFIG" --execute &
+ELSPETH_DEMO_BARRIER_ROLE=leader .venv/bin/python examples/multi_worker/start_barrier.py run --settings "$PIPELINE_CONFIG" --execute &
 LEADER_PID=$!
 
 # --- Poll audit DB (read-only) for RUNNING run with >=1 claimed work item ---
@@ -132,9 +148,22 @@ fi
 if [ -n "$RUN_ID" ]; then
     for i in $(seq 1 "$WORKERS"); do
         echo "Launching follower $i: elspeth join $RUN_ID ..."
-        .venv/bin/elspeth join "$RUN_ID" --settings "$PIPELINE_CONFIG" &
+        ELSPETH_DEMO_BARRIER_ROLE=follower ELSPETH_DEMO_BARRIER_SLOT="$i" .venv/bin/python examples/multi_worker/start_barrier.py join "$RUN_ID" --settings "$PIPELINE_CONFIG" &
         FOLLOWER_PIDS+=("$!")
     done
+fi
+if [ -n "$RUN_ID" ]; then
+    ELSPETH_DEMO_BARRIER_DIR="$BARRIER_DIR" .venv/bin/python - "$LEADER_PID" "${FOLLOWER_PIDS[@]}" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+directory = pathlib.Path(os.environ["ELSPETH_DEMO_BARRIER_DIR"])
+staging = directory / "workers.json.tmp"
+staging.write_text(json.dumps([int(pid) for pid in sys.argv[1:]]))
+os.replace(staging, directory / "workers.json")
+PY
 fi
 
 # --- Optionally tail combined progress every ~2s while leader is alive ---
@@ -159,6 +188,11 @@ else
     WORKER_FAILED=1
 fi
 echo "Leader exited ($LEADER_EXIT)."
+if [ "$LEADER_EXIT" -ne 0 ]; then
+    for pid in "${FOLLOWER_PIDS[@]}"; do
+        kill -0 "$pid" 2>/dev/null && kill "$pid" 2>/dev/null || true
+    done
+fi
 if [ ${#FOLLOWER_PIDS[@]} -gt 0 ]; then
     for pid in "${FOLLOWER_PIDS[@]}"; do
         if wait "$pid"; then
