@@ -766,6 +766,47 @@ def _url_host(value: str) -> str | None:
         return None
 
 
+def _string_scalars(node: Any) -> Iterator[str]:
+    """Every string in a parsed YAML document: mapping keys, mapping values and list items."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            yield from _string_scalars(key)
+            yield from _string_scalars(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _string_scalars(value)
+    elif isinstance(node, str):
+        yield node
+
+
+def _config_url_reason(value: str) -> str | None:
+    """Why one config string value names something beyond loopback, or None.
+
+    Only values holding '://' are URLs here. A value is judged as one whole URL: its scheme starts
+    it and it carries no whitespace or control character (URL parsers drop those). A URL with no
+    network location (sqlite:///path) names no host. Anything else holding '://' is refused, not
+    guessed at.
+    """
+    if "://" not in value:
+        return None
+    try:
+        parts = urlsplit(value)
+    except ValueError as exc:
+        return f"unparseable URL ({exc})"
+    whole = (
+        bool(parts.scheme)
+        and value[: len(parts.scheme) + 3].lower() == f"{parts.scheme}://"
+        and not any(char.isspace() or ord(char) < 0x20 or char == "\x7f" for char in value)
+    )
+    if not whole:
+        return "URL inside text: only a value that is one whole URL is judged"
+    if parts.netloc == "":
+        return None
+    if parts.hostname not in LOOPBACK_HOSTS:
+        return f"non-loopback URL host {parts.hostname}"
+    return None
+
+
 def _source_paths(doc: dict[str, Any]) -> list[str]:
     sources = doc.get("sources") or ({"primary": doc["source"]} if "source" in doc else {})
     paths = []
@@ -800,10 +841,12 @@ def network_findings(
         number, line = _line_of(text, needle)
         findings.append(f"{rel}:{number}: {line} -- {reason}")
 
-    for match in URL_RE.finditer(text):
-        host = _url_host(match.group(0))
-        if host not in LOOPBACK_HOSTS:
-            add(match.group(0), f"non-loopback URL host {host}")
+    # URLs are judged from the parsed values, never from the raw text (a YAML flow list's
+    # closing bracket is not part of the URL; a comment is not configuration).
+    for value in _string_scalars(doc):
+        reason = _config_url_reason(value)
+        if reason is not None:
+            add(next(line for line in value.splitlines() if "://" in line), reason)
     for _path, key, value in _walk(doc):
         if key == "plugin" and value in REMOTE_PLUGINS:
             add(f"plugin: {value}", f"remote-service plugin {value}")
@@ -820,8 +863,7 @@ def network_findings(
             if not isinstance(base_url, str):
                 add(f"provider: {provider}", f"LLM provider {provider} with no base_url (public API)")
             else:
-                base_match = URL_RE.match(base_url)
-                if base_match is None or _url_host(base_match.group(0)) not in LOOPBACK_HOSTS:
+                if "://" not in base_url or _config_url_reason(base_url) is not None or _url_host(base_url) is None:
                     add(base_url, "LLM base_url is not loopback")
     for _path, key, _value in _walk(doc):
         if key == "vault_url":

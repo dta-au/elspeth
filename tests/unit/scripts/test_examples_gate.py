@@ -313,6 +313,44 @@ def test_guard_refuses_remote_url_schemes(tmp_path: Path, url: str) -> None:
     assert any("non-loopback URL" in finding for finding in examples_gate.network_findings(tree, config))
 
 
+@pytest.mark.parametrize(
+    "line",
+    [
+        "allowed_origins: [http://127.0.0.1:8215]\n",
+        "allowed_origins: ['http://[::1]:8000']\n",
+        "endpoint: http://[::1]:8000\n",
+        "allowed_origins: [http://localhost:8215, 'http://127.0.0.1:8216']\n",
+        "landscape_url: sqlite:///runs/audit.db\n",
+        "# a comment is not configuration: https://example.com/doc\n",
+    ],
+)
+def test_guard_judges_each_parsed_url_value_and_accepts_loopback(tmp_path: Path, line: str) -> None:
+    tree, _ = _fixture(tmp_path)
+    config = tree / "examples/demo/settings.yaml"
+    config.write_text(config.read_text() + line)
+    assert examples_gate.network_findings(tree, config) == []
+
+
+@pytest.mark.parametrize(
+    "line,reason",
+    [
+        # Control: a remote host inside a flow list is still refused.
+        ("allowed_origins: [http://example.com:8215]\n", "non-loopback URL host example.com"),
+        ("allowed_origins: [http://127.0.0.1:8215, https://example.com]\n", "non-loopback URL host example.com"),
+        ("endpoint: 'http://[::1:8000/x'\n", "unparseable URL"),
+        ("prompt: 'fetch http://127.0.0.1:8000/x then https://example.com/y'\n", "URL inside text"),
+        ('prompt: "\\thttps://example.com/x"\n', "URL inside text"),
+        ("? https://example.com/key\n: value\n", "non-loopback URL host example.com"),
+    ],
+)
+def test_guard_refuses_a_remote_malformed_or_embedded_url_value(tmp_path: Path, line: str, reason: str) -> None:
+    tree, _ = _fixture(tmp_path)
+    config = tree / "examples/demo/settings.yaml"
+    config.write_text(config.read_text() + line)
+    findings = examples_gate.network_findings(tree, config)
+    assert any(reason in finding for finding in findings), findings
+
+
 def test_guard_uses_url_host_after_userinfo(tmp_path: Path) -> None:
     tree, _ = _fixture(tmp_path)
     config = tree / "examples/demo/settings.yaml"
