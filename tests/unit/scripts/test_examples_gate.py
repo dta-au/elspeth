@@ -1377,8 +1377,24 @@ def test_a_mount_point_beneath_a_source_is_a_finding_and_is_not_entered() -> Non
     assert not [finding for finding in findings if any(finding.startswith(f"socket {point}/") for point in mounts)]
 
 
+def _marking_bwrap(tmp_path: Path) -> tuple[dict[str, str], Path]:
+    """A fake bwrap first on PATH that leaves a marker and fails if it is ever started.
+
+    The bind check runs on the host helper, before any sandbox starts: these tests need no real
+    bwrap, only one the gate can find, and the absent marker proves the refusal came first.
+    """
+    fake_bin = tmp_path / "marking-bin"
+    fake_bin.mkdir()
+    marker = tmp_path / "bwrap-was-started"
+    fake = fake_bin / "bwrap"
+    fake.write_text(f"#!/bin/bash\ntouch {shlex.quote(str(marker))}\nexit 97\n")
+    fake.chmod(0o755)
+    return {"PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}"}, marker
+
+
 def test_a_bind_check_that_ends_without_a_verdict_says_how_it_ended(tmp_path: Path) -> None:
     _fixture(tmp_path)
+    env, marker = _marking_bwrap(tmp_path)
     driver = tmp_path / "driver"
     driver.mkdir()
     shutil.copy2(GATE, driver / "examples-gate.sh")
@@ -1398,15 +1414,18 @@ def test_a_bind_check_that_ends_without_a_verdict_says_how_it_ended(tmp_path: Pa
         str(log_dir),
         "--min-mem-gb",
         "0",
+        env=env,
         gate=driver / "examples-gate.sh",
     )
     assert result.returncode == 2, (result.stdout, result.stderr)
     assert "REFUSED: shared sandbox bind check ended without a result (signal 15)" in result.stderr
     assert not (log_dir / "self-test.out").exists()
+    assert not marker.exists()
 
 
 def test_a_host_root_in_the_shared_binds_is_refused_by_the_bind_check_before_the_self_test(tmp_path: Path) -> None:
     _fixture(tmp_path)
+    env, marker = _marking_bwrap(tmp_path)
     driver = tmp_path / "driver"
     driver.mkdir()
     gate_text = GATE.read_text()
@@ -1424,11 +1443,13 @@ def test_a_host_root_in_the_shared_binds_is_refused_by_the_bind_check_before_the
         str(log_dir),
         "--min-mem-gb",
         "0",
+        env=env,
         gate=driver / "examples-gate.sh",
     )
     assert result.returncode == 2, (result.stdout, result.stderr)
     assert "REFUSED: shared sandbox bind check failed: REFUSE bind /: the host root" in result.stderr
     assert not (log_dir / "self-test.out").exists()
+    assert not marker.exists()
 
 
 @pytest.mark.parametrize("source", ["/usr/../var", "/etc/../home"])
