@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import logging
 import math
 import threading
 import time
@@ -32,6 +33,8 @@ from elspeth.web.required_executor import (
 )
 from elspeth.web.required_sql_outcomes import RequiredSQLFinishOnce, RequiredSQLRaised, RequiredSQLReturned
 from elspeth.web.required_work import RequiredWorkTicket
+
+logger = logging.getLogger(__name__)
 
 #: Threads in the process-wide worker pool.
 MAX_WORKERS: Final[int] = 16
@@ -843,9 +846,18 @@ async def run_auth_audit_in_worker[**P, T](func: Callable[P, T], *args: P.args, 
 
 
 def _retrieve_abandoned_exception(future: asyncio.Future[Any]) -> None:
-    """Consume the outcome after the audit caller has disconnected."""
+    """Consume the outcome after an ordinary caller has disconnected."""
     if not future.cancelled():
         future.exception()
+
+
+def _report_abandoned_auth_audit_exception(future: asyncio.Future[Any]) -> None:
+    """Report an audit write that failed after its caller disconnected."""
+    if future.cancelled():
+        return
+    original = future.exception()
+    if original is not None:
+        logger.error("Abandoned auth audit failed", exc_info=(type(original), original, original.__traceback__))
 
 
 async def _await_worker_future[T](concurrent_future: ConcurrentFuture[T], *, cancel_queued: bool) -> T:
@@ -887,14 +899,17 @@ async def _await_worker_future[T](concurrent_future: ConcurrentFuture[T], *, can
         # teardown happens once via ``shutdown_async_workers()``.
         if future.done():
             # Completion can win the race with cancellation of the waiter.
-            _retrieve_abandoned_exception(future)
+            if cancel_queued:
+                _retrieve_abandoned_exception(future)
+            else:
+                _report_abandoned_auth_audit_exception(future)
         elif cancel_queued:
             future.cancel()
         else:
             # A refused request already owes this audit. Keep queued work
             # as well as running work; observe any late exception without
             # publishing a second response to a disconnected caller.
-            future.add_done_callback(_retrieve_abandoned_exception)
+            future.add_done_callback(_report_abandoned_auth_audit_exception)
 
 
 async def _finish_joined_shared_future[T](
