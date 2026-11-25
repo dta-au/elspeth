@@ -29,8 +29,10 @@ changes land and is not a release.
   below that limit.
 - **Changed:** a request that a provider or proxy refuses with HTTP 413 is
   now a size rejection: it is sent once more with earlier turns left out and
-  is never resent unchanged. On the direct Anthropic route a 413 is not
-  recognised and stays an ordinary rejected request.
+  is never resent unchanged. This includes a 413 that the client library
+  reports under another status: a 429 rate limit on the OpenAI route, or a
+  400 on the direct Anthropic route. A 429 or 400 without an underlying 413
+  is handled as before.
 - **Changed:** a request a provider or proxy refuses as too large is now
   reported as too large, without a Retry button; an administrator can raise
   that limit.
