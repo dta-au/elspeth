@@ -13,10 +13,18 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
-# peer-flood-stalled: the owner's first accept resumes this long before its startup deadline. Half the
-# startup window: the flood waits in the listen queue while the owner is not running, and the owner keeps
-# a second, not a tight margin, to refuse the peer over its limit on a loaded host.
+# peer-flood-stalled: the owner is set to resume its first accept this long before its startup deadline
+# (half the startup window), so that, when the child connects promptly, the whole flood is meant to wait in
+# the listen queue while the owner is not running. Nothing here observes that the flood was queued.
 STALL_RESUME_BEFORE_DEADLINE_NS = 1_000_000_000
+# Both flood modes: the owner's clock is held just short of its startup deadline until the child has
+# published its witness, or for at most FLOOD_HOLD_LIMIT_NS of real time. The deadline is then enforced
+# after the witness phase, so a slow host cannot kill the child part-way through its checks.
+FLOOD_HOLD_SHORT_NS = 50_000_000
+FLOOD_HOLD_LIMIT_NS = 8_000_000_000
+# The child's waits for the owner. Shorter than the hold, so an owner that never closes the peer over its
+# limit fails the child's own check, not the deadline.
+FLOOD_CHILD_WAIT_SECONDS = 6.0
 
 
 def event(directory: Path, name: str) -> None:
@@ -46,6 +54,10 @@ def supervise(directory: Path, mode: str, speed: int, ignored_chld: bool) -> int
         if first_reading is None:
             # The owner's first reading sets its startup deadline (STARTUP_NS after it).
             first_reading = now
+        if mode in ("peer-flood", "peer-flood-stalled") and owner.armed_at is None and not owner.completed:
+            witness_pending = not (directory / "peer-limit-refused").exists()
+            if witness_pending and now - first_reading < FLOOD_HOLD_LIMIT_NS:
+                return min(now, first_reading + namespace["STARTUP_NS"] - FLOOD_HOLD_SHORT_NS)
         if owner.armed_at is not None and (not mode.startswith("early-stop") or (directory / "connected").exists()):
             return owner.armed_at + (now - owner.armed_at) * speed
         if owner.completed:
@@ -85,9 +97,9 @@ def supervise(directory: Path, mode: str, speed: int, ignored_chld: bool) -> int
             stalled = False
 
             def accept(self):
-                # The first accept blocks until STALL_RESUME_BEFORE_DEADLINE_NS before the startup
-                # deadline, so the whole flood waits in the listen queue and the owner refuses the
-                # peer over its limit in the time left.
+                # The first accept sleeps until STALL_RESUME_BEFORE_DEADLINE_NS before the startup
+                # deadline. When the child connects promptly the whole flood is queued by then; if it
+                # connects later the sleep is shorter or zero and the run is an ordinary flood.
                 if not StalledSocket.stalled:
                     StalledSocket.stalled = True
                     assert first_reading is not None
@@ -152,22 +164,21 @@ def raw_child(directory: Path, mode: str) -> int:
 
         owner = runpy.run_path(str(ROOT / "src/elspeth/composer_mcp/portable_supervisor.py"))
         limit = owner["PEER_LIMIT"]
-        startup_seconds = owner["STARTUP_NS"] / 1e9
         # The owner listens with a backlog of PEER_LIMIT and Linux queues backlog + 1 completed
         # connections, so all PEER_LIMIT + 1 connects complete whether or not the owner is
         # scheduled during the flood.
         held = []
         for _ in range(limit):
-            peer = socket.create_connection(("127.0.0.1", port), timeout=startup_seconds)
+            peer = socket.create_connection(("127.0.0.1", port), timeout=FLOOD_CHILD_WAIT_SECONDS)
             # One byte of a frame header: an incomplete frame, so the peer is held, not refused.
             peer.sendall(b"\x00")
             held.append(peer)
-        over_limit = socket.create_connection(("127.0.0.1", port), timeout=startup_seconds)
+        over_limit = socket.create_connection(("127.0.0.1", port), timeout=FLOOD_CHILD_WAIT_SECONDS)
         # The accept queue is first in, first out, so this is accept attempt PEER_LIMIT + 1, which
-        # the owner closes. It sent nothing, so the close arrives as end of stream. The wait runs
-        # to the startup deadline: the close comes whenever the owner next runs, and the deadline
-        # kills this child first if it does not.
-        over_limit.settimeout(startup_seconds)
+        # the owner closes. It sent nothing, so the close arrives as end of stream. The owner's
+        # startup deadline is held until the witness below exists, so this wait ends either at
+        # the close or at FLOOD_CHILD_WAIT_SECONDS.
+        over_limit.settimeout(FLOOD_CHILD_WAIT_SECONDS)
         assert over_limit.recv(1) == b"", "the owner did not close the peer over its limit"
         # Checked at the moment the close is seen: the owner is one thread accepting in queue
         # order, so it accepted every held peer before this close. A non-blocking peek on each

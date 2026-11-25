@@ -394,9 +394,10 @@ def test_authentication_and_partial_startup_fail_closed(tmp_path, mode):
     assert not (tmp_path / "authenticated").exists()
     if mode in ("peer-flood", "peer-flood-stalled"):
         # The child saw the owner close accept attempt PEER_LIMIT + 1 while the first PEER_LIMIT
-        # stayed open. Stalled, the owner first runs a second before its startup deadline; it needs
-        # that time, because each loop checks the startup deadline before it selects, so an accept
-        # still queued at the deadline never runs and the child is killed without the witness.
+        # stayed open. Stalled, the owner is set to resume a second before its startup deadline.
+        # The probe holds the owner's clock short of that deadline until the witness exists,
+        # because each loop checks the deadline before it selects: an accept still queued at the
+        # deadline would never run, and a slow host would kill the child before its checks.
         assert (tmp_path / "peer-limit-refused").exists()
 
 
