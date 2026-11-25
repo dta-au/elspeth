@@ -227,7 +227,8 @@ async def test_corrupt_park_identity_never_enters_trusted_provider_context(opera
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("managed_reference", [False, True])
-async def test_recovery_checkpoint_excludes_literal_credentials_but_keeps_unresolved_references(operation_store, managed_reference):
+async def test_recovery_restores_the_sessions_own_checkpoint_with_literal_or_referenced_options(operation_store, managed_reference):
+    # Recovery restores the session's own graph; credential admission ran when the text arrived.
     engine, repository, _authority, service, session_id = operation_store
     credential = {"secret_ref": "UNAVAILABLE_CREDENTIAL"} if managed_reference else "private-literal-credential"
     state = CompositionState(
@@ -262,14 +263,9 @@ async def test_recovery_checkpoint_excludes_literal_credentials_but_keeps_unreso
         )
         assert recovered.data is not None
         assert recovered.data.is_valid is False and recovered.data.composer_meta is None
-        if managed_reference:
-            assert recovered.target_state_id == state_id
-            assert deep_thaw(recovered.data.nodes) == state.to_dict()["nodes"]
-            assert recovered.empty_fallback is False
-        else:
-            assert recovered.target_state_id is None
-            assert recovered.data.nodes == ()
-            assert recovered.empty_fallback is True
+        assert recovered.target_state_id == state_id
+        assert deep_thaw(recovered.data.nodes) == state.to_dict()["nodes"]
+        assert recovered.empty_fallback is False
         with engine.connect() as conn:
             assert conn.execute(
                 select(composition_states_table.c.nodes).where(composition_states_table.c.id == str(state_id))
