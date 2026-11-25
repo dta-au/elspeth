@@ -344,7 +344,8 @@
     ],
     "transform:llm_0": [
       "text"
-    ]
+    ],
+    "transform:start_barrier": []
   },
   "examples/multi_worker_showcase/settings.yaml": {
     "transform:explode": [
@@ -352,7 +353,8 @@
     ],
     "transform:llm_0": [
       "text"
-    ]
+    ],
+    "transform:start_barrier": []
   },
   "examples/openrouter_multi_query_assessment/settings.yaml": {
     "transform:llm_0": []

@@ -36,16 +36,20 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from examples.multi_worker.start_barrier import _ExamplePlugins
 
 from elspeth.config_loading import load_settings
 from elspeth.core.canonical import compute_full_topology_hash
 from elspeth.core.dag import ExecutionGraph
-from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+from elspeth.plugins.infrastructure.manager import PluginManager, get_shared_plugin_manager, scoped_plugin_manager
 from elspeth.plugins.infrastructure.runtime_factory import instantiate_plugins_from_config
 from tests.fixtures.declared_input_proof_pin import named_declared_input_proof
 
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 _EXAMPLES = _REPO_ROOT / "examples"
+# Only these shipped examples need a local plugin entrypoint. Keep the roster
+# explicit so adding a new example plugin requires review of this corpus gate.
+_EXAMPLE_PLUGIN_REGISTRY = {"multi_worker": _ExamplePlugins, "multi_worker_showcase": _ExamplePlugins}
 _PINS_PATH = Path(__file__).parent / "canonical_hash_corpus.json"
 _RECORD = os.environ.get("ELSPETH_CANONICAL_CORPUS_RECORD") == "1"
 # The declared-input proof pin (R2, systems C4) — same build, its own pin
@@ -82,6 +86,16 @@ def _settings_files() -> list[Path]:
 
 
 def _build_graph(settings_path: Path) -> ExecutionGraph:
+    if settings_path.parent.name in _EXAMPLE_PLUGIN_REGISTRY:
+        manager = PluginManager()
+        manager.register_builtin_plugins()
+        manager.register(_EXAMPLE_PLUGIN_REGISTRY[settings_path.parent.name]())
+        with scoped_plugin_manager(manager):
+            return _build_graph_with_registered_plugins(settings_path)
+    return _build_graph_with_registered_plugins(settings_path)
+
+
+def _build_graph_with_registered_plugins(settings_path: Path) -> ExecutionGraph:
     config = load_settings(settings_path)
     plugins = instantiate_plugins_from_config(config, preflight_mode=True)
     graph = ExecutionGraph.from_plugin_instances(

@@ -733,8 +733,12 @@ class TestShippedExamples:
         explode = settings["transforms"][0]
         assert explode["plugin"] == "json_explode"
         assert explode["input"] == "exploded"
-        assert explode["on_success"] == "llm_input"
-        assert settings["transforms"][1]["input"] == "llm_input"
+        assert explode["on_success"] == "barrier_input"
+        barrier = settings["transforms"][1]
+        assert barrier["plugin"] == "demonstration_start_barrier"
+        assert barrier["input"] == "barrier_input"
+        assert barrier["on_success"] == "llm_input"
+        assert settings["transforms"][2]["input"] == "llm_input"
 
         input_path = example_pipeline_dir.parent / source["options"]["path"]
         input_rows = [json.loads(line) for line in input_path.read_text().splitlines() if line.strip()]
