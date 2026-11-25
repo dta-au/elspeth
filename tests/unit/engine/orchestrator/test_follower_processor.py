@@ -626,8 +626,8 @@ class TestFollowerSeatDead:
         ]
         factory = _StubFactory(running=True)
         run_result_running = _RunStatusRecord(status=RunStatus.RUNNING)
-        run_result_completed = _RunStatusRecord(status=RunStatus.COMPLETED)
-        factory.run_lifecycle.get_run_results = [run_result_running, run_result_completed]
+        # The loop-top read, then the dead-seat recheck: the run is still running when the seat is gone.
+        factory.run_lifecycle.get_run_results = [run_result_running, run_result_running]
         heartbeat = _StubHeartbeat()
         member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         follower = FollowerProcessor(
@@ -646,6 +646,7 @@ class TestFollowerSeatDead:
             follower.run(ctx=_ctx())
 
         assert processor.claim_checks == 1
+        assert factory.run_lifecycle.get_run_results == []
         assert len(coord_repo.seat_holder_calls) == 3
         assert len(coord_repo.depart_calls) == 1
 
