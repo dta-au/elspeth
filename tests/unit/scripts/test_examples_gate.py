@@ -1509,3 +1509,227 @@ def test_a_same_filesystem_bind_mount_is_missed_by_device_and_caught_by_the_moun
     # Both mounts are on the same filesystem as the source: the device check sees neither.
     assert seen["by_device"] == []
     assert seen["by_table"] == [str(source / "file.txt"), str(source / "sub")]
+
+
+# ------------------------------------------------------------- generated inputs
+
+_NONCE = "0123456789abcdef0123456789abcdef"
+
+
+def _generated_fixture(
+    tmp_path: Path, *, source_path: str = "examples/demo/generated.csv", command: str = "./examples/demo/run.sh"
+) -> tuple[Path, Path]:
+    """The demo case reading an input its own launcher writes: gitignored, absent from the tree."""
+    tree, cases = _fixture(tmp_path)
+    example = tree / "examples/demo"
+    (example / "settings.yaml").write_text(f"source: {{plugin: csv, options: {{path: '{source_path}'}}}}\nsinks: []\n")
+    (example / "input.csv").unlink()
+    (example / ".gitignore").write_text("generated.csv\nother.csv\nelsewhere.csv\n")
+    data = yaml.safe_load(cases.read_text())
+    data["cases"][0].update(
+        command=command, generated_inputs={"generator": "examples/demo/run.sh", "paths": ["examples/demo/generated.csv"]}
+    )
+    cases.write_text(yaml.safe_dump(data))
+    return tree, cases
+
+
+def _preflight(tmp_path: Path, tree: Path, cases: Path, *, proof: str | None = f"self-test-ok {_NONCE}", nonce: str = _NONCE) -> int:
+    argv = ["preflight", "--cases", str(cases), "--tree", str(tree), "--case", "demo"]
+    if proof is not None:
+        proof_file = tmp_path / "self-test.out"
+        proof_file.write_text(proof + "\n")
+        scratch = tmp_path / "scratch"
+        scratch.mkdir(exist_ok=True)
+        argv += ["--sandbox-proof", str(proof_file), "--nonce", nonce, "--scratch", str(scratch)]
+    return examples_gate.main(argv)
+
+
+def test_generated_input_is_deferred_only_with_this_runs_sandbox_proof(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    tree, cases = _generated_fixture(tmp_path)
+    assert _validate(tree, cases) == 0
+    capsys.readouterr()
+    assert _preflight(tmp_path, tree, cases) == 0
+    assert "1 generated input(s) inspected after the run" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("mutation", "needle"),
+    [
+        ("no_proof", "no sandbox self-test proof"),
+        ("other_nonce", "no sandbox self-test proof"),
+        ("tracked", "exists before the run"),
+        ("not_ignored", "is not gitignored"),
+        ("no_generator", "generator examples/demo/run.sh is not a tracked file"),
+        ("undeclared", "generated.csv missing or unreadable"),
+    ],
+)
+def test_generated_input_refusals_before_the_run(tmp_path: Path, capsys: pytest.CaptureFixture[str], mutation: str, needle: str) -> None:
+    tree, cases = _generated_fixture(tmp_path)
+    proof = f"self-test-ok {_NONCE}"
+    if mutation == "no_proof":
+        code = _preflight(tmp_path, tree, cases, proof=None)
+    else:
+        if mutation == "other_nonce":
+            proof = "self-test-ok " + "f" * 32
+        elif mutation == "tracked":
+            (tree / "examples/demo/generated.csv").write_text("id\n1\n")
+        elif mutation == "not_ignored":
+            (tree / "examples/demo/.gitignore").write_text("other.csv\n")
+        elif mutation == "no_generator":
+            (tree / "examples/demo/run.sh").unlink()
+        else:
+            data = yaml.safe_load(cases.read_text())
+            data["cases"][0]["generated_inputs"]["paths"] = ["examples/demo/other.csv"]
+            cases.write_text(yaml.safe_dump(data))
+        code = _preflight(tmp_path, tree, cases, proof=proof)
+    out = capsys.readouterr().out
+    assert code == 1, out
+    assert needle in out, out
+    if mutation in {"no_proof", "other_nonce"}:
+        # Without the proof nothing is deferred: the missing input is refused as before.
+        assert "generated.csv missing or unreadable" in out, out
+
+
+@pytest.mark.parametrize(
+    ("command", "refused"),
+    [
+        ("./examples/demo/run.sh", False),
+        ("DEMO_INPUT=examples/demo/generated.csv ./examples/demo/run.sh", False),
+        ("DEMO_INPUT=examples/demo/elsewhere.csv ./examples/demo/run.sh", True),
+    ],
+)
+def test_path_variable_resolves_from_the_case_command(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], command: str, refused: bool
+) -> None:
+    # The command may point the variable at an undeclared, untracked file: absent from the export, it is refused.
+    tree, cases = _generated_fixture(tmp_path, source_path="${DEMO_INPUT:-examples/demo/generated.csv}", command=command)
+    assert _validate(tree, cases) == 0
+    capsys.readouterr()
+    code = _preflight(tmp_path, tree, cases)
+    out = capsys.readouterr().out
+    assert code == (1 if refused else 0), out
+    assert ("elsewhere.csv missing or unreadable" in out) is refused, out
+
+
+def test_resolve_source_path_uses_only_the_case_environment() -> None:
+    raw = "${DEMO_INPUT:-examples/demo/generated.csv}"
+    assert examples_gate.resolve_source_path(raw, {}) == "examples/demo/generated.csv"
+    assert examples_gate.resolve_source_path(raw, {"DEMO_INPUT": "examples/demo/x.csv"}) == "examples/demo/x.csv"
+    assert examples_gate.resolve_source_path("${UNSET_NO_DEFAULT}", {}) == "${UNSET_NO_DEFAULT}"
+    case = {"id": "c", "command": "A=1 B='two words' ./run.sh C=not-an-assignment", "env": {"A": "env", "D": "4"}}
+    assert examples_gate.case_environment(case) == {"A": "1", "B": "two words", "D": "4"}
+
+
+@pytest.mark.parametrize(
+    ("change", "value"),
+    [
+        ("generator", "examples/demo/other.sh"),
+        ("path", "examples/other/generated.csv"),
+        ("path", "/abs/generated.csv"),
+        ("path", "examples/demo/../demo/generated.csv"),
+        ("path", "examples/demo/*.csv"),
+        ("path", "examples/demo/generated.txt"),
+        ("duplicate", "examples/demo/generated.csv"),
+    ],
+)
+def test_validate_rejects_bad_generated_inputs(tmp_path: Path, change: str, value: str) -> None:
+    tree, cases = _generated_fixture(tmp_path)
+    data = yaml.safe_load(cases.read_text())
+    block = data["cases"][0]["generated_inputs"]
+    if change == "generator":
+        block["generator"] = value
+    elif change == "path":
+        block["paths"] = [value]
+    else:
+        block["paths"] = [value, value]
+    cases.write_text(yaml.safe_dump(data))
+    assert _validate(tree, cases) == 2
+
+
+def _inspect(tmp_path: Path, name: str, content: str | None) -> tuple[list[str], list[str]]:
+    root = tmp_path / "root"
+    target = root / "examples/demo" / name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if content is not None:
+        target.write_text(content)
+    return examples_gate.generated_input_failures(
+        root, {"generated_inputs": {"generator": "examples/demo/run.sh", "paths": [f"examples/demo/{name}"]}}
+    )
+
+
+@pytest.mark.parametrize(
+    ("name", "content", "needle"),
+    [
+        ("generated.csv", "id,url\n1,https://example.com/a\n", "remote URL host example.com"),
+        ("generated.jsonl", '{"parts": [{"source": "s3://bucket/key"}]}\n', "remote URL host bucket"),
+        ("generated.json", '{"rows": ["ftp://files.example.org/x"]}', "remote URL host files.example.org"),
+        ("generated.csv", "id,path\n1,{outside}\n", "outside the case copy"),
+        ("generated.csv", "id,path\n1,file://{outside}\n", "outside the case copy"),
+        ("generated.csv", "id,path\n1,../../../outside.txt\n", "outside the case copy"),
+        ("generated.jsonl", "{not json\n", "unreadable"),
+        ("generated.csv", None, "not a file inside the case copy"),
+    ],
+)
+def test_generated_input_inspection_fails_remote_or_outside_values(tmp_path: Path, name: str, content: str | None, needle: str) -> None:
+    outside = tmp_path / "outside.txt"
+    outside.write_text("host file")
+    failures, _ = _inspect(tmp_path, name, None if content is None else content.replace("{outside}", str(outside)))
+    assert any(needle in failure for failure in failures), failures
+
+
+def test_generated_input_inspection_accepts_loopback_and_paths_inside_the_copy(tmp_path: Path) -> None:
+    inside = tmp_path / "root/examples/demo/payload.bin"
+    inside.parent.mkdir(parents=True)
+    inside.write_bytes(b"x")
+    content = f"id,url,path,rel\n1,http://127.0.0.1:8199/x,{inside},examples/demo/payload.bin\n2,,file://{inside},\n"
+    failures, evidence = _inspect(tmp_path, "generated.csv", content)
+    assert failures == []
+    assert evidence and "none remote or outside the copy" in evidence[0]
+
+
+def test_generated_input_symlinked_out_of_the_copy_fails(tmp_path: Path) -> None:
+    outside = tmp_path / "outside.csv"
+    outside.write_text("id\n1\n")
+    target = tmp_path / "root/examples/demo/generated.csv"
+    target.parent.mkdir(parents=True)
+    target.symlink_to(outside)
+    failures, _ = examples_gate.generated_input_failures(
+        tmp_path / "root", {"generated_inputs": {"generator": "examples/demo/run.sh", "paths": ["examples/demo/generated.csv"]}}
+    )
+    assert any("not a file inside the case copy" in failure for failure in failures), failures
+
+
+@pytest.mark.parametrize(("row", "verdict"), [("1,http://127.0.0.1:8199/x", "PASS"), ("1,https://example.com/x", "FAIL")])
+def test_gate_runs_a_generated_input_case_and_inspects_it_after(tmp_path: Path, row: str, verdict: str) -> None:
+    tree, cases = _generated_fixture(tmp_path)
+    (tree / "examples/demo/run.sh").write_text(f"#!/bin/sh\nprintf 'id,url\\n{row}\\n' > examples/demo/generated.csv\necho verified\n")
+    (tree / "examples/demo/run.sh").chmod(0o755)
+    data = yaml.safe_load(cases.read_text())
+    data["cases"][0]["audit"] = []
+    cases.write_text(yaml.safe_dump(data))
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    fake = fake_bin / "bwrap"
+    fake.write_text(
+        '#!/bin/bash\nwhile [ "$1" != "--" ]; do shift; done\nshift\nif [ "$1" = bash ]; then exec "$@"; fi\n' + _FORGED_SELF_TEST
+    )
+    fake.chmod(0o755)
+    log_dir = tmp_path / "logs"
+    result = _dry_run(
+        tmp_path,
+        "--execute",
+        "--only",
+        "demo",
+        "--tmp-root",
+        str(tmp_path / "work"),
+        "--log-dir",
+        str(log_dir),
+        "--min-mem-gb",
+        "0",
+        env={"PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}"},
+    )
+    summary = (log_dir / "summary.txt").read_text()
+    # The gate handed preflight this run's self-test proof (else NOTRUN), and check read the written input.
+    assert f"{verdict} demo" in summary, (summary, result.stderr)
+    if verdict == "FAIL":
+        assert "remote URL host example.com" in summary, summary
