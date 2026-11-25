@@ -50,15 +50,18 @@
 # inside its allowed root (an /etc source is one of the listed entries), and no
 # mount point, socket or FIFO is beneath it. Checked before each case: the
 # same for the shared binds' sources and mount points, and the full walk for
-# the case's own binds. A socket made under a shared bind after the first walk
-# is not seen.
+# the case's own binds. The gate assumes the shared bind sources do not change
+# during the run.
 #
 # Self-test, before the first case, inside the sandbox: network interfaces are
 # loopback only and an outbound connect fails; an abstract socket and a path
 # socket held outside are unreachable, and a host path that is not bound is
 # absent; /run is empty and no SysV IPC object is visible; no descriptor above
-# 2 is open; writes into the venv, into /usr and into a read-only probe bind,
-# and a mkdir at /, fail read-only; an unlisted /etc entry is absent. It must
+# 2 is open; every mount is read-only except a listed writable set (the
+# private /dev, /proc, /tmp, /run) and its own directory; writes into the venv,
+# into /usr and into a read-only probe bind, and a mkdir at /, fail read-only;
+# /etc holds only the listed entries. Each case, before its command, checks the
+# mounts the same way with its own directory as the writable one. It must
 # print this run's nonce, which shows the output came from this run. The text
 # guard remains an early refusal.
 #
@@ -315,8 +318,10 @@ for top in bin sbin lib lib32 lib64 libx32; do
     fi
 done
 # The helper refuses any /etc source not in its own copy of this list (ETC_BIND_SOURCES).
-for etc_entry in passwd group nsswitch.conf hosts resolv.conf ld.so.cache localtime protocols services \
-                 mime.types alternatives ssl/certs ssl/openssl.cnf; do
+ETC_ENTRIES=(passwd group nsswitch.conf hosts resolv.conf ld.so.cache localtime protocols services
+             mime.types alternatives ssl/certs ssl/openssl.cnf)
+ETC_TOPS="$(printf '%s\n' "${ETC_ENTRIES[@]%%/*}" | sort -u | paste -sd, -)"
+for etc_entry in "${ETC_ENTRIES[@]}"; do
     BWRAP_ARGS+=(--ro-bind-try "/etc/$etc_entry" "/etc/$etc_entry")
 done
 BWRAP_ARGS+=(--ro-bind "$VENV" "$VENV" --dev /dev --proc /proc --tmpfs /tmp --tmpfs /run
@@ -363,11 +368,44 @@ in_sandbox() {
     )
 }
 
+# Every mount inside the sandbox is read-only except these, and the run's own directory (the
+# self-test's, or the case's). An entry that is absent is fine; a writable mount not listed refuses.
+WRITABLE_MOUNTS=(
+    /dev            # bwrap --dev: a private minimal device directory
+    /dev/null       # device node bound by --dev
+    /dev/zero       # device node bound by --dev
+    /dev/full       # device node bound by --dev
+    /dev/random     # device node bound by --dev
+    /dev/urandom    # device node bound by --dev
+    /dev/tty        # device node bound by --dev
+    /dev/pts        # --dev: a private devpts instance
+    /proc           # --proc: procfs for the private PID namespace
+    /tmp            # --tmpfs: empty, private
+    /run            # --tmpfs: empty, private
+)
+# Read /proc/self/mountinfo inside the sandbox; argv: the writable set.
+MOUNT_CHECK_PY='
+import re
+import sys
+
+writable = set(sys.argv[1:])
+loose = []
+for line in open("/proc/self/mountinfo"):
+    fields = line.split()
+    point = re.sub(r"\\([0-7]{3})", lambda match: chr(int(match.group(1), 8)), fields[4])
+    if "ro" not in fields[5].split(",") and point not in writable:
+        loose.append(point)
+if loose:
+    sys.exit("writable mount outside the writable set: " + ", ".join(loose))
+print("mount-check-ok")
+'
+
 # Self-test: the properties listed in the header, checked inside the sandbox. The probe must echo
 # this run's nonce, which shows its output came from this run.
 SELF_TEST_DIR="$CASE_BASE/self-test"
 OUTSIDE_DIR="$CASE_BASE/outside"
 mkdir -p "$SELF_TEST_DIR/ro" "$OUTSIDE_DIR"
+printf '%s' "$MOUNT_CHECK_PY" > "$SELF_TEST_DIR/mount-check.py"
 NONCE="$("$PY" -I -c 'import secrets; print(secrets.token_hex(16))')"
 # A listener outside every bind (path and abstract name), reachable from here.
 "$PY" -I -c '
@@ -406,8 +444,22 @@ in_sandbox HOME="$SELF_TEST_DIR" PATH="/usr/local/bin:/usr/bin:/bin" TMPDIR="$SE
 import errno
 import os
 import socket
+import subprocess
 import sys
-nonce, listener, abstract, read_only_target, absent, venv = sys.argv[1:7]
+nonce, listener, abstract, read_only_target, absent, venv, etc_tops, mount_check = sys.argv[1:9]
+writable = sys.argv[9:]
+
+
+def write_refused(path):
+    # O_EXCL: a file this probe did not make is never opened, and one it made by mistake is removed.
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except OSError as error:
+        assert error.errno == errno.EROFS, (path, error)
+    else:
+        os.close(descriptor)
+        os.unlink(path)
+        raise AssertionError(f"write {path} succeeded")
 
 
 def refused(code, action, *args):
@@ -427,10 +479,13 @@ assert inherited == [], {fd: os.readlink(f"/proc/self/fd/{fd}") for fd in inheri
 for kind in ("shm", "msg", "sem"):
     rows = [row for row in open(f"/proc/sysvipc/{kind}").read().splitlines()[1:] if row.strip()]
     assert rows == [], (kind, rows)
+checked = subprocess.run([sys.executable, "-I", mount_check, *writable], capture_output=True, text=True, check=False)
+assert checked.returncode == 0 and checked.stdout.strip() == "mount-check-ok", (checked.stdout, checked.stderr)
 for target in (read_only_target, os.path.join(venv, "examples-gate-probe"), "/usr/examples-gate-probe"):
-    refused(errno.EROFS, lambda path: os.close(os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)), target)
+    write_refused(target)
 refused(errno.EROFS, os.mkdir, "/examples-gate-probe")
-refused(errno.ENOENT, os.stat, "/etc/os-release")
+unlisted = set(os.listdir("/etc")) - set(etc_tops.split(","))
+assert not unlisted, ("/etc", sorted(unlisted))
 refused(errno.ENOENT, os.stat, absent)
 refused(errno.ENOENT, os.stat, listener)
 refused(errno.ENOENT, os.chdir, os.path.dirname(listener))
@@ -451,7 +506,8 @@ with socket.socket() as server:
         peer, _ = server.accept()
         peer.close()
 print(f"self-test-ok {nonce}")
-' "$NONCE" "$OUTSIDE_DIR/listener.sock" "examples-gate-$NONCE" "$SELF_TEST_DIR/ro/write-probe" "$LOG_DIR" "$VENV" \
+' "$NONCE" "$OUTSIDE_DIR/listener.sock" "examples-gate-$NONCE" "$SELF_TEST_DIR/ro/write-probe" "$LOG_DIR" "$VENV" "$ETC_TOPS" \
+    "$SELF_TEST_DIR/mount-check.py" "${WRITABLE_MOUNTS[@]}" "$SELF_TEST_DIR" \
     > "$LOG_DIR/self-test.out" 2>&1
 self_test_rc=$?
 : > "$OUTSIDE_DIR/done"
@@ -570,6 +626,12 @@ for line in "${CASE_LINES[@]}"; do
 #!/usr/bin/env bash
 set -u
 root="$1"; cmd="$2"; scmd="$3"; sport="$4"; log="$5"; server_log="$6"; rc_file="$7"; server_marker="$8"
+python="$9"; mount_check="${10}"; mount_out="${11}"; mount_marker="${12}"
+shift 12
+if ! "$python" -I "$mount_check" "$@" > "$mount_out" 2>&1; then
+    : > "$mount_marker"
+    exit 2
+fi
 cd "$root" || exit 2
 port_busy() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
 if [ -n "$scmd" ]; then
@@ -585,13 +647,19 @@ rc=$?
 printf '%s\n' "$rc" > "$rc_file"
 exit "$rc"
 INNER
+    printf '%s' "$MOUNT_CHECK_PY" > "$case_dir/mount-check.py"
     t0=$(date +%s)
     set +e
     in_sandbox "${ENVV[@]}" -- "${case_binds[@]}" -- \
         bash "$case_dir/inner.sh" "$root" "$cmd" "$scmd" "$sport" "$case_dir/command.log" "$case_dir/server.log" \
-        "$case_dir/command.exit" "$case_dir/server.failed" > "$LOG_DIR/logs/$id.sandbox.log" 2>&1
+        "$case_dir/command.exit" "$case_dir/server.failed" \
+        "$PY" "$case_dir/mount-check.py" "$case_dir/mount-check.out" "$case_dir/mount.failed" \
+        "${WRITABLE_MOUNTS[@]}" "$case_dir" > "$LOG_DIR/logs/$id.sandbox.log" 2>&1
     sandbox_rc=$?
     set -e
+    if [ -e "$case_dir/mount.failed" ]; then
+        refuse "case $id sandbox mount check failed: $(tr '\n' ' ' < "$case_dir/mount-check.out")"
+    fi
     [ ! -f "$case_dir/command.log" ] || cp -- "$case_dir/command.log" "$log"
     [ ! -f "$case_dir/server.log" ] || cp -- "$case_dir/server.log" "$LOG_DIR/logs/$id.server.log"
     secs=$(( $(date +%s) - t0 ))

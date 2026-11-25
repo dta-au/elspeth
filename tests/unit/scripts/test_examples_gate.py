@@ -9,6 +9,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import sysconfig
 import uuid
 from collections.abc import Iterator
 from itertools import pairwise
@@ -463,6 +464,8 @@ def test_execute_refuses_a_sandbox_that_does_not_isolate(tmp_path: Path) -> None
 # A fake bwrap that does not run the self-test probe must forge this run's nonce explicitly:
 # the probe's arguments are -c SOURCE NONCE ...
 _FORGED_SELF_TEST = 'while [ "$1" != -c ]; do shift; done\necho "self-test-ok $3"\n'
+# A fake bwrap runs the case on the host, with no private mounts: it forges the case's mount check
+# (inner.sh argument 10, "${12}" after "bash inner.sh") as it forges the self-test.
 
 
 def _processes_with(token: str) -> list[int]:
@@ -829,6 +832,7 @@ def test_fake_bwrap_records_shared_mount_flags_and_partial_summary(tmp_path: Pat
         "shift\n"
         'if [ "$1" = bash ]; then\n'
         f"  printf '%s\\n' \"${{flags[@]}}\" > {shlex.quote(str(case_flags))}\n"
+        '  printf \'print("mount-check-ok")\\n\' > "${12}"\n'
         '  exec "$@"\n'
         "fi\n"
         f"printf '%s\\n' \"${{flags[@]}}\" > {shlex.quote(str(self_flags))}\n" + _FORGED_SELF_TEST
@@ -938,7 +942,8 @@ def test_checker_stderr_does_not_prefix_pass_verdict(tmp_path: Path) -> None:
     fake_bin.mkdir()
     fake = fake_bin / "bwrap"
     fake.write_text(
-        '#!/bin/bash\nwhile [ "$1" != "--" ]; do shift; done\nshift\nif [ "$1" = bash ]; then exec "$@"; fi\n' + _FORGED_SELF_TEST
+        '#!/bin/bash\nwhile [ "$1" != "--" ]; do shift; done\nshift\nif [ "$1" = bash ]; then printf \'print("mount-check-ok")\\n\' > "${12}"; exec "$@"; fi\n'
+        + _FORGED_SELF_TEST
     )
     fake.chmod(0o755)
     log_dir = tmp_path / "logs"
@@ -977,6 +982,7 @@ def test_changed_helper_snapshot_marks_tree_unfrozen(tmp_path: Path) -> None:
         "shift\n"
         'if [ "$1" = bash ]; then\n'
         f"  printf '\\n# changed\\n' >> {shlex.quote(str(log_dir / 'examples_gate.py'))}\n"
+        '  printf \'print("mount-check-ok")\\n\' > "${12}"\n'
         '  exec "$@"\n'
         "fi\n" + _FORGED_SELF_TEST
     )
@@ -1129,7 +1135,9 @@ def test_a_socket_in_the_case_copy_refuses_the_run_and_names_the_bind(tmp_path: 
     assert not (log_dir / "logs/demo.sandbox.log").exists()
 
 
-def _gate_with_an_open_descriptor(tmp_path: Path, gate: Path, case_command: str) -> tuple[subprocess.CompletedProcess[str], Path]:
+def _gate_with_an_open_descriptor(
+    tmp_path: Path, gate: Path, case_command: str, venv: Path | None = None
+) -> tuple[subprocess.CompletedProcess[str], Path]:
     _, cases = _fixture(tmp_path)
     data = yaml.safe_load(cases.read_text())
     data["cases"][0]["audit"] = []
@@ -1153,7 +1161,7 @@ def _gate_with_an_open_descriptor(tmp_path: Path, gate: Path, case_command: str)
                 "--cases",
                 str(cases_path),
                 "--venv",
-                str(Path(sys.executable).parent.parent),
+                str(venv or Path(sys.executable).parent.parent),
                 "--execute",
                 "--tmp-root",
                 str(tmp_path / "work"),
@@ -1239,6 +1247,7 @@ def test_the_case_copy_holds_tracked_content_only_and_the_environment_no_credent
         'if [ "$1" = bash ]; then\n'
         f"  env > {shlex.quote(str(seen_env))}\n"
         f'  (cd "$3" && find . -mindepth 1 | sort) > {shlex.quote(str(seen_files))}\n'
+        '  printf \'print("mount-check-ok")\\n\' > "${12}"\n'
         '  exec "$@"\n'
         "fi\n" + _FORGED_SELF_TEST
     )
@@ -1389,7 +1398,7 @@ def test_a_source_with_dot_segments_is_judged_where_it_points(source: str) -> No
     assert examples_gate.bind_source_refusal(source, []) == "outside the allowed bind roots"
 
 
-def test_a_directory_linked_out_of_an_allowed_root_is_refused_but_a_linked_file_is_not(tmp_path: Path) -> None:
+def test_a_directory_or_file_linked_out_of_an_allowed_root_is_refused(tmp_path: Path) -> None:
     allowed = tmp_path / "allowed"
     outside = tmp_path / "outside"
     allowed.mkdir()
@@ -1399,7 +1408,8 @@ def test_a_directory_linked_out_of_an_allowed_root_is_refused_but_a_linked_file_
     (allowed / "file-link").symlink_to(outside / "file.txt")
     reason = examples_gate.bind_source_refusal(str(allowed / "dir-link"), [str(allowed)])
     assert reason == f"resolves to {outside}, outside the allowed bind roots"
-    assert examples_gate.bind_source_refusal(str(allowed / "file-link"), [str(allowed)]) is None
+    reason = examples_gate.bind_source_refusal(str(allowed / "file-link"), [str(allowed)])
+    assert reason == f"resolves to {outside / 'file.txt'}, outside the allowed bind roots"
     assert examples_gate.bind_source_refusal(str(allowed), [str(allowed)]) is None
 
 
@@ -1491,13 +1501,13 @@ def test_a_same_filesystem_bind_mount_is_missed_by_device_and_caught_by_the_moun
     result = subprocess.run(
         [
             shutil.which("bwrap") or "bwrap",
-            "--dev-bind",
+            "--ro-bind",
             "/",
             "/",
-            "--bind",
+            "--ro-bind",
             str(other),
             str(source / "sub"),
-            "--bind",
+            "--ro-bind",
             str(other / "file.txt"),
             str(source / "file.txt"),
             "--",
@@ -1595,16 +1605,45 @@ def _gate_variant(tmp_path: Path, old: str, new: str) -> Path:
     return driver / "examples-gate.sh"
 
 
-def test_a_writable_venv_bind_fails_the_self_test_when_bwrap_works(tmp_path: Path) -> None:
+def _throwaway_venv(tmp_path: Path) -> Path:
+    # Stands in for the venv in tests that make its bind writable: the shared venv is never bound writable.
+    # Outside the sandbox the gate's helper imports the shared venv's packages through a .pth, read only.
+    venv = tmp_path / "throwaway-venv"
+    subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(venv)], check=True)
+    shared = sysconfig.get_paths()["purelib"]
+    (venv / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages" / "shared.pth").write_text(shared + "\n")
+    # The gate's preflight requires these console scripts; the run is refused at the self-test before any is used.
+    for name in ("elspeth", "chaosllm", "chaosweb"):
+        (venv / "bin" / name).write_text("#!/bin/sh\nexit 1\n")
+        (venv / "bin" / name).chmod(0o755)
+    return venv.resolve()
+
+
+@pytest.mark.parametrize("witness", ["mount table", "write probe"])
+def test_a_writable_venv_bind_fails_the_self_test_when_bwrap_works(tmp_path: Path, witness: str) -> None:
+    # The mount check names the writable venv first; with it removed, the write probe still refuses and
+    # removes the file it made. Both run against a throwaway venv.
     reason = _bwrap_unusable_reason()
     if reason is not None:
         pytest.skip(reason)
     (tmp_path / "checkout").mkdir()
+    venv = _throwaway_venv(tmp_path)
     gate = _gate_variant(tmp_path, '--ro-bind "$VENV" "$VENV"', '--bind "$VENV" "$VENV"')
-    result, log_dir = _gate_with_an_open_descriptor(tmp_path, gate, "echo descriptors-ok")
+    if witness == "write probe":
+        text = gate.read_text()
+        check = 'assert checked.returncode == 0 and checked.stdout.strip() == "mount-check-ok", (checked.stdout, checked.stderr)\n'
+        assert text.count(check) == 1
+        gate.write_text(text.replace(check, ""))
+    result, log_dir = _gate_with_an_open_descriptor(tmp_path, gate, "echo descriptors-ok", venv=venv)
     assert result.returncode == 2, (result.stdout, result.stderr)
     assert "bwrap sandbox self-test failed" in result.stderr
-    assert "examples-gate-probe" in (log_dir / "self-test.out").read_text()
+    self_test = (log_dir / "self-test.out").read_text()
+    if witness == "mount table":
+        assert f"writable mount outside the writable set: {venv}" in self_test, self_test
+    else:
+        assert f"write {venv}/examples-gate-probe succeeded" in self_test, self_test
+    assert not (venv / "examples-gate-probe").exists()
+    assert not (Path(sys.executable).parent.parent / "examples-gate-probe").exists()
 
 
 @pytest.mark.parametrize("unshare_ipc", [True, False])
@@ -1614,6 +1653,8 @@ def test_a_host_sysv_segment_is_not_visible_inside_when_bwrap_works(tmp_path: Pa
     if reason is not None:
         pytest.skip(reason)
     (tmp_path / "checkout").mkdir()
+    if shutil.which("ipcmk") is None or shutil.which("ipcrm") is None:
+        pytest.skip("ipcmk/ipcrm not installed")
     gate = GATE if unshare_ipc else _gate_variant(tmp_path, "--unshare-ipc ", "")
     made = subprocess.run(["ipcmk", "-M", "4096"], capture_output=True, text=True, check=True)
     shmid = made.stdout.split()[-1]
@@ -1627,3 +1668,121 @@ def test_a_host_sysv_segment_is_not_visible_inside_when_bwrap_works(tmp_path: Pa
     else:
         assert result.returncode == 2, (result.stdout, result.stderr)
         assert "('shm', [" in (log_dir / "self-test.out").read_text()
+
+
+@pytest.mark.parametrize(
+    ("variant", "where"),
+    [
+        (None, None),
+        ("shared", "self-test"),
+        ("case", "case"),
+    ],
+)
+def test_every_mount_is_read_only_except_the_writable_set_when_bwrap_works(tmp_path: Path, variant: str | None, where: str | None) -> None:
+    # Control: the real gate passes. "shared": the self-test's own probe bind made writable is refused.
+    # "case": the case's own directory left out of its writable set is refused by the case's own check.
+    reason = _bwrap_unusable_reason()
+    if reason is not None:
+        pytest.skip(reason)
+    (tmp_path / "checkout").mkdir()
+    if variant is None:
+        gate = GATE
+    elif variant == "shared":
+        gate = _gate_variant(
+            tmp_path, '--ro-bind "$SELF_TEST_DIR/ro" "$SELF_TEST_DIR/ro"', '--bind "$SELF_TEST_DIR/ro" "$SELF_TEST_DIR/ro"'
+        )
+    else:
+        gate = _gate_variant(tmp_path, '"${WRITABLE_MOUNTS[@]}" "$case_dir" > "$LOG_DIR', '"${WRITABLE_MOUNTS[@]}" > "$LOG_DIR')
+    result, log_dir = _gate_with_an_open_descriptor(tmp_path, gate, "echo descriptors-ok")
+    if variant is None:
+        assert result.returncode == 0, (result.stdout, result.stderr, (log_dir / "preflight.txt").read_text())
+        assert "PASS demo" in (log_dir / "summary.txt").read_text()
+        return
+    assert result.returncode == 2, (result.stdout, result.stderr)
+    if where == "self-test":
+        assert "bwrap sandbox self-test failed" in result.stderr
+        self_test = (log_dir / "self-test.out").read_text()
+        assert "writable mount outside the writable set:" in self_test and "/self-test/ro" in self_test, self_test
+    else:
+        assert "case demo sandbox mount check failed: writable mount outside the writable set:" in result.stderr
+        assert "/demo" in result.stderr.split("mount check failed:", 1)[1], result.stderr
+
+
+def test_home_ro_is_bound_read_only_from_the_physical_cache_and_a_link_out_refuses(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    (home / ".cache" / "model").mkdir(parents=True)
+    outside = tmp_path / "outside-cache"
+    outside.mkdir()
+    (home / ".cache" / "linked").symlink_to(outside)
+    case_flags = tmp_path / "case-flags"
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    fake = fake_bin / "bwrap"
+    fake.write_text(
+        "#!/bin/bash\n"
+        "flags=()\n"
+        'while [ "$1" != "--" ]; do flags+=("$1"); shift; done\n'
+        "shift\n"
+        'if [ "$1" = bash ]; then\n'
+        f"  printf '%s\\n' \"${{flags[@]}}\" > {shlex.quote(str(case_flags))}\n"
+        '  printf \'print("mount-check-ok")\\n\' > "${12}"\n'
+        '  exec "$@"\n'
+        "fi\n" + _FORGED_SELF_TEST
+    )
+    fake.chmod(0o755)
+    _, cases = _fixture(tmp_path)
+    data = yaml.safe_load(cases.read_text())
+    data["cases"][0].update(command="echo verified", audit=[], requires={"home_ro": [".cache/model"]})
+    cases.write_text(yaml.safe_dump(data))
+    env = {"PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}", "HOME": str(home)}
+    options = ["--execute", "--only", "demo", "--tmp-root", str(tmp_path / "work"), "--min-mem-gb", "0"]
+    result = _dry_run(tmp_path, *options, "--log-dir", str(tmp_path / "logs"), env=env)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    flags = case_flags.read_text().splitlines()
+    triples = list(zip(flags, flags[1:], flags[2:], strict=False))
+    assert any(
+        option == "--ro-bind" and source == str((home / ".cache" / "model").resolve()) and target.endswith("/home/.cache/model")
+        for option, source, target in triples
+    ), flags
+    data["cases"][0]["requires"] = {"home_ro": [".cache/linked"]}
+    cases.write_text(yaml.safe_dump(data))
+    result = _dry_run(tmp_path, *options, "--log-dir", str(tmp_path / "logs-linked"), env=env)
+    assert result.returncode == 2, (result.stdout, result.stderr)
+    assert f"resolves to {outside.resolve()}, outside the allowed bind roots" in result.stderr
+
+
+def test_a_file_linked_out_of_an_allowed_root_is_refused(tmp_path: Path) -> None:
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    secret = tmp_path / "secret.txt"
+    secret.write_text("x")
+    (cache / "model").symlink_to(secret)
+    assert examples_gate.bind_source_refusal(str(cache / "model"), [str(cache)]) == f"resolves to {secret}, outside the allowed bind roots"
+    (cache / "plain.txt").write_text("x")
+    assert examples_gate.bind_source_refusal(str(cache / "plain.txt"), [str(cache)]) is None
+
+
+@pytest.mark.parametrize(
+    ("home_ro", "accepted"), [("./.cache/model", False), (".cache//model", False), (".cache/model/", False), (".cache/model", True)]
+)
+def test_home_ro_must_be_in_normal_form(tmp_path: Path, home_ro: str, accepted: bool) -> None:
+    tree, cases = _fixture(tmp_path)
+    data = yaml.safe_load(cases.read_text())
+    data["cases"][0]["requires"] = {"home_ro": [home_ro]}
+    cases.write_text(yaml.safe_dump(data))
+    assert _validate(tree, cases) == (0 if accepted else 2)
+
+
+def test_a_fifo_as_the_bind_source_is_refused(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    os.mkfifo(tmp_path / "pipe")
+    assert examples_gate.main(["socket-walk", "--allow", str(tmp_path), "--", "--ro-bind", str(tmp_path / "pipe"), "/p"]) == 1
+    assert f"REFUSE bind {tmp_path / 'pipe'}: fifo {tmp_path / 'pipe'}" in capsys.readouterr().out
+
+
+def test_an_etc_directory_entry_that_resolves_elsewhere_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    real_realpath = os.path.realpath
+    monkeypatch.setattr(
+        examples_gate.os.path, "realpath", lambda path: "/opt/elsewhere" if path == "/etc/alternatives" else real_realpath(path)
+    )
+    monkeypatch.setattr(examples_gate.os.path, "isdir", lambda path: path == "/opt/elsewhere")
+    assert examples_gate.bind_source_refusal("/etc/alternatives", []) == "resolves to /opt/elsewhere, outside the listed /etc entry"

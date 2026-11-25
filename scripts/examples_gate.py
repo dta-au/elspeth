@@ -103,6 +103,8 @@ def _relative_home_path(raw: str, label: str) -> Path:
     path = Path(raw)
     if path.is_absolute() or path == Path(".") or "," in raw or any(part in {"..", ""} for part in path.parts):
         raise DataError(f"{label}: expected a HOME-relative path")
+    if raw != path.as_posix():
+        raise DataError(f"{label}: {raw} is not in normal form (write {path.as_posix()})")
     if len(path.parts) < 2 or path.parts[0] != ".cache":
         raise DataError(f"{label}: {raw} is not under ~/.cache")
     return path
@@ -384,9 +386,10 @@ def _within(path: str, root: str) -> bool:
 def bind_source_refusal(source: str, allowed_roots: list[str]) -> str | None:
     """Why a bind source may not be bound at all, decided before anything is walked.
 
-    The source is judged as written with dot segments removed, and a directory also by where it
-    resolves: bwrap binds the resolved directory, so a link out of an allowed root is refused.
-    A file source may resolve elsewhere (the /etc links into /usr and /run): only that file is bound.
+    The source is judged as written with dot segments removed, and by where it resolves: bwrap
+    binds the resolved file or directory, so a link out of an allowed root is refused. An /etc
+    entry is one of the listed paths exactly; a listed file may resolve elsewhere (several link
+    into /usr and /run), a listed directory may not.
     """
     lexical = os.path.normpath(source)
     real = os.path.realpath(source)
@@ -406,7 +409,7 @@ def bind_source_refusal(source: str, allowed_roots: list[str]) -> str | None:
     roots = [root for root in (*SYSTEM_BIND_ROOTS, *allowed_roots) if root.rstrip("/")]
     if not any(_within(lexical, root) for root in roots):
         return "outside the allowed bind roots"
-    if os.path.isdir(real) and not any(_within(real, os.path.realpath(root)) for root in roots):
+    if not any(_within(real, os.path.realpath(root)) for root in roots):
         return f"resolves to {real}, outside the allowed bind roots"
     return None
 
@@ -444,6 +447,8 @@ def sockets_under(source: Path) -> tuple[list[str], int]:
     info = real.lstat()
     if stat.S_ISSOCK(info.st_mode):
         return [f"socket {real}"], 0
+    if stat.S_ISFIFO(info.st_mode):
+        return [f"fifo {real}"], 0
     if not stat.S_ISDIR(info.st_mode):
         return [], 0
     device = info.st_dev
