@@ -980,15 +980,29 @@ class _TierOneThenMembershipLossProcessor:
     scheduler_drain re-raises it. ``link="cause"`` names the Tier-1 error only
     as the refusal's ``__cause__``, with an unrelated ``__context__``.
 
-    The Tier-1 error has its own lower-level cause, as a recorder error
-    wrapping a database error does.
+    The Tier-1 error has its own lower-level error, as a recorder error
+    wrapping a database error does: as its explicit cause
+    (``lower_link="cause"``) or as its implicit context
+    (``lower_link="context"``).
     """
 
-    def __init__(self, *, signal: type[Exception], link: str) -> None:
+    def __init__(self, *, signal: type[Exception], link: str, lower_link: str = "cause") -> None:
         self.lower_level_error = SQLAOperationalError("UPDATE run_workers", {}, Exception("connection reset"))
         self.tier_1_error = AuditIntegrityError("claimed token's ledger row disagrees with the work item")
         self._signal = signal
         self._link = link
+        self._lower_link = lower_link
+
+    def _raise_tier_1_error(self) -> None:
+        raise self.tier_1_error
+
+    def _process(self) -> None:
+        if self._lower_link == "cause":
+            raise self.tier_1_error from self.lower_level_error
+        try:
+            raise self.lower_level_error
+        except SQLAOperationalError:
+            self._raise_tier_1_error()
 
     def _fenced_failure_write(self) -> None:
         if self._signal is RunMembershipLostError:
@@ -1006,7 +1020,7 @@ class _TierOneThenMembershipLossProcessor:
 
     def drain_follower_ready_work(self, ctx: PluginContext, *, before_claim: object = None) -> list[object]:
         try:
-            raise self.tier_1_error from self.lower_level_error
+            self._process()
         except AuditIntegrityError as processing_exc:
             if self._link == "context":
                 try:
@@ -1066,10 +1080,46 @@ class TestFollowerTierOneErrorOutranksMembershipLoss:
 
         assert exc_info.value is processor.tier_1_error
         # Its own chain is left as the processing raised it, and the membership loss is noted on it.
-        assert exc_info.value.__cause__ is processor.lower_level_error
-        loss_notes = [note for note in exc_info.value.__notes__ if note.startswith(f"follower {WORKER_ID!r} lost its run membership")]
+        tier_1_error = exc_info.value
+        assert (tier_1_error.__cause__, tier_1_error.__context__, tier_1_error.__suppress_context__) == (
+            processor.lower_level_error,
+            None,
+            True,
+        )
+        loss_notes = [note for note in tier_1_error.__notes__ if note.startswith(f"follower {WORKER_ID!r} lost its run membership")]
         assert len(loss_notes) == 1
         assert f": {signal.__name__}: " in loss_notes[0]
+        assert len(coord_repo.depart_calls) == 1
+
+    def test_cleanup_failure_after_the_tier_1_error_carries_it_as_context(self) -> None:
+        processor = _TierOneThenMembershipLossProcessor(signal=RunMembershipLostError, link="context", lower_link="context")
+        coord_repo = _StubRunCoordRepo()
+        heartbeat = _StubHeartbeat(evicted=False)
+        heartbeat.fatal_error = AuditIntegrityError("heartbeat write corrupted the coordination ledger")
+        follower = FollowerProcessor(
+            processor=processor,
+            member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID),
+            run_coordination=coord_repo,
+            factory=_StubFactory(running=True),
+            wait_fn=lambda _: None,
+        )
+
+        with (
+            patch("elspeth.engine.orchestrator.follower.RunHeartbeatThread", return_value=heartbeat),
+            pytest.raises(AuditIntegrityError) as exc_info,
+        ):
+            follower.run(ctx=_ctx())
+
+        # The heartbeat's fatal failure still wins, and still carries the processing error.
+        assert exc_info.value is heartbeat.fatal_error
+        tier_1_error = exc_info.value.__context__
+        assert tier_1_error is processor.tier_1_error
+        assert (tier_1_error.__cause__, tier_1_error.__context__, tier_1_error.__suppress_context__) == (
+            None,
+            processor.lower_level_error,
+            False,
+        )
+        assert any(note.startswith(f"follower {WORKER_ID!r} lost its run membership") for note in tier_1_error.__notes__)
         assert len(coord_repo.depart_calls) == 1
 
     def test_looping_chain_without_tier_1_error_is_still_an_eviction(self) -> None:

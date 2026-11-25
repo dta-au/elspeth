@@ -106,13 +106,7 @@ from elspeth.contracts.coordination import (
     WorkerMembershipToken,
 )
 from elspeth.contracts.enums import RunStatus
-from elspeth.contracts.errors import (
-    AuditIntegrityError,
-    FollowerSeatDeadError,
-    OrchestrationInvariantError,
-    RunMembershipLostError,
-    RunWorkerEvictedError,
-)
+from elspeth.contracts.errors import AuditIntegrityError, FollowerSeatDeadError, RunMembershipLostError, RunWorkerEvictedError
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.engine.orchestrator.heartbeat import RunHeartbeatThread
 
@@ -323,9 +317,10 @@ class FollowerProcessor:
         )
         heartbeat.start()
         terminal_exit = False
-        # A Tier-1 error found inside a membership loss, raised after the try
-        # statement below.
+        # A Tier-1 error found inside a membership loss, and its own cause,
+        # context and suppression flag as the processing raised it.
         tier_1_error: BaseException | None = None
+        tier_1_links: tuple[BaseException | None, BaseException | None, bool] = (None, None, False)
         try:
             self._drain_loop(ctx, heartbeat)
         except RunMembershipLostError as exc:
@@ -342,36 +337,40 @@ class FollowerProcessor:
             # A Tier-1 error the processing raised before the refusal leaves
             # as itself, whatever the run's status (CLI exit 4).
             tier_1_error = self._tier_1_error_noting_membership_loss(exc)
-            if tier_1_error is None:
-                if self._run_is_terminal():
-                    logger.info(
-                        "follower %r: membership lost, run %r is terminal — exiting cleanly",
-                        self._token.worker_id,
-                        self._token.run_id,
-                    )
-                    terminal_exit = True
-                    return self._observed_terminal_status
-                # True eviction: leader's housekeeping sweep evicted us while the
-                # run is still RUNNING (design case b). Report it as the eviction
-                # it is (CLI exit 3), whichever fence observed it.
-                raise RunWorkerEvictedError(
-                    worker_id=self._token.worker_id,
-                    run_id=self._token.run_id,
-                    reason=f"membership fence refused verb {exc.verb!r}",
-                ) from exc
+            if tier_1_error is not None:
+                tier_1_links = (tier_1_error.__cause__, tier_1_error.__context__, tier_1_error.__suppress_context__)
+                raise tier_1_error from exc
+            if self._run_is_terminal():
+                logger.info(
+                    "follower %r: membership lost, run %r is terminal — exiting cleanly",
+                    self._token.worker_id,
+                    self._token.run_id,
+                )
+                terminal_exit = True
+                return self._observed_terminal_status
+            # True eviction: leader's housekeeping sweep evicted us while the
+            # run is still RUNNING (design case b). Report it as the eviction
+            # it is (CLI exit 3), whichever fence observed it.
+            raise RunWorkerEvictedError(
+                worker_id=self._token.worker_id,
+                run_id=self._token.run_id,
+                reason=f"membership fence refused verb {exc.verb!r}",
+            ) from exc
         except RunWorkerEvictedError as exc:
             # The claim re-probe's eviction: discriminated as the arm above.
             tier_1_error = self._tier_1_error_noting_membership_loss(exc)
-            if tier_1_error is None:
-                if self._run_is_terminal():
-                    logger.info(
-                        "follower %r: membership lost, run %r is terminal — exiting cleanly",
-                        self._token.worker_id,
-                        self._token.run_id,
-                    )
-                    terminal_exit = True
-                    return self._observed_terminal_status
-                raise
+            if tier_1_error is not None:
+                tier_1_links = (tier_1_error.__cause__, tier_1_error.__context__, tier_1_error.__suppress_context__)
+                raise tier_1_error from exc
+            if self._run_is_terminal():
+                logger.info(
+                    "follower %r: membership lost, run %r is terminal — exiting cleanly",
+                    self._token.worker_id,
+                    self._token.run_id,
+                )
+                terminal_exit = True
+                return self._observed_terminal_status
+            raise
         except KeyboardInterrupt:
             logger.info(
                 "follower %r: SIGINT received — departing from run %r",
@@ -405,6 +404,12 @@ class FollowerProcessor:
             terminal_exit = True
             return self._observed_terminal_status
         finally:
+            if tier_1_error is not None:
+                # Raising it from the membership loss rewrote these links.
+                # Restored here, the Tier-1 error leaves with its chain as the
+                # processing raised it, and a cleanup failure below that
+                # supersedes it still carries it, chain and all, as context.
+                tier_1_error.__cause__, tier_1_error.__context__, tier_1_error.__suppress_context__ = tier_1_links
             try:
                 if terminal_exit:
                     heartbeat.stop(final_beat=False)
@@ -419,15 +424,6 @@ class FollowerProcessor:
                     self._best_effort_depart()
                 finally:
                     heartbeat.raise_fatal_failure()
-        # Reached only from a membership-loss arm that found a Tier-1 error.
-        # Raising it here, after the cleanup above and outside every handler,
-        # leaves its own cause, context and traceback as the processing raised
-        # them; the membership loss is recorded on it as a note.
-        if tier_1_error is None:
-            raise OrchestrationInvariantError(
-                f"follower {self._token.worker_id!r} left its drain for run {self._token.run_id!r} without an outcome"
-            )
-        raise tier_1_error
 
     def _tier_1_error_noting_membership_loss(self, membership_loss: BaseException) -> BaseException | None:
         """Return a Tier-1 error from the membership loss's chain, noted with the loss, or None."""
