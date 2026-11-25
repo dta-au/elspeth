@@ -241,8 +241,8 @@ def project_composer_operation_error(
     if isinstance(leaf, PromptFileTooLargeError):
         # The review-card writer refuses a prompt file over an inline cap when a pipeline proposal is
         # accepted. Answer 413 with the YAML import's body shape: the error code and a message naming only
-        # the node and the cap, plus what the user can do from here (the file is not yet bound, so it
-        # cannot be edited in place).
+        # the node and the cap, plus what the user can do from the accept screen while the proposal stays
+        # pending.
         message = f"{leaf} {_PENDING_PROPOSAL_WAY_ON}"
         return _http_error(413, {"detail": {"error_code": leaf.error_code, "message": message, "request_id": request_id}})
     if isinstance(leaf, FingerprintKeyMissingError):

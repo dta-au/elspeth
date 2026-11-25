@@ -172,7 +172,7 @@ async def test_accept_of_an_oversize_prompt_file_is_a_typed_413_and_a_smaller_fi
         }
     }
     # The refusal names the node and the cap only, never the file's content or identity.
-    for private in (_CONTENT_MARKER, str(oversize), sha256(_OVERSIZE).hexdigest()):
+    for private in (_CONTENT_MARKER, str(oversize), sha256(_OVERSIZE).hexdigest(), "prompt.txt"):
         assert private not in refused.text
     # Nothing committed: the proposal is still pending and the head did not move.
     assert [p.status for p in await harness.service.list_composition_proposals(harness.session_id)] == ["pending"]
