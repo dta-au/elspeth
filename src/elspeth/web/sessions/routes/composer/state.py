@@ -2114,7 +2114,8 @@ async def get_state_yaml(
 
         # Audit-first and fence-first: a failed or stale COMPOSE authority
         # returns no YAML and emits no completion telemetry.
-        service.session_operation_authority.mutate(
+        await run_sync_in_worker(
+            service.session_operation_authority.mutate,
             lease.context,
             lambda transaction: transaction.composer_completion.record_yaml_export(
                 composition_state_id=state_record.id,

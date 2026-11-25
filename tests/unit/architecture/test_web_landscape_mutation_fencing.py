@@ -4996,7 +4996,7 @@ _ADMISSION_REFUSAL_CALLER = (
 # Closed recipe: closure-bound UUID; observed terminal status; distinct running
 # and reconciliation leaders; cleanup held inside the latter's current fence.
 # Equality includes both finally releases and the durable completion ordering.
-_ADMISSION_REFUSAL_RECIPE_SHA256 = "5fa9c45dcfdd026ab4bd079bf39133958b9831267c168e8637bb20f930506297"
+_ADMISSION_REFUSAL_RECIPE_SHA256 = "1c89bb09fe38a16e5e8427f9198fa9ce82a6f14ad609fc05441516737182c15e"
 _EXACT_ESTABLISHMENT_CALLERS = {
     "acquire_reconciliation_leadership": frozenset(
         {
@@ -5872,7 +5872,7 @@ _reserve_CANCEL_ROUTE_SHA256 = "084791796bc88481d879d0a09b7ab43e8f483c378d56cff6
 _reserve_CANCEL_CONSUMERS = {
     "src/elspeth/web/composer_watch_reads.py": "099b7e92f3617d5d9f39b479c1f21f229375e24e20208d294c822d7099cf6e3f",
     "src/elspeth/web/sessions/composer_turn.py": "b0a326ae16a369285d785d58bc57f6f5f1fba5b5c88f1d6201e3eefcc223ae5e",
-    "src/elspeth/web/sessions/composer_async_worker.py": "b5990c3971990c924f0288eefd543a607151fb7c0db5def4e9a02a36f7422a0a",
+    "src/elspeth/web/sessions/composer_async_worker.py": "3e41f0c8f858069b715a14d4b5200d0d6a12c4076907dbe155afa16f7946d19e",
 }
 
 

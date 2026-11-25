@@ -3225,7 +3225,7 @@ class ExecutionServiceImpl:
 
         async def finish_cleanup() -> None:
             if self._blob_service is not None:
-                lease.guard_external_effect()
+                await run_sync_in_worker(lease.guard_external_effect)
                 outcome = await self._blob_service.finalize_run_output_blobs(
                     run_id,
                     success=False,

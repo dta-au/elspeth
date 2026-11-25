@@ -1509,7 +1509,7 @@ class AdvisorCheckpointOwner:
                 findings_text="Final review cannot be admitted within the existing planner budget.",
                 failure_class="budget_exhausted",
                 provider_failure=provider_failure,
-                retryable=provider_failure is None,
+                retryable=provider_failure is None and last_failure_retryable,
             )
 
         first_attempt_schema_valid: bool | None = None
@@ -1737,25 +1737,25 @@ class AdvisorCheckpointOwner:
             except provider_failures as exc:
                 # Only declared provider failures become provider verdicts.
                 # Audit failures and defects in controlled code must propagate.
-                # Retain exceptions only to classify the final outcome.
-                last_exc = exc
-                last_response_unparseable = False
-                last_cut_off_cap = None
                 call_arguments = arguments
                 format_reprompt_pending = False
                 failure = classify_provider_failure(exc)
-                if failure is not None and failure.request_rejection is not None:
-                    last_request_failure = self._retain_request_failure(
-                        exc, failure.request_rejection, recorder=recorder, attempt_call_offset=attempt_call_offset
-                    )
+                # Only a dispatched request replaces the previous outcome. If
+                # none has dispatched yet, keep the current admission failure.
+                if attempt_dispatched or provider_attempts == 0:
+                    last_exc = exc
+                    last_response_unparseable = False
+                    last_cut_off_cap = None
+                    if failure is not None and failure.request_rejection is not None:
+                        last_request_failure = self._retain_request_failure(
+                            exc, failure.request_rejection, recorder=recorder, attempt_call_offset=attempt_call_offset
+                        )
+                    if attempt_dispatched:
+                        # Review retries are immediate: a provider 429 would
+                        # land inside the provider's own wait.
+                        last_failure_retryable = failure is None or (failure.retryable and not failure.rate_limited)
                 if continuation_budget is not None and not continuation_budget.has_cost_headroom():
                     return continuation_withheld(provider_failure=last_request_failure)
-                if attempt_dispatched:
-                    # An attempt stopped before dispatch (a timeout in the guard or
-                    # quota admission) leaves the last call's retryability standing.
-                    # Review retries are immediate, so a provider 429 is never re-sent
-                    # here: it would land inside the provider's own wait.
-                    last_failure_retryable = failure is None or (failure.retryable and not failure.rate_limited)
                 if request_size_rejection(exc) is not None and sent_earlier_turn and not leave_out_all_earlier:
                     leave_out_all_earlier = True
                     size_resend_pending = True

@@ -552,7 +552,7 @@ class ComposerAsyncWorker:
 
     async def _job(self, claim: ComposerOperationClaim) -> _AdoptionSettlementHandoff | None:
         services = composer_app_services(self._app)
-        lock = await services.compose_locks.get_lock(str(claim.session_id))
+        lock: asyncio.Lock = await services.compose_locks.get_lock(str(claim.session_id))
         record = await _owned(
             run_sync_in_worker(self._authority.get_for_turn, session_id=claim.session_id, operation_id=claim.operation_id)
         )

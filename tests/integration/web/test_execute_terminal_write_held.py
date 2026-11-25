@@ -34,6 +34,7 @@ from sqlalchemy.engine import Engine
 
 from elspeth.contracts.errors import GracefulShutdownError
 from elspeth.web.app import create_app
+from elspeth.web.async_workers import run_lease_upkeep_in_worker
 from elspeth.web.composer.state import CompositionState, OutputSpec, PipelineMetadata, SourceSpec
 from elspeth.web.config import WebSettings
 from elspeth.web.coordination.upkeep_engine import lease_upkeep_authority
@@ -58,6 +59,36 @@ _SCENARIO_BOUND_SECONDS = 90.0
 #: What a scenario that never returned had got to; read only when the bound is hit.
 _SCENARIO_NOTES: list[str] = []
 _LIVE_REGISTRIES: list[Any] = []
+
+
+def _lease_registry_notes(registry: Any) -> list[str]:
+    obligations = tuple(registry._pending.values())
+    notes = [f"execution lease registry: {len(obligations)} pending obligation(s)"]
+    for obligation in obligations:
+        release = obligation.release_submission
+        notes.append(
+            "unretired lease obligation: "
+            f"release observed={release is not None and release.observed}, "
+            f"release ended with={None if release is None else release.original_error!r}, "
+            f"succeeded={obligation.release_succeeded}, lost={obligation.release_lost}, "
+            f"completion={obligation.completion_required}/{obligation.completion_observed}, "
+            f"lifecycle={obligation.lifecycle_required}/{obligation.lifecycle_observed}"
+        )
+    return notes
+
+
+@asynccontextmanager
+async def _preserve_first_failure(failures: list[BaseException]) -> AsyncIterator[None]:
+    try:
+        yield
+    except BaseException as closing:
+        if not failures:
+            raise
+        original = failures[0]
+        if closing is not original:
+            original.add_note(f"app shutdown also failed with {type(closing).__name__}: {closing}")
+            raise original from closing
+        raise
 
 
 def _bounded(scenario: Callable[..., Coroutine[Any, Any, None]]) -> Callable[..., None]:
@@ -95,16 +126,7 @@ def _bounded(scenario: Callable[..., Coroutine[Any, Any, None]]) -> Callable[...
             faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
             waiting.extend(_SCENARIO_NOTES)
             for registry in _LIVE_REGISTRIES:
-                for obligation in tuple(registry._pending.values()):
-                    release = obligation.release_submission
-                    waiting.append(
-                        "unretired lease obligation: "
-                        f"release observed={release is not None and release.observed}, "
-                        f"release ended with={None if release is None else release.original_error!r}, "
-                        f"succeeded={obligation.release_succeeded}, lost={obligation.release_lost}, "
-                        f"completion={obligation.completion_required}/{obligation.completion_observed}, "
-                        f"lifecycle={obligation.lifecycle_required}/{obligation.lifecycle_observed}"
-                    )
+                waiting.extend(_lease_registry_notes(registry))
             pytest.fail(
                 f"the scenario, or the app shutdown that ends it, did not return within {_SCENARIO_BOUND_SECONDS:.0f} s. "
                 "Unfinished tasks:\n" + "\n".join(sorted(waiting))
@@ -143,6 +165,8 @@ class _HeldRun:
     bridged_when_cancelled: int | None = None
     #: Heartbeats refused after ``stop_lease_renewal``.
     renewals_refused: int = 0
+    #: The upkeep authority's own renew, kept when the heartbeat is stopped.
+    unstopped_renew: Any = None
 
     async def status(self) -> dict[str, Any]:
         response = await self.client.get(f"/api/runs/{self.run_id}", headers=self.headers)
@@ -179,15 +203,34 @@ class _HeldRun:
         """Make the next heartbeat fail, as it does when the store that stalled the write stalls it too.
 
         The heartbeat renews through the lease-upkeep authority, so that is the
-        one stopped; ``renewals_refused`` counts the heartbeats it refused.
+        one stopped; ``renewals_refused`` counts the refusals of this run's own
+        lease, whatever else renews through the same authority.
         """
+        registry = self.app.state.execution_service.execution_lease_release_registry
+        (obligation,) = tuple(registry._pending.values())
+        run_context = obligation.context
+        assert run_context is not None
 
-        def renewal_stalled(*_args: Any, **_kwargs: Any) -> Any:
-            self.renewals_refused += 1
+        def renewal_stalled(context: Any, *_args: Any, **_kwargs: Any) -> Any:
+            if context == run_context:
+                self.renewals_refused += 1
             raise RuntimeError("the test stopped lease renewal")
 
         upkeep = lease_upkeep_authority(self.app.state.session_service.session_operation_authority)
+        self.unstopped_renew = upkeep.renew
         monkeypatch.setattr(upkeep, "renew", renewal_stalled)
+
+    async def shorten_lease(self, lease_seconds: int) -> None:
+        """Renew the run's lease once more, for ``lease_seconds``, past the stopped heartbeat.
+
+        Call it only after a heartbeat was refused: a refused renewal ends the
+        heartbeat, so no renewal still in flight can extend the lease again.
+        """
+        assert self.renewals_refused >= 1, "the heartbeat must have stopped first"
+        registry = self.app.state.execution_service.execution_lease_release_registry
+        (obligation,) = tuple(registry._pending.values())
+        assert obligation.context is not None
+        await run_lease_upkeep_in_worker(self.unstopped_renew, obligation.context, lease_seconds=lease_seconds)
 
     def drop_the_unreleased_lease_obligation(self) -> None:
         """Let this test's app close after its lease ran out under a live thread.
@@ -269,7 +312,6 @@ async def _run_with_a_held_write(
     *,
     hold: Literal["terminal status", "progress event"] = "terminal status",
     slow_calls: _FakeCounter | None = None,
-    lease_seconds: int | None = None,
     give_up_seconds: float | None = None,
 ) -> AsyncIterator[_HeldRun]:
     """Start a run whose first write of the ``hold`` kind is held until ``release`` is set.
@@ -278,6 +320,8 @@ async def _run_with_a_held_write(
     write has been sent. Shortening it for the whole run would also cut an
     ordinary call that runs slowly (a first, cold call under coverage takes
     longer than 0.25 s), and the run would end before it reached the held write.
+    The run's lease keeps its ordinary length for the same reason; a test that
+    needs it short shortens it on the held run (``_HeldRun.shorten_lease``).
     """
     for name in ("blobs", "outputs", "runs"):
         (tmp_path / name).mkdir()
@@ -298,7 +342,8 @@ async def _run_with_a_held_write(
     app.state.auth_provider.create_user("testuser", "testpass123", display_name="Test User")
     wire_test_pipeline_user_authority(app, identity_id="testuser", engine=app.state.session_engine)
 
-    async with AsyncExitStack() as app_lifetime:
+    scenario_failures: list[BaseException] = []
+    async with _preserve_first_failure(scenario_failures), AsyncExitStack() as app_lifetime:
         await app_lifetime.enter_async_context(LifespanManager(app))
         client = await app_lifetime.enter_async_context(AsyncClient(transport=ASGITransport(app=app), base_url="http://test"))
         login = await client.post("/api/auth/login", json={"username": "testuser", "password": "testpass123"})
@@ -349,9 +394,6 @@ async def _run_with_a_held_write(
                 "_telemetry",
                 replace(app.state.execution_service._telemetry, execution_loop_bridge_slow_total=slow_calls),
             )
-        if lease_seconds is not None:
-            monkeypatch.setattr(session_service, "_session_operation_lease_seconds", lease_seconds)
-
         run = _HeldRun(
             app=app,
             settings=settings,
@@ -407,13 +449,6 @@ async def _run_with_a_held_write(
 
         monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", schedule)
 
-        started = await client.post(f"/api/sessions/{session_id}/execute", headers=headers)
-        assert started.status_code == 202, started.text
-        run.run_id = started.json()["run_id"]
-        try:
-            await asyncio.wait_for(run.held.wait(), _BOUND_SECONDS)
-        except TimeoutError:
-            pytest.fail(f"the run did not reach the held write within {_BOUND_SECONDS:.0f} s; bridged calls so far: {run.bridged}")
         real_finalize = app.state.execution_service._finalize_output_blobs
 
         def finalize(run_id: str, *, success: bool, **kwargs: Any) -> Any:
@@ -421,7 +456,8 @@ async def _run_with_a_held_write(
             return real_finalize(run_id, success=success, **kwargs)
 
         monkeypatch.setattr(app.state.execution_service, "_finalize_output_blobs", finalize)
-        _LIVE_REGISTRIES.append(app.state.execution_service.execution_lease_release_registry)
+        lease_registry = app.state.execution_service.execution_lease_release_registry
+        _LIVE_REGISTRIES.append(lease_registry)
         real_begin = app.state.process_recovery._begin
 
         def begin(reason: Any, *, signal_target: bool) -> None:
@@ -432,7 +468,6 @@ async def _run_with_a_held_write(
             real_begin(reason, signal_target=signal_target)
 
         monkeypatch.setattr(app.state.process_recovery, "_begin", begin)
-        lease_registry = app.state.execution_service.execution_lease_release_registry
         real_record_failure = lease_registry.record_failure
 
         def record_failure(original: BaseException) -> None:
@@ -441,12 +476,31 @@ async def _run_with_a_held_write(
 
         monkeypatch.setattr(lease_registry, "record_failure", record_failure)
         try:
+            started = await client.post(f"/api/sessions/{session_id}/execute", headers=headers)
+            assert started.status_code == 202, started.text
+            run.run_id = started.json()["run_id"]
+            try:
+                await asyncio.wait_for(run.held.wait(), _BOUND_SECONDS)
+            except TimeoutError:
+                pytest.fail(f"the run did not reach the held write within {_BOUND_SECONDS:.0f} s; bridged calls so far: {run.bridged}")
+        except BaseException as raised:
+            note = f"held-write setup failed with {type(raised).__name__}: {raised}"
+            _SCENARIO_NOTES.append(note)
+            raised.add_note("\n".join([note, *_lease_registry_notes(lease_registry)]))
+            scenario_failures.append(raised)
+            run.drop_the_unreleased_lease_obligation()
+            run.release.set()
+            raise
+        try:
             yield run
         except BaseException as raised:
             where = " > ".join(
                 f"{frame.filename.rsplit('/', 1)[-1]}:{frame.lineno} {frame.name}" for frame in traceback.extract_tb(raised.__traceback__)
             )
             _SCENARIO_NOTES.append(f"the test body had already ended with {type(raised).__name__}: {raised} at {where}")
+            raised.add_note("\n".join(_lease_registry_notes(lease_registry)))
+            scenario_failures.append(raised)
+            run.drop_the_unreleased_lease_obligation()
             raise
         else:
             _SCENARIO_NOTES.append("the test body had already finished; the app shutdown did not return")
@@ -663,14 +717,16 @@ async def test_a_lapsed_lease_neither_lets_recovery_take_a_waiting_run_nor_lets_
     reached_the_end: list[bool] = []
     # The app reports the lost lease when it closes; the assertions inside must still all have run.
     with pytest.raises(ExceptionGroup, match="Application lifecycle obligations failed"):
-        async with _run_with_a_held_write(tmp_path, monkeypatch, lease_seconds=2) as run:
+        async with _run_with_a_held_write(tmp_path, monkeypatch) as run:
             epoch = run.fence_epoch()
             # The stall that holds the write also stops the heartbeat, so the lease runs out
-            # while the thread is still waiting on the bridge.
+            # while the thread is still waiting on the bridge. The heartbeat really is stopped
+            # where it renews, and its first refusal ends it; only then is the lease cut to 2 s,
+            # so no renewal still in flight can extend it again.
             run.stop_lease_renewal(monkeypatch)
+            await run.until(lambda: run.renewals_refused >= 1)
+            await run.shorten_lease(2)
             await run.until(run.lease_has_lapsed)
-            # The heartbeat really was stopped where it renews.
-            assert run.renewals_refused >= 1
 
             await run.recover()
 
