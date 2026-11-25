@@ -53,6 +53,7 @@ from elspeth.contracts.results import FailureInfo
 from elspeth.contracts.scheduler import GroupLossSpec, TokenWorkItem, TokenWorkStatus
 from elspeth.core.landscape.lease_deadlines import LeaseDeadlineExpiredError
 from elspeth.engine._error_hash import compute_error_hash
+from elspeth.engine._tier_1_chain import raise_keeping_own_links, tier_1_error_in_chain
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -79,6 +80,24 @@ if TYPE_CHECKING:
 MAX_WORK_QUEUE_ITERATIONS = 100_000
 SCHEDULER_MAINTENANCE_INTERVAL = 64
 logger = logging.getLogger(__name__)
+
+
+def _raise_tier_1_error_in_chain(coordination_signal: BaseException) -> None:
+    """Raise a Tier-1 error carried in a coordination signal's chain as itself.
+
+    A lost claim lease, membership or leadership found while a processing
+    error propagates carries that error only in its cause or context chain.
+    A Tier-1 error found there leaves with its own links, the signal noted on
+    it. With none in the chain this returns and the caller handles the signal.
+    """
+    tier_1_error = tier_1_error_in_chain(coordination_signal)
+    if tier_1_error is None:
+        return
+    tier_1_error.add_note(
+        "the claim's coordination was found lost while this error was propagating: "
+        f"{type(coordination_signal).__name__}: {coordination_signal}"
+    )
+    raise_keeping_own_links(tier_1_error)
 
 
 class RowResultError(Exception):
@@ -684,6 +703,10 @@ class SchedulerDrainCoordinator:
                         # peer's re-drive re-stages them with its own disposition).
                         self._pending_group_losses.clear()
                         exc.add_note("scheduler lease lost during row processing; in-flight token result was abandoned")
+                        # A Tier-1 error the processing raised before the lease
+                        # loss was found leaves the drain as itself, still
+                        # without any disposition for the abandoned claim.
+                        _raise_tier_1_error_in_chain(exc)
                         self._spans.mark_error(row_span, exc)
                         return results
                     except (RunLeadershipLostError, RunMembershipLostError, RunWorkerEvictedError) as exc:
@@ -695,6 +718,9 @@ class SchedulerDrainCoordinator:
                         # AuditIntegrityError when another member remains.
                         self._pending_group_losses.clear()
                         exc.add_note("worker membership lost during row processing; in-flight token result was abandoned")
+                        # A Tier-1 error the processing raised before the loss
+                        # was found leaves the drain as itself.
+                        _raise_tier_1_error_in_chain(exc)
                         raise
                     except LeaseDeadlineExpiredError as exc:
                         # The heartbeat transaction rolled back for insufficient
@@ -721,6 +747,9 @@ class SchedulerDrainCoordinator:
                             evicted_exc.add_note(
                                 f"processing exception {type(processing_exc).__name__} was superseded by the eviction refusal"
                             )
+                            # A Tier-1 processing error is not superseded: it
+                            # leaves the drain as itself.
+                            _raise_tier_1_error_in_chain(evicted_exc)
                             raise
                         except Exception as scheduler_exc:
                             raise AuditIntegrityError(
