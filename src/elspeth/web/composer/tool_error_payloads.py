@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, TypedDict
 
 from elspeth.web.composer.audit import canonicalize_pydantic_cause, canonicalize_schema_violations
 from elspeth.web.composer.protocol import SchemaViolationCode, ToolArgumentError
+from elspeth.web.composer.redaction import safe_arg_error_class
 from elspeth.web.composer.tools._dispatch import declared_argument_length_bounds, declared_argument_names
 from elspeth.web.composer.tools.wire_projection import EmptyArgumentsMarker, EnvelopeUnwrap, WireTool
 
@@ -16,6 +17,23 @@ UNKNOWN_TOOL_REDACTION_STATUS: Final[str] = "unknown_tool"
 
 if TYPE_CHECKING:
     from elspeth.web.composer.redaction_telemetry import RedactionTelemetry
+
+
+class ArgErrorArgumentsProjection(TypedDict):
+    """The value-free arguments stored for an ARG_ERROR tool invocation."""
+
+    _redaction_status: str
+    error_class: str | None
+    field_count: int
+
+
+def arg_error_arguments_projection(*, error_class: str | None, field_count: int) -> ArgErrorArgumentsProjection:
+    """Return the value-free argument projection for an ARG_ERROR invocation."""
+    return {
+        "_redaction_status": INVALID_TOOL_ARGUMENTS_REDACTION_STATUS,
+        "error_class": safe_arg_error_class(error_class),
+        "field_count": field_count,
+    }
 
 
 def unknown_tool_arguments_redaction(*, telemetry: RedactionTelemetry) -> Mapping[str, Any]:
