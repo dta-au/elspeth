@@ -971,6 +971,127 @@ class TestFollowerMembershipFenceRefusalMidDrain:
         assert len(coord_repo.depart_calls) == 1
 
 
+class _TierOneThenMembershipLossProcessor:
+    """A drain pass whose processing raised a Tier-1 error and then lost membership.
+
+    ``link="context"`` mirrors the drain's failure bookkeeping: the
+    membership-fenced failure write refuses, and the refusal carries the
+    Tier-1 error only as its ``__context__`` plus a note, exactly as
+    scheduler_drain re-raises it. ``link="cause"`` names the Tier-1 error only
+    as the refusal's ``__cause__``, with an unrelated ``__context__``.
+
+    The Tier-1 error has its own lower-level cause, as a recorder error
+    wrapping a database error does.
+    """
+
+    def __init__(self, *, signal: type[Exception], link: str) -> None:
+        self.lower_level_error = SQLAOperationalError("UPDATE run_workers", {}, Exception("connection reset"))
+        self.tier_1_error = AuditIntegrityError("claimed token's ledger row disagrees with the work item")
+        self._signal = signal
+        self._link = link
+
+    def _fenced_failure_write(self) -> None:
+        if self._signal is RunMembershipLostError:
+            raise RunMembershipLostError(run_id=RUN_ID, worker_id=WORKER_ID, verb="mark_failed")
+        raise RunWorkerEvictedError(worker_id=WORKER_ID, run_id=RUN_ID, reason="claim re-probe found the member departed")
+
+    def _refusal_caused_by(self, processing_error: BaseException) -> None:
+        try:
+            raise ValueError("failure bookkeeping could not be prepared")
+        except ValueError:
+            try:
+                self._fenced_failure_write()
+            except (RunMembershipLostError, RunWorkerEvictedError) as refusal:
+                raise refusal from processing_error
+
+    def drain_follower_ready_work(self, ctx: PluginContext, *, before_claim: object = None) -> list[object]:
+        try:
+            raise self.tier_1_error from self.lower_level_error
+        except AuditIntegrityError as processing_exc:
+            if self._link == "context":
+                try:
+                    self._fenced_failure_write()
+                except (RunMembershipLostError, RunWorkerEvictedError) as refusal:
+                    refusal.add_note(f"processing exception {type(processing_exc).__name__} was superseded by the eviction refusal")
+                    raise
+            processing_error = processing_exc
+        self._refusal_caused_by(processing_error)
+        return []
+
+
+class _LoopingChainMembershipLossProcessor:
+    """A membership refusal whose cause chain loops back on itself and holds no Tier-1 error."""
+
+    def drain_follower_ready_work(self, ctx: PluginContext, *, before_claim: object = None) -> list[object]:
+        refusal = RunMembershipLostError(run_id=RUN_ID, worker_id=WORKER_ID, verb="mark_failed")
+        middle = ValueError("plugin failure")
+        middle.__cause__ = refusal
+        refusal.__cause__ = middle
+        raise refusal
+
+
+class TestFollowerTierOneErrorOutranksMembershipLoss:
+    """A Tier-1 error raised in processing leaves the follower as itself.
+
+    It is raised even when membership was lost at the same moment, whatever the
+    run's status, so ``elspeth join`` reports it as a framework failure (exit 4
+    with its traceback) instead of a clean departure or an eviction.
+    """
+
+    @pytest.mark.parametrize("link", ["context", "cause"])
+    @pytest.mark.parametrize("signal", [RunMembershipLostError, RunWorkerEvictedError])
+    @pytest.mark.parametrize("run_terminal", [True, False], ids=["run-terminal", "run-running"])
+    def test_tier_1_error_carried_by_the_membership_loss_is_raised(self, signal: type[Exception], run_terminal: bool, link: str) -> None:
+        processor = _TierOneThenMembershipLossProcessor(signal=signal, link=link)
+        coord_repo = _StubRunCoordRepo()
+        heartbeat = _StubHeartbeat(evicted=False)
+        factory = _StubFactory(running=True)
+        factory.run_lifecycle.get_run_results = [
+            _RunStatusRecord(status=RunStatus.RUNNING),
+            _RunStatusRecord(status=RunStatus.COMPLETED if run_terminal else RunStatus.RUNNING),
+        ]
+        follower = FollowerProcessor(
+            processor=processor,
+            member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID),
+            run_coordination=coord_repo,
+            factory=factory,
+            wait_fn=lambda _: None,
+        )
+
+        with (
+            patch("elspeth.engine.orchestrator.follower.RunHeartbeatThread", return_value=heartbeat),
+            pytest.raises(AuditIntegrityError) as exc_info,
+        ):
+            follower.run(ctx=_ctx())
+
+        assert exc_info.value is processor.tier_1_error
+        # Its own chain is left as the processing raised it, and the membership loss is noted on it.
+        assert exc_info.value.__cause__ is processor.lower_level_error
+        loss_notes = [note for note in exc_info.value.__notes__ if note.startswith(f"follower {WORKER_ID!r} lost its run membership")]
+        assert len(loss_notes) == 1
+        assert f": {signal.__name__}: " in loss_notes[0]
+        assert len(coord_repo.depart_calls) == 1
+
+    def test_looping_chain_without_tier_1_error_is_still_an_eviction(self) -> None:
+        coord_repo = _StubRunCoordRepo()
+        follower = FollowerProcessor(
+            processor=_LoopingChainMembershipLossProcessor(),
+            member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID),
+            run_coordination=coord_repo,
+            factory=_StubFactory(running=True),
+            wait_fn=lambda _: None,
+        )
+
+        with (
+            patch("elspeth.engine.orchestrator.follower.RunHeartbeatThread", return_value=_StubHeartbeat(evicted=False)),
+            pytest.raises(RunWorkerEvictedError) as exc_info,
+        ):
+            follower.run(ctx=_ctx())
+
+        assert type(exc_info.value.__cause__) is RunMembershipLostError
+        assert len(coord_repo.depart_calls) == 1
+
+
 _TERMINAL_STATUSES = [status for status in RunStatus if status is not RunStatus.RUNNING]
 
 
