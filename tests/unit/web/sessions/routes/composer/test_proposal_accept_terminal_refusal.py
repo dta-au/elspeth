@@ -32,6 +32,13 @@ from elspeth.web.sessions.models import composition_states_table
 from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.routes.composer import proposals as routes
 
+# Bounds each wait in the legacy-refusal cancellation test. Its first case in a
+# fresh process under branch coverage measured 3.7-4.1 s of call time (0.76 s
+# without coverage), most of it before the gate is entered. 20 s leaves about
+# 5x that and stays below the 30 s session-operation lease the route holds, so
+# a hang fails here before that lease can lapse.
+_HANG_GUARD_SECONDS = 20.0
+
 
 def _proposal(
     service: Any,
@@ -510,7 +517,7 @@ async def test_cancellation_drains_legacy_refusal_and_lease(
     def gated_dispatch(*args: Any, **kwargs: Any) -> Any:
         if gate == "dispatch":
             loop.call_soon_threadsafe(entered.set)
-            assert release_dispatch.wait(10), "dispatch was never released"
+            assert release_dispatch.wait(_HANG_GUARD_SECONDS), "dispatch was never released"
         return real_dispatch(*args, **kwargs)
 
     def capture_cancellation(state: Any, error: asyncio.CancelledError) -> None:
@@ -541,7 +548,7 @@ async def test_cancellation_drains_legacy_refusal_and_lease(
     monkeypatch.setattr(_DeferredCancellationState, "retain", capture_cancellation)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         request = asyncio.create_task(client.post(endpoint))
-        await asyncio.wait_for(entered.wait(), timeout=5)
+        await asyncio.wait_for(entered.wait(), timeout=_HANG_GUARD_SECONDS)
         request.cancel("legacy-refusal-cancel")
         request.cancel("legacy-refusal-cancel")
         await asyncio.sleep(0)
@@ -550,7 +557,7 @@ async def test_cancellation_drains_legacy_refusal_and_lease(
         release.set()
         release_dispatch.set()
         with pytest.raises(asyncio.CancelledError) as caught:
-            await asyncio.wait_for(request, timeout=5)
+            await asyncio.wait_for(request, timeout=_HANG_GUARD_SECONDS)
         if gate != "lease_close":
             assert caught.value is cancellations[0]
             assert caught.value.args == ("legacy-refusal-cancel",)
