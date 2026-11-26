@@ -373,6 +373,9 @@ jobs:
           image-ref: ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}@${{ steps.ghcr-push.outputs.digest }}
           format: table
           output: ${{ github.workspace }}/${{ env.CI_CHECKOUT_PATH }}/.build-evidence/main-vulnerabilities-ghcr-linux-amd64.txt
+          # Version-scoped, expiring base-image OpenSSL exceptions; see the file
+          # header. A missing file fails the step (trivy-action exits 1).
+          trivyignores: ${{ env.CI_CHECKOUT_PATH }}/.trivyignore.yaml
           scanners: vuln
           severity: CRITICAL,HIGH
           ignore-unfixed: false
@@ -387,6 +390,7 @@ jobs:
           image-ref: ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}@${{ steps.ghcr-push.outputs.digest }}
           format: table
           output: ${{ github.workspace }}/${{ env.CI_CHECKOUT_PATH }}/.build-evidence/main-vulnerabilities-ghcr-linux-arm64.txt
+          trivyignores: ${{ env.CI_CHECKOUT_PATH }}/.trivyignore.yaml
           scanners: vuln
           severity: CRITICAL,HIGH
           ignore-unfixed: false
@@ -448,6 +452,7 @@ jobs:
           image-ref: ${{ secrets.ACR_REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.acr-push.outputs.digest }}
           format: table
           output: ${{ github.workspace }}/${{ env.CI_CHECKOUT_PATH }}/.build-evidence/main-vulnerabilities-acr-linux-amd64.txt
+          trivyignores: ${{ env.CI_CHECKOUT_PATH }}/.trivyignore.yaml
           scanners: vuln
           severity: CRITICAL,HIGH
           ignore-unfixed: false
@@ -462,6 +467,7 @@ jobs:
           image-ref: ${{ secrets.ACR_REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.acr-push.outputs.digest }}
           format: table
           output: ${{ github.workspace }}/${{ env.CI_CHECKOUT_PATH }}/.build-evidence/main-vulnerabilities-acr-linux-arm64.txt
+          trivyignores: ${{ env.CI_CHECKOUT_PATH }}/.trivyignore.yaml
           scanners: vuln
           severity: CRITICAL,HIGH
           ignore-unfixed: false

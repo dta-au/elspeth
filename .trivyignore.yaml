@@ -1,0 +1,37 @@
+# Trivy exceptions for the main ELSPETH image scans in
+# .github/workflows/build-push.yaml. The gateway image scans do not use this
+# file, and the pip-audit gates take no exceptions.
+#
+# Both entries are unfixed High findings in Debian 13's OpenSSL package
+# (libssl3t64), which the distroless runtime base image carries. Debian marks
+# them "affected" with no fixed package. Each entry is scoped to the exact
+# package version, on every architecture, and expires: a base image that moves
+# libssl3t64 to another version, or the expiry date, returns the scan to
+# failing. Remove the file once a fixed package is in the pinned base image.
+#
+# Why they do not reach ELSPETH: both are denial-of-service defects in
+# OpenSSL's QUIC implementation. Measured on the 0.8.18 amd64 image:
+#   - no executable or shared library in the image declares a dependency on
+#     the system libssl.so.3 or libcrypto.so.3 other than OpenSSL's own files
+#     (readelf NEEDED; this does not see a library opened with dlopen);
+#   - the bundled CPython uses its own statically linked OpenSSL, and its ssl
+#     module exposes no QUIC interface;
+#   - no QUIC or HTTP/3 package is in uv.lock.
+
+vulnerabilities:
+  - id: CVE-2026-107494
+    purls:
+      - "pkg:deb/debian/libssl3t64@3.5.9-1~deb13u1"
+    statement: >-
+      Denial of service through unbounded QUIC frame queueing in OpenSSL.
+      Debian 13 status affected, no fixed package. Nothing in the image links
+      the system libssl, and ELSPETH uses no QUIC.
+    expired_at: 2027-02-28
+  - id: CVE-2026-124709
+    purls:
+      - "pkg:deb/debian/libssl3t64@3.5.9-1~deb13u1"
+    statement: >-
+      Denial of service through a memory leak in OpenSSL QUIC stream
+      handling. Debian 13 status affected, no fixed package. Nothing in the
+      image links the system libssl, and ELSPETH uses no QUIC.
+    expired_at: 2027-02-28

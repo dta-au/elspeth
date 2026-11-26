@@ -6,6 +6,7 @@ import copy
 import json
 import re
 import tomllib
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,14 @@ _SETUP_UV_PREFIX = "astral-sh/setup-uv@"
 _TRIVY_ACTION_RE = re.compile(r"aquasecurity/trivy-action@[0-9a-f]{40}")
 TRIVY_IGNOREFILE = REPO_ROOT / ".trivyignore.yaml"
 CI_WORKFLOW = WORKFLOW_DIR / "ci.yaml"
+_MAIN_SCAN_IGNOREFILE = "${{ env.CI_CHECKOUT_PATH }}/.trivyignore.yaml"
+# The only accepted main-image exceptions: unfixed High OpenSSL QUIC findings in
+# the distroless base image's Debian 13 libssl3t64, scoped to that exact package
+# version on every architecture (no arch/distro qualifiers).
+_ACCEPTED_TRIVY_EXCEPTIONS = {
+    "CVE-2026-107494": "pkg:deb/debian/libssl3t64@3.5.9-1~deb13u1",
+    "CVE-2026-124709": "pkg:deb/debian/libssl3t64@3.5.9-1~deb13u1",
+}
 _IGNORE_VULN_RE = re.compile(r"--ignore-vuln\s+(\S+)")
 
 _MAIN_SCAN_CASES = (
@@ -100,7 +109,7 @@ def _assert_main_release_scan_contract(job: dict[str, Any]) -> None:
             assert step["with"]["severity"] == "CRITICAL,HIGH"
             assert step["with"]["ignore-unfixed"] is False
             assert step["with"]["exit-code"] == "1"
-            assert "trivyignores" not in step["with"], f"{name} must take no vulnerability exceptions"
+            assert step["with"].get("trivyignores") == _MAIN_SCAN_IGNOREFILE, f"{name} must use only the version-scoped exception file"
             report = f"main-vulnerabilities-{file_label}-linux-{architecture}.txt"
             assert report in step["with"]["output"]
             assert _step_index(job, build_name) < _step_index(job, name) < _step_index(job, sign_name)
@@ -130,6 +139,7 @@ def _compliant_main_release_job() -> dict[str, Any]:
                         "severity": "CRITICAL,HIGH",
                         "ignore-unfixed": False,
                         "exit-code": "1",
+                        "trivyignores": _MAIN_SCAN_IGNOREFILE,
                     },
                 }
             )
@@ -181,10 +191,15 @@ def test_main_release_scan_validator_rejects_missing_rebound_late_or_unretained_
     with pytest.raises(AssertionError, match="must retain"):
         _assert_main_release_scan_contract(unretained)
 
-    excepted = copy.deepcopy(job)
-    _one_step(excepted, "Scan published main GHCR arm64 digest")["with"]["trivyignores"] = ".trivyignore.yaml"
-    with pytest.raises(AssertionError, match="no vulnerability exceptions"):
-        _assert_main_release_scan_contract(excepted)
+    widened = copy.deepcopy(job)
+    _one_step(widened, "Scan published main GHCR arm64 digest")["with"]["trivyignores"] = ".trivyignore"
+    with pytest.raises(AssertionError, match="version-scoped exception file"):
+        _assert_main_release_scan_contract(widened)
+
+    unscoped = copy.deepcopy(job)
+    del _one_step(unscoped, "Scan published main ACR-only amd64 digest")["with"]["trivyignores"]
+    with pytest.raises(AssertionError, match="version-scoped exception file"):
+        _assert_main_release_scan_contract(unscoped)
 
 
 def _pip_audit_runs() -> list[str]:
@@ -199,18 +214,58 @@ def _pip_audit_runs() -> list[str]:
     return runs
 
 
-def test_pip_audit_and_image_scans_take_no_vulnerability_exceptions() -> None:
-    """chromadb, the only excepted package, left the dependency set in 0.8.18.
+def test_pip_audit_takes_no_vulnerability_exceptions() -> None:
+    """chromadb, the only pip-audit exception, left the dependency set in 0.8.18.
 
-    Its four server-side CVEs were the sole pip-audit ``--ignore-vuln`` entries
-    and the sole ``.trivyignore.yaml`` entries. With the package gone, any new
-    exception is a fresh decision, not an inherited one.
+    Its four server-side CVEs were the sole pip-audit ``--ignore-vuln`` entries.
+    With the package gone, any new Python exception is a fresh decision.
     """
     for run in _pip_audit_runs():
         assert _IGNORE_VULN_RE.findall(run) == [], "pip-audit must take no --ignore-vuln exceptions"
-    assert not TRIVY_IGNOREFILE.exists(), "no image scan takes exceptions, so no Trivy ignore file is kept"
     locked = tomllib.loads((REPO_ROOT / "uv.lock").read_text(encoding="utf-8"))["package"]
     assert "chromadb" not in {package["name"] for package in locked}
+
+
+def _assert_trivy_exceptions_are_exactly_the_accepted_set(entries: object) -> None:
+    assert isinstance(entries, list) and entries, "the exception file must list its entries"
+    ids = [entry["id"] for entry in entries]
+    assert sorted(ids) == sorted(_ACCEPTED_TRIVY_EXCEPTIONS), f"unaccepted or missing Trivy exception: {ids}"
+    for entry in entries:
+        vuln_id = entry["id"]
+        assert set(entry) == {"id", "purls", "statement", "expired_at"}, f"{vuln_id} must not widen its scope"
+        assert entry["purls"] == [_ACCEPTED_TRIVY_EXCEPTIONS[vuln_id]], f"{vuln_id} must be scoped to one exact package version"
+        assert isinstance(entry["expired_at"], date), f"{vuln_id} must carry an expiry date"
+        assert entry["statement"].strip(), f"{vuln_id} must state why it does not apply"
+
+
+def test_trivy_exceptions_are_the_accepted_version_scoped_expiring_set() -> None:
+    document = yaml.safe_load(TRIVY_IGNOREFILE.read_text(encoding="utf-8"))
+    assert set(document) == {"vulnerabilities"}, "the exception file must hold vulnerability entries only"
+    _assert_trivy_exceptions_are_exactly_the_accepted_set(document["vulnerabilities"])
+
+
+def test_trivy_exception_validator_rejects_added_widened_or_unexpiring_entries() -> None:
+    entries = yaml.safe_load(TRIVY_IGNOREFILE.read_text(encoding="utf-8"))["vulnerabilities"]
+    _assert_trivy_exceptions_are_exactly_the_accepted_set(entries)
+
+    added = [*copy.deepcopy(entries), {**copy.deepcopy(entries[0]), "id": "CVE-2026-0001"}]
+    with pytest.raises(AssertionError, match="unaccepted or missing"):
+        _assert_trivy_exceptions_are_exactly_the_accepted_set(added)
+
+    unversioned = copy.deepcopy(entries)
+    unversioned[0]["purls"] = ["pkg:deb/debian/libssl3t64"]
+    with pytest.raises(AssertionError, match="one exact package version"):
+        _assert_trivy_exceptions_are_exactly_the_accepted_set(unversioned)
+
+    path_scoped = copy.deepcopy(entries)
+    path_scoped[1]["paths"] = ["**"]
+    with pytest.raises(AssertionError, match="must not widen"):
+        _assert_trivy_exceptions_are_exactly_the_accepted_set(path_scoped)
+
+    unexpiring = copy.deepcopy(entries)
+    unexpiring[0]["expired_at"] = "never"
+    with pytest.raises(AssertionError, match="expiry date"):
+        _assert_trivy_exceptions_are_exactly_the_accepted_set(unexpiring)
 
 
 def test_pip_audit_exception_instrument_detects_an_ignore() -> None:
