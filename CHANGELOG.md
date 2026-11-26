@@ -183,6 +183,15 @@ establish qualification, a published tag or an image.
 
 ### Fixed
 
+- The release container image can start the web server again. Since 0.8.14,
+  `elspeth web` in the published image stopped with `AttributeError: module
+  'os' has no attribute 'pidfd_open'`, because the CPython 3.14.5 build that
+  the pinned uv 0.11.15 installs lacks `os.pidfd_open` and
+  `signal.pidfd_send_signal`, which the web process watchdog needs. The image
+  now installs CPython 3.14.10 with uv 0.13.10, whose build has both, and the
+  image build refuses an interpreter that lacks either. The gateway image uses
+  the same uv. CLI pipelines and installs from source were not affected.
+
 - Composer validation now refuses a step that requires named fields when it
   sits behind a queue or row_union whose inputs do not all guarantee them. The
   runtime build already refused these pipelines; the composer reported them

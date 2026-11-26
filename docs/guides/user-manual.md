@@ -516,7 +516,7 @@ elspeth health --json
   "checks": {
     "version": {"status": "ok", "value": "0.8.0"},
     "commit": {"status": "ok", "value": "abc123f"},
-    "python": {"status": "ok", "value": "3.14.5"},
+    "python": {"status": "ok", "value": "3.14.10"},
     "database": {"status": "ok", "value": "connected"},
     "config_dir": {"status": "ok", "value": "./config"},
     "output_dir": {"status": "ok", "value": "./output"},
