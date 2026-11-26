@@ -108,23 +108,9 @@ class TestValidatorRecognisesMissingPluginTypes:
         assert model is not None
         assert model.__name__ == "DataverseSourceConfig"
 
-    def test_transform_rag_retrieval_recognised(self) -> None:
-        from elspeth.plugins.infrastructure.validation import get_transform_config_model
-
-        model = get_transform_config_model("rag_retrieval")
-        assert model is not None
-        assert model.__name__ == "RAGRetrievalConfig"
-
     def test_sink_dataverse_recognised(self) -> None:
         from elspeth.plugins.infrastructure.validation import get_sink_config_model
 
         model = get_sink_config_model("dataverse")
         assert model is not None
         assert model.__name__ == "DataverseSinkConfig"
-
-    def test_sink_chroma_sink_recognised(self) -> None:
-        from elspeth.plugins.infrastructure.validation import get_sink_config_model
-
-        model = get_sink_config_model("chroma_sink")
-        assert model is not None
-        assert model.__name__ == "ChromaSinkConfig"

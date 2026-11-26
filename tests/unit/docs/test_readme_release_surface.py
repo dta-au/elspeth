@@ -59,17 +59,30 @@ def test_readme_operational_cutover_states_the_live_schema_epochs() -> None:
     readme = _readme_text()
     text = _section(readme, f"\n## What changed in {version}\n")
 
-    assert f"{version} is a hotfix for 0.8.16 with three Web Composer fixes" in text
-    assert f"Session epoch {SESSION_SCHEMA_EPOCH} and Landscape epoch {SQLITE_SCHEMA_EPOCH} are unchanged from 0.8.16" in text
+    assert f"{version} changes canonical hashing for new runs" in text
+    assert "improves worker coordination and recovery" in text
+    assert f"Session epoch {SESSION_SCHEMA_EPOCH} and Landscape epoch {SQLITE_SCHEMA_EPOCH} are unchanged from 0.8.17" in text
     assert "this release adds no schema-epoch cutover" in text
-    assert "existing 0.8.16 session and Landscape stores open unchanged" in text
-    assert "Upgrading from 0.8.15 or earlier means applying the 0.8.16 upgrade notes first" in text
+    assert "existing 0.8.17 session and Landscape stores open unchanged" in text
+    assert "Finish CLI runs and interrupted web runs before upgrading" in text
+    assert "Upgrading from 0.8.16 or earlier means applying the 0.8.17 and 0.8.16 upgrade notes first" in text
     assert "Backwards compatibility is permitted and considered from 0.8.5 within explicitly supported boundaries" in text
     assert "authorizes no in-place migration, reset or downgrade" in text
     assert f"Package metadata is {version};" in text
     assert "the package version alone does not establish qualification or image publication" in text
     assert "Automatic image publication from main is held" in text
     assert "verify the release tag and image digest" in text
+
+
+def test_readme_keeps_the_0_8_17_upgrade_actions_as_a_historical_pin() -> None:
+    """The 0.8.17 entry keeps its store and prompt-pinning guidance."""
+    text = _upgrade_notes(_readme_text(), "0.8.17")
+
+    assert "0.8.17 changed no schema epoch; 0.8.16 session and Landscape stores open unchanged" in text
+    assert "Existing stores need no action" in text
+    assert "Upgrading from 0.8.15 or earlier means applying the 0.8.16 upgrade notes first" in text
+    assert "`get_pipeline_state` tool description and the advisor's evidence header gained one sentence each" in text
+    assert "Package metadata is" not in text
 
 
 def test_readme_keeps_the_0_8_16_upgrade_actions_as_a_historical_pin() -> None:

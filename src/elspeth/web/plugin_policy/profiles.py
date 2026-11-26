@@ -872,8 +872,7 @@ _S3_PROFILED_USAGE_WHEN_NOT_TO_USE: Final[str] = (
     "approved prefix, or the workflow needs to enumerate or stream multiple objects."
 )
 _AZURE_SEARCH_PROFILED_USAGE_WHEN_NOT_TO_USE: Final[str] = (
-    "Do not use when no operator-approved profile admits the index you need, for indexing documents, "
-    "or for generating answers; use rag_retrieval for Chroma collections."
+    "Do not use when no operator-approved profile admits the index you need, for indexing documents, or for generating answers."
 )
 
 

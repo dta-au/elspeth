@@ -18,9 +18,9 @@ none of it is required to contribute.
 
 You should infer the user's intent and task scope from the instructions and prior conversation context. Your job is to bias towards action and carry the user's intended task to completion.
 
-When the user expresses intent to perform new work or fix an existing issue, persist until the user's intended goal is complete. Progress autonomously towards the user's goal (e.g. creating isolated worktrees / checkouts if needed, resolving merge conflicts, read-only actions, creating draft PRs etc.) unless they are clearly destructive or irreversible.
+When the user expresses intent to perform new work or fix an existing issue, persist until the user's intended goal is complete. Progress autonomously towards the user's goal (e.g. creating isolated worktrees / checkouts if needed, resolving merge conflicts, read-only actions, creating draft PRs etc.) unless they are clearly destructive or irreversible. In the maintainer's multi-lane workflow, lanes do not open PRs: the integrator opens release PRs to `main` ([docs/maintainer/integration-book.md](docs/maintainer/integration-book.md)).
 
-All work must be done inside the project folder inside the project root or a work tree. Under no Circumstances should project work ever be done or stored inside /tmp .
+All work must be done inside the project folder inside the project root or a work tree. Under no Circumstances should project work ever be done or stored inside /tmp . Temporary files (`TMPDIR`, pytest `--basetemp`) are not project work: put them on disk outside `/tmp`, under `~/.pt/<session>/<lane>`, and delete a run's basetemp when it exits 0.
 
 ## Working Directory Discipline
 
@@ -63,11 +63,11 @@ ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing \
 elspeth run --settings examples/<name>/settings.yaml --execute
 ```
 
-### Canonical scripts: worktree cleanup, branch safety, full-suite gate
+### Canonical scripts: worktree cleanup, branch safety, full-suite gate, examples gate
 
-Three scripts under `scripts/` are the canonical way to do the tasks agents
-otherwise improvise by hand (the header of each one cites the transcript
-measurement and the incident behind every rule it enforces). All three are
+Four scripts under `scripts/` are the canonical way to do the tasks agents
+otherwise improvise by hand. Their headers explain the safety rules and the
+reasons behind them. All four are
 **dry-run by default** and print the exact commands they would run; nothing
 changes without `--execute`. Prefer them over retyping the underlying git and
 pytest incantations, and fix the script when a rule is wrong rather than
@@ -103,6 +103,15 @@ working around it.
   `-o pythonpath` and an exported `PYTHONPATH`, workers capped when sibling
   suites are on the box. From an agent shell use `--execute --detach` and poll
   the printed `.done` path. The suite is never piped through `tail`.
+- `scripts/examples-gate.sh [--execute] [--root DIR] [--only IDS] [--tmp-root DIR] [--log-dir DIR]`
+  runs every offline shipped example the way its documentation says and checks
+  its documented result, each in a fresh copy of an exported tree and, with
+  `--execute`, inside a bubblewrap (`bwrap`) private network the gate
+  self-tests first; it refuses to run without one. Case copies
+  go under `--tmp-root` (default `${XDG_CACHE_HOME:-$HOME/.cache}/elspeth-examples-gate`;
+  never `/tmp`, never inside the checkout). `summary.txt` records one PASS, FAIL,
+  NOTRUN or SKIP line per case, and a tree that changed during the run makes the
+  run fail (`frozen=NO`).
 
 ## Gotchas
 
@@ -117,7 +126,10 @@ working around it.
   whole-tree gate whose scanned inputs could change. Run the full
   `pytest tests/` before merging changes whose effects cannot be bounded by
   those checks, such as shared runtime behavior, contracts, schemas, plugin
-  registration, graph construction, or test/scan infrastructure. An isolated
+  registration, graph construction, or test/scan infrastructure. In the
+  maintainer's multi-lane workflow a lane runs its scoped tests and names an
+  unbounded change in its HANDOFF; the integrator runs the full gate once on
+  the stacked release branch before pushing it. An isolated
   test, fixture, documentation, or frontend change does not automatically
   require the Python full suite. If the full suite already passed on the same
   production tree, verify a subsequent isolated test repair with its focused
@@ -290,23 +302,20 @@ working around it.
 
 ## Project delivery posture
 
-From 0.8.5 onward, backwards compatibility is permitted and must be considered
-when changing public interfaces, configuration, persisted data or operator
-workflows. This is not a guarantee of perpetual support for every historical
-version or format. State compatibility decisions and supported boundaries
-explicitly; retain current preserve/refuse contracts unless a separate change
-is approved. This policy alone does not authorize migrations, resets or
-downgrades.
+There is no backwards compatibility before 1.0; 1.0 will carry full
+backwards compatibility. Do not write migration code, dual reads or fallback
+parsers for older versions or formats. The maintainer may make a one-off
+exception for a specific need; that does not change the policy. What still
+holds:
 
-For 0.8.7, compatibility with existing Composer graphs is not required.
-Individual adjustments or migrations for older records, including 0.8.6
-records, may be removed when no longer needed; retain the basic dynamic upgrade
-framework. State each actual breaking change and any reinspection or
-reconstruction requirement without claiming every historical graph can be
-reconstructed. Other public interfaces, configuration, operator workflows and
-persisted data still require compatibility consideration. Preserve integrity
-and preserve/refuse contracts; this exception grants no authority to wipe data,
-run migrations, reset stores or downgrade them.
+- state every breaking change, and any reinspection or reconstruction an
+  upgrade needs, plainly in the upgrade notes;
+- keep the current preserve/refuse contracts: a store or record the release
+  cannot read is refused, never silently reinterpreted;
+- corrupt stored data fails closed; a shape an older writer legitimately
+  produced in a store the release still opens must still read;
+- this policy grants no authority to run migrations, reset, wipe or downgrade
+  any store. Those need the maintainer.
 
 ELSPETH is pre-release software maintained by a single developer. Keep a
 process, gate, or document only when it materially improves at least one of:
@@ -380,7 +389,7 @@ keyless finding sets before and after a change. The operator verifies and signs
 the reviewed package in a trusted context after churn has settled. Keep the
 operator-held key out of CI and agent environments.
 
-The `trust_tier.tier_model` lint allowlist seals each judge-gated suppression with an operator-held HMAC signature. Acquiring, repairing, or rotating those signatures runs across a two-actor seam: an agent **stages** a worklist key-free via the `elspeth-judge` MCP server (`mcp__elspeth-judge__*`: `stage_scan` / `stage_status` / `stage_annotate` / `verify_signatures` / `stage_preview` / `stage_rekey`), and the **operator** fires it with the key via the `elspeth-lints` CLI (`sign-bundle` / `rekey`). **Staging asserts; firing verifies** — the operator step re-derives every binding from the live tree and aborts before any write on staleness. An agent must NEVER hold `ELSPETH_JUDGE_METADATA_HMAC_KEY` (the [O1] custody rule) and signing never runs in CI. Do not hand-edit a `judge_metadata_signature` or resurrect the old per-release signing runbooks — stage a bundle and have the operator fire it. All judging — including the final signature verdict — runs with read-only judge tool access (`--judge-tools readonly`) on whichever `--judge-transport` the operator selects: the judge explores the tree before ruling, and its rationale is secret-scrubbed before persist. The full workflow lives in the `judge-signature-workflow` skill and [docs/judge-signature-handoff.md](docs/judge-signature-handoff.md).
+The `trust_tier.tier_model` lint allowlist seals each judge-gated suppression with an operator-held HMAC signature. Acquiring, repairing, or rotating those signatures runs across a two-actor seam: an agent **stages** a worklist key-free via the `elspeth-judge` MCP server (`mcp__elspeth-judge__*`: `stage_scan` / `stage_status` / `stage_annotate` / `verify_signatures` / `stage_preview` / `stage_rekey`), and the **operator** fires it with the key via the `elspeth-lints` CLI (`sign-bundle` / `rekey`). **Staging asserts; firing verifies** — the operator step re-derives every binding from the live tree and aborts before any write on staleness. An agent must NEVER hold `ELSPETH_JUDGE_METADATA_HMAC_KEY` (the [O1] custody rule) and signing never runs in CI. Do not hand-edit a `judge_metadata_signature` or resurrect the old per-release signing runbooks — stage a bundle and have the operator fire it. Stage a worklist only when the maintainer asks for one, then once, on the final tree; until then record tier-model signature churn in each HANDOFF as an operator obligation and stage nothing. An xfailed signature test is not a defect to fix; leave it as it is. All judging — including the final signature verdict — runs with read-only judge tool access (`--judge-tools readonly`) on whichever `--judge-transport` the operator selects: the judge explores the tree before ruling, and its rationale is secret-scrubbed before persist. The full workflow lives in the `judge-signature-workflow` skill and [docs/judge-signature-handoff.md](docs/judge-signature-handoff.md).
 
 ## Shared issue tracking
 

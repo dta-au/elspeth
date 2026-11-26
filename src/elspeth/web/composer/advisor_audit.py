@@ -91,10 +91,12 @@ def _graph_review_wording_bounds() -> tuple[int, int]:
             findings_backend_authored=backend,
             category=category,
             notice=notice,
+            draft_has_content=draft_has_content,
         )
         for reason in _TERMINAL_BLOCK_REASONS
         for category in ADVISOR_FINDING_CATEGORIES
         for backend in (False, True)
+        for draft_has_content in (False, True)
         for notice in (
             advisor_policy._ADVISOR_SIGNOFF_PENDING_PUBLISHED_NOTICE,
             advisor_policy._ADVISOR_SIGNOFF_UNVERIFIED_PUBLISHED_NOTICE,
@@ -306,6 +308,7 @@ AdvisorTerminalBlockReason = Literal[
     "request_rejected",
     "malformed",
     "budget_exhausted",
+    "prior_call_cost_unknown",
     "publication_withheld",
     "flagged_final_pass",
     "flagged_no_repair",
@@ -317,6 +320,7 @@ _TERMINAL_BLOCK_REASONS: Final[frozenset[str]] = frozenset(
         "request_rejected",
         "malformed",
         "budget_exhausted",
+        "prior_call_cost_unknown",
         "publication_withheld",
         "flagged_final_pass",
         "flagged_no_repair",
@@ -423,8 +427,8 @@ class AdvisorCheckpointPassRecord:
             raise AuditIntegrityError("AdvisorCheckpointPassRecord.pass_index must be a non-negative exact int")
         if type(self.findings_hash) is not str or not self.findings_hash:
             raise AuditIntegrityError("AdvisorCheckpointPassRecord.findings_hash must be a non-empty exact string")
-        if type(self.provider_attempts) is not int or not 0 <= self.provider_attempts <= 2:
-            raise AuditIntegrityError("AdvisorCheckpointPassRecord.provider_attempts must be an exact int from zero to two")
+        if type(self.provider_attempts) is not int or not 0 <= self.provider_attempts <= 3:
+            raise AuditIntegrityError("AdvisorCheckpointPassRecord.provider_attempts must be an exact int from zero to three")
         for name, value in (
             ("first_attempt_schema_valid", self.first_attempt_schema_valid),
             ("first_attempt_accepted", self.first_attempt_accepted),
@@ -448,7 +452,7 @@ class AdvisorCheckpointPassRecord:
             # failure has no provider response to describe, unlike an
             # accepted model verdict, which always requires dispatch.
             raise AuditIntegrityError("AdvisorCheckpointPassRecord undispatched model pass must fail without response conformance")
-        if self.format_reprompt_sent != (self.provider_attempts == 2 and self.first_attempt_accepted is False):
+        if self.format_reprompt_sent != (self.provider_attempts >= 2 and self.first_attempt_accepted is False):
             raise AuditIntegrityError("AdvisorCheckpointPassRecord format reprompt requires a started retry after rejected text")
 
         accepted_response = self.source == "model" and self.verdict in {"clean", "flagged"}

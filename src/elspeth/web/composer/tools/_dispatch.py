@@ -165,7 +165,7 @@ _REQUEST_ADVISOR_HINT_DEFINITION: Final[Mapping[str, Any]] = _validate_and_freez
                         "set_pipeline for security/safety-sensitive flows. Use "
                         "proactive_red_listed_plugin before set_pipeline when the plan "
                         "uses a red-listed plugin such as llm, database, dataverse, "
-                        "Azure safety transforms, RAG retrieval, or Chroma sinks."
+                        "Azure safety transforms, or Azure AI Search retrieval."
                     ),
                 },
                 "problem_summary": {

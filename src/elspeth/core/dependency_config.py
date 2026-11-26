@@ -104,7 +104,9 @@ class CommencementGateConfig(BaseModel):
         return stripped
 
 
-# Supported probe providers — intentionally small, system-owned registry.
+# Probe provider names. No provider ships since 0.8.18 and settings refuse a
+# non-empty collection_probes list; "chroma" names the removed provider so a
+# directly constructed config still type-checks against the old shape.
 SupportedProbeProvider = Literal["chroma"]
 
 
@@ -114,7 +116,7 @@ class CollectionProbeConfig(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     collection: str = Field(min_length=1, description="Collection name to probe")
-    provider: SupportedProbeProvider = Field(description="Provider type (e.g., 'chroma')")
+    provider: SupportedProbeProvider = Field(description="Provider type")
     provider_config: Mapping[str, Any] = Field(
         default_factory=dict,
         description="Provider-specific connection config",

@@ -65,6 +65,7 @@ from elspeth.contracts.sink_effects import (
     SinkEffectRuntimeBinding,
 )
 from elspeth.core.canonical import canonical_json as pipeline_canonical_json
+from elspeth.core.canonical import normalize_for_canonical
 from elspeth.core.clock import Clock
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
 from elspeth.core.landscape.errors import LandscapeRecordError
@@ -492,8 +493,8 @@ class SinkExecutor:
 
         ``PluginContractViolation`` covers both ``SinkTransactionalInvariantError``
         (its subclass) and the bare violation raised by sink input-schema
-        validation (elspeth-82d4c5146c): the run still crashes, but every
-        token at the boundary must carry a terminal outcome first.
+        validation (elspeth-82d4c5146c): the run still crashes. Callers pass
+        only the fresh open members this attempt terminalizes.
         """
         base_context = dict(violation.to_audit_dict())
         failing_token_id = base_context["token_id"] if "token_id" in base_context else None
@@ -549,7 +550,8 @@ class SinkExecutor:
         upstream proves; this settles the rest on the row. It also covers
         failsink rows: the diversion enrichment adds ``__diversion_*`` keys, which
         no declaration spells. The sink seam routes no contract violation, so
-        both callers end the run with every token's terminal recorded.
+        callers terminalize this attempt's fresh members; effect-bound members
+        are left to their effect's recovery.
         """
         declared_spellings = DeclaredSpellings.of(reads=sink.declared_read_fields, creates=())
         # Resolved through each token's own contract — the one a lookup of the
@@ -677,8 +679,8 @@ class SinkExecutor:
         step_in_pipeline: int,
         ctx: PluginContext,
         role: SinkEffectRole = SinkEffectRole.PRIMARY,
-    ) -> list[tuple[TokenInfo, NodeState]]:
-        """Reuse the exact current state set left by an interrupted effect call."""
+    ) -> tuple[list[tuple[TokenInfo, NodeState]], frozenset[str]]:
+        """Reuse current states and return their durable sink-effect member IDs."""
         if self._factory is None:
             raise OrchestrationInvariantError("effect state recovery requires the owning RecorderFactory")
         token_ids = tuple(token.token_id for token in tokens)
@@ -693,6 +695,7 @@ class SinkExecutor:
             role=role,
             token_ids=token_ids,
         )
+        durable_token_ids = frozenset(member.token_id for member in durable_members)
         if not open_ids and not durable_members:
             return [
                 (token, state)
@@ -703,14 +706,13 @@ class SinkExecutor:
                     step_in_pipeline=step_in_pipeline,
                     ctx=ctx,
                 )
-            ]
+            ], durable_token_ids
         # A retry batch may mix interrupted members (durable membership or an
         # open state) with genuinely fresh members; reservation partitions the
         # union into recovered and new effects, so recovery must not demand
         # full durable coverage of the batch (elspeth-d1a1399381). Fresh
         # members get newly opened states; interrupted members must still
         # produce their exact durable witness or fail closed.
-        durable_token_ids = {member.token_id for member in durable_members}
         fresh_tokens: list[TokenInfo] = []
         fresh_rows: list[dict[str, object]] = []
         for token, row in zip(tokens, rows, strict=True):
@@ -743,7 +745,7 @@ class SinkExecutor:
             if state is None or state.token_id != token.token_id or state.node_id != sink_node_id:
                 raise AuditIntegrityError("interrupted sink effect current node-state witness is divergent")
             states.append((token, state))
-        return states
+        return states, durable_token_ids
 
     def _write_primary_effect(
         self,
@@ -754,6 +756,7 @@ class SinkExecutor:
         tokens: list[TokenInfo],
         pending_outcome: PendingOutcome,
         all_states: list[tuple[TokenInfo, NodeState]],
+        durable_member_ids: frozenset[str],
         sink_name: str,
         sink_node_id: str,
         join_group_id_by_token: Mapping[str, str | None],
@@ -777,13 +780,16 @@ class SinkExecutor:
             )
             self._validate_sink_input(sink, rows, contracts=row_contracts)
         except (DeclarationContractViolation, AggregateDeclarationContractViolation, PluginContractViolation) as violation:
+            failing = [
+                (token, state) for token, state in all_states if type(state) is NodeStateOpen and token.token_id not in durable_member_ids
+            ]
             self._complete_states_failed(
-                states=[(token, state) for token, state in all_states if type(state) is NodeStateOpen],
+                states=failing,
                 duration_ms=0.0,
                 error=self._build_boundary_error(exc=violation, phase="sink_write"),
             )
             self._record_boundary_failure_outcomes(
-                tokens=tokens,
+                tokens=[token for token, _state in failing],
                 sink_name=sink_name,
                 phase="sink_write",
                 violation=violation,
@@ -1152,17 +1158,23 @@ class SinkExecutor:
         for token, index, _state in primary_divert_states:
             diversion = diversion_by_index[index]
             reason_hash = diversion_reason_hashes[index]
-            row = {
+            raw_row = {
                 **diversion.row_data,
                 "__diversion_reason": f"effect-diversion:{reason_hash}",
                 "__diverted_from": sink_name,
                 "__diversion_timestamp": stable_timestamp,
             }
+            try:
+                row = normalize_for_canonical(raw_row)
+            except (TypeError, ValueError) as exc:
+                raise AuditIntegrityError(
+                    f"Sink effect lineage audit integrity violation: member {token.token_id!r} has non-canonical sink-boundary input"
+                ) from exc
             enriched_rows.append(row)
             enriched_by_token[token.token_id] = row
             diverted_tokens.append(token)
 
-        failsink_states = self._open_or_reuse_effect_states(
+        failsink_states, failsink_durable_member_ids = self._open_or_reuse_effect_states(
             tokens=diverted_tokens,
             rows=enriched_rows,
             sink_node_id=failsink_node_id,
@@ -1181,31 +1193,38 @@ class SinkExecutor:
             )
             self._validate_sink_input(failsink, enriched_rows, skip_schema=True)
         except (DeclarationContractViolation, AggregateDeclarationContractViolation, PluginContractViolation) as violation:
-            # Mirror the primary path's boundary-failure terminalization
-            # (elspeth-2a75af7f8f): the enriched row never reached the
-            # failsink, so terminalize both the quarantine states just opened
-            # and the still-open primary divert anchors, then record failure
-            # outcomes so no diverted token is left in progress.
+            # Terminalize fresh open failsink members and their primary divert
+            # anchors. Durable members retain their recovery witnesses.
             boundary_error = self._build_boundary_error(exc=violation, phase="failsink_write")
+            failing = [
+                (token, state)
+                for token, state in failsink_states
+                if type(state) is NodeStateOpen and token.token_id not in failsink_durable_member_ids
+            ]
+            failing_ids = {token.token_id for token, _state in failing}
             self._complete_states_failed(
-                states=[(token, state) for token, state in failsink_states if type(state) is NodeStateOpen],
+                states=failing,
                 duration_ms=0.0,
                 error=boundary_error,
             )
             self._complete_states_failed(
-                states=[(token, state) for token, _index, state in primary_divert_states if type(state) is NodeStateOpen],
+                states=[
+                    (token, state)
+                    for token, _index, state in primary_divert_states
+                    if type(state) is NodeStateOpen and token.token_id in failing_ids
+                ],
                 duration_ms=0.0,
                 error=boundary_error,
             )
             self._record_boundary_failure_outcomes(
-                tokens=diverted_tokens,
+                tokens=[token for token, _state in failing],
                 sink_name=failsink_name,
                 phase="failsink_write",
                 violation=violation,
             )
-            # The failsink effect was never reserved either, and the primary
-            # effect has already finalized its own operation as 'completed', so
-            # without this the run carries no failed operation at all.
+            # No failsink effect was reserved for this attempt's fresh members.
+            # The primary effect already completed its operation, so record
+            # the boundary rejection as a failed operation here.
             self._record_boundary_failure_operation(
                 sink_node_id=failsink_node_id,
                 sink_name=failsink_name,
@@ -1569,7 +1588,7 @@ class SinkExecutor:
         primary_ctx.state_id = None
 
         # ── PRE-PHASE: Open or recover node_states for the durable effect ──
-        all_states = self._open_or_reuse_effect_states(
+        all_states, durable_member_ids = self._open_or_reuse_effect_states(
             tokens=tokens,
             rows=rows,
             sink_node_id=sink_node_id,
@@ -1587,6 +1606,7 @@ class SinkExecutor:
             tokens=tokens,
             pending_outcome=pending_outcome,
             all_states=all_states,
+            durable_member_ids=durable_member_ids,
             sink_name=sink_name,
             sink_node_id=sink_node_id,
             join_group_id_by_token=join_group_id_by_token,

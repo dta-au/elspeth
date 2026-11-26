@@ -260,7 +260,13 @@ def test_advisor_suggestion_survives_reload_and_clears_on_graph_change() -> None
 
     state = _make_state()
     result = advisor_signoff_pending_validation(
-        _green_result(), reason="unavailable", findings="Model unavailable.", category="other", step_ids=(), note=None
+        _green_result(),
+        draft_has_content=True,
+        reason="unavailable",
+        findings="Model unavailable.",
+        category="other",
+        step_ids=(),
+        note=None,
     )
     suggestion = (
         "The advisor model was unavailable; check the advisor model configuration. "
@@ -332,9 +338,15 @@ def test_advisor_readiness_never_publishes_model_findings(reason: str) -> None:
 
     findings = "PRIVATE_PROVIDER_FINDING credential-shaped-content"
     results = [
-        advisor_signoff_blocked_validation(reason=reason, findings=findings, category="other", step_ids=(), note=None),
-        advisor_signoff_unverified_validation(reason=reason, findings=findings, category="other", step_ids=(), note=None),
-        advisor_signoff_pending_validation(_green_result(), reason=reason, findings=findings, category="other", step_ids=(), note=None),
+        advisor_signoff_blocked_validation(
+            draft_has_content=True, reason=reason, findings=findings, category="other", step_ids=(), note=None
+        ),
+        advisor_signoff_unverified_validation(
+            draft_has_content=True, reason=reason, findings=findings, category="other", step_ids=(), note=None
+        ),
+        advisor_signoff_pending_validation(
+            _green_result(), draft_has_content=True, reason=reason, findings=findings, category="other", step_ids=(), note=None
+        ),
     ]
     for result in results:
         blocker = result.readiness.blockers[0]
@@ -359,10 +371,14 @@ def test_advisor_note_reaches_only_the_blocker_note_field(reason: str) -> None:
     findings = "PRIVATE_PROVIDER_FINDING credential-shaped-content"
     note = "The merge step cannot route failures; pick per-branch sinks or a partial-arrival policy."
     results = [
-        advisor_signoff_blocked_validation(reason=reason, findings=findings, category="error_handling", step_ids=(), note=note),
-        advisor_signoff_unverified_validation(reason=reason, findings=findings, category="error_handling", step_ids=(), note=note),
+        advisor_signoff_blocked_validation(
+            draft_has_content=True, reason=reason, findings=findings, category="error_handling", step_ids=(), note=note
+        ),
+        advisor_signoff_unverified_validation(
+            draft_has_content=True, reason=reason, findings=findings, category="error_handling", step_ids=(), note=note
+        ),
         advisor_signoff_pending_validation(
-            _green_result(), reason=reason, findings=findings, category="error_handling", step_ids=(), note=note
+            _green_result(), draft_has_content=True, reason=reason, findings=findings, category="error_handling", step_ids=(), note=note
         ),
     ]
     for result in results:
@@ -692,6 +708,7 @@ def test_note_survives_reload_and_reaches_validate() -> None:
     state = _make_state()
     result = advisor_signoff_pending_validation(
         _green_result(),
+        draft_has_content=True,
         reason="flagged_final_pass",
         findings="FLAGGED: choose per-branch sinks",
         category="error_handling",

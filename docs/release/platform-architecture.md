@@ -1,7 +1,7 @@
 # ELSPETH Platform Architecture
 
 **Document date:** 9 November 2026
-**Release covered:** 0.8.17 candidate
+**Release covered:** 0.8.18 candidate
 **Audience:** Evaluators, technical leaders, architects, and assurance reviewers
 **Register:** Public-facing / technical
 **Status:** Current architecture overview
@@ -109,7 +109,7 @@ ELSPETH integrates with external systems through plugins and clients, including:
 - Azure Blob Storage;
 - Azure Document Intelligence;
 - Microsoft Dataverse;
-- ChromaDB;
+- Azure AI Search, for retrieval;
 - Azure OpenAI;
 - Amazon Bedrock and Bedrock Guardrails;
 - OpenRouter;

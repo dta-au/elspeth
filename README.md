@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.14+](https://img.shields.io/badge/python-3.14+-blue.svg)](https://www.python.org/downloads/)
-![Status: 0.8.17](https://img.shields.io/badge/status-0.8.17-green.svg)
+![Status: 0.8.18](https://img.shields.io/badge/status-0.8.18-green.svg)
 
 ELSPETH builds, validates, runs, and audits data and LLM workflows whose
 outputs need to be reviewed and explained. You can author a pipeline in
@@ -19,17 +19,6 @@ Landscape audit trail.
 > **AI-generated code:** ELSPETH is a rapid prototype, generated and reviewed by AI,
 > that is in active development with major systems subject to change. Limited user
 > testing has been conducted on a small set of use cases.
->
-> **Chroma security advisory:** Do not use Chroma with ELSPETH until upstream
-> publishes a fixed release and ELSPETH adopts and verifies it. This includes
-> the `rag_retrieval` transform with `provider: chroma`, the `chroma_sink` sink,
-> and Chroma examples in all connection modes. ChromaDB has unresolved
-> code-execution vulnerabilities in every release up to and including 1.5.9,
-> the latest at the time of writing, including the 1.5.5 that ELSPETH locks;
-> no fixed release exists. See the
-> [pre-authentication advisory](https://github.com/advisories/GHSA-f4j7-r4q5-qw2c),
-> [collection-update advisory](https://github.com/advisories/GHSA-36p7-vc44-83pf),
-> and [upstream server and client issue](https://github.com/chroma-core/chroma/issues/6717).
 
 ## What it does
 
@@ -100,22 +89,27 @@ ELSPETH supports audit export and optional signing. The
 [export settings and limits](docs/reference/configuration.md#export-settings)
 describe what is exported and how to configure it.
 
-## What changed in 0.8.17
+## What changed in 0.8.18
 
-0.8.17 is a hotfix for 0.8.16 with three Web Composer fixes for large
-pipelines and prompts held in files: the planner can read exact state on a
-large invalid pipeline, saving prompt files in the editor reads each file once,
-and advisor checks no longer fail on a long prompt file. See the
-[release notes](CHANGELOG.md), which also record earlier releases.
+0.8.18 changes canonical hashing for new runs, improves worker coordination
+and recovery, and fixes several Web Composer validation, request-size and
+credential-check paths. See the [release notes](CHANGELOG.md) for the specific
+behaviour and upgrade actions.
 
-Session epoch 79 and Landscape epoch 51 are unchanged from 0.8.16; this release
-adds no schema-epoch cutover, and existing 0.8.16 session and Landscape stores
-open unchanged. Upgrading from 0.8.15 or earlier means applying the 0.8.16
-upgrade notes first; the upgrading section below lists what each earlier
+0.8.18 removes Chroma support: the `chroma_sink` sink, the `rag_retrieval`
+transform and Chroma collection probes. Settings and saved pipelines that use
+them are refused after upgrading; `azure_ai_search` is the retrieval transform.
+
+Session epoch 79 and Landscape epoch 51 are unchanged from 0.8.17; this release
+adds no schema-epoch cutover, and existing 0.8.17 session and Landscape stores
+open unchanged. Finish CLI runs and interrupted web runs before upgrading;
+runs admitted under earlier canonical or implementation versions cannot be
+continued. Upgrading from 0.8.16 or earlier means applying the 0.8.17 and
+0.8.16 upgrade notes first; the upgrading section below lists what each earlier
 release requires. Backwards compatibility is permitted and considered from
 0.8.5 within explicitly supported boundaries.
 This release authorizes no in-place migration, reset or downgrade. Package
-metadata is 0.8.17; the package version alone does not establish qualification
+metadata is 0.8.18; the package version alone does not establish qualification
 or image publication. Automatic image publication from main is held; verify
 the release tag and image digest before installing a published image.
 
@@ -128,6 +122,18 @@ carry each release's full upgrade notes, and the
 compatibility is permitted and considered from 0.8.5 within explicitly
 supported boundaries. None of these releases authorizes an in-place migration,
 reset or downgrade.
+
+### 0.8.17
+
+0.8.17 changed no schema epoch; 0.8.16 session and Landscape stores open
+unchanged. Existing stores need no action. Finish interrupted web runs before
+upgrading: a web run admitted under 0.8.16 is refused on resume as
+`IMPLEMENTATION_CHANGED`. Upgrading from 0.8.15 or earlier means applying the
+0.8.16 upgrade notes first.
+
+- The `get_pipeline_state` tool description and the advisor's evidence header
+  gained one sentence each; clients or tests pinning those prompts must follow
+  the 0.8.17 release notes.
 
 ### 0.8.16
 

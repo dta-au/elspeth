@@ -1,0 +1,418 @@
+"""A request the provider, or a proxy in front of it, refuses as too large (HTTP 413) is a size rejection.
+
+The status is structured evidence: no provider text is read. The installed
+litellm surfaces a 413 differently per route (measured through its own
+mapping, ``exception_type``, as ``acompletion`` raises it):
+
+- OpenAI-compatible routes: ``APIError`` with ``status_code`` 413, or a
+  ``RateLimitError`` (429) when the body does not name the error type;
+- Bedrock: ``BadRequestError`` with ``status_code`` 413;
+- Anthropic: ``BadRequestError`` with ``status_code`` 400.
+
+The relabelled cases are recognised only from litellm's typed exception chain
+(``test_provider_errors.py`` pins it per route); ``exception_type`` called
+directly, as ``mapped_provider_error`` does, builds no such chain.
+
+A size rejection is not retried unchanged. While an earlier turn is still in
+the request, it is resent once with every earlier turn left out, as a
+context-limit rejection is.
+"""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Callable
+from pathlib import Path
+from typing import cast
+
+import httpx
+import litellm
+import pytest
+from litellm.exceptions import APIError as LiteLLMAPIError
+from litellm.exceptions import RateLimitError as LiteLLMRateLimitError
+from litellm.litellm_core_utils.exception_mapping_utils import exception_type
+from litellm.llms.anthropic.common_utils import AnthropicError
+from litellm.llms.base_llm.chat.transformation import BaseLLMException
+from litellm.llms.bedrock.common_utils import BedrockError
+from litellm.llms.openai.common_utils import OpenAIError
+from openai import AsyncOpenAI
+
+from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
+from elspeth.contracts.composer_progress import (
+    CONTEXT_BUDGET_PROVIDER_REFUSAL_DETAIL,
+    CONTEXT_BUDGET_REQUEST_TOO_LARGE_DETAIL,
+    ProviderSizeReason,
+    context_budget_provider_refusal_detail,
+)
+from elspeth.contracts.provider_rejection import SafeRequestRejection
+from elspeth.web.composer import audit as composer_audit
+from elspeth.web.composer import provider_gateway
+from elspeth.web.composer.audit import llm_call_audit_envelope
+from elspeth.web.composer.protocol import ComposerConvergenceError
+from elspeth.web.composer.provider_errors import classify_provider_failure, request_size_rejection
+from elspeth.web.composer.provider_gateway import _BadRequestLLMError
+from tests.unit.web.composer.test_compose_loop_llm_audit import _make_llm_response
+from tests.unit.web.composer.test_endpoint_affordance import _service as _text_service
+from tests.unit.web.composer.test_gateway_capacity_rejection import _GENEROUS_SETTING, _compose, _ScriptedProvider, _service, _too_long
+from tests.unit.web.composer.test_gateway_capacity_rejection import (
+    _advisor_end_gate_clean as _advisor_end_gate_clean_fixture,
+)
+from tests.unit.web.composer.test_provider_rejection_retry import _HISTORY_TEXTS, _budget, _history, _history_in
+
+_advisor_end_gate_clean = _advisor_end_gate_clean_fixture
+
+_PROXY_BODY = "<html><head><title>413 Request Entity Too Large</title></head><body><center>nginx</center></body></html>"
+_ROUTES: dict[str, type[BaseLLMException]] = {
+    "openai": OpenAIError,
+    "anthropic": AnthropicError,
+    "bedrock": BedrockError,
+    "bedrock_mantle": BedrockError,
+}
+# The routes whose 413 the installed litellm reports with that status.
+SIZE_413_ROUTES = ("bedrock", "bedrock_mantle", "openai")
+
+
+def mapped_provider_error(route: str, status: int) -> BaseException:
+    """The exception the installed litellm raises for an HTTP ``status`` from ``route``."""
+    litellm.suppress_debug_info = True
+    provider_error = _ROUTES[route]
+    try:
+        try:
+            raise provider_error(status_code=status, message=_PROXY_BODY)
+        except BaseLLMException as caught:
+            exception_type(model="test-model", original_exception=caught, custom_llm_provider=route)
+    except Exception as mapped:
+        return mapped
+    raise AssertionError("litellm did not map the provider error")
+
+
+_TOO_LARGE = SafeRequestRejection(reason_code="request_too_large", reason_disposition="retained", reason_source="http_status")
+
+
+@pytest.mark.parametrize("route", SIZE_413_ROUTES)
+def test_a_413_is_a_request_too_large_rejection_that_is_not_retried_unchanged(route: str) -> None:
+    failure = classify_provider_failure(mapped_provider_error(route, 413))
+
+    assert failure is not None
+    assert (failure.audit_status, failure.kind, failure.retryable) == (ComposerLLMCallStatus.BAD_REQUEST_ERROR, "bad_request", False)
+    assert failure.request_rejection == _TOO_LARGE
+    assert request_size_rejection(mapped_provider_error(route, 413)) == _TOO_LARGE
+
+
+def test_an_anthropic_413_is_a_rejected_request_that_is_not_retried_unchanged() -> None:
+    # litellm reports it as 400, so it is not a size rejection; it is not an outage either.
+    exc = mapped_provider_error("anthropic", 413)
+    failure = classify_provider_failure(exc)
+
+    assert failure is not None
+    assert (failure.kind, failure.retryable) == ("bad_request", False)
+    assert request_size_rejection(exc) is None
+
+
+@pytest.mark.parametrize("route", sorted(_ROUTES))
+@pytest.mark.parametrize("status", [400, 500, 503])
+def test_another_status_with_the_same_body_is_not_a_size_rejection(route: str, status: int) -> None:
+    # Control: only the status decides; the proxy's 413 page as a body does not.
+    assert request_size_rejection(mapped_provider_error(route, status)) is None
+
+
+def test_the_rejection_explains_itself_apart_from_a_context_limit() -> None:
+    context_limit = SafeRequestRejection(reason_code="context_length_exceeded", reason_disposition="retained", reason_source="sdk_class")
+    assert _TOO_LARGE.explanation != context_limit.explanation
+    assert _TOO_LARGE.to_wire()["reason_code"] == "request_too_large"
+    assert _TOO_LARGE.to_wire()["reason_source"] == "http_status"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", SIZE_413_ROUTES)
+async def test_a_413_with_history_present_is_resent_once_with_every_earlier_turn_left_out(route: str) -> None:
+    service, session_id = _service(_GENEROUS_SETTING)
+    provider = _ScriptedProvider(mapped_provider_error(route, 413), _make_llm_response(content="Pipeline built."))
+
+    result = await _compose(service, session_id, provider, _history())
+
+    assert len(provider.requests) == 2
+    assert _history_in(provider.requests[0]) == list(_HISTORY_TEXTS)
+    assert _history_in(provider.requests[1]) == []
+    rejected, retried = result.llm_calls
+    assert rejected.status is ComposerLLMCallStatus.BAD_REQUEST_ERROR
+    # Recorded by its closed reason, never by provider text.
+    assert rejected.error_message == "request_too_large"
+    assert rejected.rejection_reason_source == "http_status"
+    assert retried.status is ComposerLLMCallStatus.SUCCESS
+    assert _budget(retried).retry_after_provider_rejection is True
+
+
+@pytest.mark.asyncio
+async def test_a_413_with_nothing_left_to_leave_out_is_the_size_refusal_naming_the_provider() -> None:
+    service, session_id = _service(_GENEROUS_SETTING)
+    provider = _ScriptedProvider(mapped_provider_error("openai", 413))
+
+    with pytest.raises(ComposerConvergenceError) as exc_info:
+        await _compose(service, session_id, provider)
+
+    assert len(provider.requests) == 1
+    assert exc_info.value.reason == "context_budget_exceeded"
+    assert exc_info.value.evidence["ceiling"] == "provider"
+    (call,) = exc_info.value.llm_calls
+    assert call.error_message == "request_too_large"
+    assert call.to_dict()["rejection_reason_source"] == "http_status"
+    assert _PROXY_BODY not in str(call.to_dict())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("rejection", "reason", "detail"),
+    [
+        pytest.param(lambda: mapped_provider_error("openai", 413), "request_too_large", CONTEXT_BUDGET_REQUEST_TOO_LARGE_DETAIL, id="413"),
+        pytest.param(
+            lambda: mapped_provider_error("bedrock", 413), "request_too_large", CONTEXT_BUDGET_REQUEST_TOO_LARGE_DETAIL, id="bedrock-413"
+        ),
+        pytest.param(_too_long, "context_length_exceeded", CONTEXT_BUDGET_PROVIDER_REFUSAL_DETAIL, id="context-limit"),
+    ],
+)
+async def test_the_compose_loop_refusal_text_is_chosen_by_the_typed_size_reason(
+    rejection: Callable[[], BaseException], reason: str, detail: str
+) -> None:
+    # The refusal evidence carries the provider's typed reason; the user's text
+    # (the route's ``detail`` is ``str(exc)``) is chosen by it, never by text.
+    service, session_id = _service(_GENEROUS_SETTING)
+    provider = _ScriptedProvider(rejection())
+
+    with pytest.raises(ComposerConvergenceError) as exc_info:
+        await _compose(service, session_id, provider)
+
+    assert exc_info.value.evidence["ceiling"] == "provider"
+    assert exc_info.value.evidence["provider_reason"] == reason
+    assert str(exc_info.value) == detail
+
+
+@pytest.mark.parametrize(
+    ("reason", "detail"),
+    [("request_too_large", CONTEXT_BUDGET_REQUEST_TOO_LARGE_DETAIL), ("context_length_exceeded", CONTEXT_BUDGET_PROVIDER_REFUSAL_DETAIL)],
+    ids=["request_too_large", "context_length_exceeded"],
+)
+def test_the_provider_refusal_detail_is_selected_by_reason(reason: ProviderSizeReason, detail: str) -> None:
+    assert context_budget_provider_refusal_detail(reason) == detail
+
+
+def test_control_the_two_provider_refusal_texts_differ_and_an_unknown_reason_is_refused() -> None:
+    assert CONTEXT_BUDGET_REQUEST_TOO_LARGE_DETAIL != CONTEXT_BUDGET_PROVIDER_REFUSAL_DETAIL
+    with pytest.raises(ValueError):
+        context_budget_provider_refusal_detail(cast(ProviderSizeReason, "invalid_request"))
+
+
+@pytest.mark.asyncio
+async def test_the_persisted_call_audit_names_what_recognised_the_rejection(monkeypatch: pytest.MonkeyPatch) -> None:
+    service, session_id = _service(_GENEROUS_SETTING)
+    provider = _ScriptedProvider(mapped_provider_error("openai", 413))
+
+    with pytest.raises(ComposerConvergenceError) as exc_info:
+        await _compose(service, session_id, provider)
+
+    (call,) = exc_info.value.llm_calls
+    persisted = llm_call_audit_envelope(call)["call"]
+    assert isinstance(persisted, dict)
+    assert persisted["rejection_reason_source"] == "http_status"
+    # Control: the instrument goes red when the public whitelist drops the field.
+    monkeypatch.setattr(
+        composer_audit,
+        "_LLM_CALL_PUBLIC_AUDIT_FIELDS",
+        tuple(name for name in composer_audit._LLM_CALL_PUBLIC_AUDIT_FIELDS if name != "rejection_reason_source"),
+    )
+    dropped = llm_call_audit_envelope(call)["call"]
+    assert isinstance(dropped, dict)
+    assert "rejection_reason_source" not in dropped
+
+
+def _bedrock_413(body: dict[str, object]) -> BaseException:
+    """A Bedrock HTTP 413 whose JSON body is ``body``, as the installed litellm raises it (``BadRequestError``, status 413)."""
+    litellm.suppress_debug_info = True
+    request = httpx.Request("POST", "https://bedrock-runtime.invalid/model/invoke")
+    content = json.dumps(body)
+    try:
+        exception_type(
+            model="bedrock/anthropic.claude-opus-4-8",
+            original_exception=BedrockError(
+                status_code=413, message=content, request=request, response=httpx.Response(413, request=request, content=content.encode())
+            ),
+            custom_llm_provider="bedrock",
+        )
+    except Exception as mapped:
+        return mapped
+    raise AssertionError("litellm did not map the provider error")
+
+
+_SPECIFIC_CODE_BODY: dict[str, object] = {"error": {"code": "unsupported_parameter", "message": _PROXY_BODY}}
+
+
+def test_a_413_with_a_specific_retained_code_keeps_the_code_and_is_not_a_size_rejection() -> None:
+    # A specific structured code takes precedence over the status, as it does over context-limit evidence.
+    exc = _bedrock_413(_SPECIFIC_CODE_BODY)
+    failure = classify_provider_failure(exc)
+
+    assert failure is not None
+    assert (failure.audit_status, failure.kind, failure.retryable) == (ComposerLLMCallStatus.BAD_REQUEST_ERROR, "bad_request", False)
+    assert failure.request_rejection is not None
+    assert (failure.request_rejection.reason_code, failure.request_rejection.reason_source) == ("unsupported_parameter", "http_response")
+    assert request_size_rejection(exc) is None
+
+
+def test_control_a_413_without_a_specific_code_is_request_too_large() -> None:
+    # The same Bedrock 413 with no code in its body: the status decides.
+    assert request_size_rejection(_bedrock_413({"message": "Request Entity Too Large"})) == _TOO_LARGE
+
+
+@pytest.mark.asyncio
+async def test_a_413_with_a_specific_retained_code_is_not_resent_with_earlier_turns_left_out() -> None:
+    service, session_id = _service(_GENEROUS_SETTING)
+    provider = _ScriptedProvider(_bedrock_413(_SPECIFIC_CODE_BODY), _make_llm_response(content="Pipeline built."))
+
+    with pytest.raises(_BadRequestLLMError):
+        await _compose(service, session_id, provider, _history())
+
+    assert len(provider.requests) == 1
+    assert _history_in(provider.requests[0]) == list(_HISTORY_TEXTS)
+
+
+# --- The gateway's text path (run diagnostics) ------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", SIZE_413_ROUTES)
+async def test_a_413_on_the_gateway_text_path_is_the_rejected_request_carrier(
+    route: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # OpenAI-compatible routes raise APIError(413), Bedrock BadRequestError(413): both
+    # leave the text path as the bad-request carrier, never as an outage.
+    rejection = mapped_provider_error(route, 413)
+
+    async def refuse(**_kwargs: object) -> object:
+        raise rejection
+
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", refuse)
+
+    with pytest.raises(_BadRequestLLMError) as caught:
+        await _text_service(tmp_path)._provider_gateway._call_text_llm([{"role": "user", "content": "hi"}])
+
+    assert caught.value.__cause__ is rejection
+    assert caught.value.provider_status_code == 413
+    assert request_size_rejection(caught.value.__cause__) == _TOO_LARGE
+
+
+@pytest.mark.asyncio
+async def test_control_another_api_error_on_the_gateway_text_path_is_not_the_rejected_request_carrier(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The same exception class with another status leaves the text path unchanged.
+    failure = mapped_provider_error("openai", 418)
+    assert isinstance(failure, LiteLLMAPIError)
+
+    async def fail(**_kwargs: object) -> object:
+        raise failure
+
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fail)
+
+    with pytest.raises(LiteLLMAPIError) as caught:
+        await _text_service(tmp_path)._provider_gateway._call_text_llm([{"role": "user", "content": "hi"}])
+
+    assert caught.value is failure
+
+
+# --- A 413 that litellm reports as a rate limit (OpenAI route) ----------------------------------
+
+
+async def _openai_route_failure(status: int, content: bytes) -> LiteLLMRateLimitError:
+    """What real ``litellm.acompletion`` raises for an OpenAI-route ``status`` over a mock transport (no network)."""
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(status, content=content, headers={"content-type": "text/plain"}))
+    ) as http_client:
+        client = AsyncOpenAI(api_key="test-key", base_url="https://example.invalid/v1", http_client=http_client, max_retries=0)
+        with pytest.raises(LiteLLMRateLimitError) as caught:
+            await litellm.acompletion(
+                model="openai/gpt-4o",
+                messages=[{"role": "user", "content": "hello"}],
+                client=client,
+                api_key="test-key",
+                num_retries=0,
+                max_retries=0,
+            )
+    return caught.value
+
+
+async def _relabelled_413() -> LiteLLMRateLimitError:
+    return await _openai_route_failure(413, b"Request too large")
+
+
+async def _genuine_429() -> LiteLLMRateLimitError:
+    return await _openai_route_failure(429, b"Rate limit reached on tokens per min (TPM)")
+
+
+@pytest.mark.asyncio
+async def test_a_413_reported_as_a_rate_limit_with_history_present_is_resent_once_with_every_earlier_turn_left_out() -> None:
+    service, session_id = _service(_GENEROUS_SETTING)
+    provider = _ScriptedProvider(await _relabelled_413(), _make_llm_response(content="Pipeline built."))
+
+    result = await _compose(service, session_id, provider, _history())
+
+    assert len(provider.requests) == 2
+    assert _history_in(provider.requests[0]) == list(_HISTORY_TEXTS)
+    assert _history_in(provider.requests[1]) == []
+    rejected, retried = result.llm_calls
+    assert rejected.status is ComposerLLMCallStatus.BAD_REQUEST_ERROR
+    assert rejected.error_message == "request_too_large"
+    assert rejected.rejection_reason_source == "http_status"
+    assert retried.status is ComposerLLMCallStatus.SUCCESS
+    assert _budget(retried).retry_after_provider_rejection is True
+
+
+@pytest.mark.asyncio
+async def test_a_413_reported_as_a_rate_limit_with_nothing_left_to_leave_out_is_the_size_refusal() -> None:
+    service, session_id = _service(_GENEROUS_SETTING)
+    provider = _ScriptedProvider(await _relabelled_413())
+
+    with pytest.raises(ComposerConvergenceError) as exc_info:
+        await _compose(service, session_id, provider)
+
+    assert len(provider.requests) == 1
+    assert exc_info.value.reason == "context_budget_exceeded"
+    assert exc_info.value.evidence["ceiling"] == "provider"
+    assert exc_info.value.evidence["provider_reason"] == "request_too_large"
+    (call,) = exc_info.value.llm_calls
+    assert call.error_message == "request_too_large"
+    assert call.to_dict()["rejection_reason_source"] == "http_status"
+
+
+@pytest.mark.asyncio
+async def test_a_413_reported_as_a_rate_limit_on_the_gateway_text_path_is_the_rejected_request_carrier(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    rejection = await _relabelled_413()
+
+    async def refuse(**_kwargs: object) -> object:
+        raise rejection
+
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", refuse)
+
+    with pytest.raises(_BadRequestLLMError) as caught:
+        await _text_service(tmp_path)._provider_gateway._call_text_llm([{"role": "user", "content": "hi"}])
+
+    assert caught.value.__cause__ is rejection
+    assert request_size_rejection(caught.value.__cause__) == _TOO_LARGE
+
+
+@pytest.mark.asyncio
+async def test_control_a_genuine_rate_limit_on_the_gateway_text_path_is_not_the_rejected_request_carrier(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    failure = await _genuine_429()
+
+    async def fail(**_kwargs: object) -> object:
+        raise failure
+
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fail)
+
+    with pytest.raises(LiteLLMRateLimitError) as caught:
+        await _text_service(tmp_path)._provider_gateway._call_text_llm([{"role": "user", "content": "hi"}])
+
+    assert caught.value is failure

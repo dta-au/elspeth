@@ -63,9 +63,19 @@ describe("prompt file editability display mirror", () => {
   const stateFor = (options: Record<string, unknown>, otherNodes: Array<{ id: string; plugin: string; options: Record<string, unknown> }> = []) => ({
     sources: {}, outputs: [], nodes: [{ id: "llm", plugin: "llm", options }, ...otherNodes],
   }) as unknown as CompositionState;
-  const check = (overrides: { state?: CompositionState; blobs?: BlobMetadata[]; pendingEvents?: InterpretationEvent[] } = {}) =>
+  const check = (overrides: { state?: CompositionState; blobs?: BlobMetadata[]; listIncomplete?: boolean; pendingEvents?: InterpretationEvent[] } = {}) =>
     promptFileEditability({ state: overrides.state ?? stateFor({ prompt_template: marker }), blobs: overrides.blobs ?? [blob],
+      listIncomplete: overrides.listIncomplete ?? false,
       pendingEvents: overrides.pendingEvents ?? [], nodeId: "llm", fieldPath: "prompt_template", blobId: "file" });
+
+  it("distinguishes an incomplete list from a complete list without the file", () => {
+    expect(check({ blobs: [], listIncomplete: true })).toEqual({
+      editable: false, code: "prompt_file_list_incomplete", reason: "File names are unavailable.", opens: false,
+    });
+    expect(check({ blobs: [], listIncomplete: false })).toEqual({
+      editable: false, code: "prompt_file_not_found", reason: "This file is not in this session.", opens: false,
+    });
+  });
 
   it("allows one ready UTF-8 prompt file, including an unrelated pending card", () => {
     expect(check()).toEqual({ editable: true });

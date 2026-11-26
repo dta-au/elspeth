@@ -54,6 +54,7 @@ def test_changelog_preserves_historical_epochs_and_documents_current_compatibili
     current_heading = f"\n## {CURRENT_VERSION} - "
     assert changelog.count(current_heading) == 1
     current_release = changelog.split(current_heading, maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
+    release_0817 = changelog.split("\n## 0.8.17 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
     release_0816 = changelog.split("\n## 0.8.16 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
     release_0815 = changelog.split("\n## 0.8.15 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
     release_0814 = changelog.split("\n## 0.8.14 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
@@ -71,15 +72,22 @@ def test_changelog_preserves_historical_epochs_and_documents_current_compatibili
     current_text = " ".join(current_release.split())
     release_date = current_release.splitlines()[0].strip()
     assert date.fromisoformat(release_date).isoformat() == release_date
-    assert (
-        f"The session epoch stays at {SESSION_SCHEMA_EPOCH} and the Landscape epoch at {SQLITE_SCHEMA_EPOCH}, "
-        "so 0.8.16 session and Landscape stores open unchanged" in current_text
-    )
-    assert "No schema epoch changed and no stored data is migrated, reset or rewritten" in current_text
-    assert "Existing 0.8.16 session and Landscape stores need no action" in current_text
-    assert "**Upgrading from 0.8.15 or earlier: apply the 0.8.16 upgrade notes first.**" in current_text
+    assert f"The session epoch stays at {SESSION_SCHEMA_EPOCH} and the Landscape epoch at {SQLITE_SCHEMA_EPOCH}" in current_text
+    assert "0.8.17 session and Landscape stores open unchanged" in current_text
+    assert "**Upgrading from 0.8.16 or earlier: apply the 0.8.17 and 0.8.16 upgrade notes first.**" in current_text
+    assert "sha256-rfc8785-v2" in current_text
+    assert "canonical_version_changed" in current_text
     assert "This authorizes no migration, reset, restamping or downgrade" in current_text
-    assert "A hotfix for 0.8.16: three Web Composer fixes" in current_text
+    # The 0.8.17 hotfix is history, pinned against its own section.
+    text_0817 = " ".join(release_0817.split())
+    assert release_0817.splitlines()[0].strip() == "2026-11-23"
+    assert "The session epoch stays at 79 and the Landscape epoch at 51, so 0.8.16 session and Landscape stores open unchanged" in text_0817
+    assert "No schema epoch changed and no stored data is migrated, reset or rewritten" in text_0817
+    assert "Existing 0.8.16 session and Landscape stores need no action" in text_0817
+    assert "**Upgrading from 0.8.15 or earlier: apply the 0.8.16 upgrade notes first.**" in text_0817
+    assert "This authorizes no migration, reset, restamping or downgrade" in text_0817
+    assert "A hotfix for 0.8.16: three Web Composer fixes" in text_0817
+    assert "The 0.8.17 tag and container publication follow successful required checks and the protected merge" in text_0817
     # 0.8.16 is history, pinned against its own section.
     text_0816 = " ".join(release_0816.split())
     assert release_0816.splitlines()[0].strip() == "2026-11-22"

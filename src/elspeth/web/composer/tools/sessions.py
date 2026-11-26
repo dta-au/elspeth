@@ -172,11 +172,6 @@ from elspeth.web.composer.tools.state_responses import (
     has_duplicate_component_identities,
     pipeline_state_changes,
 )
-from elspeth.web.credential_guard import (
-    CREDENTIAL_REFUSAL_DETAIL,
-    CredentialMaterialRefused,
-    require_no_credential_material_in_state,
-)
 from elspeth.web.execution._validation_materialization import llm_prompt_file_scalar_field
 from elspeth.web.interpretation_state import (
     BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX,
@@ -2090,7 +2085,6 @@ def build_set_pipeline_candidate(
         out_path_error = _validate_sink_path(
             out_options,
             data_dir,
-            plugin=out_plugin,
             session_id=session_id,
             require_data_dir=context.require_data_dir_for_paths,
             mcp_root_authority=context.mcp_root_authority,
@@ -2864,23 +2858,6 @@ def _execute_get_pipeline_state(
     outputs with options, edges, and metadata.
     """
     validated = _validate_mutation_arguments(GetPipelineStateArgumentsModel, args, "get_pipeline_state arguments")
-    env_ref_names = (
-        frozenset(item.name for item in context.secret_service.list_refs(context.user_id))
-        if context.secret_service is not None and context.user_id is not None
-        else frozenset()
-    )
-    try:
-        require_no_credential_material_in_state(
-            state,
-            surface="composer_pipeline_state_disclosure",
-            env_ref_names=env_ref_names,
-        )
-    except CredentialMaterialRefused:
-        return _failure_result(
-            state,
-            CREDENTIAL_REFUSAL_DETAIL,
-            error_code="credential_material_rejected",
-        )
     component = validated.component
     data: Any
     # A whole-graph read (no component, or a full-state alias) is refused when

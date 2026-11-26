@@ -82,7 +82,7 @@ def test_runtime_yaml_refuses_invalid_values_before_path_coercion(
     """Resolver entry points cannot turn an invalid scalar/container into a filename."""
     configured: dict[str, Any]
     if component == "provider":
-        configured = {"transforms": [{"name": "lookup", "plugin": "rag_retrieval", "options": {"provider_config": {key: value}}}]}
+        configured = {"transforms": [{"name": "lookup", "plugin": "value_transform", "options": {"provider_config": {key: value}}}]}
     else:
         item = {"plugin": "csv", "options": {key: value}}
         configured = {component: item if component == "source" else {"main": item}}
@@ -100,7 +100,7 @@ def test_runtime_yaml_keeps_absent_path_options_and_nullable_provider(tmp_path: 
     document = {
         "sources": {"main": {"plugin": "null", "options": {}}},
         "sinks": {"main": {"plugin": "csv", "options": {}}},
-        "transforms": [{"name": "lookup", "plugin": "rag_retrieval", "options": {"provider_config": {"persist_directory": None}}}],
+        "transforms": [{"name": "lookup", "plugin": "value_transform", "options": {"provider_config": {"persist_directory": None}}}],
     }
     result = execution_preflight.resolve_runtime_yaml_paths(
         yaml.safe_dump(document),
@@ -152,7 +152,11 @@ def _csv_worker_probe_state(tmp_path: Path) -> CompositionState:
     )
 
 
-def _chroma_persist_outside_data_dir_state(tmp_path: Path) -> CompositionState:
+def _sink_persist_directory_outside_data_dir_state(tmp_path: Path) -> CompositionState:
+    # ``persist_directory`` is one of SINK_LOCAL_PATH_OPTION_KEYS and the sink
+    # path gate walks those keys on every sink regardless of plugin. No shipped
+    # sink declares it since chroma_sink was removed, so an installed sink
+    # carries it here; path_allowlist runs before plugin option validation.
     blobs_dir = tmp_path / "blobs" / "test-session"
     outputs_dir = tmp_path / "outputs" / "test-session"
     blobs_dir.mkdir(parents=True, exist_ok=True)
@@ -171,12 +175,9 @@ def _chroma_persist_outside_data_dir_state(tmp_path: Path) -> CompositionState:
         outputs=(
             OutputSpec(
                 name="primary",
-                plugin="chroma_sink",
+                plugin="csv",
                 options={
-                    "collection": "docs",
-                    "mode": "persistent",
-                    "persist_directory": str(tmp_path.parent / "outside-chroma"),
-                    "field_mapping": {"id_field": "id", "document_field": "text"},
+                    "persist_directory": str(tmp_path.parent / "outside-store"),
                     "schema": {"mode": "fixed", "fields": ["id: str", "text: str"]},
                 },
                 on_write_failure="discard",
@@ -782,16 +783,11 @@ def _external_plugin_probe_pipeline_yaml(tmp_path: Path) -> str:
     Sinks include all risky external-client families available in this checkout:
       - azure_blob: BlobServiceClient deferred via _get_blob_client() lazy property.
       - dataverse: DataverseClient/credential deferred to on_start().
-      - chroma_sink: chromadb.HttpClient deferred to on_start().
       - csv: baseline, no external client.
 
-    The RAG transform is omitted from the transform chain because it requires the
-    on_start() provider (azure_search) for construction of a live RetrievalProvider,
-    and adding it as a transform would require the full LifecycleContext during
-    graph validation which is outside the scope of constructor-purity tests.
-    RAG's on_start()-deferred pattern is structurally identical to the LLM transform
-    already covered, and the sink representatives ensure coverage of all four
-    external-client families.
+    The azure_ai_search retrieval transform is omitted from the transform chain:
+    its client is built in on_start(), the same deferred pattern as the LLM
+    transform already covered here.
     """
     blobs_dir = tmp_path / "blobs"
     outputs_dir = tmp_path / "outputs"
@@ -870,20 +866,6 @@ sinks:
         method: managed_identity
       field_mapping:
         probe_field: probe_field
-  chroma_probe:
-    plugin: chroma_sink
-    on_write_failure: discard
-    options:
-      collection: probe-collection
-      mode: client
-      host: invariant.example.com
-      port: 8000
-      ssl: true
-      schema:
-        mode: observed
-      field_mapping:
-        document_field: page_content
-        id_field: probe_id
 """
 
 
@@ -894,7 +876,7 @@ def test_preflight_mode_instantiates_external_plugins_without_network(
     """Representative external constructors stay pure in preflight mode.
 
     Include plugins whose real runtime path creates Azure, Dataverse, OpenAI/
-    OpenRouter, RAG, Chroma, or HTTP clients in lifecycle methods. Prefer each
+    OpenRouter, or HTTP clients in lifecycle methods. Prefer each
     plugin's probe_config() where it exists; the test is about constructor
     purity, not live credentials.
     """
@@ -1034,9 +1016,9 @@ async def test_run_sync_in_worker_preserves_preflight_mode_for_plugin_constructo
     assert {kind for kind, _preflight in observed} == {"source", "sink"}
 
 
-def test_validate_pipeline_rejects_chroma_persist_directory_outside_data_dir(tmp_path: Path) -> None:
+def test_validate_pipeline_rejects_sink_persist_directory_outside_data_dir(tmp_path: Path) -> None:
     result = validate_pipeline_for_trained_operator(
-        _chroma_persist_outside_data_dir_state(tmp_path),
+        _sink_persist_directory_outside_data_dir_state(tmp_path),
         _web_settings(tmp_path),
         yaml_generator,
         session_id="test-session",

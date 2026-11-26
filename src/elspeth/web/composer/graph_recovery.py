@@ -26,7 +26,6 @@ from elspeth.web.composer.state import (
     validate_composer_output_name,
     validate_composer_source_name,
 )
-from elspeth.web.credential_guard import CredentialMaterialRefused, require_no_credential_material_in_state
 from elspeth.web.resource_identity import canonical_resource_uuid
 
 GraphRecoveryAction = Literal["park", "reset_to_turn_start", "reset_to_safe_checkpoint", "restore_parked_graph"]
@@ -211,9 +210,5 @@ def qualify_editable_checkpoint(state: CompositionState) -> EditableCheckpointQu
         return EditableCheckpointQualification(False, ("checkpoint_spec_malformed",))
     except (TypeError, ValueError, OverflowError, RecursionError):
         return EditableCheckpointQualification(False, ("checkpoint_not_representable",))
-    try:
-        require_no_credential_material_in_state(reconstructed, surface="composer_recovery_checkpoint")
-    except CredentialMaterialRefused:
-        return EditableCheckpointQualification(False, ("checkpoint_credential_material",))
     failures = _checkpoint_identity_failures(reconstructed)
     return EditableCheckpointQualification(not failures, failures)

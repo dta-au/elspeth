@@ -229,7 +229,6 @@ from elspeth.contracts.errors import (
     violations_to_error_reason,
 )
 from elspeth.contracts.events import (
-    ChromaWriteStatistics,
     DataverseLoadStatistics,
     ExternalCallCompleted,
     FieldResolutionApplied,
@@ -631,7 +630,6 @@ __all__ = [  # Grouped by category for readability
     "RunStarted",
     "RunSummary",
     "TelemetryEvent",
-    "ChromaWriteStatistics",
     "DataverseLoadStatistics",
     "RAGRetrievalStatistics",
     "TokenCompleted",

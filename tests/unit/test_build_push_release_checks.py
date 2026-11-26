@@ -699,7 +699,7 @@ def test_release_dockerfile_keeps_builder_os_packages_out_of_the_runtime() -> No
 
     assert (
         "FROM gcr.io/distroless/cc-debian13:debug-nonroot"
-        "@sha256:c69d16acb50ae6ee26adfb0645467b507753c0eb91c389afad87914cd2ecf6de AS runtime"
+        "@sha256:36978857457484568ebc541e7b47b291c30ffa2ae292d3d15ea5d294c0247f27 AS runtime"
     ) in runtime
     # Distroless ships no Python 3.14, so the uv-managed interpreter the venv
     # records travels with it, at the same /opt/python path as in the builder.

@@ -306,7 +306,7 @@ def validate_sink_failsink_destinations(
     Args:
         sink_configs: Dict of sink_name -> config object with on_write_failure attr.
         available_sinks: Set of all sink names in the pipeline.
-        sink_plugins: Dict of sink_name -> plugin type name (e.g., "csv", "chroma_sink").
+        sink_plugins: Dict of sink_name -> plugin type name (e.g., "csv", "json").
         allowed_failsink_plugins: Set of plugin types allowed as failsinks.
 
     Raises:

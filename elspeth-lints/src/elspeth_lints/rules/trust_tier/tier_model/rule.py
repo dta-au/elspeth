@@ -510,7 +510,6 @@ class TierModelVisitor(ast.NodeVisitor):
     _R5_NAMED_BOUNDARY_CONTEXTS: ClassVar[dict[str, frozenset[str]]] = {
         "engine/dependency_resolver.py": frozenset({"_load_depends_on"}),
         "plugins/infrastructure/clients/retrieval/azure_search.py": frozenset({"AzureSearchProvider._parse_response"}),
-        "plugins/infrastructure/clients/retrieval/chroma.py": frozenset({"ChromaSearchProvider._parse_and_build_chunks"}),
         "plugins/transforms/azure/prompt_shield.py": frozenset({"AzurePromptShield._analyze_prompt"}),
         "web/composer/audit.py": frozenset(
             {

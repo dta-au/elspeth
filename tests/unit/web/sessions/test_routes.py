@@ -55,7 +55,7 @@ from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.composer.advisor_transcript import AdvisorTranscriptHistory
-from elspeth.web.composer.context_budget_history import ContextBudgetHistory
+from elspeth.web.composer.context_budget_history import ContextBudgetHistory, MeasuredDensity
 from elspeth.web.composer.control_messages import advisor_signoff_withheld_control_envelope, anti_anchor_control_envelope
 from elspeth.web.composer.diagnostic_evidence import (
     DIAGNOSTIC_EVIDENCE_KIND,
@@ -6852,6 +6852,17 @@ class TestLiteLLMErrorRedaction:
         exc.__cause__ = RuntimeError(f"upstream: {self._CANARY_CAUSE}")
         return exc
 
+    def _make_permission_error(self) -> Exception:
+        from httpx import Request, Response
+        from litellm.exceptions import PermissionDeniedError
+
+        response = Response(403, request=Request("POST", "https://example.invalid"))
+        exc = PermissionDeniedError(
+            message=self._canary_message(), llm_provider=self._CANARY_PROVIDER, model=self._CANARY_MODEL, response=response
+        )
+        exc.__cause__ = RuntimeError(f"upstream: {self._CANARY_CAUSE}")
+        return exc
+
     def _make_api_error(self) -> Exception:
         from litellm.exceptions import APIError as LiteLLMAPIError
 
@@ -7114,10 +7125,12 @@ class TestLiteLLMErrorRedaction:
                 "exception field into the response."
             )
 
-    def test_send_message_auth_error_body_carries_class_name_only(self, tmp_path) -> None:
+    @pytest.mark.parametrize("failure_kind", ("authentication", "permission"))
+    def test_send_message_auth_error_body_carries_class_name_only(self, tmp_path, failure_kind: str) -> None:
         """LiteLLMAuthError from compose() → 502 with class-name-only detail."""
         mock_composer = SimpleNamespace()
-        mock_composer.compose = AsyncMock(spec=ComposerService.compose, side_effect=self._make_auth_error())
+        failure = self._make_auth_error() if failure_kind == "authentication" else self._make_permission_error()
+        mock_composer.compose = AsyncMock(spec=ComposerService.compose, side_effect=failure)
 
         app, _ = _make_app(tmp_path)
         app.state.composer_service = mock_composer
@@ -7132,7 +7145,11 @@ class TestLiteLLMErrorRedaction:
             path=f"/api/sessions/{session_id}/messages",
             body=message_body("Hello", state_id=current_head_state_id_sync(client, session_id), operation_id=str(uuid.uuid4())),
         )
-        self._assert_redacted(msg_resp, "llm_auth_error", "AuthenticationError")
+        expected_class = "AuthenticationError" if failure_kind == "authentication" else "PermissionDeniedError"
+        self._assert_redacted(msg_resp, "llm_auth_error", expected_class)
+        progress = asyncio.run(app.state.composer_progress_registry.get_latest(str(session_id)))
+        assert progress.reason == "provider_auth_failed"
+        assert progress.headline == "The composer model is not available."
 
     def test_send_message_api_error_body_carries_class_name_only(self, tmp_path) -> None:
         """LiteLLMAPIError from compose() → 502 with class-name-only detail."""
@@ -7354,12 +7371,14 @@ class TestLiteLLMErrorRedaction:
         assert "provider_detail" not in detail
         assert "provider_status_code" not in detail
 
-    def test_recompose_auth_error_body_carries_class_name_only(self, tmp_path) -> None:
+    @pytest.mark.parametrize("failure_kind", ("authentication", "permission"))
+    def test_recompose_auth_error_body_carries_class_name_only(self, tmp_path, failure_kind: str) -> None:
         """recompose path must mirror send_message's redaction."""
         import asyncio
 
         mock_composer = SimpleNamespace()
-        mock_composer.compose = AsyncMock(spec=ComposerService.compose, side_effect=self._make_auth_error())
+        failure = self._make_auth_error() if failure_kind == "authentication" else self._make_permission_error()
+        mock_composer.compose = AsyncMock(spec=ComposerService.compose, side_effect=failure)
 
         app, service = _make_app(tmp_path)
         app.state.composer_service = mock_composer
@@ -7378,7 +7397,11 @@ class TestLiteLLMErrorRedaction:
         recompose_resp = _settled_composer_response(
             client, app, path=f"/api/sessions/{session_id}/recompose", body=_recompose_request(service, session_id)
         )
-        self._assert_redacted(recompose_resp, "llm_auth_error", "AuthenticationError")
+        expected_class = "AuthenticationError" if failure_kind == "authentication" else "PermissionDeniedError"
+        self._assert_redacted(recompose_resp, "llm_auth_error", expected_class)
+        progress = asyncio.run(app.state.composer_progress_registry.get_latest(str(session_id)))
+        assert progress.reason == "provider_auth_failed"
+        assert progress.headline == "The composer model is not available."
 
     def test_recompose_api_error_body_carries_class_name_only(self, tmp_path) -> None:
         """recompose path must mirror send_message's redaction for APIError too."""
@@ -12110,8 +12133,11 @@ class TestSendMessageTranscriptSnapshot:
 
         assert resp.status_code == 200, resp.text
         assert mock_composer.compose.await_count == 1
+        # The stored call also gives the session's measured density (400 wire bytes for 100
+        # prompt tokens), which prices the next turn's first call.
         assert mock_composer.compose.await_args.kwargs["context_budget_history"] == ContextBudgetHistory(
             previously_shed_history=frozenset({"history:1"}),
+            measured=(MeasuredDensity(model="test/composer-model", dialect=None, bytes_per_token=4.0),),
         )
 
     def test_send_message_transcript_snapshot_contains_prior_turns(self, tmp_path) -> None:

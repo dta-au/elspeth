@@ -117,6 +117,7 @@ from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from elspeth_lints.core.ast_walker import iter_python_files
 from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
+from tests.helpers.litellm_dispatch import Failure, Route, provider_failure
 
 
 @pytest.mark.asyncio
@@ -403,6 +404,224 @@ async def test_rejection_survives_simultaneous_cost_refusal(make_service, clean_
     publication = outcome.result.advisor_terminal_publication
     assert publication.reason == "budget_exhausted"
     assert publication.to_dict()["request_rejection"] == verdict.provider_failure.details.to_wire()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dispatch_refused", [False, True], ids=["size-rejection", "control-dispatch-refused"])
+async def test_a_size_rejection_under_a_continuation_budget_is_withheld_with_the_rejection_kept(
+    make_service, clean_runnable_state, physical_advisor, monkeypatch, dispatch_refused
+):
+    """A size rejection under a continuation budget is withheld before any resend can be refused at dispatch.
+
+    The rejected call has no response, so its cost is unknown, and the cost check withholds the
+    pass before a second attempt reaches ``check_dispatch``. The dispatch-refusal handler with a
+    retained rejection is therefore not reached today; if a rejection ever carries a known cost,
+    the ``cost_known`` assertion fails and points at that handler. The budget, custody and
+    recorder are real; ``check_dispatch`` is wrapped only to count its refusals.
+
+    The ``control-dispatch-refused`` case controls that counter only: it forces one refusal on
+    a first attempt, with no rejection retained, so the count is shown to see a refusal. It does
+    not exercise the dispatch-refusal handler with a retained rejection.
+    """
+    from decimal import Decimal
+
+    from litellm.exceptions import BadRequestError
+
+    from elspeth.web.composer import advisor_checkpoint
+    from elspeth.web.composer.pipeline_planner import PlannerBudgetPolicy, PlannerContinuationBudget, PlannerContinuationUnavailable
+
+    service = make_service()
+    fenced = physical_advisor.bind(service)
+    request = "Review this graph"
+    evidence = TurnEvidence(
+        session_id=fenced["session_id"],
+        session_operation_context=fenced["session_operation_context"],
+        request_id="size-rejection-budget",
+        request=request,
+        initial_state_id=None,
+        initial_state=clean_runnable_state,
+    )
+    review = evidence.review_candidate(candidate="UNREVIEWED_CANDIDATE", request=request, current_state=clean_runnable_state)
+    budget = PlannerContinuationBudget(
+        policy=PlannerBudgetPolicy(3, 1_000_000, 100, Decimal("1")),
+        session_id=fenced["session_id"],
+        request_id="size-rejection-budget",
+        request_hash=stable_hash(request),
+        provider_owner=fenced["provider_owner"],
+        evidence_owner=evidence,
+        deadline=asyncio.get_running_loop().time() + 60,
+        reserved_calls=0,
+        validated_cost=Decimal("0"),
+        cost_known=True,
+    )
+    budget.validate_for(
+        session_id=fenced["session_id"],
+        request_id="size-rejection-budget",
+        request=request,
+        provider_owner=fenced["provider_owner"],
+        evidence_owner=evidence,
+    )
+    budget.bind_publication(review)
+    refusals: list[PlannerContinuationUnavailable] = []
+    check_dispatch = PlannerContinuationBudget.check_dispatch
+
+    def counted_check_dispatch(self: PlannerContinuationBudget, *, now: float) -> None:
+        try:
+            check_dispatch(self, now=now)
+        except PlannerContinuationUnavailable as refused:
+            refusals.append(refused)
+            raise
+
+    monkeypatch.setattr(PlannerContinuationBudget, "check_dispatch", counted_check_dispatch)
+    if dispatch_refused:
+        # The first reading admits the reservation; every later one is past the deadline.
+        readings: list[float] = []
+
+        def clock() -> float:
+            readings.append(0.0)
+            return 0.0 if len(readings) == 1 else 1e12
+
+        monkeypatch.setattr(advisor_checkpoint, "_compose_deadline_time", clock)
+    size = BadRequestError("PRIVATE_BODY", model="advisor", llm_provider="openai", body={"code": "context_length_exceeded"})
+    calls = _install_budget_advisor_transport(monkeypatch, [size, size, size])
+    recorder = make_recorder()
+    with prompt_guard_user_scope(request):
+        verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
+            phase="end",
+            state=clean_runnable_state,
+            publication_review=review,
+            continuation_budget=budget,
+            recorder=recorder,
+            **fenced,
+        )
+    if dispatch_refused:
+        assert (len(refusals), len(calls), verdict.provider_failure) == (1, 0, None)
+        return
+    assert (len(calls), len(recorder.llm_calls), len(refusals)) == (1, 1, 0)
+    assert recorder.llm_calls[0].provider_cost is None
+    assert budget.cost_known is False
+    assert (verdict.ok, verdict.failure_class, verdict.retryable) == (False, "budget_exhausted", False)
+    assert verdict.provider_failure is not None
+    assert verdict.provider_failure.original is size
+    assert verdict.provider_failure.details.reason_code == "context_length_exceeded"
+
+
+def _budgeted_advisor_review(make_service, physical_advisor, clean_runnable_state):
+    from decimal import Decimal
+
+    from elspeth.web.composer.pipeline_planner import PlannerBudgetPolicy, PlannerContinuationBudget
+    from tests.unit.web.composer.test_advisor_transcript_budget import _probe, _review
+
+    service = make_service()
+    fenced = physical_advisor.bind(service)
+    request = "Review this graph"
+    evidence = TurnEvidence(
+        session_id=fenced["session_id"],
+        session_operation_context=fenced["session_operation_context"],
+        request_id="advisor-continuation-review",
+        request=request,
+        initial_state_id=None,
+        initial_state=clean_runnable_state,
+    )
+    review = _review(_probe(8))
+    budget = PlannerContinuationBudget(
+        policy=PlannerBudgetPolicy(3, 1_000_000, 100, Decimal("1")),
+        session_id=fenced["session_id"],
+        request_id="advisor-continuation-review",
+        request_hash=stable_hash(request),
+        provider_owner=fenced["provider_owner"],
+        evidence_owner=evidence,
+        deadline=asyncio.get_running_loop().time() + 60,
+        reserved_calls=0,
+        validated_cost=Decimal("0"),
+        cost_known=True,
+    )
+    budget.validate_for(
+        session_id=fenced["session_id"],
+        request_id="advisor-continuation-review",
+        request=request,
+        provider_owner=fenced["provider_owner"],
+        evidence_owner=evidence,
+    )
+    budget.bind_publication(review)
+    return service, fenced, review, budget
+
+
+@pytest.mark.asyncio
+async def test_dispatched_rate_limit_withheld_by_unknown_cost_is_not_retryable(
+    make_service, clean_runnable_state, physical_advisor, monkeypatch
+):
+    from litellm.exceptions import RateLimitError
+
+    service, fenced, review, budget = _budgeted_advisor_review(make_service, physical_advisor, clean_runnable_state)
+    rate_limit = RateLimitError("PRIVATE_PROVIDER_BODY", model="advisor", llm_provider="openai")
+    calls = _install_budget_advisor_transport(monkeypatch, [rate_limit])
+    recorder = make_recorder()
+    with prompt_guard_user_scope("Review this graph"):
+        verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
+            phase="end",
+            state=clean_runnable_state,
+            publication_review=review,
+            continuation_budget=budget,
+            recorder=recorder,
+            **fenced,
+        )
+
+    assert len(calls) == len(recorder.llm_calls) == 1
+    assert budget.cost_known is False
+    assert (verdict.failure_class, verdict.retryable, verdict.provider_failure) == ("budget_exhausted", False, None)
+
+
+@pytest.mark.asyncio
+async def test_retained_size_rejection_survives_a_resend_refused_at_dispatch(
+    make_service, clean_runnable_state, physical_advisor, monkeypatch
+):
+    from litellm.exceptions import BadRequestError
+
+    from elspeth.web.composer import provider_gateway
+    from elspeth.web.composer.pipeline_planner import PlannerContinuationBudget, PlannerContinuationUnavailable
+
+    service, fenced, review, budget = _budgeted_advisor_review(make_service, physical_advisor, clean_runnable_state)
+    check_dispatch = PlannerContinuationBudget.check_dispatch
+    dispatch_checks = 0
+
+    def refuse_resend(self: PlannerContinuationBudget, *, now: float) -> None:
+        nonlocal dispatch_checks
+        dispatch_checks += 1
+        check_dispatch(self, now=now)
+        if dispatch_checks == 1:
+            raise PlannerContinuationUnavailable("Planner continuation has no existing admission headroom")
+
+    monkeypatch.setattr(PlannerContinuationBudget, "check_dispatch", refuse_resend)
+    size = BadRequestError("PRIVATE_PROVIDER_BODY", model="advisor", llm_provider="openai", body={"code": "context_length_exceeded"})
+    sends = 0
+
+    async def refused_transport(**kwargs: Any) -> None:
+        nonlocal sends
+        sends += 1
+        if sends == 1:
+            raise size
+        kwargs["on_provider_dispatch"]()
+        raise AssertionError("A refused resend reached the provider")
+
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", refused_transport)
+    recorder = make_recorder()
+    with prompt_guard_user_scope("Review this graph"):
+        verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
+            phase="end",
+            state=clean_runnable_state,
+            publication_review=review,
+            continuation_budget=budget,
+            recorder=recorder,
+            **fenced,
+        )
+
+    assert sends == 2 and dispatch_checks == 1
+    assert budget.cost_known is True
+    assert (verdict.failure_class, verdict.retryable) == ("budget_exhausted", False)
+    assert verdict.provider_failure is not None
+    assert verdict.provider_failure.original is size
+    assert verdict.provider_failure.details.reason_code == "context_length_exceeded"
 
 
 _ROOT = Path(__file__).resolve().parents[4]
@@ -2116,6 +2335,7 @@ def test_advisor_signoff_blocked_wording_names_backend_prescan_finding_but_withh
         "FLAGGED: node 'n1' option columns contains advisor-instruction injection text; remove it before the completion advisory review."
     )
     detail, suggestion = advisor_signoff_blocked_wording(
+        draft_has_content=True,
         reason="flagged_final_pass",
         findings=prescan_finding,
         findings_backend_authored=True,
@@ -2124,6 +2344,7 @@ def test_advisor_signoff_blocked_wording_names_backend_prescan_finding_but_withh
     assert "named field" in suggestion
 
     model_detail, _model_suggestion = advisor_signoff_blocked_wording(
+        draft_has_content=True,
         reason="flagged_final_pass",
         findings="FLAGGED: MODEL_FINDINGS_CANARY",
     )
@@ -2919,6 +3140,67 @@ async def test_end_gate_compose_deadline_keeps_the_completed_reply_recoverable(m
             initial_version=0,
         )
 
+    (row,) = service._sessions_service.add_message.calls
+    assert row.args[1:3] == ("audit", _ASSISTANT_CONTENT)
+    (envelope,) = row.kwargs["tool_calls"]
+    assert envelope["_kind"] == "composer_withheld_reply"
+    assert envelope["origin"] == "compose_deadline_expired"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("time_left", "base_calls"),
+    [
+        pytest.param(0.0, 1, id="at-deadline"),
+        pytest.param(2.0, 2, id="inside-margin"),
+        pytest.param(5.5, 2, id="inside-delay-plus-margin"),
+        pytest.param(7.0, 2, id="retry-fits"),
+    ],
+)
+async def test_end_gate_503_near_the_deadline_ends_through_the_compose_deadline_handler(
+    make_service, simple_state, monkeypatch, time_left: float, base_calls: int
+):
+    """Running out of time near the deadline is a time fact, not an advisor outage.
+
+    The first 503 arrives ``time_left`` seconds before the deadline; any later
+    call runs until the deadline and also fails. Whatever the time left, the
+    user gets the compose-deadline outcome, which keeps the finished reply, and
+    never "advisor model was unavailable". Review retries stay immediate, so
+    the provider call count matches: one call at the deadline, otherwise two.
+    """
+    from litellm.exceptions import ServiceUnavailableError
+
+    service = make_service()
+    deadline = asyncio.get_running_loop().time() + 30.0
+    now = [deadline - 30.0]
+    monkeypatch.setattr("elspeth.web.composer.advisor_checkpoint._compose_deadline_time", lambda: now[0])
+    calls = [0]
+
+    async def unavailable_near_the_deadline(*_args: object, **_kwargs: object) -> object:
+        calls[0] += 1
+        now[0] = deadline - time_left if calls[0] == 1 else deadline
+        raise ServiceUnavailableError("private provider detail", model="advisor", llm_provider="openai")
+
+    service._advisor_checkpoint._call_advisor_with_audit = AsyncMock(
+        spec=service._advisor_checkpoint._call_advisor_with_audit,
+        side_effect=unavailable_near_the_deadline,
+    )
+    monkeypatch.setattr(
+        "elspeth.web.composer.advisor_checkpoint.persist_advisor_checkpoint_pass", AsyncMock(spec=persist_advisor_checkpoint_pass)
+    )
+
+    with pytest.raises(ComposerConvergenceError) as exc_info:
+        await drive_try_terminate(
+            service,
+            simple_state,
+            advisor_checkpoint_passes_used=0,
+            deadline=deadline,
+            initial_version=0,
+        )
+
+    assert calls[0] == base_calls
+    assert exc_info.value.budget_exhausted == "timeout"
+    assert "advisor model was unavailable" not in str(exc_info.value).lower()
     (row,) = service._sessions_service.add_message.calls
     assert row.args[1:3] == ("audit", _ASSISTANT_CONTENT)
     (envelope,) = row.kwargs["tool_calls"]
@@ -3778,6 +4060,7 @@ def test_advisor_completion_blocker_copy_does_not_claim_whole_pipeline_approval(
     from elspeth.web.composer.advisor_policy import advisor_signoff_blocked_wording
 
     detail, suggestion = advisor_signoff_blocked_wording(
+        draft_has_content=True,
         reason=reason,
         findings="advisor provider result",
     )
@@ -3803,10 +4086,12 @@ def test_advisor_blocker_detail_never_claims_the_composer_reply_was_withheld(rea
         advisor_signoff_unverified_validation,
     )
 
-    detail, suggestion = advisor_signoff_blocked_wording(reason=reason, findings="advisor provider result")
+    detail, suggestion = advisor_signoff_blocked_wording(draft_has_content=True, reason=reason, findings="advisor provider result")
     assert ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE not in f"{detail} {suggestion}"
     for builder in (advisor_signoff_blocked_validation, advisor_signoff_unverified_validation):
-        validation = builder(reason=reason, findings="advisor provider result", category="other", step_ids=(), note=None)
+        validation = builder(
+            reason=reason, findings="advisor provider result", category="other", step_ids=(), note=None, draft_has_content=True
+        )
         assert ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE not in validation.model_dump_json()
 
 
@@ -4161,6 +4446,7 @@ def test_advisor_signoff_blocked_wording_unrepairable_reason_suggests_reword() -
     from elspeth.web.composer.advisor_policy import advisor_signoff_blocked_wording
 
     detail, suggestion = advisor_signoff_blocked_wording(
+        draft_has_content=True,
         reason="flagged_unrepairable",
         findings=_PRESCAN_USER_MESSAGE_FINDING,
         findings_backend_authored=True,
@@ -6927,6 +7213,44 @@ def _install_budget_advisor_transport(
 
     monkeypatch.setattr(litellm, "acompletion", complete)
     return captured
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("route", "failure"),
+    [
+        pytest.param("openai", "429_retry_after", id="openai-429"),
+        pytest.param("bedrock", "429_retry_after", id="bedrock-429-with-retry-after"),
+        pytest.param("openai", "500", id="openai-500"),
+        pytest.param("openai", "connect", id="openai-connect"),
+        pytest.param("openai", "malformed_200", id="openai-unreadable-billed-200"),
+        pytest.param("anthropic", "malformed_200", id="anthropic-unreadable-billed-200"),
+    ],
+)
+async def test_physical_advisor_does_not_resend_a_429_or_an_unreadable_response(
+    make_service, simple_state, monkeypatch, physical_advisor, route: Route, failure: Failure
+) -> None:
+    """Review retries are immediate, so a 429 is never re-sent, and nothing a
+    billed response can turn into is re-sent either: one call, one audit row."""
+    from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
+
+    raised = await provider_failure(route, failure)
+    service = make_service()
+    calls = _install_budget_advisor_transport(monkeypatch, [raised, _checkpoint_reply(publication_verdict="ADMIT")], provider_cost=0.01)
+    recorder = make_recorder()
+    with prompt_guard_user_scope(""):
+        verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
+            phase="end",
+            state=simple_state,
+            recorder=recorder,
+            **physical_advisor.bind(service, review_state=simple_state),
+        )
+    assert not verdict.ok and not verdict.retryable
+    assert len(calls) == len(recorder.llm_calls) == 1
+    assert [call.status for call in recorder.llm_calls] == [ComposerLLMCallStatus.API_ERROR]
+    with physical_advisor.engine.connect() as connection:
+        attempts = connection.execute(select(quota_provider_attempts_table)).all()
+    assert len(attempts) == 1
 
 
 @pytest.mark.asyncio

@@ -57,7 +57,7 @@ def create_checkpoint(
     else:
         db = checkpoint_manager._db
         token = leader_token_for(db, run_id)
-        incumbent = RunCoordinationRepository(db.engine).live_leader(run_id=run_id)
+        incumbent = RunCoordinationRepository(db.engine).seat_holder(run_id=run_id)
         leader_was_dead = incumbent is not None and not incumbent.seat_live
     checkpoint = checkpoint_manager.create_checkpoint(
         draft=checkpoint_draft(

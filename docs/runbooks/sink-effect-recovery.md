@@ -149,12 +149,11 @@ claim must share the target transaction. Missing ledger DDL, insufficient
 permissions, or a transaction boundary that cannot prove the effect ID is a
 preflight failure; it is not a reason to fall back to legacy writes.
 
-### Dataverse and Chroma
+### Dataverse
 
-These adapters reconcile durable member sub-effects. Recovery is per member;
+This adapter reconciles durable member sub-effects. Recovery is per member;
 one uncertain member must not cause already proven members to be submitted
-again. Chroma recovery also preserves the adapter's documented skip/error
-outcomes rather than upgrading them to accepted publication.
+again.
 
 ### Audit exports
 

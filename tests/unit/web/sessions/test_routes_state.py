@@ -2835,7 +2835,7 @@ sinks:
                 ),
                 "category": "credential_field",
                 "surface": "composer_yaml_import",
-                "detector_version": "1",
+                "detector_version": "2",
             },
             "request_id": None,
         }
@@ -2938,7 +2938,7 @@ sinks:
                 ),
                 "category": "credential_field",
                 "surface": "composer_yaml_import",
-                "detector_version": "1",
+                "detector_version": "2",
             },
             "request_id": None,
         }

@@ -81,7 +81,10 @@ async def test_a_rejection_with_history_present_is_retried_once_with_every_earli
     rejected, retried = result.llm_calls
     assert rejected.status is ComposerLLMCallStatus.BAD_REQUEST_ERROR
     assert rejected.error_message == "context_length_exceeded"
+    # Recognised from the SDK's own class, and recorded as such.
+    assert rejected.rejection_reason_source == "sdk_class"
     assert retried.status is ComposerLLMCallStatus.SUCCESS
+    assert retried.rejection_reason_source is None
     assert _budget(rejected).shed_history_indices == ()
     assert _budget(rejected).retry_after_provider_rejection is None
     retry_budget = _budget(retried)
@@ -90,6 +93,14 @@ async def test_a_rejection_with_history_present_is_retried_once_with_every_earli
     assert retry_budget.stubbed_tool_call_ids == ()
     assert retry_budget.to_dict()["retry_after_provider_rejection"] is True
     assert "retry_after_provider_rejection" not in _budget(rejected).to_dict()
+    # Each budget record names its surface and what its density came from; a
+    # rejected call gives none, so the resend is priced as the first call was.
+    for call in (rejected, retried):
+        assert (_budget(call).surface, _budget(call).density_source, _budget(call).measured_bytes_per_token) == (
+            "compose_loop",
+            "fallback",
+            None,
+        )
 
 
 @pytest.mark.asyncio
@@ -206,3 +217,43 @@ async def test_a_rejection_mid_turn_is_retried_with_every_round_of_the_turn_whol
     ]
     assert [_budget(call).retry_after_provider_rejection for call in result.llm_calls] == [None, None, True]
     assert all(_budget(call).stubbed_tool_call_ids == () for call in result.llm_calls)
+
+
+@pytest.mark.asyncio
+async def test_last_chance_size_rejection_resends_without_earlier_turns() -> None:
+    service, session_id = _loop_service(_GENEROUS_TOKENS)
+    service._max_composition_turns = 1
+    provider = _ScriptedProvider(_tool_turn("call-1"), _too_long(), _make_llm_response(content="Pipeline built."))
+
+    result = await _loop_compose(service, session_id, _history(), provider, tool_data={"call-1": {"rows": "ready"}})
+
+    assert len(provider.requests) == 3
+    assert [_history_in(request) for request in provider.requests[1:]] == [list(_HISTORY_TEXTS), []]
+    assert _turn_in_progress(provider.requests[2]) == _turn_in_progress(provider.requests[1])
+    assert _budget(result.llm_calls[2]).retry_after_provider_rejection is True
+
+
+@pytest.mark.asyncio
+async def test_last_chance_second_size_rejection_reports_provider_ceiling() -> None:
+    service, session_id = _loop_service(_GENEROUS_TOKENS)
+    service._max_composition_turns = 1
+    provider = _ScriptedProvider(_tool_turn("call-1"), _too_long(), _too_long())
+
+    with pytest.raises(ComposerConvergenceError) as exc_info:
+        await _loop_compose(service, session_id, _history(), provider, tool_data={"call-1": {"rows": "ready"}})
+
+    assert len(provider.requests) == 3
+    assert exc_info.value.reason == "context_budget_exceeded"
+    assert exc_info.value.evidence["ceiling"] == "provider"
+
+
+@pytest.mark.asyncio
+async def test_last_chance_non_size_rejection_is_not_resent() -> None:
+    service, session_id = _loop_service(_GENEROUS_TOKENS)
+    service._max_composition_turns = 1
+    provider = _ScriptedProvider(_tool_turn("call-1"), _other_rejection())
+
+    with pytest.raises(_BadRequestLLMError):
+        await _loop_compose(service, session_id, _history(), provider, tool_data={"call-1": {"rows": "ready"}})
+
+    assert len(provider.requests) == 2

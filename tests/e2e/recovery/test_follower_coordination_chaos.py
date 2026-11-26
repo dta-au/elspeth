@@ -60,6 +60,7 @@ from tests.e2e.recovery.harness import (
 from tests.e2e.recovery.test_follower_join_and_drain import (
     _get_db_config_hash,
     _join_follower,
+    _join_inputs,
     _orchestrator,
     _seat_run_with_live_leader,
     _seed_ready_row,
@@ -167,6 +168,7 @@ class TestFollowerIsolation:
                     run_id=crashed.run_id,
                     settings=types.SimpleNamespace(),
                     window_seconds=_GUARD_LIVE_SEAT_WINDOW_SECONDS,
+                    **_join_inputs(),
                 )
                 .worker_id
             )
@@ -273,6 +275,7 @@ class TestFollowerIsolation:
                     run_id=crashed.run_id,
                     settings=types.SimpleNamespace(),
                     window_seconds=_GUARD_LIVE_SEAT_WINDOW_SECONDS,
+                    **_join_inputs(),
                 )
                 .worker_id
             )
@@ -347,6 +350,7 @@ class TestFollowerIsolation:
                     run_id=crashed.run_id,
                     settings=types.SimpleNamespace(),
                     window_seconds=_GUARD_LIVE_SEAT_WINDOW_SECONDS,
+                    **_join_inputs(),
                 )
                 .worker_id
             )

@@ -96,7 +96,9 @@ _EXPECTED_ARMING_REJECTIONS = frozenset(
 # Transforms that must stay inside the armed sweep. Not an arbitrary sample — one
 # per creation mechanism, so a refactor cannot quietly drop a whole family:
 #
-# * ``llm`` / ``rag_retrieval`` — fields created from a provider response.
+# * ``llm`` / ``azure_ai_search`` — fields created from a provider response
+#   (``azure_ai_search`` replaced ``rag_retrieval``, removed with Chroma in
+#   0.8.18 on 2026-11-26; both create theirs in ``RetrievalTransformBase``).
 # * ``web_scrape`` / ``azure_document_intelligence`` — fields created from a
 #   network fetch, the family whose configs name both read and written columns.
 # * ``field_mapper`` — created set computed in ``__init__`` from ``mapping``, the
@@ -109,11 +111,11 @@ _EXPECTED_ARMING_REJECTIONS = frozenset(
 #   columns. If it leaves this roster the override path is untested.
 _ARMED_SWEEP_ANCHORS = frozenset(
     {
+        "azure_ai_search",
         "azure_document_intelligence",
         "batch_stats",
         "field_mapper",
         "llm",
-        "rag_retrieval",
         "value_transform",
         "web_scrape",
     }

@@ -24,6 +24,15 @@ from elspeth.contracts.composer_audit import PrivateFailureFacts, PrivateReceive
 from elspeth.contracts.composer_provider_context import PrivateProviderContext
 from elspeth.contracts.credential_material import CredentialCategory
 from elspeth.contracts.freeze import deep_thaw, freeze_fields, require_int
+from elspeth.contracts.provider_rejection import ReasonSource
+
+# The composer call a context-budget decision was made for: a compose-loop
+# call, the reply stage's call, a planner call, or an escape-hatch call.
+ContextBudgetSurface = Literal["compose_loop", "reply", "planner", "hatch"]
+# Where the measured density that priced the byte rate came from: a successful
+# call earlier in this exchange, the session's stored calls, or neither (the
+# policy's fallback rate).
+ContextBudgetDensitySource = Literal["live_call", "stored_call", "fallback"]
 
 ContextBudgetAnchorStatus = Literal[
     "no_previous_call",
@@ -247,6 +256,17 @@ class ComposerContextBudgetRecord:
     # request of the turn as over its context limit, with every earlier turn
     # left out. ``None`` on every other record: absence never means "false".
     retry_after_provider_rejection: bool | None = None
+    # The call this decision was made for, and where the density that priced
+    # its byte rate came from. ``measured_bytes_per_token`` is that density as
+    # measured (wire bytes over the provider's prompt count, before the policy's
+    # margin), set exactly when one was used; ``bytes_per_token`` stays the rate
+    # the estimate applied, which an anchor may lower. The call's own status,
+    # ``error_message`` and ``rejection_reason_source`` say whether the request
+    # was accepted. ``None`` on a record written before these were kept:
+    # absence means unknown.
+    surface: ContextBudgetSurface | None = None
+    density_source: ContextBudgetDensitySource | None = None
+    measured_bytes_per_token: str | None = None
 
     def __post_init__(self) -> None:
         _require_non_empty_str(self.policy_hash, "policy_hash")
@@ -271,6 +291,21 @@ class ComposerContextBudgetRecord:
             raise TypeError("over_estimate must be bool or None")
         if self.retry_after_provider_rejection is not None and self.retry_after_provider_rejection is not True:
             raise ValueError("retry_after_provider_rejection is True or absent")
+        if self.surface is not None:
+            _require_non_empty_str(self.surface, "surface")
+            if self.surface not in get_args(ContextBudgetSurface):
+                raise ValueError("invalid surface")
+        if self.density_source is not None:
+            _require_non_empty_str(self.density_source, "density_source")
+            if self.density_source not in get_args(ContextBudgetDensitySource):
+                raise ValueError("invalid density_source")
+        if (self.measured_bytes_per_token is not None) != (self.density_source in ("live_call", "stored_call")):
+            raise ValueError("a measured density is recorded exactly when one was used")
+        if self.measured_bytes_per_token is not None:
+            _require_non_empty_str(self.measured_bytes_per_token, "measured_bytes_per_token")
+            measured = float(self.measured_bytes_per_token)
+            if not math.isfinite(measured) or measured <= 0:
+                raise ValueError("measured_bytes_per_token must be a positive finite rate")
         if (self.over_estimate is None) != (self.max_prompt_tokens is None):
             raise ValueError("over_estimate and max_prompt_tokens are recorded together")
         if self.max_prompt_tokens is not None:
@@ -367,6 +402,12 @@ class ComposerContextBudgetRecord:
             result["max_prompt_tokens"] = self.max_prompt_tokens
         if self.retry_after_provider_rejection is not None:
             result["retry_after_provider_rejection"] = self.retry_after_provider_rejection
+        if self.surface is not None:
+            result["surface"] = self.surface
+        if self.density_source is not None:
+            result["density_source"] = self.density_source
+        if self.measured_bytes_per_token is not None:
+            result["measured_bytes_per_token"] = self.measured_bytes_per_token
         return result
 
 
@@ -494,6 +535,16 @@ class ComposerLLMCall:
     ``context_budget`` is the :class:`ComposerContextBudgetRecord` of the
     pre-call context-budget decision (estimates, policy hash, what was shed),
     or ``None`` when the call was not budgeted.
+
+    ``rejection_reason_source`` says what recognised a size rejection (an
+    ``error_message`` of ``context_length_exceeded`` or ``request_too_large``):
+    a structured SDK or HTTP field (``sdk_body``, ``http_response``), litellm's
+    context-window exception class (``sdk_class``), the HTTP status
+    (``http_status``), or ELSPETH's fixed-wording match on the provider's
+    message (``message_pattern``). ``sdk_class`` is not typed evidence: on some
+    routes (Anthropic, Bedrock, OpenAI-compatible) litellm itself assigns that
+    class by matching the provider's wording. ``None`` on every other call, and
+    on records written before it was kept.
     """
 
     model_requested: str
@@ -535,6 +586,7 @@ class ComposerLLMCall:
     strict_tool_count: int | None = None
     request_byte_split: ComposerLLMRequestByteSplit | None = None
     context_budget: ComposerContextBudgetRecord | None = None
+    rejection_reason_source: ReasonSource | None = None
     private_failure: PrivateFailureFacts | None = field(default=None, repr=False)
     private_diagnostics: tuple[PrivateReceivedDiagnostic, ...] = field(default=(), repr=False)
     private_request: PrivateProviderContext | None = field(default=None, repr=False)
@@ -635,6 +687,8 @@ class ComposerLLMCall:
             raise ValueError("SUCCESS calls must not include error_class or error_message")
         if self.status is not ComposerLLMCallStatus.SUCCESS and (self.error_class is None or self.error_message is None):
             raise ValueError("non-success calls must include error_class and error_message")
+        if self.rejection_reason_source is not None:
+            _require_size_rejection_source(self.rejection_reason_source, self.status, self.error_message)
         if self.reasoning_content is not None and type(self.reasoning_content) is not str:
             raise TypeError(f"reasoning_content must be str or None, got {type(self.reasoning_content).__name__}")
         freeze_fields(self, "declared_tool_names", "reasoning_details", "thinking_blocks", "reasoning_withholds")
@@ -671,6 +725,23 @@ class ComposerLLMCall:
         raw["started_at"] = self.started_at.isoformat()
         raw["finished_at"] = self.finished_at.isoformat()
         return raw
+
+
+# Every source that can recognise a rejection's reason. ``unavailable`` names a
+# rejection with no reason, so it never describes a size rejection.
+_SIZE_REJECTION_SOURCES: Final[frozenset[str]] = frozenset(get_args(ReasonSource)) - {"unavailable"}
+
+
+def _require_size_rejection_source(source: object, status: ComposerLLMCallStatus, error_message: str | None) -> None:
+    """A recorded reason source must describe the size rejection the call records."""
+    if type(source) is not str or source not in _SIZE_REJECTION_SOURCES:
+        raise ValueError(f"rejection_reason_source must be one of {sorted(_SIZE_REJECTION_SOURCES)}, got {source!r}")
+    if status is not ComposerLLMCallStatus.BAD_REQUEST_ERROR:
+        raise ValueError("rejection_reason_source is recorded only on a rejected request")
+    if error_message not in ("context_length_exceeded", "request_too_large"):
+        raise ValueError("rejection_reason_source is recorded only on a size rejection")
+    if (source == "http_status") != (error_message == "request_too_large"):
+        raise ValueError("a request-too-large rejection is recognised only from its HTTP status")
 
 
 class ComposerLLMCallRecorder(Protocol):

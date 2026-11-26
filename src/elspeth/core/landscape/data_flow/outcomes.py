@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Select, and_, or_, select
+from sqlalchemy import Select, and_, bindparam, literal, or_, select
 from sqlalchemy.engine import Connection
 from sqlalchemy.engine import Row as SQLAlchemyRow
 from sqlalchemy.exc import SQLAlchemyError
@@ -34,7 +34,7 @@ from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.scheduler import BarrierTerminalOutcomeSpec, TokenWorkItem
 from elspeth.core.canonical import canonical_json
 from elspeth.core.ids import generate_id
-from elspeth.core.landscape._database_ops import DatabaseOps
+from elspeth.core.landscape._database_ops import DatabaseOps, ReadSnapshot
 from elspeth.core.landscape._helpers import now
 from elspeth.core.landscape.data_flow.ownership import RowTokenOwnership
 from elspeth.core.landscape.errors import LandscapeRecordError
@@ -66,6 +66,11 @@ __all__ = [
 # keeps each PostgreSQL extended-protocol statement far below its 32767
 # bind cap on large sink flushes.
 _TOKEN_ID_CHUNK_SIZE = 500
+
+# Candidate rows per run-end orphan-sweep partition; each partition's distinct
+# parent ids bind one witness SELECT (<= 900 ids plus two run_id binds), the
+# repository's convention under SQLite's historical 999-variable limit.
+_ORPHAN_SWEEP_PARTITION_ROWS = 900
 
 
 @dataclass(frozen=True, slots=True)
@@ -760,34 +765,13 @@ class TokenOutcomeRepository:
         )
 
     def find_orphaned_transient_parents(self, run_id: str) -> list[SQLAlchemyRow[Any]]:
-        """Find I1a parent tokens with no child token outcome witnesses."""
-        parent_paths = (
-            TerminalPath.FORK_PARENT.value,
-            TerminalPath.EXPAND_PARENT.value,
-        )
-        child_outcomes = token_outcomes_table.alias("child_outcomes")
-        child_witness = (
-            select(child_outcomes.c.outcome_id)
-            .select_from(
-                token_parents_table.join(
-                    child_outcomes,
-                    and_(
-                        child_outcomes.c.token_id == token_parents_table.c.token_id,
-                        child_outcomes.c.run_id == run_id,
-                    ),
-                )
-            )
-            .where(token_parents_table.c.parent_token_id == token_outcomes_table.c.token_id)
-            .where(token_parents_table.c.run_id == run_id)
-        )
-        query = (
-            select(token_outcomes_table.c.token_id, token_outcomes_table.c.path)
-            .where(token_outcomes_table.c.run_id == run_id)
-            .where(token_outcomes_table.c.path.in_(parent_paths))
-            .where(token_outcomes_table.c.outcome == TerminalOutcome.TRANSIENT.value)
-            .where(~child_witness.exists())
-        )
-        return list(self._ops.execute_fetchall(query))
+        """Find I1a parent tokens with no child token outcome witnesses.
+
+        Both steps of the sweep read ONE snapshot; see
+        :func:`_orphaned_transient_parents_in`.
+        """
+        with self._ops.read_snapshot() as snapshot:
+            return _orphaned_transient_parents_in(snapshot, run_id)
 
     def find_orphaned_batch_consumptions(self, run_id: str) -> list[str]:
         """Find I1b batch IDs consumed by tokens whose batch did not complete."""
@@ -994,3 +978,66 @@ def record_terminal_outcomes_guarded(
     if len(result.fetchall()) != len(values):
         raise LandscapeRecordError("record_terminal_outcomes_guarded: incomplete batch — audit write failed")
     return outcome_ids
+
+
+def _orphaned_transient_parents_in(snapshot: ReadSnapshot, run_id: str) -> list[SQLAlchemyRow[Any]]:
+    """Read the I1a orphan sweep for ``run_id`` from one snapshot.
+
+    A transient fork/expand parent outcome is witnessed when an edge of this
+    run names it as parent and the edge's child token has any outcome in this
+    run. Candidate parent outcomes stream in partitions; each partition's
+    witnessed parent ids are read in one bounded SELECT. The former single
+    correlated ``NOT EXISTS`` statement was quadratic on SQLite with no or
+    stale statistics; this shape is linear with none or fresh. Residual: when
+    ``sqlite_stat1`` recorded ``token_parents`` as tiny (about 1-40 rows),
+    each witness SELECT scans all of ``token_parents``, every run, once per
+    900-candidate partition, which with many foreign-run edges can cost more
+    than the former statement. Only an operator ``ANALYZE`` (database
+    maintenance runbook) creates that state; the product never runs
+    ``ANALYZE`` or ``PRAGMA optimize``. Python holds one partition plus the
+    orphans found.
+    Both steps must share ``snapshot``: mixing snapshots can report an orphan
+    that no committed state has, or miss one that every state has.
+
+    Returns one ``(token_id, path)`` row per orphaned outcome row (duplicate
+    outcome rows stay duplicated), ordered by ``(token_id, path)`` under the
+    database's collation (the former statement had no defined order).
+    """
+    parent_paths = (
+        TerminalPath.FORK_PARENT.value,
+        TerminalPath.EXPAND_PARENT.value,
+    )
+    candidates = (
+        select(token_outcomes_table.c.token_id, token_outcomes_table.c.path)
+        .where(token_outcomes_table.c.run_id == run_id)
+        .where(token_outcomes_table.c.path.in_(parent_paths))
+        .where(token_outcomes_table.c.outcome == TerminalOutcome.TRANSIENT.value)
+        .order_by(token_outcomes_table.c.token_id, token_outcomes_table.c.path)
+    )
+    child_outcomes = token_outcomes_table.alias("child_outcomes")
+    # SELECT 1, not a column: (run_id, token_id) then covers the probe. With a
+    # non-covered column, SQLite on stale ANALYZE statistics (tables believed
+    # tiny) scanned child outcomes once per edge (measured quadratic).
+    child_witness = (
+        select(literal(1))
+        .where(child_outcomes.c.token_id == token_parents_table.c.token_id)
+        .where(child_outcomes.c.run_id == run_id)
+        .exists()
+    )
+    # Built once: binding each partition's ids at execution keeps the loop
+    # from leaving a statement per partition (holding its ids) for the
+    # cyclic collector, so live memory stays at one partition.
+    witnesses = (
+        select(token_parents_table.c.parent_token_id)
+        .distinct()
+        .where(token_parents_table.c.run_id == run_id)
+        .where(token_parents_table.c.parent_token_id.in_(bindparam("parent_ids", expanding=True)))
+        .where(child_witness)
+    )
+    orphans: list[SQLAlchemyRow[Any]] = []
+    with snapshot.stream_partitions(candidates, _ORPHAN_SWEEP_PARTITION_ROWS) as partitions:
+        for partition in partitions:
+            parent_ids = list(dict.fromkeys(row.token_id for row in partition))
+            witnessed = {row.parent_token_id for row in snapshot.select_all(witnesses, {"parent_ids": parent_ids})}
+            orphans.extend(row for row in partition if row.token_id not in witnessed)
+    return orphans

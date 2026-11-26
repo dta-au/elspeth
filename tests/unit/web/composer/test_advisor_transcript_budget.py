@@ -27,7 +27,7 @@ from litellm.types.utils import ModelResponse, Usage
 
 from elspeth.contracts.composer_llm_audit import ComposerContextBudgetRecord, ComposerLLMCall, ComposerLLMCallStatus
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.web.composer import advisor_context, provider_gateway
+from elspeth.web.composer import advisor_context, advisor_policy, provider_gateway
 from elspeth.web.composer import advisor_transcript as transcript_module
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
 from elspeth.web.composer.advisor_transcript import AdvisorTranscriptHistory, AdvisorTranscriptOwner, AdvisorVisibleTranscript
@@ -811,6 +811,9 @@ async def test_a_provider_rejection_of_a_request_over_its_estimate_is_an_ordinar
 
     async def rejected(**kwargs: Any) -> None:
         await admit_provider_attempt(model=kwargs["model"])
+        # The real transport calls the dispatch hook once the attempt is admitted, before sending.
+        if kwargs.get("on_provider_dispatch") is not None:
+            kwargs["on_provider_dispatch"]()
         sent.append(copy.deepcopy(kwargs))
         raise BadRequestError(
             "PRIVATE_PROVIDER_BODY", model=kwargs["model"], llm_provider="openai", body={"code": "context_length_exceeded"}
@@ -830,6 +833,477 @@ async def test_a_provider_rejection_of_a_request_over_its_estimate_is_an_ordinar
     assert verdict.provider_failure.details.reason_code == "context_length_exceeded"
     assert verdict.findings_text == verdict.provider_failure.details.explanation
     assert _NOT_SENT not in verdict.findings_text
+
+
+@pytest.mark.asyncio
+async def test_advisor_size_rejection_resends_with_earlier_turns_disclosed_as_omitted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from litellm.exceptions import BadRequestError
+
+    from tests.unit.web.composer._helpers import _empty_state
+
+    _require_age_api()
+    successful = _transport(monkeypatch)
+    complete = provider_gateway._litellm_acompletion
+    sent: list[dict[str, Any]] = []
+
+    async def rejected_once(**kwargs: Any) -> Any:
+        sent.append(copy.deepcopy(kwargs))
+        if len(sent) == 1:
+            await admit_provider_attempt(model=kwargs["model"])
+            if kwargs.get("on_provider_dispatch") is not None:
+                kwargs["on_provider_dispatch"]()
+            raise BadRequestError(
+                "PRIVATE_PROVIDER_BODY", model=kwargs["model"], llm_provider="openai", body={"code": "context_length_exceeded"}
+            )
+        return await complete(**kwargs)
+
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", rejected_once)
+    recorder = BufferingRecorder()
+    verdict = await _owner(tmp_path)._run_advisor_checkpoint(
+        phase="end", state=_empty_state(), session_id=None, recorder=recorder, publication_review=_review(_probe(8))
+    )
+
+    assert verdict.ok is True
+    assert len(sent) == len(recorder.llm_calls) == 2
+    assert len(successful) == 1
+    first = _sent_transcript(sent[0]["messages"][1]["content"])
+    second = _sent_transcript(sent[1]["messages"][1]["content"])
+    assert _labels(first) != _NOW
+    assert _labels(second) == _NOW
+    assert _counts(second)["not_shown"] == 8
+    assert _NOT_SHOWN_GAP in second["availability_gaps"]
+
+
+@pytest.mark.asyncio
+async def test_advisor_size_resend_is_available_after_the_last_ordinary_attempt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from litellm.exceptions import BadRequestError
+
+    from tests.unit.web.composer._helpers import _empty_state
+
+    _transport(monkeypatch)
+    complete = provider_gateway._litellm_acompletion
+    sent: list[dict[str, Any]] = []
+
+    async def fail_then_succeed(**kwargs: Any) -> Any:
+        sent.append(copy.deepcopy(kwargs))
+        if len(sent) < 3:
+            await admit_provider_attempt(model=kwargs["model"])
+            if kwargs.get("on_provider_dispatch") is not None:
+                kwargs["on_provider_dispatch"]()
+            if len(sent) == 1:
+                raise TimeoutError("advisor provider timed out")
+            raise BadRequestError(
+                "PRIVATE_PROVIDER_BODY", model=kwargs["model"], llm_provider="openai", body={"code": "context_length_exceeded"}
+            )
+        return await complete(**kwargs)
+
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fail_then_succeed)
+    verdict = await _owner(tmp_path)._run_advisor_checkpoint(
+        phase="end", state=_empty_state(), session_id=None, recorder=BufferingRecorder(), publication_review=_review(_probe(8))
+    )
+
+    assert verdict.ok is True
+    assert len(sent) == 3
+    assert _labels(_sent_transcript(sent[2]["messages"][1]["content"])) == _NOW
+
+
+def _scripted_advisor(monkeypatch: pytest.MonkeyPatch, script: list[str]) -> list[dict[str, Any]]:
+    """Each call takes the next step: ``size`` (rejected as over the context limit), ``timeout``,
+    ``predispatch_timeout`` (times out in quota admission, before the provider dispatch, as
+    ``asyncio.wait_for`` does when the deadline runs out in the guard or admission), ``413``
+    (refused as too large by the provider or a proxy in front of it), ``junk`` (text that is
+    no verdict), ``empty`` (whitespace text, a malformed reply) or ``ok``."""
+    from litellm.exceptions import BadRequestError
+
+    _transport(monkeypatch)
+    complete = provider_gateway._litellm_acompletion
+    sent: list[dict[str, Any]] = []
+
+    async def scripted(**kwargs: Any) -> Any:
+        sent.append(copy.deepcopy(kwargs))
+        step = script[len(sent) - 1]
+        if step == "ok":
+            return await complete(**kwargs)
+        if step == "predispatch_timeout":
+            raise TimeoutError("the deadline ran out before dispatch")
+        await admit_provider_attempt(model=kwargs["model"])
+        if kwargs.get("on_provider_dispatch") is not None:
+            kwargs["on_provider_dispatch"]()
+        if step == "size":
+            raise BadRequestError(
+                "PRIVATE_PROVIDER_BODY", model=kwargs["model"], llm_provider="openai", body={"code": "context_length_exceeded"}
+            )
+        if step == "timeout":
+            raise TimeoutError("advisor provider timed out")
+        if step == "413":
+            from tests.unit.web.composer.test_request_too_large import mapped_provider_error
+
+            raise mapped_provider_error("openai", 413)
+        if step == "cutoff_junk":
+            return ModelResponse(
+                id="advisor-cutoff",
+                model=kwargs["model"],
+                choices=[{"finish_reason": "length", "message": {"role": "assistant", "content": "no verdict here", "tool_calls": None}}],
+                usage=Usage(prompt_tokens=100, completion_tokens=5, total_tokens=105),
+            )
+        return ModelResponse(
+            id=f"advisor-{step}",
+            model=kwargs["model"],
+            choices=[{"message": {"role": "assistant", "content": "   " if step == "empty" else "no verdict here", "tool_calls": None}}],
+            usage=Usage(prompt_tokens=100, completion_tokens=5, total_tokens=105),
+        )
+
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", scripted)
+    return sent
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("steps", "failure_class", "retryable", "provider_attempts", "detail"),
+    [
+        pytest.param(
+            ["junk", "predispatch_timeout"], "malformed", True, 1, advisor_policy.ADVISOR_MALFORMED_USER_DETAIL, id="unparseable-reply"
+        ),
+        pytest.param(
+            ["empty", "predispatch_timeout"], "malformed", True, 1, advisor_policy.ADVISOR_MALFORMED_USER_DETAIL, id="malformed-reply"
+        ),
+        pytest.param(["junk", "timeout"], "unavailable", True, 2, advisor_policy.ADVISOR_UNAVAILABLE_USER_DETAIL, id="dispatched-failure"),
+        pytest.param(
+            ["predispatch_timeout", "predispatch_timeout"],
+            "unavailable",
+            True,
+            0,
+            advisor_policy.ADVISOR_UNAVAILABLE_USER_DETAIL,
+            id="no-dispatched-request",
+        ),
+    ],
+)
+async def test_checkpoint_reports_the_last_dispatched_request_after_an_unsent_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    steps: list[str],
+    failure_class: str,
+    retryable: bool,
+    provider_attempts: int,
+    detail: str,
+) -> None:
+    from elspeth.web.composer import advisor_checkpoint
+    from tests.unit.web.composer._helpers import _empty_state
+
+    records: list[Any] = []
+
+    async def capture(**kwargs: Any) -> None:
+        records.append(kwargs["record"])
+
+    monkeypatch.setattr(advisor_checkpoint, "persist_advisor_checkpoint_pass", capture)
+    sent = _scripted_advisor(monkeypatch, steps)
+    recorder = BufferingRecorder()
+    verdict = await _owner(tmp_path)._run_advisor_checkpoint(
+        phase="end",
+        state=_empty_state(),
+        session_id=None,
+        recorder=recorder,
+        publication_review=_review(_probe(8)),
+    )
+
+    assert len(sent) == 2
+    assert len(recorder.llm_calls) == 2
+    assert (verdict.failure_class, verdict.retryable, verdict.findings_text) == (failure_class, retryable, detail)
+    assert verdict.provider_failure is None
+    (record,) = records
+    assert (record.verdict, record.provider_attempts) == (failure_class, provider_attempts)
+
+
+@pytest.mark.asyncio
+async def test_cut_off_detail_survives_retry_that_times_out_before_dispatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from tests.unit.web.composer._helpers import _empty_state
+
+    sent = _scripted_advisor(monkeypatch, ["cutoff_junk", "predispatch_timeout"])
+    recorder = BufferingRecorder()
+    owner = _owner(tmp_path)
+    verdict = await owner._run_advisor_checkpoint(
+        phase="end",
+        state=_empty_state(),
+        session_id=None,
+        recorder=recorder,
+        publication_review=_review(_probe(8)),
+    )
+
+    expected = advisor_policy.advisor_reply_cut_off_detail(
+        cap=owner._settings.composer_advisor_max_completion_tokens, planner_cap_applied=False
+    )
+    assert len(sent) == 2
+    assert recorder.llm_calls[0].finish_reason == "length"
+    assert (verdict.failure_class, verdict.findings_text) == ("malformed", expected)
+    assert expected != advisor_policy.ADVISOR_MALFORMED_USER_DETAIL
+
+
+@pytest.mark.asyncio
+async def test_first_unsent_failure_remains_advisor_unavailable_when_deadline_expires(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from elspeth.web.composer import advisor_checkpoint
+    from tests.unit.web.composer._helpers import _empty_state
+
+    clock = iter([0.0] + [100.0] * 50)
+    monkeypatch.setattr(advisor_checkpoint, "_compose_deadline_time", lambda: next(clock))
+    sent = _scripted_advisor(monkeypatch, ["predispatch_timeout", "ok"])
+    verdict = await _owner(tmp_path)._run_advisor_checkpoint(
+        phase="end",
+        state=_empty_state(),
+        session_id=None,
+        recorder=BufferingRecorder(),
+        publication_review=_review(_probe(8)),
+        deadline=10.0,
+    )
+
+    assert len(sent) == 1
+    assert (verdict.failure_class, verdict.retryable) == ("unavailable", True)
+
+
+@pytest.mark.asyncio
+async def test_advisor_text_first_seen_after_a_size_resend_gets_a_plain_retry_and_a_true_pass_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The first attempt was rejected for size, so it carried no text. A
+    # format re-prompt would claim the first attempt's text was rejected;
+    # the pass record refuses that claim, so the retry is plain.
+    from tests.unit.web.composer._helpers import _empty_state
+
+    sent = _scripted_advisor(monkeypatch, ["size", "junk", "ok"])
+    verdict = await _owner(tmp_path)._run_advisor_checkpoint(
+        phase="end", state=_empty_state(), session_id=None, recorder=BufferingRecorder(), publication_review=_review(_probe(8))
+    )
+
+    assert verdict.ok is True
+    assert len(sent) == 3
+    assert all("publication_verdict=ADMIT|WITHHOLD" not in request["messages"][1]["content"] for request in sent)
+
+
+@pytest.mark.asyncio
+async def test_advisor_size_resend_of_a_format_reprompt_keeps_the_reprompt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from tests.unit.web.composer._helpers import _empty_state
+
+    sent = _scripted_advisor(monkeypatch, ["junk", "size", "ok"])
+    verdict = await _owner(tmp_path)._run_advisor_checkpoint(
+        phase="end", state=_empty_state(), session_id=None, recorder=BufferingRecorder(), publication_review=_review(_probe(8))
+    )
+
+    assert verdict.ok is True
+    assert len(sent) == 3
+    first, reprompt, resend = (request["messages"][1]["content"] for request in sent)
+    assert reprompt != first
+    assert _labels(_sent_transcript(resend)) == _NOW
+    # The resend is the re-prompt with the earlier turns left out, not the original request.
+    assert _labels(_sent_transcript(reprompt)) != _NOW
+    assert "publication_verdict=ADMIT|WITHHOLD" in reprompt
+    assert "publication_verdict=ADMIT|WITHHOLD" in resend
+    assert "publication_verdict=ADMIT|WITHHOLD" not in first
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "script",
+    [["size", "junk", "junk", "ok"], ["junk", "size", "junk", "ok"], ["size", "junk", "size", "ok"]],
+    ids=["resend-then-two-rejected-texts", "resend-of-the-reprompt-rejected", "second-size-rejection"],
+)
+async def test_an_advisor_pass_makes_at_most_three_provider_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, script: list[str]
+) -> None:
+    # Two ordinary attempts and one size resend. A fourth call would succeed,
+    # so only the loop's own bound stops it; the pass record schema allows 3.
+    from elspeth.web.composer import advisor_checkpoint
+    from tests.unit.web.composer._helpers import _empty_state
+
+    records: list[Any] = []
+
+    async def capture(**kwargs: Any) -> None:
+        records.append(kwargs["record"])
+
+    monkeypatch.setattr(advisor_checkpoint, "persist_advisor_checkpoint_pass", capture)
+    sent = _scripted_advisor(monkeypatch, script)
+    verdict = await _owner(tmp_path)._run_advisor_checkpoint(
+        phase="end", state=_empty_state(), session_id=None, recorder=BufferingRecorder(), publication_review=_review(_probe(8))
+    )
+
+    assert verdict.ok is False
+    assert len(sent) == 3
+    (record,) = records
+    assert record.provider_attempts == 3
+
+
+@pytest.mark.asyncio
+async def test_a_size_resend_rejected_again_is_recorded_as_a_rejected_request(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from elspeth.web.composer import advisor_checkpoint
+    from tests.unit.web.composer._helpers import _empty_state
+
+    records: list[Any] = []
+
+    async def capture(**kwargs: Any) -> None:
+        records.append(kwargs["record"])
+
+    monkeypatch.setattr(advisor_checkpoint, "persist_advisor_checkpoint_pass", capture)
+    sent = _scripted_advisor(monkeypatch, ["size", "size", "ok"])
+    verdict = await _owner(tmp_path)._run_advisor_checkpoint(
+        phase="end", state=_empty_state(), session_id=None, recorder=BufferingRecorder(), publication_review=_review(_probe(8))
+    )
+
+    assert verdict.ok is False
+    assert len(sent) == 2
+    (record,) = records
+    assert record.verdict == "request_rejected"
+    assert record.provider_attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_a_size_resend_that_then_times_out_is_recorded_as_unavailable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The rejection described the first, larger request. The smaller resend
+    # and the last attempt were never rejected; they timed out, so the pass
+    # reports the advisor unavailable, not the first request's rejection.
+    from elspeth.web.composer import advisor_checkpoint
+    from tests.unit.web.composer._helpers import _empty_state
+
+    records: list[Any] = []
+
+    async def capture(**kwargs: Any) -> None:
+        records.append(kwargs["record"])
+
+    monkeypatch.setattr(advisor_checkpoint, "persist_advisor_checkpoint_pass", capture)
+    sent = _scripted_advisor(monkeypatch, ["size", "timeout", "timeout"])
+    verdict = await _owner(tmp_path)._run_advisor_checkpoint(
+        phase="end", state=_empty_state(), session_id=None, recorder=BufferingRecorder(), publication_review=_review(_probe(8))
+    )
+
+    assert len(sent) == 3
+    assert (verdict.ok, verdict.failure_class) == (False, "unavailable")
+    (record,) = records
+    assert record.verdict == "unavailable"
+    assert record.provider_attempts == 3
+
+
+@pytest.mark.asyncio
+async def test_a_size_resend_the_deadline_stops_before_dispatch_keeps_the_rejection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Only the first request reached the provider, and it was rejected for size.
+    # The resend never went, so the pass describes that rejection: not the
+    # advisor unavailable, and not worth repeating unchanged.
+    from elspeth.web.composer import advisor_checkpoint
+    from tests.unit.web.composer._helpers import _empty_state
+
+    records: list[Any] = []
+
+    async def capture(**kwargs: Any) -> None:
+        records.append(kwargs["record"])
+
+    monkeypatch.setattr(advisor_checkpoint, "persist_advisor_checkpoint_pass", capture)
+    sent = _scripted_advisor(monkeypatch, ["size", "ok"])
+    # The shared compose deadline passes once the first call has been made.
+    monkeypatch.setattr(advisor_checkpoint, "_compose_deadline_time", lambda: 0.0 if not sent else 1_000.0)
+    verdict = await _owner(tmp_path)._run_advisor_checkpoint(
+        phase="end",
+        state=_empty_state(),
+        session_id=None,
+        recorder=BufferingRecorder(),
+        publication_review=_review(_probe(8)),
+        deadline=100.0,
+    )
+
+    assert len(sent) == 1
+    assert (verdict.ok, verdict.failure_class, verdict.retryable) == (False, "request_rejected", False)
+    assert verdict.provider_failure is not None
+    assert verdict.provider_failure.details.reason_code == "context_length_exceeded"
+    (record,) = records
+    assert record.provider_attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_a_size_resend_that_times_out_before_dispatch_keeps_the_rejection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The resend started, then the deadline ran out in quota admission, before
+    # it reached the provider; the next attempt finds the deadline passed. Only
+    # the first request went, and it was rejected for size: the pass describes
+    # that rejection, not the advisor unavailable, and not worth repeating unchanged.
+    from elspeth.web.composer import advisor_checkpoint
+    from tests.unit.web.composer._helpers import _empty_state
+
+    records: list[Any] = []
+
+    async def capture(**kwargs: Any) -> None:
+        records.append(kwargs["record"])
+
+    monkeypatch.setattr(advisor_checkpoint, "persist_advisor_checkpoint_pass", capture)
+    sent = _scripted_advisor(monkeypatch, ["size", "predispatch_timeout", "ok"])
+    monkeypatch.setattr(advisor_checkpoint, "_compose_deadline_time", lambda: 0.0 if len(sent) < 2 else 1_000.0)
+    verdict = await _owner(tmp_path)._run_advisor_checkpoint(
+        phase="end",
+        state=_empty_state(),
+        session_id=None,
+        recorder=BufferingRecorder(),
+        publication_review=_review(_probe(8)),
+        deadline=100.0,
+    )
+
+    assert len(sent) == 2
+    assert (verdict.ok, verdict.failure_class, verdict.retryable) == (False, "request_rejected", False)
+    assert verdict.provider_failure is not None
+    assert verdict.provider_failure.details.reason_code == "context_length_exceeded"
+    (record,) = records
+    assert record.verdict == "request_rejected"
+    assert record.provider_attempts == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "script",
+    [["size", "empty", "empty"], ["size", "junk", "empty"]],
+    ids=["resend-then-two-malformed-replies", "resend-then-no-verdict-then-malformed"],
+)
+async def test_a_size_resend_that_then_gets_malformed_replies_is_recorded_as_malformed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, script: list[str]
+) -> None:
+    # The model answered the later attempts, badly. The first request's size
+    # rejection does not describe them, and a malformed pass carries no
+    # request-rejection evidence (the pass record refuses that combination).
+    from elspeth.web.composer import advisor_checkpoint
+    from tests.unit.web.composer._helpers import _empty_state
+
+    records: list[Any] = []
+
+    async def capture(**kwargs: Any) -> None:
+        records.append(kwargs["record"])
+
+    monkeypatch.setattr(advisor_checkpoint, "persist_advisor_checkpoint_pass", capture)
+    sent = _scripted_advisor(monkeypatch, script)
+    verdict = await _owner(tmp_path)._run_advisor_checkpoint(
+        phase="end", state=_empty_state(), session_id=None, recorder=BufferingRecorder(), publication_review=_review(_probe(8))
+    )
+
+    assert len(sent) == 3
+    assert (verdict.ok, verdict.failure_class, verdict.provider_failure) == (False, "malformed", None)
+    (record,) = records
+    assert record.verdict == "malformed"
+    assert record.provider_attempts == 3
+
+
+@pytest.mark.asyncio
+async def test_a_413_gets_the_size_resend_with_every_earlier_turn_left_out(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from tests.unit.web.composer._helpers import _empty_state
+
+    sent = _scripted_advisor(monkeypatch, ["413", "ok"])
+    recorder = BufferingRecorder()
+    verdict = await _owner(tmp_path)._run_advisor_checkpoint(
+        phase="end", state=_empty_state(), session_id=None, recorder=recorder, publication_review=_review(_probe(8))
+    )
+
+    assert verdict.ok is True
+    assert len(sent) == 2
+    assert _labels(_sent_transcript(sent[0]["messages"][1]["content"])) != _NOW
+    assert _labels(_sent_transcript(sent[1]["messages"][1]["content"])) == _NOW
+    assert recorder.llm_calls[0].error_message == "request_too_large"
+    assert recorder.llm_calls[0].rejection_reason_source == "http_status"
+    assert recorder.llm_calls[1].rejection_reason_source is None
 
 
 @pytest.mark.asyncio
@@ -898,7 +1372,7 @@ def test_a_budget_exhausted_review_keeps_the_existing_request_limit_wording() ->
     from elspeth.web.composer import advisor_policy
 
     detail, suggestion = advisor_policy.advisor_signoff_blocked_wording(
-        reason="budget_exhausted", findings="Final review cannot be admitted within the existing planner budget."
+        draft_has_content=True, reason="budget_exhausted", findings="Final review cannot be admitted within the existing planner budget."
     )
     assert detail == _STOP_DETAIL
     assert suggestion == "Saved draft progress remains available; continue in a new message."
@@ -908,7 +1382,62 @@ def test_a_budget_exhausted_review_keeps_the_existing_request_limit_wording() ->
         "(composer_context_max_prompt_tokens). Earlier conversation was already left out of it; what remains is the "
         "pipeline's own content and this turn's evidence."
     )
-    assert advisor_policy.advisor_signoff_blocked_wording(reason="budget_exhausted", findings=legacy)[0] == _STOP_DETAIL
+    assert (
+        advisor_policy.advisor_signoff_blocked_wording(draft_has_content=True, reason="budget_exhausted", findings=legacy)[0]
+        == _STOP_DETAIL
+    )
+
+
+@pytest.mark.parametrize(
+    ("reason", "draft_has_content", "expected"),
+    [
+        (
+            "budget_exhausted",
+            True,
+            (
+                "The reply was withheld because the completion review could not run within the existing request limits.",
+                "Saved draft progress remains available; continue in a new message.",
+            ),
+        ),
+        (
+            "budget_exhausted",
+            False,
+            (
+                "The reply was withheld because the completion review could not run within the existing request limits.",
+                "Continue in a new message.",
+            ),
+        ),
+        (
+            "prior_call_cost_unknown",
+            True,
+            (
+                "The reply was withheld because the completion review could not run: the cost of an earlier model call "
+                "in this request could not be confirmed.",
+                "Saved draft progress remains available; continue in a new message.",
+            ),
+        ),
+        (
+            "prior_call_cost_unknown",
+            False,
+            (
+                "The reply was withheld because the completion review could not run: the cost of an earlier model call "
+                "in this request could not be confirmed.",
+                "Continue in a new message.",
+            ),
+        ),
+    ],
+)
+def test_review_not_run_blocker_claims_saved_draft_progress_only_with_a_draft(
+    reason: str, draft_has_content: bool, expected: tuple[str, str]
+) -> None:
+    from elspeth.web.composer import advisor_policy
+
+    assert (
+        advisor_policy.advisor_signoff_blocked_wording(
+            reason=reason, findings="Final review cannot be admitted.", draft_has_content=draft_has_content
+        )
+        == expected
+    )
 
 
 @pytest.mark.asyncio
@@ -941,7 +1470,9 @@ def test_a_context_length_rejection_suggests_the_context_budget_recourse(reason_
         reason_disposition=disposition,
         reason_source="sdk_body" if reason_code is not None else "unavailable",
     )
-    detail, suggestion = advisor_signoff_blocked_wording(reason="request_rejected", findings="", request_rejection=rejection)
+    detail, suggestion = advisor_signoff_blocked_wording(
+        draft_has_content=True, reason="request_rejected", findings="", request_rejection=rejection
+    )
     assert detail == rejection.public_detail
     if reason_code == "context_length_exceeded":
         assert suggestion == CONTEXT_BUDGET_REFUSAL_DETAIL
@@ -953,10 +1484,11 @@ def test_a_context_length_rejection_suggests_the_context_budget_recourse(reason_
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("code", "expected"), [("context_length_exceeded", "context_length_exceeded"), ("invalid_request", "BadRequestError")]
+    ("code", "expected", "source"),
+    [("context_length_exceeded", "context_length_exceeded", "sdk_body"), ("invalid_request", "BadRequestError", None)],
 )
 async def test_the_advisor_call_row_names_a_context_length_rejection(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: str, expected: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: str, expected: str, source: str | None
 ) -> None:
     from litellm.exceptions import BadRequestError
 
@@ -973,3 +1505,4 @@ async def test_the_advisor_call_row_names_a_context_length_rejection(
     assert len(recorder.llm_calls) == 1
     assert recorder.llm_calls[0].error_class == "BadRequestError"
     assert recorder.llm_calls[0].error_message == expected
+    assert recorder.llm_calls[0].rejection_reason_source == source

@@ -54,7 +54,8 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: Promp
   // never the list index the slot path uses.
   const slotLabel = queryName === undefined ? optionLabel(fieldPath) : `User prompt, query ${queryName}`;
   const sessionId = useSessionStore((state) => state.activeSessionId);
-  const filenameLoading = useBlobStore((state) => state.activeSessionId !== sessionId || state.isLoading);
+  const filenameLoading = useBlobStore((state) => sessionId === null || state.activeSessionId !== sessionId || !state.listCurrent || state.isLoading);
+  const listError = useBlobStore((state) => state.activeSessionId === sessionId ? state.listError : null);
   const blobSessionId = useBlobStore((state) => state.activeSessionId);
   const blobs = useBlobStore((state) => state.blobs);
   // The file's hash as the file list last reported it. A change that is not
@@ -95,11 +96,12 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: Promp
   const shouldFocusRef = useRef(false);
   const editability = compositionState?.nodes.some((node) => node.id === nodeId)
     ? promptFileEditability({ state: compositionState, blobs: blobSessionId === sessionId ? blobs : [],
-      pendingEvents: Object.values(pending ?? {}), nodeId, fieldPath, blobId })
+      listIncomplete: listError !== null, pendingEvents: Object.values(pending ?? {}), nodeId, fieldPath, blobId })
     : null;
-  // Why the server would refuse a save right now. While set, the editor is
-  // read-only: the text is shown, Save is disabled and this reason is given.
-  const refusal = editability?.editable === false ? editability.reason : null;
+  const checkingFileList = filenameLoading && editability?.editable === false && editability.code === "prompt_file_not_found";
+  const fileListUncertain = checkingFileList || (editability?.editable === false && editability.code === "prompt_file_list_incomplete");
+  // Keep Save blocked and show the reason while the list cannot establish editability.
+  const refusal = checkingFileList ? "Checking files in this session." : editability?.editable === false ? editability.reason : null;
 
   // The draft no longer matches the file this slot reads: re-pointed to another
   // file, or the file changed underneath. Its text is kept and shown, and Save
@@ -313,7 +315,8 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: Promp
   const refusalId = `${fieldId}-refusal`;
   const hintId = `${fieldId}-hint`;
   const staleId = `${fieldId}-stale`;
-  const shownName = filename ?? (filenameLoading ? "Loading file name…" : "File not in this session");
+  const shownName = filename ?? (filenameLoading ? "Loading file name…"
+    : listError !== null ? "File name unavailable" : "File not in this session");
   const loading = text === null && status?.tone !== "error";
   const dirty = draft !== undefined;
   // Why Save is disabled when the server would not refuse: said in one line
@@ -361,7 +364,7 @@ export function PromptFileEditor({ nodeId, blobId, fieldPath, queryName }: Promp
     <section className="graph-config-section prompt-editor">
       <div className="prompt-editor-heading">
         <label className="prompt-editor-label" htmlFor={fieldId}>Edit prompt file {shownName} ({slotLabel})</label>
-        {refusal !== null && <span className="prompt-editor-tag">Read only</span>}
+        {refusal !== null && !fileListUncertain && <span className="prompt-editor-tag">Read only</span>}
         {dirty && <span className="prompt-editor-tag">Unsaved changes</span>}
       </div>
       {refusal && (

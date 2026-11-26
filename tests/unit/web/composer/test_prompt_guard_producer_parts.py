@@ -731,7 +731,10 @@ async def test_real_freeform_batch_and_cache_retain_complete_nominal_schema(invo
     assert result is not None, "plausible anchor must admit authored schema at the shipped cap"
     assert len(completion.requests) == 2
     assert result.llm_calls[0].context_budget.bytes_per_token == repr(3.0)
-    assert result.llm_calls[1].context_budget.bytes_per_token == repr(3.0)
+    # The second call is priced at 0.9 of the density the first one measured: its sent bytes over the provider's count.
+    measured = result.llm_calls[0].context_budget.request_wire_bytes / result.llm_calls[0].prompt_tokens
+    assert 1 <= measured <= 8
+    assert result.llm_calls[1].context_budget.bytes_per_token == repr(measured * 0.9)
     assert result.llm_calls[1].context_budget.pricing_mode == "authored_prefix"
     assert [invocation.cache_hit for invocation in result.tool_invocations] == ([False] if schema_count == 1 else [False, True])
     tools = [message for message in completion.requests[1]["messages"] if message["role"] == "tool"]
@@ -764,20 +767,28 @@ async def test_real_freeform_batch_and_cache_retain_complete_nominal_schema(invo
     priced = budgets.call_args_list[1].kwargs
     assert priced["authored_bytes"] == sum(region_bytes.values())
     assert priced["anchor_tokens"] == 63201
+    # The fallback rate (a first call, with nothing measured yet) covers the real token count with margin.
     estimate = math.ceil(priced["request_bytes"] / 3)
     encoder = tiktoken.get_encoding("o200k_base")
     real = len(encoder.encode(canonical_json({"messages": wire["messages"], "tools": wire["tools"]})))
     assert math.ceil(real * 1.4) <= estimate
-    # The turn is admitted (result above), nothing is shed (below) and every schema is retained:
-    # those are the guarded behaviour, not a fixed estimate ceiling.
-    assert result.llm_calls[1].context_budget.estimated_tokens_after == estimate
+    # This second call is priced at 0.9 of the first call's measured density (its provider
+    # count is the scripted 63,201). The turn is admitted (result above), nothing is shed
+    # (below) and every schema is retained: those are the guarded behaviour, not a fixed
+    # estimate ceiling.
+    assert priced["measured_bytes_per_token"] == measured
+    measured_estimate = math.ceil(priced["request_bytes"] / (measured * 0.9))
+    assert result.llm_calls[1].context_budget.estimated_tokens_after == measured_estimate
     for name, texts in regions.items():
         tokens = sum(len(encoder.encode(text)) for text in texts)
         assert tokens <= math.ceil(region_bytes[name] / 3), name
         print(
             f"region={name} bytes={region_bytes[name]} o200k={tokens} price={math.ceil(region_bytes[name] / 3)} real_1.4={math.ceil(tokens * 1.4)}"
         )
-    print(f"authored_regions={region_bytes} total_rate=1/3 estimate={estimate} o200k={real} margin_1.4={math.ceil(real * 1.4)}")
+    print(
+        f"authored_regions={region_bytes} total_rate=1/3 estimate={estimate} measured_estimate={measured_estimate} "
+        f"o200k={real} margin_1.4={math.ceil(real * 1.4)}"
+    )
     assert wire["messages"] == forwarded["messages"]
     assert wire["messages"][0]["cache_control"] == {"type": "ephemeral"}
     assert wire["tools"][-1]["cache_control"] == {"type": "ephemeral"}

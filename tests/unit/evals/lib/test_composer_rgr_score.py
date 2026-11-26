@@ -392,8 +392,7 @@ class TestBaselineAmberSignals:
     @pytest.mark.parametrize(
         ("expected_token", "observed_plugin"),
         [
-            ("rag", "rag_retrieval"),
-            ("rag", "chroma"),
+            ("rag", "azure_ai_search"),
             ("batch", "batch_stats"),
             ("batch", "stats"),
             ("content_safety", "azure_content_safety"),
@@ -527,7 +526,7 @@ class TestNodeChainInOrder:
         state = _state_valid(
             source={"plugin": "csv", "options": {"schema": {"mode": "observed"}}},
             nodes=[
-                {"id": "n0", "node_type": "transform", "plugin": "rag_retrieval"},
+                {"id": "n0", "node_type": "transform", "plugin": "azure_ai_search"},
                 {"id": "n1", "node_type": "transform", "plugin": "azure_content_safety"},
             ],
             outputs=[{"name": "out", "plugin": "jsonl"}],

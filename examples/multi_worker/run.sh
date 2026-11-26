@@ -35,35 +35,67 @@ CHAOS_PID=""
 LEADER_PID=""
 FOLLOWER_PIDS=()
 WORKERS="${WORKERS:-1}"
+BARRIER_DIR=""
 
 if [[ ! "$WORKERS" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERROR: WORKERS must be a positive integer." >&2
     exit 2
 fi
 
-cleanup() {
-    # Kill any still-running followers and the leader, then the ChaosLLM server.
-    # Array-length-guarded so an empty FOLLOWER_PIDS under `set -u` does not
-    # expand to one empty-string element (which would run `kill -0 ""`).
-    if [ ${#FOLLOWER_PIDS[@]} -gt 0 ]; then
-        for pid in "${FOLLOWER_PIDS[@]}"; do
-            kill -0 "$pid" 2>/dev/null && kill "$pid" 2>/dev/null || true
+export PYTHONPATH="$PROJECT_ROOT/src:$PROJECT_ROOT/elspeth-lints/src:$PROJECT_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+if ! .venv/bin/python examples/multi_worker/start_barrier.py --check-fanout examples/multi_worker/input.jsonl "$WORKERS"; then
+    exit 2
+fi
+
+stop_children() {
+    local pid attempt alive
+    for pid in "$@"; do
+        kill -0 "$pid" 2>/dev/null && kill -TERM "$pid" 2>/dev/null || true
+    done
+    # Three seconds is enough for normal CLI teardown and well inside the
+    # barrier's 60-second startup budget. Never wait indefinitely on a stop.
+    for attempt in $(seq 1 30); do
+        alive=0
+        for pid in "$@"; do
+            if kill -0 "$pid" 2>/dev/null; then alive=1; fi
         done
-    fi
-    [ -n "$LEADER_PID" ] && kill -0 "$LEADER_PID" 2>/dev/null && kill "$LEADER_PID" 2>/dev/null || true
+        if [ "$alive" -eq 0 ]; then break; fi
+        sleep 0.1
+    done
+    for pid in "$@"; do
+        kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+    done
+}
+
+cleanup() {
+    local status=$?
+    trap - EXIT INT TERM
+    # Stop all workers together, then the server, even on a failed launch.
+    local -a children=()
+    if [ -n "$LEADER_PID" ]; then children+=("$LEADER_PID"); fi
+    if [ ${#FOLLOWER_PIDS[@]} -gt 0 ]; then children+=("${FOLLOWER_PIDS[@]}"); fi
+    if [ ${#children[@]} -gt 0 ]; then stop_children "${children[@]}"; fi
     if [ -n "$CHAOS_PID" ] && kill -0 "$CHAOS_PID" 2>/dev/null; then
         echo ""
         echo "Stopping ChaosLLM server (PID $CHAOS_PID)..."
-        kill "$CHAOS_PID" 2>/dev/null || true
-        wait "$CHAOS_PID" 2>/dev/null || true
+        stop_children "$CHAOS_PID"
     fi
+    [ -n "$BARRIER_DIR" ] && rm -rf "$BARRIER_DIR"
+    exit "$status"
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+# SIGKILL cannot run the EXIT trap; an interrupted host may leave this directory.
 
 # Clean previous run artifacts
 rm -f examples/multi_worker/runs/audit.db examples/multi_worker/runs/audit.db-wal examples/multi_worker/runs/audit.db-shm
 rm -f examples/multi_worker/output/results.json examples/multi_worker/output/quarantined.json
 mkdir -p examples/multi_worker/runs examples/multi_worker/output
+BARRIER_DIR="$(mktemp -d "$PROJECT_ROOT/examples/multi_worker/runs/start-barrier.XXXXXX")"
+export ELSPETH_DEMO_BARRIER_DIR="$BARRIER_DIR"
+export ELSPETH_DEMO_BARRIER_WORKERS="$((WORKERS + 1))"
+export ELSPETH_DEMO_BARRIER_DB="$PROJECT_ROOT/$DB"
 
 echo "=== multi_worker (elspeth join) — leader + $WORKERS follower(s) ==="
 echo ""
@@ -90,7 +122,7 @@ fi
 
 # --- Launch LEADER (background) ---
 echo "Launching leader: elspeth run --execute ..."
-.venv/bin/elspeth run --settings "$PIPELINE_CONFIG" --execute &
+ELSPETH_DEMO_BARRIER_ROLE=leader .venv/bin/python examples/multi_worker/start_barrier.py run --settings "$PIPELINE_CONFIG" --execute &
 LEADER_PID=$!
 
 # --- Poll audit DB (read-only) for RUNNING run with >=1 claimed work item ---
@@ -124,9 +156,20 @@ fi
 # --- Launch FOLLOWERS (same --settings => identical config_hash; NO --execute) ---
 for i in $(seq 1 "$WORKERS"); do
     echo "Launching follower $i: elspeth join $RUN_ID ..."
-    .venv/bin/elspeth join "$RUN_ID" --settings "$PIPELINE_CONFIG" &
+    ELSPETH_DEMO_BARRIER_ROLE=follower ELSPETH_DEMO_BARRIER_SLOT="$i" .venv/bin/python examples/multi_worker/start_barrier.py join "$RUN_ID" --settings "$PIPELINE_CONFIG" &
     FOLLOWER_PIDS+=("$!")
 done
+ELSPETH_DEMO_BARRIER_DIR="$BARRIER_DIR" .venv/bin/python - "$LEADER_PID" "${FOLLOWER_PIDS[@]}" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+directory = pathlib.Path(os.environ["ELSPETH_DEMO_BARRIER_DIR"])
+staging = directory / "workers.json.tmp"
+staging.write_text(json.dumps([int(pid) for pid in sys.argv[1:]]))
+os.replace(staging, directory / "workers.json")
+PY
 
 # --- Reap leader + followers; fold every non-zero exit into the final verdict ---
 # A clean run has the leader AND every follower exit 0 (README "Exit-code
@@ -141,6 +184,10 @@ else
     WORKER_FAILED=1
 fi
 echo "Leader exited ($LEADER_EXIT)."
+if [ "$LEADER_EXIT" -ne 0 ]; then
+    # Bounded: TERM, then KILL, so a follower that cannot stop never hangs the wait below.
+    stop_children "${FOLLOWER_PIDS[@]}"
+fi
 for pid in "${FOLLOWER_PIDS[@]}"; do
     if wait "$pid"; then
         echo "Follower $pid exited cleanly (0)."

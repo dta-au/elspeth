@@ -12,25 +12,49 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Callable, Generator
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from structlog.testing import capture_logs
 
 from elspeth.contracts import Determinism, TransformResult
+from elspeth.contracts.config import RuntimeRetryConfig
 from elspeth.contracts.contexts import TransformContext
-from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError, RunWorkerEvictedError, SchedulerLeaseLostError
+from elspeth.contracts.data import PluginSchema as _PermissiveSchema
+from elspeth.contracts.errors import (
+    AuditIntegrityError,
+    CapacityError,
+    FrameworkBugError,
+    PluginContractViolation,
+    PluginRetryableError,
+    RunWorkerEvictedError,
+    SchedulerLeaseLostError,
+    SinkTransactionalInvariantError,
+)
 from elspeth.contracts.identity import TokenInfo
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.engine.batch_adapter import SharedBatchAdapter
+from elspeth.engine.executors import TransformExecutor
+from elspeth.engine.retry import RetryManager
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.batching import BatchTransformMixin
 from elspeth.plugins.infrastructure.batching.ports import CollectorOutputPort, OutputPort
 from elspeth.plugins.infrastructure.batching.row_reorder_buffer import ShutdownError
 from elspeth.testing import make_pipeline_row
+from tests.fixtures.executors import (
+    _make_contract,
+    _make_span_factory,
+    _make_token,
+)
+from tests.fixtures.executors import (
+    _make_factory as _make_executor_factory,
+)
 from tests.fixtures.factories import make_context
 from tests.fixtures.landscape import make_factory
+from tests.unit.engine.conftest import make_test_step_resolver
 
 
 def _wait_for(condition: Callable[[], bool], *, timeout: float = 3.0, poll: float = 0.05, desc: str = "condition") -> None:
@@ -386,6 +410,206 @@ class BlockingBatchTransform(BaseTransform, BatchTransformMixin):
 
 
 class TestBatchTransformMixinEviction:
+    def test_engine_retry_survives_evicted_worker_late_connection_error(self) -> None:
+        class RetryBatchTransform(SimpleBatchTransform):
+            name = "retry_batch_transform"
+            determinism = Determinism.DETERMINISTIC
+            output_schema = _PermissiveSchema
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.node_id = "node_1"
+                self.on_error = "discard"
+                self._on_start_called = True
+                self.input_schema = _PermissiveSchema
+                self.started = threading.Event()
+                self.release = threading.Event()
+                self.completed = threading.Event()
+                self.calls = 0
+
+            def connect_output(self, output: OutputPort, max_pending: int = 10) -> None:
+                self.init_batch_processing(
+                    max_pending=max_pending,
+                    output=output,
+                    name=self.name,
+                    max_workers=max_pending,
+                    batch_wait_timeout=2.0,
+                )
+                self._batch_initialized = True
+
+            def accept(self, row: dict[str, Any] | PipelineRow, ctx: TransformContext) -> None:
+                self.accept_row(row if isinstance(row, PipelineRow) else make_pipeline_row(row), ctx, self._process_row)
+
+            def _process_row(self, row: PipelineRow, ctx: TransformContext) -> TransformResult:
+                self.calls += 1
+                if self.calls == 1:
+                    self.started.set()
+                    try:
+                        assert self.release.wait(timeout=10)
+                        raise ConnectionError("late connection failure")
+                    finally:
+                        self.completed.set()
+                return TransformResult.success(row, success_reason={"action": "test"})
+
+        factory = _make_executor_factory()
+        begin_state = factory.execution.begin_node_state.side_effect
+        state_ids: list[str] = []
+
+        def begin_distinct_state(**kwargs: Any) -> SimpleNamespace:
+            state = begin_state(**kwargs)
+            state_id = f"state_{len(state_ids) + 1:03d}"
+            state_ids.append(state_id)
+            return SimpleNamespace(state_id=state_id, input_hash=state.input_hash)
+
+        factory.execution.begin_node_state.side_effect = begin_distinct_state
+        executor = TransformExecutor(factory.execution, _make_span_factory(), make_test_step_resolver(), data_flow=factory.data_flow)
+        transform = RetryBatchTransform()
+        token = _make_token(contract=_make_contract())
+        ctx = make_context(token=token)
+        retry = RetryManager(RuntimeRetryConfig(max_attempts=2, base_delay=0.01, max_delay=0.1, jitter=0.0, exponential_base=2.0))
+
+        outcome: dict[str, Any] = {}
+
+        def run_retry() -> None:
+            attempt = 0
+
+            def run_attempt() -> tuple[Any, Any, Any]:
+                nonlocal attempt
+                current_attempt = attempt
+                attempt += 1
+                return executor.execute_transform(transform, token, ctx, attempt=current_attempt)
+
+            try:
+                outcome["result"] = retry.execute_with_retry(
+                    operation=run_attempt,
+                    is_retryable=lambda error: isinstance(error, TimeoutError),
+                )
+            except BaseException as error:
+                outcome["error"] = error
+
+        runner = threading.Thread(target=run_retry, daemon=True, name="batch-retry-test")
+        with capture_logs() as logs:
+            try:
+                runner.start()
+                if not transform.started.wait(timeout=3):
+                    pytest.fail("batch worker did not start")
+                runner.join(timeout=4)
+                assert not runner.is_alive(), "batch retry hung before completing"
+                if "error" in outcome:
+                    raise outcome["error"]
+                result, out_token, error_sink = outcome["result"]
+                assert result.status == "success"
+                assert out_token.token_id == token.token_id
+                assert error_sink is None
+                assert transform.completed.is_set() is False
+                transform.release.set()
+                assert transform.completed.wait(timeout=3)
+                _wait_for(
+                    lambda: any(
+                        event.get("event") == "late_result_discarded"
+                        and event.get("reason") == "row_failure_after_eviction"
+                        and event.get("exception_type") == "ConnectionError"
+                        and event.get("state_id") == state_ids[0]
+                        and event.get("token_id") == token.token_id
+                        for event in logs
+                    ),
+                    timeout=3,
+                    desc="first attempt late discard log",
+                )
+                assert factory.execution.complete_node_state.call_count == 2
+                completions = factory.execution.complete_node_state.call_args_list
+                assert [call.kwargs["status"].value for call in completions] == ["failed", "completed"]
+                assert len(state_ids) == 2
+                assert state_ids[0] != state_ids[1]
+                assert [call.kwargs["state_id"] for call in completions] == state_ids
+            finally:
+                transform.release.set()
+                runner.join(timeout=3)
+                try:
+                    assert not runner.is_alive(), "batch retry hung during cleanup"
+                finally:
+                    if transform._batch_initialized:
+                        transform.shutdown_batch_processing(timeout=3, wait_for_workers=False)
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            InterruptedError("interrupted"),
+            PluginRetryableError("retryable", retryable=True),
+            ConnectionError("connection"),
+            TimeoutError("timeout"),
+            CapacityError(429, "capacity"),
+            PluginContractViolation("contract"),
+        ],
+        ids=["interrupted", "plugin_retryable", "connection", "timeout", "capacity", "contract"],
+    )
+    def test_evicted_row_failure_is_discarded_and_next_row_proceeds(self, failure: Exception) -> None:
+        adapter = SharedBatchAdapter()
+        transform = SimpleBatchTransform()
+        transform.connect_output(adapter, max_pending=1)
+        try:
+            self._evict_then_fail_late(transform, failure, "late-row-failure")
+            transform._batch_executor.submit(lambda: None).result(timeout=5)
+            second = make_token("next-row")
+            second_ctx = make_context(landscape=_make_factory(), token=second, state_id="next-state")
+            next_waiter = adapter.register(second.token_id, "next-state")
+            transform.accept({"data": "next"}, second_ctx)
+            result = next_waiter.wait(timeout=5)
+            assert result.row is not None
+            assert result.row["processed"] is True
+        finally:
+            transform.close()
+
+    def test_evicted_row_failure_cases_cover_row_scoped_tuple(self) -> None:
+        from elspeth.contracts.errors import ROW_SCOPED_PLUGIN_ERRORS
+
+        assert set(ROW_SCOPED_PLUGIN_ERRORS) == {
+            InterruptedError,
+            PluginRetryableError,
+            ConnectionError,
+            TimeoutError,
+            CapacityError,
+            PluginContractViolation,
+        }
+
+    @pytest.mark.parametrize(
+        ("failure", "expected"),
+        [
+            (RuntimeError("ordinary"), FrameworkBugError),
+            (AuditIntegrityError("integrity"), AuditIntegrityError),
+            (RunWorkerEvictedError(run_id="run", worker_id="worker"), FrameworkBugError),
+            (SinkTransactionalInvariantError("sink integrity"), SinkTransactionalInvariantError),
+        ],
+        ids=["ordinary", "audit_integrity", "worker_evicted", "tier1_contract"],
+    )
+    def test_evicted_late_failure_controls_end_run(self, failure: Exception, expected: type[Exception]) -> None:
+        transform = SimpleBatchTransform()
+        transform.connect_output(CollectorOutputPort())
+        self._evict_then_fail_late(transform, failure, "late-control")
+        with pytest.raises(expected) as caught:
+            transform.shutdown_batch_processing()
+        if expected is FrameworkBugError:
+            assert caught.value.__cause__ is failure
+        else:
+            assert caught.value is failure
+
+    def test_live_tier1_overlap_still_ends_run_after_eviction(self) -> None:
+        import elspeth.contracts.errors as errors
+
+        tier1 = errors.TIER_1_ERRORS
+        assert len(tier1) >= 10
+        overlap = [cls for cls in tier1 if issubclass(cls, errors.ROW_SCOPED_PLUGIN_ERRORS)]
+        assert overlap
+        for cls in overlap:
+            failure = cls.__new__(cls)
+            Exception.__init__(failure, "late tier1 overlap")
+            transform = SimpleBatchTransform()
+            transform.connect_output(CollectorOutputPort())
+            self._evict_then_fail_late(transform, failure, cls.__name__)
+            with pytest.raises(cls) as caught:
+                transform.shutdown_batch_processing()
+            assert caught.value is failure
+
     def test_late_evicted_lease_loss_does_not_poison_next_row(self) -> None:
         adapter = SharedBatchAdapter()
         transform = SimpleBatchTransform()

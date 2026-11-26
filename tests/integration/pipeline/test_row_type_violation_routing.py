@@ -27,6 +27,7 @@ from sqlalchemy import select
 
 from elspeth.contracts import Determinism, PluginSchema, RunStatus, TerminalOutcome, TerminalPath, TransformResult
 from elspeth.contracts.contexts import TransformContext
+from elspeth.contracts.probes import CollectionReadinessResult
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.core.canonical import canonical_json
 from elspeth.core.config import ElspethSettings, SinkSettings, SourceSettings, TransformSettings
@@ -36,6 +37,8 @@ from elspeth.core.landscape.schema import token_outcomes_table, tokens_table
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
 from elspeth.plugins.infrastructure.base import BaseTransform
+from elspeth.plugins.infrastructure.clients.retrieval.types import RetrievalChunk
+from elspeth.plugins.transforms.azure.ai_search import AzureAISearchTransform
 from elspeth.testing import make_pipeline_row
 from tests.fixtures.base_classes import as_sink, as_source, as_transform
 from tests.fixtures.factories import make_context
@@ -240,8 +243,58 @@ def test_wrong_typed_row_value_is_reported_with_its_type_and_never_its_value(
 _RAG_QUERY_SENTINEL = 739184265
 
 
+class _StubSearcher:
+    """A retrieval backend that answers every query with one chunk and is always ready.
+
+    The query is built and refused in the shared retrieval core
+    (``RetrievalTransformBase``), before any backend is asked, so the backend
+    here only has to exist for ``on_start``.
+    """
+
+    def __init__(self) -> None:
+        self.last_skipped_count = 0
+        self.last_skipped_reasons: list[dict[str, Any]] = []
+
+    def search(self, query: str, top_k: int, min_score: float, **audit: Any) -> list[RetrievalChunk]:
+        del query, top_k, min_score, audit
+        return [RetrievalChunk(content="Refunds are processed within 30 days.", score=0.9, source_id="doc-1", metadata={})]
+
+    def check_readiness(self) -> CollectionReadinessResult:
+        return CollectionReadinessResult(collection="stub", reachable=True, count=1, message="stub collection")
+
+    def close(self) -> None:
+        return None
+
+
+def _stub_retrieval_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run ``azure_ai_search`` against the stub instead of a live index.
+
+    ``runtime_preflight`` is the Azure index count probe; it accepts only a
+    real ``AzureSearchProvider`` and is covered in
+    ``tests/unit/plugins/transforms/azure/test_ai_search.py``. These tests
+    are about what the shared core does with a row.
+    """
+    monkeypatch.setattr(AzureAISearchTransform, "_build_searcher", lambda self, ctx: _StubSearcher())
+    monkeypatch.setattr(AzureAISearchTransform, "runtime_preflight", lambda self, ctx: None)
+
+
+def _retrieval_options(**options: Any) -> dict[str, Any]:
+    """``azure_ai_search``'s options with a placeholder service; the stub answers instead."""
+    return {
+        "output_prefix": "kb",
+        "query_field": "question",
+        "endpoint": "https://invariant.example.search.windows.net",
+        "index": "invariant-probe",
+        "api_key": "probe-key",
+        "schema": {"mode": "observed"},
+        **options,
+    }
+
+
 @pytest.mark.parametrize("query_pattern", [None, r"(\d+)"], ids=["field_only", "regex"])
-def test_a_non_str_rag_query_routes_to_the_named_error_sink_without_its_value(query_pattern: str | None, tmp_path: Any) -> None:
+def test_a_non_str_rag_query_routes_to_the_named_error_sink_without_its_value(
+    query_pattern: str | None, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A wrong-typed ``query_field`` is a row failure routed to on_error, not a run abort.
 
     Both modes that consume the value as a str are covered: field-only, and
@@ -251,29 +304,14 @@ def test_a_non_str_rag_query_routes_to_the_named_error_sink_without_its_value(qu
     cannot pass this test by accident.
     """
     import json
-    import uuid
-
-    import chromadb
 
     from elspeth.core.landscape.schema import transform_errors_table
-    from elspeth.plugins.transforms.rag.transform import RAGRetrievalTransform
 
-    # on_start resolves the collection, so it must exist before the run. The
-    # ephemeral backend is process-global, hence a name unique to this test.
-    collection = f"row-type-routing-{uuid.uuid4().hex[:12]}"
-    chromadb.Client().get_or_create_collection(name=collection, metadata={"hnsw:space": "cosine"}).add(
-        documents=["Refunds are processed within 30 days."], ids=["doc-1"]
-    )
-    options: dict[str, Any] = {
-        "output_prefix": "kb",
-        "query_field": "question",
-        "provider": "chroma",
-        "provider_config": {"collection": collection, "mode": "ephemeral", "distance_function": "cosine"},
-        "schema_config": {"mode": "observed"},
-    }
+    _stub_retrieval_backend(monkeypatch)
+    options = _retrieval_options()
     if query_pattern is not None:
         options["query_pattern"] = query_pattern
-    transform = RAGRetrievalTransform(options)
+    transform = AzureAISearchTransform(options)
 
     db = make_landscape_db()
     payload_store = FilesystemPayloadStore(tmp_path / "payloads")
@@ -321,7 +359,7 @@ def test_a_non_str_rag_query_routes_to_the_named_error_sink_without_its_value(qu
 _TEMPLATE_KEY_SENTINEL = "SENTINEL-R5-rowkey-5d2a"
 
 
-def test_a_template_lookup_keyed_by_a_row_value_is_routed_without_that_value(tmp_path: Any) -> None:
+def test_a_template_lookup_keyed_by_a_row_value_is_routed_without_that_value(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     """A template that computes a lookup key from the row fails the row, not the audit trail (RAG-F1).
 
     Jinja's own message quotes the key (``'dict object' has no attribute
@@ -330,28 +368,16 @@ def test_a_template_lookup_keyed_by_a_row_value_is_routed_without_that_value(tmp
     The scan's one permitted hit, the row itself, is its positive control.
     """
     import json
-    import uuid
-
-    import chromadb
 
     from elspeth.core.landscape.schema import transform_errors_table
-    from elspeth.plugins.transforms.rag.transform import RAGRetrievalTransform
 
-    collection = f"template-key-routing-{uuid.uuid4().hex[:12]}"
-    chromadb.Client().get_or_create_collection(name=collection, metadata={"hnsw:space": "cosine"}).add(
-        documents=["Refunds are processed within 30 days."], ids=["doc-1"]
-    )
-    transform = RAGRetrievalTransform(
-        {
-            "output_prefix": "kb",
-            "query_field": "question",
-            "query_template": "{{ query }} {{ row[row.k] }}",
+    _stub_retrieval_backend(monkeypatch)
+    transform = AzureAISearchTransform(
+        _retrieval_options(
+            query_template="{{ query }} {{ row[row.k] }}",
             # A computed key is admitted only under the opt-out, the whole row (ADR-051).
-            "required_input_fields": [],
-            "provider": "chroma",
-            "provider_config": {"collection": collection, "mode": "ephemeral", "distance_function": "cosine"},
-            "schema_config": {"mode": "observed"},
-        }
+            required_input_fields=[],
+        )
     )
 
     db = make_landscape_db()

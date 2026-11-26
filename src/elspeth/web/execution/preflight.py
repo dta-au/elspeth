@@ -22,10 +22,7 @@ from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.sink_effects import SinkEffectRuntimeBinding
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.config import (
-    AggregationSettings,
-    CollectorSettings,
     ElspethSettings,
-    TransformSettings,
     load_bounded_pipeline_yaml,
     resolve_config,
 )
@@ -42,7 +39,6 @@ from elspeth.web.paths import (
     NESTED_LOCAL_PATH_OPTION_KEYS,
     SINK_LOCAL_PATH_OPTION_KEYS,
     SOURCE_LOCAL_PATH_OPTION_KEYS,
-    is_absent_sink_path,
     is_local_path_value,
     require_mcp_root_context,
     resolve_data_path,
@@ -134,14 +130,10 @@ def resolve_runtime_yaml_paths(
         if type(opts) is not dict:
             raise TypeError(f"YAML generator produced non-dict '{component_path}.options' value (got {type(opts).__name__})")
         path_options = cast(dict[str, Any], opts)
-        plugin = component["plugin"] if "plugin" in component else None
-        mode = path_options["mode"] if "mode" in path_options else None
         for key in path_option_keys:
             if key not in path_options:
                 continue
             value = path_options[key]
-            if sink_paths and is_absent_sink_path(plugin, mode, key, value):
-                continue
             if not is_local_path_value(value):
                 raise ValueError(f"{component_path}.options.{key} must be a nonempty string path without NUL")
             if not Path(value).is_absolute():
@@ -197,17 +189,17 @@ def resolve_runtime_yaml_paths(
                         sink_paths=True,
                     )
 
-    # Nested transform provider_config paths (RAG retrieval transforms carry a
-    # local Chroma persist_directory under options.provider_config). Confine
-    # the same way as sink paths: rewrite relative values to absolute under
+    # Nested transform provider_config paths (a transform may carry a local
+    # persist_directory under options.provider_config; no shipped plugin does
+    # since 0.8.18). Confine the same way as sink paths: rewrite relative values to absolute under
     # data_dir so the allowlist approves what the plugin actually reads/writes.
     #
     # DOCUMENTED EXCLUSION: `collectors` and `aggregations` are deliberately not
     # walked (elspeth-ca79b2c63a). `NESTED_LOCAL_PATH_OPTION_KEYS` is
-    # ("persist_directory",), carried only by `rag_retrieval`, which is not
-    # batch-aware and therefore illegal as a collector. Swept the live registry
-    # at 2026-08-26: none of the 13 batch-aware (collector-legal) transforms
-    # declares `provider_config` at all.
+    # ("persist_directory",), which no shipped plugin carries since 0.8.18 (the
+    # only one, `rag_retrieval`, was removed). Swept the live registry at
+    # 2026-08-26: none of the batch-aware (collector-legal) transforms declares
+    # `provider_config` at all.
     #
     # NOTE — this walk is keyed on the generated YAML's top-level `transforms:`
     # list, NOT on `node_type`. `yaml_generator` emits `transforms:`,
@@ -301,31 +293,6 @@ def require_settings_plugins_available(
         raise ValueError("Configured plugin is not available in the frozen plugin snapshot.")
     for sink_name in settings.sinks:
         _require_metered_web_sink_storage(settings, sink_name)
-    plugin_nodes: tuple[TransformSettings | AggregationSettings | CollectorSettings, ...] = (
-        *settings.transforms,
-        *settings.aggregations,
-        *settings.collectors,
-    )
-    for transform in plugin_nodes:
-        if transform.plugin != "rag_retrieval":
-            continue
-        options = transform.options
-        if "provider" not in options or options["provider"] != "chroma" or "provider_config" not in options:
-            continue
-        provider_config = options["provider_config"]
-        if isinstance(provider_config, Mapping) and "mode" in provider_config and provider_config["mode"] == "persistent":
-            detail = (
-                "Web execution cannot enforce storage quotas for local persistent Chroma retrieval. "
-                "Use provider_config.mode='client' with a remote Chroma server."
-            )
-            raise PluginConfigError(detail, cause=detail, plugin_name=transform.plugin, component_type="transform")
-    for probe in settings.collection_probes:
-        if probe.provider == "chroma" and "mode" in probe.provider_config and probe.provider_config["mode"] == "persistent":
-            detail = (
-                "Web execution cannot enforce storage quotas for a local persistent Chroma collection probe. "
-                "Use provider_config.mode='client' with a remote Chroma server."
-            )
-            raise PluginConfigError(detail, cause=detail)
 
 
 def _require_metered_web_sink_storage(settings: ElspethSettings, sink_name: str) -> None:
@@ -338,12 +305,7 @@ def _require_metered_web_sink_storage(settings: ElspethSettings, sink_name: str)
     """
     sink = settings.sinks[sink_name]
     detail: str | None = None
-    if sink.plugin == "chroma_sink" and "mode" in sink.options and sink.options["mode"] == "persistent":
-        detail = (
-            "Web execution cannot enforce storage quotas for Chroma mode='persistent'. "
-            "Use mode='client' with a remote Chroma server, or choose a file output."
-        )
-    elif sink.plugin == "database" and "url" in sink.options and type(sink.options["url"]) is str:
+    if sink.plugin == "database" and "url" in sink.options and type(sink.options["url"]) is str:
         try:
             backend = make_url(sink.options["url"]).get_backend_name()
         except ArgumentError:

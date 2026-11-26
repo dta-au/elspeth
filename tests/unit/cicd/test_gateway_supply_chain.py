@@ -172,17 +172,14 @@ def test_gateway_qualification_helpers_run_from_gateway_package() -> None:
         assert repaired_directory.returncode == 0, repaired_directory.stderr
 
 
-def test_root_audit_ignore_set_contains_only_current_chromadb_exceptions() -> None:
+def test_root_audit_takes_no_ignore_vuln_exceptions() -> None:
+    """The chromadb exceptions left with chromadb in 0.8.18; none replace them."""
     job = _yaml(CI_WORKFLOW)["jobs"]["supply-chain-audit"]
     run = _step(job, "Audit Python dependencies")["run"]
+    assert "pip-audit" in run
     ignored = set(re.findall(r"--ignore-vuln\s+(\S+)", run))
 
-    assert ignored == {
-        "CVE-2026-45829",
-        "CVE-2026-45830",
-        "CVE-2026-45831",
-        "CVE-2026-45833",
-    }
+    assert ignored == set()
     assert "PYSEC-2025-183" not in run
 
 

@@ -37,7 +37,6 @@ from elspeth.plugins.infrastructure.templates import (
     declared_row_projection,
 )
 from elspeth.plugins.transforms.azure.ai_search import AzureAISearchConfig
-from elspeth.plugins.transforms.rag.config import RAGRetrievalConfig
 from elspeth.plugins.transforms.rag.query import QueryBuilder
 from tests.unit.plugins.infrastructure.test_template_projection import _LEAK_FORMS
 
@@ -47,18 +46,19 @@ _UNDECLARED_SECRET = "Undeclared field: the template reads 'secret', a field thi
 _OMITTED = object()
 
 
-def _config(template: str, required_input_fields: Any = _OMITTED) -> RAGRetrievalConfig:
+def _config(template: str, required_input_fields: Any = _OMITTED) -> AzureAISearchConfig:
     options: dict[str, Any] = {
         "output_prefix": "kb",
         "query_field": "question",
         "query_template": template,
-        "provider": "chroma",
-        "provider_config": {"collection": "p3-facts", "mode": "ephemeral"},
+        "endpoint": "https://invariant.example.search.windows.net",
+        "index": "p3-facts",
+        "api_key": "probe-key",
         "schema_config": {"mode": "observed"},
     }
     if required_input_fields is not _OMITTED:
         options["required_input_fields"] = required_input_fields
-    return RAGRetrievalConfig(**options)
+    return AzureAISearchConfig(**options)
 
 
 def _refusal(template: str, required_input_fields: Any = _OMITTED) -> str:
@@ -259,7 +259,7 @@ def test_configuration_admits_what_the_declaration_covers(template: str, require
 
 
 def test_azure_ai_search_carries_the_same_checks() -> None:
-    """``AzureAISearchConfig`` inherits ``RetrievalOutputConfig``: one rule for both retrieval plugins."""
+    """The plugin-facing ``from_dict`` path carries the ``RetrievalOutputConfig`` checks too."""
     options = {
         "output_prefix": "policy",
         "query_field": "question",

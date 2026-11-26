@@ -58,18 +58,29 @@ RUN apt-get update && \
 
 # Install uv for fast, deterministic dependency resolution
 # Using official installer (https://docs.astral.sh/uv/getting-started/installation/)
-COPY --from=ghcr.io/astral-sh/uv@sha256:e590846f4776907b254ac0f44b5b380347af5d90d668138ca7938d1b0c2f98d3 /uv /usr/local/bin/uv
+COPY --from=ghcr.io/astral-sh/uv@sha256:a3ea1357342c1a4bf9a0c53a3deb1b55379aefa037338d8113d5771efa01774f /uv /usr/local/bin/uv
 
 # The interpreter ships with the image. Distroless publishes no Python 3.14
 # image, so the pinned uv installs its checksummed, self-contained CPython
 # build under /opt/python and the runtime stage copies that tree to the same
 # path. The venv's recorded interpreter therefore resolves identically in both
 # stages and nothing is rewritten when the venv moves into the runtime image.
+# The web server's process watchdog needs os.pidfd_open and
+# signal.pidfd_send_signal. Both are optional CPython entry points: the
+# 3.14.5 build offered by uv 0.11.15 lacks them and could not start the web
+# server. The venv step below refuses an interpreter without either.
 ENV UV_PYTHON_INSTALL_DIR=/opt/python \
     UV_PYTHON_PREFERENCE=only-managed \
     UV_PYTHON_DOWNLOADS=manual
-ARG PYTHON_VERSION="3.14.5"
-RUN uv python install "$PYTHON_VERSION"
+ARG PYTHON_VERSION="3.14.10"
+# The interpreter's own pip is never used: uv builds and fills the venv, and
+# the runtime installs nothing. It vendors an old setuptools that image scans
+# report, so it is removed before /opt/python is copied into the runtime.
+RUN uv python install "$PYTHON_VERSION" && \
+    for d in /opt/python/cpython-"$PYTHON_VERSION"-*; do \
+        rm -rf "$d"/lib/python3.*/site-packages/pip "$d"/lib/python3.*/site-packages/pip-*.dist-info "$d"/bin/pip "$d"/bin/pip3 "$d"/bin/pip3.*; \
+    done && \
+    ! ls -d /opt/python/cpython-*/lib/python3.*/site-packages/pip 2>/dev/null
 
 # Set up working directory
 WORKDIR /build
@@ -84,6 +95,7 @@ ARG INSTALL_EXTRAS
 RUN uv venv --python "$PYTHON_VERSION" /opt/venv && \
     grep -q '^home = /opt/python/' /opt/venv/pyvenv.cfg && \
     test "$(/opt/venv/bin/python -c 'import platform; print(platform.python_version())')" = "$PYTHON_VERSION" && \
+    /opt/venv/bin/python -c 'import os, signal, sys; missing = [name for module, name in ((os, "pidfd_open"), (signal, "pidfd_send_signal")) if not hasattr(module, name)]; sys.exit(f"interpreter lacks {missing}; the web process watchdog needs both" if missing else 0)' && \
     . /opt/venv/bin/activate && \
     test -n "$INSTALL_EXTRAS" && \
     set -f && \
@@ -163,7 +175,7 @@ RUN groupadd --gid 1654 elspeth && \
 # =============================================================================
 # Stage 3: Runtime
 # =============================================================================
-FROM gcr.io/distroless/cc-debian13:debug-nonroot@sha256:c69d16acb50ae6ee26adfb0645467b507753c0eb91c389afad87914cd2ecf6de AS runtime
+FROM gcr.io/distroless/cc-debian13:debug-nonroot@sha256:36978857457484568ebc541e7b47b291c30ffa2ae292d3d15ea5d294c0247f27 AS runtime
 
 ARG INSTALL_EXTRAS
 ARG RDS_CA_BUNDLE_SHA256

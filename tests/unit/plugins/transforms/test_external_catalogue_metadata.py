@@ -22,7 +22,6 @@ from elspeth.core.secrets import (
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager, untrusted_content_transform_names
 from elspeth.plugins.infrastructure.preflight import plugin_preflight_mode
 from elspeth.plugins.transforms.azure.content_safety import AzureContentSafetyConfig
-from elspeth.plugins.transforms.rag.config import PROVIDERS
 from elspeth.web.config import WebSettings
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
@@ -49,7 +48,6 @@ EXPECTED_EXTERNAL_TAGS = {
     "azure_prompt_shield": ("azure", "prompt-shield", "security"),
     "blob_fetch": ("http", "network", "blob"),
     "llm": ("llm", "generation", "structured-output"),
-    "rag_retrieval": ("rag", "retrieval", "vector-search"),
     "web_scrape": ("http", "network", "scraping"),
 }
 EXPECTED_EXTERNAL_NAMES = set(EXPECTED_EXTERNAL_TAGS)
@@ -76,13 +74,9 @@ _REQUIRED_GUIDANCE = {
         ("operator-approved", "profile", "prompts", "responses", "model", "tokens", "untrusted before llm"),
         ("provider credentials", "endpoints", "web-authored options"),
     ),
-    "rag_retrieval": (
-        ("existing chroma", "ranked", "provenance", "untrusted before llm", "azure_ai_search"),
-        ("indexing", "answer generation"),
-    ),
     "azure_ai_search": (
         ("rag retrieval", "azure ai search", "ranked", "provenance", "untrusted before llm"),
-        ("indexing", "generating answers", "rag_retrieval for chroma"),
+        ("indexing", "generating answers"),
     ),
     "aws_bedrock_prompt_shield": (
         ("pre-llm", "prompt attack", "operator profile", "default aws credential chain"),
@@ -422,14 +416,6 @@ def test_azure_ai_search_example_names_its_options_at_the_top_level() -> None:
     assert "provider_config" not in options
 
 
-def test_rag_example_keeps_collection_settings_inside_provider_config() -> None:
-    options = _options(EXTERNAL_BY_NAME["rag_retrieval"])
-
-    assert options["provider"] == "chroma"
-    assert cast(Mapping[str, Any], options["provider_config"])["collection"] == "approved-documents"
-    assert "collection" not in options
-
-
 @pytest.mark.parametrize("name", sorted(untrusted_content_transform_names()))
 def test_remote_content_producers_warn_that_content_is_untrusted_before_llm_use(name: str) -> None:
     plugin_cls = EXTERNAL_BY_NAME[name].plugin_cls
@@ -534,22 +520,6 @@ def test_content_safety_composer_hint_preserves_remote_content_trust_tier() -> N
     assert "tier 2" not in hints
     assert "remote content remains untrusted" in hints
     assert "prompt-injection defenses" in hints
-
-
-def test_rag_composer_hints_name_only_real_authored_and_provider_config_fields() -> None:
-    hints = _composer_hints("rag_retrieval")
-    provider_fields = {name: set(config_cls.model_fields) for name, (config_cls, _factory) in PROVIDERS.items()}
-
-    assert set(provider_fields) == {"chroma"}
-    assert "collection" in provider_fields["chroma"]
-    assert "provider_config.collection" in hints
-    assert "provider_config.index" not in hints
-    assert "azure_ai_search" in hints
-    assert "min_score" in hints
-    assert "on_no_results" in hints
-    assert "collection_name" not in hints
-    assert "score_threshold" not in hints
-    assert "on_zero_results" not in hints
 
 
 def test_blob_fetch_composer_hint_recommends_only_a_registered_blob_parser() -> None:

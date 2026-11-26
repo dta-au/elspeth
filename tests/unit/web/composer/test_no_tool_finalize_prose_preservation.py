@@ -82,6 +82,7 @@ async def test_finalizer_does_not_add_a_categorical_prose_verdict(prose: str, pr
         result = await service._completion._finalize_no_tool_response(
             content=prose,
             state=state,
+            turn_start_state=state,
             initial_version=state.version,
             user_id="user-1",
             session_id=None,
@@ -119,6 +120,7 @@ async def test_finalizer_does_not_infer_claim_meaning_from_mutation_activity(eff
         result = await service._completion._finalize_no_tool_response(
             content=prose,
             state=state,
+            turn_start_state=initial,
             initial_version=initial.version,
             user_id="user-1",
             session_id=None,

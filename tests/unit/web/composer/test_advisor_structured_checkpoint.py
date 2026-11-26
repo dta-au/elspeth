@@ -10,6 +10,7 @@ import pytest
 import structlog
 from sqlalchemy import select
 
+from elspeth.web.composer import advisor_checkpoint as advisor_checkpoint_module
 from elspeth.web.composer import provider_gateway
 from elspeth.web.composer import service as service_module
 from elspeth.web.composer.advisor_checkpoint import _AdvisorCheckpointComposeDeadlineExpired
@@ -26,6 +27,18 @@ from tests.unit.web.composer.test_advisor_checkpoint import (
 make_service = checkpoint_fixtures.make_service
 physical_advisor = checkpoint_fixtures.physical_advisor
 simple_state = checkpoint_fixtures.simple_state
+
+# Each advisor attempt's window in the quota-admission conformance test. The
+# first attempt in a fresh process under branch coverage measured about 0.43 s
+# to reach dispatch (0.014 s without coverage), so a 0.2 s window cut it before
+# admission. 3 s leaves about 7x that, and stays below the fixture's 60 s
+# advisor timeout so the window, not that timeout, still cuts a blocked
+# admission.
+_ATTEMPT_WINDOW_SECONDS = 3.0
+# Bounds the whole checkpoint call in that test: above two attempt windows,
+# below the 60 s advisor timeout, so a checkpoint that stopped honouring its
+# deadline fails here instead of passing once that timeout cuts each attempt.
+_HANG_GUARD_SECONDS = 30.0
 
 
 @pytest.mark.asyncio
@@ -88,7 +101,7 @@ async def test_nonretryable_provider_failure_does_not_invent_a_format_retry(make
     record = service._sessions_service.add_message.calls[0].kwargs["tool_calls"][0]["pass"]
     assert record["provider_attempts"] == 1
     assert record["format_reprompt_sent"] is False
-    detail, suggestion = advisor_signoff_blocked_wording(reason="unavailable", findings=verdict.findings_text)
+    detail, suggestion = advisor_signoff_blocked_wording(draft_has_content=True, reason="unavailable", findings=verdict.findings_text)
     assert "after a format retry" not in suggestion
     assert "private-malformed-marker" not in detail + suggestion
 
@@ -478,9 +491,16 @@ async def test_conformance_counts_only_physical_dispatch_after_quota_admission(
 
     service = make_service()
     fenced = physical_advisor.bind(service)
+    attempts = 0
     admissions = 0
     physical_calls = 0
     original_admit = ProviderCallCustody.admit
+    original_gateway = provider_gateway._litellm_acompletion
+
+    async def gateway(**kwargs):
+        nonlocal attempts
+        attempts += 1
+        return await original_gateway(**kwargs)
 
     async def admission(custody: ProviderCallCustody, *, model: str) -> None:
         nonlocal admissions
@@ -504,15 +524,23 @@ async def test_conformance_counts_only_physical_dispatch_after_quota_admission(
         )
 
     monkeypatch.setattr(ProviderCallCustody, "admit", admission)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", gateway)
     monkeypatch.setattr(litellm, "acompletion", complete)
+    # Keep each attempt's admission timeout independent of earlier work.
+    monkeypatch.setattr(advisor_checkpoint_module, "_compose_deadline_time", lambda: 0.0)
     with structlog.testing.capture_logs() as events, prompt_guard_user_scope(""):
-        verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
-            phase="early",
-            state=simple_state,
-            recorder=None,
-            deadline=asyncio.get_running_loop().time() + 0.2,
-            **fenced,
-        )
+        async with asyncio.timeout(_HANG_GUARD_SECONDS):
+            verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
+                phase="early",
+                state=simple_state,
+                recorder=None,
+                deadline=_ATTEMPT_WINDOW_SECONDS,
+                **fenced,
+            )
+    # Every attempt that started reached its admission: none was cut before it,
+    # so each scenario's admission outcome is the one it scripted.
+    expected_attempts = 1 if scenario == "clean" else 2
+    assert (attempts, admissions) == (expected_attempts, expected_attempts)
     expected_calls = 0 if scenario == "blocked-first" else 1
     assert physical_calls == expected_calls
     record = service._sessions_service.add_message.await_args_list[0].kwargs["tool_calls"][0]["pass"]
@@ -523,8 +551,12 @@ async def test_conformance_counts_only_physical_dispatch_after_quota_admission(
         first_valid = None if scenario == "blocked-first" else scenario != "blocked-retry"
         assert facts["first_attempt_schema_valid"] is first_valid
         assert facts["first_attempt_accepted"] is first_valid
-    if scenario in {"blocked-first", "blocked-retry"}:
+    if scenario == "blocked-first":
         assert verdict.failure_class == "unavailable"
+        assert record["note_present"] is None
+    elif scenario == "blocked-retry":
+        # The retry never reached the provider, so the malformed reply that did stays the outcome.
+        assert verdict.failure_class == "malformed"
         assert record["note_present"] is None
     else:
         assert verdict.ok and not verdict.blocking

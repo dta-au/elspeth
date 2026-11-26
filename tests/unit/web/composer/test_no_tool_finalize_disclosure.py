@@ -70,6 +70,7 @@ async def _finalize_result(
     result = await service._completion._finalize_no_tool_response(
         content=_MODEL_PROSE,
         state=state,
+        turn_start_state=state,
         initial_version=state.version,
         user_id="user-1",
         session_id=None,

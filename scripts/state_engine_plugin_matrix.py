@@ -22,8 +22,6 @@ from elspeth.plugins.infrastructure.clients.retrieval.azure_search import (
     AzureSearchAuthMode,
     AzureSearchProviderConfig,
 )
-from elspeth.plugins.infrastructure.clients.retrieval.chroma import ChromaSearchProviderConfig
-from elspeth.plugins.infrastructure.clients.retrieval.connection import ChromaConnectionMode, ChromaSearchMode
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.infrastructure.discovery import discover_all_plugins
 from elspeth.plugins.infrastructure.power_automate import (
@@ -35,7 +33,6 @@ from elspeth.plugins.infrastructure.power_automate import (
 )
 from elspeth.plugins.infrastructure.preflight import plugin_preflight_mode
 from elspeth.plugins.sinks.azure_blob_sink import AzureBlobSinkConfig
-from elspeth.plugins.sinks.chroma_sink import ChromaSinkConfig
 from elspeth.plugins.sinks.dataverse import DataverseSinkConfig
 from elspeth.plugins.sources.azure_blob_source import AzureBlobSourceConfig
 from elspeth.plugins.sources.dataverse import DataverseSourceConfig
@@ -45,16 +42,15 @@ from elspeth.plugins.transforms.aws.textract_document_analysis import AWSTextrac
 from elspeth.plugins.transforms.aws.textract_inline_analysis import AWSTextractInlineAnalysisConfig
 from elspeth.plugins.transforms.azure.ai_search import AzureAISearchConfig
 from elspeth.plugins.transforms.llm.transform import LLMTransform
-from elspeth.plugins.transforms.rag.config import RAGRetrievalConfig, RetrievalProviderName
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 V3_CATALOG_PATH = REPOSITORY_ROOT / "docs/architecture/state_engine/proof-catalog/v3/catalog.json"
 UNCLASSIFIED = "UNCLASSIFIED"
-EXPECTED_COUNTS = {"source": 10, "transform": 42, "sink": 10}
-EXPECTED_VARIANT_COUNT = 86
+EXPECTED_COUNTS = {"source": 10, "transform": 41, "sink": 9}
+EXPECTED_VARIANT_COUNT = 81
 ALLOWED_PB_BOUNDARIES = frozenset({"PB-01", "PB-02", "PB-04", "PB-06", "PB-07", "PB-09"})
 ALLOWED_LOCAL_FIXTURES = frozenset({"hermetic", "provider-contract-fake", "real-process-http"})
-ALLOWED_RELEASE_LANES = frozenset({"local", "live-aws", "live-azure", "live-chroma", "live-dataverse", "live-provider"})
+ALLOWED_RELEASE_LANES = frozenset({"local", "live-aws", "live-azure", "live-dataverse", "live-provider"})
 _SECRET_VALIDATION_SENTINEL = "elspeth-state-engine-matrix-secret-placeholder"
 MECHANICAL_FIELDS = (
     "plugin_key",
@@ -184,9 +180,6 @@ def _variant_map() -> dict[str, tuple[str, ...]]:
     transform_discriminator, transform_llm = LLMTransform.discriminated_variants()
     if source_discriminator != "provider" or transform_discriminator != "provider":
         raise ValueError("LLM variant discriminator must remain provider")
-    retrieval_providers = get_args(RetrievalProviderName)
-    if set(retrieval_providers) != {"chroma"}:
-        raise ValueError("RAG provider Literal drifted from its owned registry contract")
     dataverse_modes = _owned_literal_values(DataverseAuthConfig, "method")
     power_automate_modes = tuple(
         value
@@ -202,9 +195,7 @@ def _variant_map() -> dict[str, tuple[str, ...]]:
         "transform:aws_textract_inline_analysis": tuple(get_args(TextractAuthMode)),
         "transform:azure_ai_search": tuple(mode.replace("_", "-") for mode in get_args(AzureSearchAuthMode)),
         "transform:llm": tuple(transform_llm),
-        "transform:rag_retrieval": tuple(f"chroma-{mode}" for mode in get_args(ChromaSearchMode)),
         "sink:azure_blob": tuple(get_args(AzureAuthMethod)),
-        "sink:chroma_sink": tuple(get_args(ChromaConnectionMode)),
         "sink:dataverse": dataverse_modes,
         "sink:power_automate": power_automate_modes,
     }
@@ -500,36 +491,6 @@ def _validate_variant_configs(variants: Mapping[str, tuple[str, ...]]) -> set[tu
             if search_config.provider_config().auth_mode != mode:
                 raise ValueError(f"azure_ai_search options for {mode!r} derived a different auth mode")
             validated_subjects.add(("transform:azure_ai_search", mode.replace("_", "-")))
-        for mode in get_args(ChromaSearchMode):
-            provider_config: dict[str, object] = {"collection": "matrix-collection", "mode": mode}
-            if mode == "persistent":
-                provider_config["persist_directory"] = ".state-engine-chroma"
-            elif mode == "client":
-                provider_config.update(host="localhost", ssl=False)
-            ChromaSearchProviderConfig.model_validate(provider_config)
-            RAGRetrievalConfig.from_dict(
-                {
-                    "output_prefix": "retrieval",
-                    "query_field": "query",
-                    "provider": "chroma",
-                    "provider_config": provider_config,
-                    "schema": schema,
-                }
-            )
-            validated_subjects.add(("transform:rag_retrieval", f"chroma-{mode}"))
-        for mode in variants["sink:chroma_sink"]:
-            config: dict[str, object] = {
-                "collection": "matrix-collection",
-                "mode": mode,
-                "field_mapping": {"document_field": "text", "id_field": "id"},
-                "schema": schema,
-            }
-            if mode == "persistent":
-                config["persist_directory"] = ".state-engine-chroma"
-            else:
-                config.update(host="localhost", ssl=False)
-            ChromaSinkConfig.from_dict(config)
-            validated_subjects.add(("sink:chroma_sink", mode))
         for plugin_key, plugin_type in _live_plugin_types_by_key().items():
             if plugin_key in variants:
                 continue

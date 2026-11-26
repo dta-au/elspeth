@@ -86,14 +86,6 @@ DATAVERSE_RESOURCES = (
     "AZURE_CLIENT_ID",
     "AZURE_CLIENT_SECRET",
 )
-CHROMA_RESOURCES = (
-    "ELSPETH_TEST_CHROMA_HOST",
-    "ELSPETH_TEST_CHROMA_PORT",
-    "ELSPETH_TEST_CHROMA_SSL",
-    "ELSPETH_TEST_CHROMA_TENANT",
-    "ELSPETH_TEST_CHROMA_DATABASE",
-    "ELSPETH_TEST_CHROMA_COLLECTION_PREFIX",
-)
 PROVIDER_RESOURCES = (
     "ELSPETH_TEST_AZURE_LLM_ENDPOINT",
     "ELSPETH_TEST_AZURE_LLM_MODEL",
@@ -110,7 +102,6 @@ PROVIDER_RESOURCES = (
     "OPENROUTER_API_KEY",
     "GATEWAY_BEARER",
     "AZURE_SEARCH_API_KEY",
-    *CHROMA_RESOURCES,
 )
 
 
@@ -175,12 +166,6 @@ _RELEASE_LANE_JOB_SPECS: dict[str, LaneSpec] = {
         POSTGRESQL_PROFILE,
         "live_dataverse and live_provider",
         (*COMMON_LIVE_RESOURCES, *DATAVERSE_RESOURCES),
-    ),
-    "live-chroma": LaneSpec(
-        "live_chroma",
-        POSTGRESQL_PROFILE,
-        "live_chroma and live_provider",
-        (*COMMON_LIVE_RESOURCES, *CHROMA_RESOURCES),
     ),
     "live-provider": LaneSpec(
         "live_provider",

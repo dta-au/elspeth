@@ -12,7 +12,7 @@ fact, the receipt records a sanitized projection of it.
 > **Status.** The implemented ACA slice received desktop acceptance:
 > `elspeth-5ec3befc1a` closed on 2026-09-10 by operator ruling. No live cloud
 > acceptance is claimed. This executable procedure can produce a future receipt
-> at `docs/operator/evidence/azure-container-apps/0.8.17.json` for the unreleased candidate. Steps marked
+> at `docs/operator/evidence/azure-container-apps/0.8.18.json` for the unreleased candidate. Steps marked
 > **LIVE** require measurements from that operator run. Neither a live run nor
 > a receipt is an outstanding closure condition. See
 > [Deployment Platforms](../reference/deployment-platforms.md) for support scope.
@@ -332,7 +332,7 @@ Keep the configured SSO provider throughout these stages. Neither local
 registration credentials nor an anonymous readiness response establishes an
 admitted acceptance user.
 
-### 0.8.17 fix-on-fail cycle
+### 0.8.18 fix-on-fail cycle
 
 Run each acceptance attempt against an exact candidate commit and published
 image digest. Give each attempt a fresh `ACCEPTANCE_RUN_ID` and private
@@ -493,7 +493,7 @@ RUNTIME_B_EXECUTION=$(run_job_to_completion doctor-runtime-b)
   cases inside the environment, the one auth mode whose truth depends on
   where the process runs.
 
-> **LIVE:** for 0.8.17 acceptance, run the Jobs with the candidate digest and
+> **LIVE:** for 0.8.18 acceptance, run the Jobs with the candidate digest and
 > require both schema checks to pass after initial creation at session epoch 79
 > and Landscape epoch 51. Record the execution names. Any no-schema dry run
 > against a `release/0.8.0` image is predecessor-only wiring evidence; it
@@ -561,7 +561,7 @@ parity test feeds one corpus through both).
   "candidate_image_digest": "sha256:64-lowercase-hex",
   "candidate_revision_sha256": "64-lowercase-hex",
   "candidate_doctor_job_sha256": "64-lowercase-hex",
-  "candidate_package_version": "0.8.17",
+  "candidate_package_version": "0.8.18",
   "previous_source_sha": "",
   "previous_image_digest": "",
   "previous_revision_sha256": "",
@@ -797,8 +797,9 @@ restore_runtime_a() {
 }
 ```
 
-From that moment `rA`'s pools (`pool_pre_ping`, 5 + 5 per engine) detect the
-dead sockets, try to reconnect and are refused: heartbeat, renew, release,
+From that moment `rA`'s pools (`pool_pre_ping`; 5 + 5 per engine, and the
+2-connection pool that heartbeat, renew and release use) detect the dead
+sockets, try to reconnect and are refused: heartbeat, renew, release,
 cancel and the `stopped` write all fail; `rB` is untouched. The secondary
 primitive is `az containerapp revision deactivate` with
 `terminationGracePeriodSeconds: 0` ("stop immediately via the kill signal";
@@ -815,9 +816,13 @@ facts §7.1) and is recorded, not used.
 
 ## Connection budget
 
-Per replica per engine the pool is `pool_size 5 + max_overflow 5`; two
-engines per replica; two replicas plus Jobs and the operator's `psql`
-(facts §4.5). `verify-connection-budget` reads
+The sessions engine and every Landscape engine (the replica's own and
+each running pipeline's) pool `pool_size 5 + max_overflow 5`. On the
+sessions database each replica also keeps a 2-connection pool (no
+overflow) for session lease renewal, lease release and the membership
+heartbeat, so the sessions side uses up to 12 connections per replica.
+The Landscape engines and the readiness probes' connections come on top,
+as do the other replicas, Jobs and the operator's `psql` (facts §4.5). `verify-connection-budget` reads
 `az monitor metrics list --metric active_connections` on the server and
 passes the series through the shared validator against the SKU's
 `max_connections`.
@@ -960,7 +965,7 @@ run). The driver captures the `bundle-validate` verdict in private
 `$EVIDENCE_DIR/bundle.json` and exits nonzero when validation fails. It does
 not create a public receipt. Review the protected receipts and publish a
 sanitized account of measured facts at
-`docs/operator/evidence/azure-container-apps/0.8.17.json` only after the live
+`docs/operator/evidence/azure-container-apps/0.8.18.json` only after the live
 procedure completes and the bundle passes. Never create a receipt from desktop
 analysis or treat skipped or failed probes as passes. If a run fails, retain
 its diagnostics, fix the defect and rerun before claiming live acceptance.

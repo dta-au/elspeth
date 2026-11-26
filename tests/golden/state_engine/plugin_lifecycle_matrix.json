@@ -69,39 +69,6 @@
       "release_lane": "live-azure"
     },
     {
-      "plugin_key": "sink:chroma_sink",
-      "kind": "sink",
-      "module": "elspeth.plugins.sinks.chroma_sink",
-      "qualname": "ChromaSink",
-      "source_path": "src/elspeth/plugins/sinks/chroma_sink.py",
-      "determinism": "io_write",
-      "execution_model": "sink-batch",
-      "lifecycle_owners": {
-        "on_start": "elspeth.plugins.sinks.chroma_sink:ChromaSink",
-        "write": "elspeth.plugins.sinks.chroma_sink:ChromaSink",
-        "flush": "elspeth.plugins.sinks.chroma_sink:ChromaSink",
-        "on_complete": "elspeth.plugins.sinks.chroma_sink:ChromaSink",
-        "close": "elspeth.plugins.sinks.chroma_sink:ChromaSink"
-      },
-      "source_hash_present": true,
-      "sink_effect_capability": "member",
-      "sink_effect_modes": [
-        "overwrite"
-      ],
-      "variants": [
-        "persistent",
-        "client"
-      ],
-      "external_observation_required": true,
-      "applicable_pb_boundaries": [
-        "PB-06",
-        "PB-07",
-        "PB-09"
-      ],
-      "local_fixture": "provider-contract-fake",
-      "release_lane": "live-chroma"
-    },
-    {
       "plugin_key": "sink:csv",
       "kind": "sink",
       "module": "elspeth.plugins.sinks.csv_sink",
@@ -1619,36 +1586,6 @@
       ],
       "local_fixture": "hermetic",
       "release_lane": "local"
-    },
-    {
-      "plugin_key": "transform:rag_retrieval",
-      "kind": "transform",
-      "module": "elspeth.plugins.transforms.rag.transform",
-      "qualname": "RAGRetrievalTransform",
-      "source_path": "src/elspeth/plugins/transforms/rag/transform.py",
-      "determinism": "external_call",
-      "execution_model": "row-transform",
-      "lifecycle_owners": {
-        "on_start": "elspeth.plugins.transforms.rag.core:RetrievalTransformBase",
-        "process": "elspeth.plugins.transforms.rag.core:RetrievalTransformBase",
-        "on_complete": "elspeth.plugins.transforms.rag.core:RetrievalTransformBase",
-        "close": "elspeth.plugins.transforms.rag.core:RetrievalTransformBase"
-      },
-      "source_hash_present": true,
-      "sink_effect_capability": null,
-      "sink_effect_modes": [],
-      "variants": [
-        "chroma-ephemeral",
-        "chroma-persistent",
-        "chroma-client"
-      ],
-      "external_observation_required": true,
-      "applicable_pb_boundaries": [
-        "PB-02",
-        "PB-09"
-      ],
-      "local_fixture": "provider-contract-fake",
-      "release_lane": "live-provider"
     },
     {
       "plugin_key": "transform:reference_join",

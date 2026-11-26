@@ -44,7 +44,6 @@ _EXAMPLES_WITH_ENV_VARS: frozenset[str] = frozenset(
         "azure_keyvault_secrets",
         "azure_openai_sentiment",
         "azure_search_rag",
-        "chroma_rag_qa",
         "llm_source",
         "multi_query_assessment",
         "openrouter_multi_query_assessment",
@@ -245,16 +244,6 @@ class TestShippedExamples:
         settings = self._find_example_settings(example_pipeline_dir)
         # We know there are 20+ example directories with settings
         assert len(settings) >= 20, f"Expected at least 20 settings files, found {len(settings)}"
-
-    def test_discovery_includes_named_pipeline_entrypoints(self, example_pipeline_dir: Path) -> None:
-        """Pipeline entry points need validation even when not named settings.yaml."""
-        discovered_paths = {path.relative_to(example_pipeline_dir) for _name, path in self._find_example_settings(example_pipeline_dir)}
-        expected_paths = {
-            Path("chroma_rag_indexed/index_pipeline.yaml"),
-            Path("chroma_rag_indexed/query_pipeline.yaml"),
-        }
-
-        assert expected_paths <= discovered_paths
 
     def test_discovery_includes_new_top_level_pipeline_names(self, tmp_path: Path) -> None:
         """A future pipeline name cannot silently escape shipped-config validation."""
@@ -733,8 +722,12 @@ class TestShippedExamples:
         explode = settings["transforms"][0]
         assert explode["plugin"] == "json_explode"
         assert explode["input"] == "exploded"
-        assert explode["on_success"] == "llm_input"
-        assert settings["transforms"][1]["input"] == "llm_input"
+        assert explode["on_success"] == "barrier_input"
+        barrier = settings["transforms"][1]
+        assert barrier["plugin"] == "demonstration_start_barrier"
+        assert barrier["input"] == "barrier_input"
+        assert barrier["on_success"] == "llm_input"
+        assert settings["transforms"][2]["input"] == "llm_input"
 
         input_path = example_pipeline_dir.parent / source["options"]["path"]
         input_rows = [json.loads(line) for line in input_path.read_text().splitlines() if line.strip()]

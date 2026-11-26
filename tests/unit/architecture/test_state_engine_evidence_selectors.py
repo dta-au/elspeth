@@ -28,7 +28,7 @@ PLUGIN_MATRIX_PATH = REPOSITORY_ROOT / "tests/golden/state_engine/plugin_lifecyc
 # Real derived per-case lane identities used as mutation subjects.
 AWS_SOURCE_LANE = "protected-live-source-aws_s3-default"
 AZURE_SOURCE_LANE = "protected-live-source-azure_blob-connection_string"
-CHROMA_CLIENT_LANE = "protected-live-sink-chroma_sink-client"
+DATAVERSE_SINK_LANE = "protected-live-sink-dataverse-managed_identity"
 COMPOSITION_LANE = "postgresql-16-aws"
 
 
@@ -148,7 +148,7 @@ def test_lane_inventory_is_fixed_lanes_then_derived_per_case_lanes_sorted() -> N
     assert len(derived) == len(non_local_pairs)
     for lane_id in derived:
         spec = specs[lane_id]
-        assert spec.workflow_job in {"live_aws", "live_azure", "live_dataverse", "live_chroma", "live_provider"}
+        assert spec.workflow_job in {"live_aws", "live_azure", "live_dataverse", "live_provider"}
         assert spec.profile_case == "postgresql-16-aws-single-leader-landscape"
 
 
@@ -340,7 +340,7 @@ def test_protected_lane_with_zero_mappings_keeps_its_dispatch_nodes() -> None:
     its node list is the dispatch selector and every cell stays honestly
     unknown until mapped."""
     manifest, _variants, _release_lanes = _valid_manifest()
-    for cell in _lane(manifest, CHROMA_CLIENT_LANE)["cells"]:
+    for cell in _lane(manifest, DATAVERSE_SINK_LANE)["cells"]:
         cell.pop("node_ids", None)
 
     _validate(manifest)

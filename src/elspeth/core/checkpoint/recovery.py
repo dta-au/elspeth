@@ -23,6 +23,7 @@ from elspeth.contracts import (
     ResumePoint,
     RunStatus,
     SchemaContract,
+    hashing,
 )
 from elspeth.contracts.barrier_scalars import BarrierScalars
 from elspeth.contracts.checkpoint import ResumeRefusalCause
@@ -71,6 +72,7 @@ __all__ = [
     "UnsatisfiableGroupMember",
     "check_group_satisfiability_resumable",
     "check_http_effects_resumable",
+    "check_run_canonical_version_resumable",
     "check_run_status_resumable",
     "check_source_lifecycle_resumable",
     "group_binding_view_from_graph",
@@ -179,7 +181,7 @@ def check_run_status_resumable(db: LandscapeDB, run_id: str) -> tuple[RunStatus 
         # Lives in the SHARED implementation so the advisory can_resume() and
         # the enforcing resume() entry guard produce the SAME verdict
         # (the elspeth-2f23292372 parity contract).
-        leader = RunCoordinationRepository(db.engine).live_leader(run_id=run_id)
+        leader = RunCoordinationRepository(db.engine).seat_holder(run_id=run_id)
         if leader is not None and leader.seat_live:
             reason = (
                 f"Run is in progress under live leader {leader.leader_worker_id!r} "
@@ -196,6 +198,20 @@ def check_run_status_resumable(db: LandscapeDB, run_id: str) -> tuple[RunStatus 
         )
 
     return run_status, ResumeCheck(can_resume=True)
+
+
+def check_run_canonical_version_resumable(db: LandscapeDB, run_id: str) -> ResumeCheck:
+    """Shared canonical-version verdict for resume admission and advisory views."""
+    run = _fetch_run(db, run_id)
+    if run is None:
+        return ResumeCheck(can_resume=False, reason=f"Run {run_id} not found", cause=ResumeRefusalCause.RUN_NOT_FOUND)
+    if run.canonical_version != hashing.CANONICAL_VERSION:
+        return ResumeCheck(
+            can_resume=False,
+            reason=f"canonical version changed from {run.canonical_version!r} to {hashing.CANONICAL_VERSION!r}",
+            cause=ResumeRefusalCause.CANONICAL_VERSION_CHANGED,
+        )
+    return ResumeCheck(can_resume=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -634,6 +650,10 @@ class RecoveryManager:
         _run_status, status_check = check_run_status_resumable(self._db, run_id)
         if not status_check.can_resume:
             return status_check
+
+        version_check = check_run_canonical_version_resumable(self._db, run_id)
+        if not version_check.can_resume:
+            return version_check
 
         checkpoint = self._checkpoint_manager.get_latest_checkpoint(run_id)
         if checkpoint is None:

@@ -38,8 +38,8 @@ from elspeth.plugins.infrastructure.templates import (
     TemplateError,
     TemplateRow,
 )
+from elspeth.plugins.transforms.azure.ai_search import AzureAISearchConfig
 from elspeth.plugins.transforms.llm.base import LLMConfig
-from elspeth.plugins.transforms.rag.config import RAGRetrievalConfig
 
 _OMITTED = object()
 _ROW_AS_OBJECT = "uses its row as an object"
@@ -100,13 +100,14 @@ def _rag(template: str, required_input_fields: Any) -> None:
         "output_prefix": "kb",
         "query_field": "question",
         "query_template": "{{ query }} " + template,
-        "provider": "chroma",
-        "provider_config": {"collection": "g3-row-api", "mode": "ephemeral"},
+        "endpoint": "https://invariant.example.search.windows.net",
+        "index": "g3-row-api",
+        "api_key": "probe-key",
         "schema_config": {"mode": "observed"},
     }
     if required_input_fields is not _OMITTED:
         options["required_input_fields"] = required_input_fields
-    RAGRetrievalConfig(**options)
+    AzureAISearchConfig(**options)
 
 
 # (surface id, builder, receiver, a declared field, the list declaration)

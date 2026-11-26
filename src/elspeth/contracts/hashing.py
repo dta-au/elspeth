@@ -26,7 +26,7 @@ from elspeth.contracts.trust_boundary import trust_boundary
 
 # Version string stored with every run for hash verification.
 # Single source of truth — core/canonical.py imports this constant.
-CANONICAL_VERSION = "sha256-rfc8785-v1"
+CANONICAL_VERSION = "sha256-rfc8785-v2"
 _LOWER_SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}")
 
 

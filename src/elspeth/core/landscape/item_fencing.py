@@ -14,6 +14,24 @@ from elspeth.core.landscape.run_coordination_repository import fenced_member_tra
 from elspeth.core.landscape.schema import token_work_items_table
 
 
+def _exact_claim_id(work_item_id: str) -> str:
+    """The claimed work item id as an exact ``str``, judged from its type alone.
+
+    The fence compares it and names it in its refusal; an exact copy means no
+    method of a ``str`` subclass runs there.
+    """
+    if issubclass(type(work_item_id), str):
+        return str.__str__(work_item_id)
+    raise TypeError(f"work_item_id holds {type(work_item_id).__qualname__}, not str")
+
+
+def _exact_claim_attempt(attempt: int) -> int:
+    """The claimed attempt as an exact ``int`` (see :func:`_exact_claim_id`)."""
+    if issubclass(type(attempt), int):
+        return int.__int__(attempt)
+    raise TypeError(f"attempt holds {type(attempt).__qualname__}, not int")
+
+
 @contextmanager
 def fenced_item_transaction(
     engine: Tier1Engine,
@@ -38,14 +56,16 @@ def fenced_item_transaction(
         raise AuditIntegrityError("Item authority must belong to the admitted worker and run")
     if work_item.status is not TokenWorkStatus.LEASED:
         raise AuditIntegrityError("Item authority must be a claimed LEASED work item")
+    claim_id = _exact_claim_id(work_item.work_item_id)
+    claim_attempt = _exact_claim_attempt(work_item.attempt)
 
     with fenced_member_transaction(engine, member_token=member_token, verb=verb) as conn:
         result = conn.execute(
             update(token_work_items_table)
             .where(
                 token_work_items_table.c.run_id == member_token.run_id,
-                token_work_items_table.c.work_item_id == work_item.work_item_id,
-                token_work_items_table.c.attempt == work_item.attempt,
+                token_work_items_table.c.work_item_id == claim_id,
+                token_work_items_table.c.attempt == claim_attempt,
                 token_work_items_table.c.token_id == work_item.token_id,
                 token_work_items_table.c.row_id == work_item.row_id,
                 token_work_items_table.c.lease_owner == member_token.worker_id,
@@ -55,7 +75,7 @@ def fenced_item_transaction(
         )
         if result.rowcount != 1:
             raise SchedulerLeaseLostError(
-                work_item_id=work_item.work_item_id,
+                work_item_id=claim_id,
                 lease_owner=member_token.worker_id,
                 run_id=member_token.run_id,
             )

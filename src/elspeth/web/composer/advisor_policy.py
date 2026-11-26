@@ -12,6 +12,7 @@ from types import MappingProxyType
 from typing import Any, Final, Literal
 
 from elspeth.contracts.composer_progress import CONTEXT_BUDGET_REFUSAL_DETAIL
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.provider_rejection import SafeRequestRejection
 from elspeth.web.composer import no_tool_policy as _no_tool_policy
 from elspeth.web.composer.state import CompositionState
@@ -142,6 +143,7 @@ def advisor_signoff_blocked_validation(
     category: str,
     step_ids: Sequence[str],
     note: str | None,
+    draft_has_content: bool,
 ) -> ValidationResult:
     """Build the fully-red shape for a RED runtime preflight.
 
@@ -169,6 +171,7 @@ def advisor_signoff_blocked_validation(
         findings_backend_authored=findings_backend_authored,
         category=category,
         step_ids=step_ids,
+        draft_has_content=draft_has_content,
     )
     return _advisor_signoff_fully_blocking_validation(detail=detail, suggestion=suggestion, note=note)
 
@@ -181,6 +184,7 @@ def advisor_signoff_unverified_validation(
     category: str,
     step_ids: Sequence[str],
     note: str | None,
+    draft_has_content: bool,
 ) -> ValidationResult:
     """Build the fully-blocking shape for an ABSENT runtime preflight.
 
@@ -200,6 +204,7 @@ def advisor_signoff_unverified_validation(
         notice=_ADVISOR_SIGNOFF_UNVERIFIED_PUBLISHED_NOTICE,
         category=category,
         step_ids=step_ids,
+        draft_has_content=draft_has_content,
     )
     return _advisor_signoff_fully_blocking_validation(detail=detail, suggestion=suggestion, note=note)
 
@@ -426,8 +431,13 @@ def advisor_signoff_blocked_wording(
     category: str = "other",
     step_ids: Sequence[str] = (),
     request_rejection: SafeRequestRejection | None = None,
+    draft_has_content: bool,
 ) -> tuple[str, str]:
     """Return the (detail, suggestion) pair for one blocked-sign-off reason.
+
+    ``draft_has_content`` is the typed draft fact for the two review-not-run
+    reasons: their suggestion claims saved draft progress only when the draft
+    has content. Every other reason ignores it.
 
     Shared by the fully-blocking result (:func:`advisor_signoff_blocked_validation`),
     the validated-but-unsigned result (:func:`advisor_signoff_pending_validation`),
@@ -471,12 +481,16 @@ def advisor_signoff_blocked_wording(
     backend-authored pre-scan finding keeps its existing wording and gets no
     header: it is not a reviewer's judgement about a step.
     """
+    not_run_suggestion = (
+        _no_tool_policy._ADVISOR_REVIEW_DRAFT_SUGGESTION if draft_has_content else _no_tool_policy._ADVISOR_REVIEW_NO_DRAFT_SUGGESTION
+    )
     if reason == "budget_exhausted":
         rejection_detail = " " + request_rejection.explanation if request_rejection is not None else ""
-        return (
-            "The reply was withheld because the completion review could not run within the existing request limits." + rejection_detail,
-            "Saved draft progress remains available; continue in a new message.",
-        )
+        return (_no_tool_policy._ADVISOR_REVIEW_BUDGET_DETAIL + rejection_detail, not_run_suggestion)
+    if reason == "prior_call_cost_unknown":
+        # Decided before the review is attempted, so no review request (and
+        # no request rejection) exists for this reason.
+        return (_no_tool_policy._ADVISOR_REVIEW_COST_UNKNOWN_DETAIL, not_run_suggestion)
     if reason == "publication_withheld":
         return (
             "The completion review did not admit the reply's claims; the reply was withheld.",
@@ -529,14 +543,15 @@ def advisor_signoff_blocked_wording(
             if request_rejection is not None
             else SafeRequestRejection(reason_code=None, reason_disposition="unavailable", reason_source="unavailable")
         )
-        # A request too large for the model's context: the recourse is the
-        # context budget's own (a new session or a shorter request). The
+        # A request too large for the model's context, or for the provider's
+        # or a proxy's size limit: the recourse is the context budget's own
+        # (a new session or a shorter request). The
         # suggestion is stored on the blocker but never matched against stored
         # text; only its length is bounded (advisor_audit).
         return (
             rejection.public_detail,
             CONTEXT_BUDGET_REFUSAL_DETAIL
-            if rejection.reason_code == "context_length_exceeded"
+            if rejection.reason_code in ("context_length_exceeded", "request_too_large")
             else "An unchanged rejected request will not be retried automatically. Review the rejection reason before sending another message.",
         )
     if reason == "unavailable":
@@ -545,11 +560,13 @@ def advisor_signoff_blocked_wording(
             "The advisor model was unavailable; check the advisor model configuration. "
             "Validation and the advisory review run again on your next message.",
         )
-    return (
-        f"The evidence-scoped completion advisory review could not be obtained; the Composer cannot mark this turn complete. {findings}",
-        "The advisor returned no usable verdict; check the advisor model configuration. "
-        "Validation and the advisory review run again on your next message.",
-    )
+    if reason == "malformed":
+        return (
+            f"The evidence-scoped completion advisory review could not be obtained; the Composer cannot mark this turn complete. {findings}",
+            "The advisor returned no usable verdict; check the advisor model configuration. "
+            "Validation and the advisory review run again on your next message.",
+        )
+    raise AuditIntegrityError(f"Blocked sign-off has no wording for END block reason {reason!r}")
 
 
 def advisor_signoff_pending_validation(
@@ -561,6 +578,7 @@ def advisor_signoff_pending_validation(
     category: str,
     step_ids: Sequence[str],
     note: str | None,
+    draft_has_content: bool,
 ) -> ValidationResult:
     """Gate COMPLETION only, on a pipeline whose validation genuinely passed.
 
@@ -588,6 +606,7 @@ def advisor_signoff_pending_validation(
         findings_backend_authored=findings_backend_authored,
         category=category,
         step_ids=step_ids,
+        draft_has_content=draft_has_content,
     )
     return base.model_copy(
         update={

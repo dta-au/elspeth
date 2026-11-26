@@ -72,6 +72,11 @@ def _output(path: object = "outputs/report.csv") -> dict[str, Any]:
     }
 
 
+# The seed's "after" node is a saved legacy retrieval node carrying a nested
+# ``provider_config.persist_directory``. No installed plugin accepts that option
+# since 0.8.18, so writers refuse it at plugin admission; the tests that use it
+# exercise the nested-path confinement below admission (loaded state, preview,
+# both materializers), which stays in force.
 def _provider_options(path: object) -> dict[str, Any]:
     return {
         "provider": "chroma",
@@ -104,19 +109,15 @@ def _seed_state() -> CompositionState:
 
 # Literal expected diagnostics keep a refusal for an unrelated plugin/options
 # error from satisfying a path-security test. The bulk cases exercise every
-# existing source branch plus the provider and output gates independently.
+# existing source branch plus the output gate independently.
 _WRITERS = [
     pytest.param("set_source", "source_path_policy_invalid", "source", id="set-source"),
     pytest.param("patch_source_options", "source_path_policy_invalid", "source", id="patch-source"),
     pytest.param("set_output", "sink_path_policy_invalid", "output:result", id="set-output"),
     pytest.param("patch_output_options", "sink_path_policy_invalid", "output:result", id="patch-output"),
-    pytest.param("upsert_node", "provider_config_path_policy_invalid", "node:after", id="upsert-provider"),
-    pytest.param("patch_node_options", "provider_config_path_policy_invalid", "node:after", id="patch-provider"),
-    pytest.param("splice_transform", "provider_config_path_policy_invalid", "node:inserted", id="splice-provider"),
     pytest.param("bulk-source", "source_path_policy_invalid", "source", id="bulk-singular-source"),
     pytest.param("bulk-sources", "source_path_policy_invalid", "source:orders", id="bulk-plural-source"),
     pytest.param("bulk-output", "sink_path_policy_invalid", "output:result", id="bulk-output"),
-    pytest.param("bulk-provider", "provider_config_path_policy_invalid", "node:after", id="bulk-provider"),
 ]
 
 
@@ -129,31 +130,14 @@ def _mutation(writer: str, path: object) -> tuple[str, dict[str, Any]]:
         return writer, _output(path)
     if writer == "patch_output_options":
         return writer, {"sink_name": "result", "patch": {"path": path}}
-    if writer == "upsert_node":
-        return writer, _provider_node(path)
-    if writer == "patch_node_options":
-        return writer, {"node_id": "after", "patch": {"provider_config": {"collection": "docs", "persist_directory": path}}}
-    if writer == "splice_transform":
-        return writer, {
-            "predecessor_id": "before",
-            "successor_id": "after",
-            "node": {
-                "id": "inserted",
-                "plugin": "rag_retrieval",
-                "on_error": "discard",
-                "options": {**_provider_options(path), "output_prefix": "lookup_"},
-            },
-        }
     args = {
         "source": _source(path)
         if writer == "bulk-source"
         else {"plugin": "null", "on_success": "rows", "options": {"schema": {"mode": "observed"}}, "on_validation_failure": "discard"},
-        "nodes": [_provider_node(path)] if writer == "bulk-provider" else [],
+        "nodes": [],
         "edges": [],
         "outputs": [_output(path)] if writer == "bulk-output" else [],
     }
-    if writer == "bulk-provider":
-        args["nodes"][0]["input"] = "rows"
     if writer == "bulk-sources":
         args.pop("source")
         args["sources"] = {
@@ -329,10 +313,7 @@ async def test_malformed_path_is_an_intentional_tool_refusal(tmp_path: Path, wri
     assert isinstance(content, TextContent)
     assert "Tool error: TypeError" not in content.text
     assert "Tool error: ValueError" not in content.text
-    if writer in {"upsert_node", "patch_node_options", "splice_transform", "bulk-provider"} and value is None:
-        assert not response.isError
-        assert json.loads(content.text)["success"] is True
-    elif response.isError:
+    if response.isError:
         assert content.text.startswith("Tool error: ")
         assert live.last_audit["status"] == "arg_error"
         assert live.last_audit["error_class"] == "ToolArgumentError"
@@ -361,20 +342,16 @@ async def test_source_encoding_patch_validates_and_retains_the_admitted_path(tmp
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("writer", ["patch_source_options", "patch_output_options", "patch_node_options"])
+@pytest.mark.parametrize("writer", ["patch_source_options", "patch_output_options"])
 async def test_nonpath_patch_cannot_reauthorize_a_legacy_escape(tmp_path: Path, writer: str) -> None:
     payload = _seed_state().to_dict()
     code, component, arguments = "source_path_policy_invalid", "source", {"patch": {"encoding": "utf-8"}}
     if writer == "patch_source_options":
         payload["sources"]["source"]["options"]["path"] = "/legacy-private/input.csv"
-    elif writer == "patch_output_options":
+    else:
         payload["outputs"][0]["options"]["path"] = "/legacy-private/output.csv"
         code, component = "sink_path_policy_invalid", "output:result"
         arguments = {"sink_name": "result", "patch": {"encoding": "utf-8"}}
-    else:
-        payload["nodes"][1]["options"]["provider_config"]["persist_directory"] = "/legacy-private/index"
-        code, component = "provider_config_path_policy_invalid", "node:after"
-        arguments = {"node_id": "after", "patch": {"output_prefix": "retrieved_"}}
     live = await _live_mcp(tmp_path, tmp_path / "data", state=CompositionState.from_dict(payload))
     before, saved = live.private_state.to_dict(), live.saved_bytes
     result = await live.call(writer, arguments)
@@ -621,17 +598,15 @@ async def test_preview_rechecks_a_symlink_changed_since_admission(tmp_path: Path
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("component", ["source", "output", "provider"])
+@pytest.mark.parametrize("component", ["source", "output"])
 @pytest.mark.parametrize("value", ["", 42, ["input.csv"], "bad\x00path"])
 async def test_malformed_legacy_path_preview_has_route_accurate_refusal(tmp_path: Path, component: str, value: object) -> None:
     """Legacy lexical errors must refuse before Path and direct repair to MCP authority."""
-    payload = _seed_state().to_dict()
+    payload = _preview_state().to_dict()
     if component == "source":
         payload["sources"]["source"]["options"]["path"] = value
-    elif component == "output":
-        payload["outputs"][0]["options"]["path"] = value
     else:
-        payload["nodes"][1]["options"]["provider_config"]["persist_directory"] = value
+        payload["outputs"][0]["options"]["path"] = value
     live = await _live_mcp(tmp_path, tmp_path / "data", state=CompositionState.from_dict(payload))
     preview = await live.call("preview_pipeline", {})
     result = preview["runtime_preflight"]
@@ -651,8 +626,7 @@ async def test_bulk_sink_spelling_is_canonicalized_without_an_mcp_session_segmen
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("source_form", ["source", "sources"])
-@pytest.mark.parametrize("late_component", ["output", "provider"])
-async def test_bulk_good_file_source_and_late_bad_path_are_atomic(tmp_path: Path, source_form: str, late_component: str) -> None:
+async def test_bulk_good_file_source_and_late_bad_path_are_atomic(tmp_path: Path, source_form: str) -> None:
     """Neither source form may replace live state before a later component refuses."""
     root = tmp_path / "data"
     root.mkdir()
@@ -663,21 +637,8 @@ async def test_bulk_good_file_source_and_late_bad_path_are_atomic(tmp_path: Path
         arguments["source"] = _source()
     else:
         arguments["sources"] = {"orders": _source()}
-    if late_component == "output":
-        arguments["outputs"].append({**_output(str(tmp_path / "outside.csv")), "sink_name": "late"})
-        code, component = "sink_path_policy_invalid", "output:late"
-    else:
-        arguments["nodes"] = [
-            {
-                **_provider_node("indexes/good"),
-                "id": "early",
-                "input": "rows",
-                "on_success": "next",
-                "options": {**_provider_options("indexes/good"), "output_prefix": "early_"},
-            },
-            {**_provider_node(str(tmp_path / "outside-index")), "input": "next"},
-        ]
-        code, component = "provider_config_path_policy_invalid", "node:after"
+    arguments["outputs"].append({**_output(str(tmp_path / "outside.csv")), "sink_name": "late"})
+    code, component = "sink_path_policy_invalid", "output:late"
     await _assert_refused_unchanged(live, "bulk-source", "unused", code, component, mutation=("set_pipeline", arguments))
 
 

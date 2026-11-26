@@ -24,7 +24,7 @@ from elspeth import __version__
 from elspeth.config_loading import load_settings
 from elspeth.contracts import ExecutionResult, SecretResolutionInput
 from elspeth.contracts.auth import AuthProviderType
-from elspeth.contracts.enums import RunMode
+from elspeth.contracts.enums import RunMode, RunStatus
 from elspeth.contracts.errors import (
     AbandonRefusedError,
     CommencementGateFailedError,
@@ -279,6 +279,8 @@ def _join_after_follower_sink_preflight(
     orchestrator: Orchestrator,
     run_id: str,
     settings: ElspethSettings,
+    config: PipelineConfig,
+    graph: ExecutionGraph,
 ) -> tuple[WorkerMembershipToken, PluginBundle, Mapping[str, SinkProtocol], Mapping[str, str], object]:
     """Join only after the exact follower execution sinks earn admission."""
     from elspeth.engine.orchestrator.preflight import SinkEffectExecutionPurpose
@@ -289,7 +291,7 @@ def _join_after_follower_sink_preflight(
         plugins,
         purpose=SinkEffectExecutionPurpose.FOLLOWER,
     )
-    member_token = orchestrator.join_run(run_id, settings)
+    member_token = orchestrator.join_run(run_id, settings, config=config, graph=graph)
     return member_token, plugins, execution_sinks, execution_sink_modes, admission
 
 
@@ -4426,8 +4428,10 @@ def join(
     pipeline config-hash compatibility.  Settings are REQUIRED — a missing or
     divergent settings file results in an admission refusal.
 
-    On clean departure (run completed) exits 0.  On refusal exits 1 with an
-    actionable message.  On SIGINT or leader-seat loss exits 3.
+    Exits 0 on a clean departure after the run reaches any terminal status,
+    including failed or interrupted; the departure message names the status.
+    On refusal exits 1 with an actionable message.  With no live leader while
+    the run is still running exits 2.  On SIGINT or eviction exits 3.
 
     Examples:
 
@@ -4439,7 +4443,7 @@ def join(
     """
     import traceback
 
-    from elspeth.contracts.errors import FollowerSeatDeadError, JoinRefusedError
+    from elspeth.contracts.errors import FollowerSeatDeadError, JoinNotReadyError, JoinRefusedError
     from elspeth.core.landscape import LandscapeDB
 
     # Settings are REQUIRED — the joiner must produce the same config_hash
@@ -4502,6 +4506,16 @@ def join(
         typer.echo(f"Sink effect preflight failed: {e}", err=True)
         raise typer.Exit(1) from None
 
+    # Build the execution graph for the follower (needed to recognise
+    # barrier / sink nodes for hand-off routing).
+    try:
+        execution_graph = _build_resume_graph(settings_config, plugins)
+    except contract_errors.TIER_1_ERRORS:
+        raise
+    except Exception as e:
+        typer.echo(f"Error building execution graph: {e}", err=True)
+        raise typer.Exit(1) from None
+
     # Resolve database URL.
     if database:
         db_path = Path(database).expanduser().resolve()
@@ -4561,6 +4575,39 @@ def join(
     follower_rate_limit_registry: RateLimitRegistry | None = None
     follower_telemetry_manager: TelemetryManager | None = None
     try:
+        from elspeth.core.config import AggregationSettings as _AggregationSettings
+        from elspeth.engine.orchestrator.preflight import execution_sink_bindings_for_runtime
+        from elspeth.engine.orchestrator.types import PipelineConfig
+
+        # Build PipelineConfig from settings (same shape as _orchestrator_context).
+        # Extract raw TransformProtocol instances from WiredTransform wrappers.
+        follower_transforms: list[RowPlugin] = [wired.plugin for wired in plugins.transforms]
+
+        agg_id_map = execution_graph.get_aggregation_id_map()
+        follower_agg_settings: dict[str, _AggregationSettings] = {}
+        for agg_name, (agg_transform, agg_config) in plugins.aggregations.items():
+            from elspeth.contracts.types import AggregationName as _AggregationName
+
+            node_id = agg_id_map[_AggregationName(agg_name)]
+            follower_agg_settings[node_id] = agg_config
+            agg_transform.node_id = node_id
+            follower_transforms.append(agg_transform)
+
+        execution_sink_bindings = execution_sink_bindings_for_runtime(settings_config, plugins.sink_effect_bindings)
+        pipeline_config = PipelineConfig(
+            config=resolve_config(settings_config),
+            sources=plugins.sources,
+            transforms=follower_transforms,
+            sinks=execution_sinks,
+            gates=list(settings_config.gates),
+            aggregation_settings=follower_agg_settings,
+            coalesce_settings=(list(settings_config.coalesce) if settings_config.coalesce else []),
+            sink_effect_modes=execution_sink_modes,
+            sink_effect_admission=sink_effect_admission,
+            sink_effect_bindings=execution_sink_bindings,
+            escalation_fixpoint_bound=execution_graph.escalation_fixpoint_bound,
+        )
+
         import threading
 
         from elspeth.contracts.config.runtime import (
@@ -4587,28 +4634,36 @@ def join(
         orchestrator = Orchestrator(db)
 
         try:
-            member_token = orchestrator.join_run(run_id, settings_config)
+            member_token = orchestrator.join_run(run_id, settings_config, config=pipeline_config, graph=execution_graph)
         except JoinRefusedError as e:
             if output_format == "json":
                 import json as json_mod
 
+                refusal_event: dict[str, str | bool] = {
+                    "event": "join_not_ready" if isinstance(e, JoinNotReadyError) else "join_refused",
+                    "run_id": run_id,
+                    "reason": e.reason,
+                }
+                if e.departure_failure is not None:
+                    refusal_event["departure_failed"] = True
+                    refusal_event["departure_failure"] = e.departure_failure
                 typer.echo(
-                    json_mod.dumps(
-                        {
-                            "event": "join_refused",
-                            "run_id": run_id,
-                            "reason": e.reason,
-                        }
-                    ),
+                    json_mod.dumps(refusal_event),
                     err=True,
                 )
             else:
                 typer.echo(f"Cannot join run {run_id}: {e.reason}", err=True)
+                if e.departure_failure is not None:
+                    typer.echo(
+                        f"Follower membership could not be released; it lapses at heartbeat expiry: {e.departure_failure}",
+                        err=True,
+                    )
             raise typer.Exit(1) from None
         except contract_errors.TIER_1_ERRORS:
             raise
         except Exception as e:
-            typer.echo(f"Sink effect preflight failed: {e}", err=True)
+            # Message plus __notes__ (e.g. a failed follower departure), rendered by the standard library.
+            typer.echo("Join failed: " + "".join(traceback.format_exception_only(e)).rstrip(), err=True)
             raise typer.Exit(1) from None
 
         # The registered identity IS the membership token's worker_id (§A.1);
@@ -4632,16 +4687,6 @@ def join(
         else:
             typer.echo(f"Joined run {run_id} as follower {worker_id}")
             typer.echo("Draining available work…")
-
-        # Build the execution graph for the follower (needed to recognise
-        # barrier / sink nodes for hand-off routing).
-        try:
-            execution_graph = _build_resume_graph(settings_config, plugins)
-        except contract_errors.TIER_1_ERRORS:
-            raise
-        except Exception as e:
-            typer.echo(f"Error building execution graph: {e}", err=True)
-            raise typer.Exit(1) from None
 
         # Get payload store.
         from elspeth.core.payload_store import FilesystemPayloadStore
@@ -4686,43 +4731,10 @@ def join(
         # Build and run the follower processor.
         from elspeth.contracts.config import RuntimeRetryConfig
         from elspeth.contracts.plugin_context import PluginContext
-        from elspeth.core.config import AggregationSettings as _AggregationSettings
         from elspeth.core.landscape.factory import RecorderFactory
         from elspeth.engine.orchestrator.follower import build_follower_processor
-        from elspeth.engine.orchestrator.types import PipelineConfig
 
         factory = RecorderFactory(active_db, payload_store=payload_store)
-
-        # Build PipelineConfig from settings (same shape as _orchestrator_context).
-        # Extract raw TransformProtocol instances from WiredTransform wrappers.
-        follower_transforms: list[RowPlugin] = [wired.plugin for wired in plugins.transforms]
-
-        agg_id_map = execution_graph.get_aggregation_id_map()
-        follower_agg_settings: dict[str, _AggregationSettings] = {}
-        for agg_name, (agg_transform, agg_config) in plugins.aggregations.items():
-            from elspeth.contracts.types import AggregationName as _AggregationName
-
-            node_id = agg_id_map[_AggregationName(agg_name)]
-            follower_agg_settings[node_id] = agg_config
-            agg_transform.node_id = node_id
-            follower_transforms.append(agg_transform)
-
-        from elspeth.engine.orchestrator.preflight import execution_sink_bindings_for_runtime
-
-        execution_sink_bindings = execution_sink_bindings_for_runtime(settings_config, plugins.sink_effect_bindings)
-        pipeline_config = PipelineConfig(
-            config=resolve_config(settings_config),
-            sources=plugins.sources,
-            transforms=follower_transforms,
-            sinks=execution_sinks,
-            gates=list(settings_config.gates),
-            aggregation_settings=follower_agg_settings,
-            coalesce_settings=(list(settings_config.coalesce) if settings_config.coalesce else []),
-            sink_effect_modes=execution_sink_modes,
-            sink_effect_admission=sink_effect_admission,
-            sink_effect_bindings=execution_sink_bindings,
-            escalation_fixpoint_bound=execution_graph.escalation_fixpoint_bound,
-        )
 
         follower_proc = build_follower_processor(
             factory=factory,
@@ -4752,6 +4764,7 @@ def join(
         # PluginContractViolation("Transform 'X' was called before on_start()")
         # on the first process() call.
         follower_run_entered = False
+        final_run_status: RunStatus | None = None
         started_follower_transforms: list[RowPlugin] = []
         started_follower_sinks: dict[str, SinkProtocol] = {}
         cleanup_pending_exc: BaseException | None = None
@@ -4768,7 +4781,7 @@ def join(
             )
 
             follower_run_entered = True
-            follower_proc.run(ctx)
+            final_run_status = follower_proc.run(ctx)
         except RunWorkerEvictedError as e:
             try:
                 _emit_worker_evicted_event(e, output_format)
@@ -4862,7 +4875,12 @@ def join(
                 started_sinks=started_follower_sinks,
             )
 
-        # Clean departure (run reached terminal state).
+        # Clean departure: the follower left a run it read as terminal. Exit 0
+        # reports the departure, not the run's outcome, so name the status read.
+        if final_run_status is None:
+            departure = "run is no longer recorded, departed cleanly"
+        else:
+            departure = f"run ended with status {final_run_status.value}, departed cleanly"
         if output_format == "json":
             import json as json_mod
 
@@ -4872,12 +4890,13 @@ def join(
                         "event": "departed",
                         "run_id": run_id,
                         "worker_id": worker_id,
-                        "message": "run completed, departed cleanly",
+                        "run_status": None if final_run_status is None else final_run_status.value,
+                        "message": departure,
                     }
                 )
             )
         else:
-            typer.echo(f"\nJoined run {run_id} as follower {worker_id}, run completed, departed cleanly.")
+            typer.echo(f"\nJoined run {run_id} as follower {worker_id}; {departure}.")
 
     except contract_errors.TIER_1_ERRORS as e:
         if output_format == "json":

@@ -815,6 +815,16 @@ sites:
   counterpart:
   - scope_opener_duplicate
   note: Stage 1 rejects two collectors declaring the same scope_opener (WS2 Task 12).
+- key: a6a7c2a867f7fc11
+  path: src/elspeth/core/config.py
+  qualname: ElspethSettings.refuse_collection_probes
+  exception: ValueError
+  message: 'collection_probes is not supported: no collection probe provider ships since 0.8.18 (the Chroma
+    provider was removed with the chromadb dependency). Remove colle'
+  ordinal: 0
+  disposition: not_authorable
+  note: '`collection_probes` is not among the keys _generate_pipeline_dict emits (yaml_generator.py:409);
+    it always takes its empty default (config.py:2176), which this validator admits.'
 - key: 776463e24d99af80
   path: src/elspeth/core/config.py
   qualname: ElspethSettings.reject_legacy_source_field
@@ -956,15 +966,6 @@ sites:
   - source_name_invalid
   note: validate_composer_source_name raises on a non-lowercase name at state.py:114 before the source
     can be stored, and validate() reports the same message as source_name_invalid.
-- key: 3001af948be2f7fd
-  path: src/elspeth/core/config.py
-  qualname: ElspethSettings.validate_unique_collection_probes
-  exception: ValueError
-  message: 'duplicate collection_probes for collection(s): {}'
-  ordinal: 0
-  disposition: not_authorable
-  note: '`collection_probes` is not among the keys _generate_pipeline_dict emits (yaml_generator.py:197-354);
-    it always takes its empty default (config.py:1943).'
 - key: f4d7ce369e768fa2
   path: src/elspeth/core/config.py
   qualname: ElspethSettings.validate_unique_dependencies

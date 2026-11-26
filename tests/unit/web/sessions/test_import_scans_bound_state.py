@@ -2,10 +2,10 @@
 
 ``POST /api/sessions/{id}/state/yaml`` scans the state for credential
 material as it will be stored, with the file markers named by
-``inline_blob_bindings`` bound, before it saves. For one LLM step with 252
-file-held query templates the import is refused with the existing
-``credential_material_rejected`` 422 and nothing is stored. At 251 queries the
-import is accepted, stored, and opens.
+``inline_blob_bindings`` bound, before it saves. The scan is best effort: for
+one LLM step with 252 file-held query templates the bound state is over the
+scan's traversal bound, so the scan stops there and the skip is counted; the
+import is still accepted, stored, and opens, as it is at 251 queries.
 """
 
 from __future__ import annotations
@@ -17,11 +17,10 @@ from typing import Any
 
 import pytest
 import yaml
-from sqlalchemy import func, select
 
+from elspeth.web import credential_scan
 from elspeth.web.composer.graph_recovery import qualify_editable_checkpoint
 from elspeth.web.sessions.converters import state_from_record
-from elspeth.web.sessions.models import metadata as sessions_metadata
 from tests.unit.web.sessions.test_import_source_binding_prompt_file import _Env
 from tests.unit.web.sessions.test_routes import _close_app_session_engines as _close_app_session_engines
 
@@ -29,7 +28,7 @@ NODE = "capacity_probe"
 FIELDS = ("case_text", "case_history", "reviewer_notes")
 QUERY_HEAD = "Score this criterion from 0 to 100. Case: {{ row.input_1 }} History: {{ row.input_2 }} Notes: {{ row.input_3 }}\n"
 # The query count at which the bound state first exceeds the credential scan's traversal bound.
-FIRST_REFUSED = 252
+FIRST_OVER_SCAN = 252
 
 
 def _query_name(index: int) -> str:
@@ -105,42 +104,37 @@ async def _import_body(env: _Env, session_id: uuid.UUID, queries: int) -> dict[s
     }
 
 
-def _row_counts(env: _Env) -> dict[str, int]:
-    """Every table of the session database and its row count."""
-    with env.service._engine.connect() as conn:
-        return {table.name: conn.execute(select(func.count()).select_from(table)).scalar_one() for table in sessions_metadata.sorted_tables}
-
-
 @pytest.fixture
 def env(tmp_path: Path) -> _Env:
     return _Env(tmp_path)
 
 
-def test_an_import_whose_bound_state_exceeds_the_scan_is_refused_and_stores_nothing(env: _Env) -> None:
+def test_an_import_whose_bound_state_exceeds_the_scan_is_stored_and_opens(env: _Env, monkeypatch: pytest.MonkeyPatch) -> None:
+    skips: list[dict[str, str]] = []
+
+    class _Recorder:
+        def add(self, value: int, attributes: dict[str, str]) -> None:
+            skips.append(dict(attributes))
+
+    monkeypatch.setattr(credential_scan, "_CREDENTIAL_SCAN_SKIPPED_COUNTER", _Recorder())
     session_id = asyncio.run(env.session())
-    body = asyncio.run(_import_body(env, session_id, FIRST_REFUSED))
-    before = _row_counts(env)
+    body = asyncio.run(_import_body(env, session_id, FIRST_OVER_SCAN))
 
     response = env.import_yaml(session_id, body)
 
-    assert response.status_code == 422, response.text
-    detail = response.json()["detail"]
-    assert (detail["failure_code"], detail["category"], detail["surface"]) == (
-        "credential_material_rejected",
-        "traversal_limit",
-        "composer_yaml_import",
-    )
-    assert asyncio.run(env.service.get_current_state(session_id)) is None
-    after = _row_counts(env)
-    assert {table: (before[table], after[table]) for table in before if before[table] != after[table]} == {}
-    state = env.client.get(f"/api/sessions/{session_id}/state")
-    assert state.status_code == 200, state.text
-    assert state.json() is None
+    assert response.status_code == 200, response.text
+    assert {"surface": "composer_yaml_import", "reason": "nodes"} in skips
+    record = asyncio.run(env.service.get_current_state(session_id))
+    assert record is not None
+    assert qualify_editable_checkpoint(state_from_record(record)).eligible
+    opened = env.client.get(f"/api/sessions/{session_id}/state")
+    assert opened.status_code == 200, opened.text
+    assert len(opened.json()["nodes"][0]["options"]["queries"]) == FIRST_OVER_SCAN
 
 
 def test_one_query_fewer_imports_stores_and_opens(env: _Env) -> None:
     session_id = asyncio.run(env.session())
-    body = asyncio.run(_import_body(env, session_id, FIRST_REFUSED - 1))
+    body = asyncio.run(_import_body(env, session_id, FIRST_OVER_SCAN - 1))
 
     response = env.import_yaml(session_id, body)
 
@@ -150,4 +144,4 @@ def test_one_query_fewer_imports_stores_and_opens(env: _Env) -> None:
     assert qualify_editable_checkpoint(state_from_record(record)).eligible
     opened = env.client.get(f"/api/sessions/{session_id}/state")
     assert opened.status_code == 200, opened.text
-    assert len(opened.json()["nodes"][0]["options"]["queries"]) == FIRST_REFUSED - 1
+    assert len(opened.json()["nodes"][0]["options"]["queries"]) == FIRST_OVER_SCAN - 1

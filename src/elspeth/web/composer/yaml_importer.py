@@ -95,7 +95,7 @@ _INTENTIONALLY_DROPPED_SECTIONS: dict[str, str] = {
 # dropped in the first place.
 #
 # Declining is legitimate. Declining SILENTLY is not: a shipped example
-# (examples/chroma_rag_indexed/query_pipeline.yaml) lost its
+# (a retrieval query pipeline, since removed) lost its
 # ``commencement_gates`` — an admission control gating the run on a non-empty
 # corpus — and the import reported success (elspeth-9482eda744). This mapping
 # turns each drop into a named refusal, extending the ruling on

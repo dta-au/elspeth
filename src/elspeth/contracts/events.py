@@ -341,21 +341,6 @@ class RAGRetrievalStatistics(TelemetryEvent):
             raise ValueError("score_std must be non-negative")
 
 
-@dataclass(frozen=True, slots=True)
-class ChromaWriteStatistics(TelemetryEvent):
-    """Per-invocation observed sink throughput, without collection content."""
-
-    node_id: str
-    plugin_name: str
-    total_written: int
-    total_bytes: int
-
-    def __post_init__(self) -> None:
-        _validate_statistics_identity(self.timestamp, self.run_id, self.node_id, self.plugin_name)
-        require_int(self.total_written, "total_written", min_value=0)
-        require_int(self.total_bytes, "total_bytes", min_value=0)
-
-
 _ENGINE_SPAN_ALLOWED_ATTRIBUTES: Mapping[EngineSpanName, frozenset[str]] = MappingProxyType(
     {
         EngineSpanName.RUN: frozenset({"run.id"}),

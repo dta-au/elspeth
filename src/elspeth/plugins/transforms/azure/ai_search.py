@@ -86,7 +86,7 @@ class AzureAISearchTransform(RetrievalTransformBase):
 
     name = "azure_ai_search"
     plugin_version = "2.0.0"
-    source_file_hash: str | None = "sha256:8ac0b39fc578d333"
+    source_file_hash: str | None = "sha256:619153c20bac6efa"
     determinism: Determinism = Determinism.EXTERNAL_CALL
     config_model = AzureAISearchConfig
     passes_through_input = True
@@ -105,7 +105,7 @@ class AzureAISearchTransform(RetrievalTransformBase):
     )
     usage_when_not_to_use = (
         "Not for indexing documents or generating answers: populate the index with Azure's own indexer, "
-        "and add an llm transform after retrieval when an answer is required. Use rag_retrieval for Chroma."
+        "and add an llm transform after retrieval when an answer is required."
     )
     example_use = (
         "transform:\n"

@@ -57,13 +57,6 @@ def _minimal_sink_configs(tmp_dir: str) -> dict[str, dict[str, Any]]:
             "connection_string": ("DefaultEndpointsProtocol=https;AccountName=a;AccountKey=Zm9v;EndpointSuffix=core.windows.net"),
             "schema": _OBSERVED,
         },
-        "chroma_sink": {
-            "collection": "my_collection",
-            "persist_directory": tmp_dir,
-            "mode": "persistent",
-            "field_mapping": {"id_field": "id", "document_field": "body"},
-            "schema": _OBSERVED,
-        },
         "csv": {"path": f"{tmp_dir}/a.csv", "schema": _OBSERVED},
         "database": {"url": f"sqlite:///{tmp_dir}/a.db", "table": "t", "schema": _OBSERVED},
         "dataverse": {

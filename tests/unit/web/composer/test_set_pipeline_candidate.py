@@ -48,7 +48,6 @@ from elspeth.web.composer.tools._common import (
     _RejectionOperation,
     _validate_sink_path,
     _validate_source_path,
-    _validate_transform_provider_config_path,
     normalize_tool_result_validation,
 )
 from elspeth.web.composer.tools.sources import _options_with_source_blob_review, _resolve_source_blob
@@ -201,7 +200,7 @@ def test_blob_binding_context_refusal_does_not_report_saved_graph_errors(tmp_pat
     assert "validation_delta" not in result.to_dict()
 
 
-@pytest.mark.parametrize("surface", ["source", "named_source", "sink", "provider"])
+@pytest.mark.parametrize("surface", ["source", "named_source", "sink"])
 def test_candidate_path_refusals_keep_server_roots_out_of_tool_history_and_planner(tmp_path: Path, surface: str) -> None:
     private_root = tmp_path / "NON-AUTHORED-SERVER-ROOT-CANARY"
     args = _linear_args(private_root)
@@ -215,21 +214,10 @@ def test_candidate_path_refusals_keep_server_roots_out_of_tool_history_and_plann
             args["sources"] = {"primary": args.pop("source")}
             args["edges"][0]["from_node"] = "source:primary"
             subject = "source:primary"
-    elif surface == "sink":
+    else:
         args["outputs"][0]["options"]["path"] = escaped_path
         raw_message = _validate_sink_path(args["outputs"][0]["options"], str(private_root), session_id="test-session")
         code, subject = "sink_path_policy_invalid", "output:main"
-    else:
-        args["nodes"][0]["plugin"] = "rag_retrieval"
-        args["nodes"][0]["options"] = {
-            "output_prefix": "rag_",
-            "query_field": "text",
-            "provider": "chroma",
-            "provider_config": {"collection": "docs", "mode": "persistent", "persist_directory": escaped_path},
-            "schema": {"mode": "observed"},
-        }
-        raw_message = _validate_transform_provider_config_path(args["nodes"][0]["options"], str(private_root), session_id="test-session")
-        code, subject = "provider_config_path_policy_invalid", "node:copy"
     # The underlying validator really contains the server-owned root: this is
     # a disclosure canary, not a test that happens to supply harmless messages.
     assert raw_message is not None and str(private_root) in raw_message
@@ -2377,27 +2365,14 @@ def test_inline_blob_canonical_b_failure_precedes_blob_persistence(tmp_path: Pat
     assert blob_files == ()
 
 
-@pytest.mark.parametrize("bad_component", ["output", "provider"])
-def test_later_path_refusal_does_not_persist_a_prepared_inline_source(tmp_path: Path, bad_component: str) -> None:
+def test_later_path_refusal_does_not_persist_a_prepared_inline_source(tmp_path: Path) -> None:
     """A good inline source must not write bytes before all paths are admitted."""
     engine, session_id, message_id = _session_with_user_message()
     args = _linear_args(tmp_path)
     args["source"]["options"] = {"schema": {"mode": "observed"}}
     args["source"]["inline_blob"] = {"filename": "data.csv", "mime_type": "text/csv", "content": "name,score\nada,42\n"}
-    args["outputs"][0]["options"]["path"] = str(tmp_path / "outputs" / session_id / "result.jsonl")
-    if bad_component == "output":
-        args["outputs"][0]["options"]["path"] = str(tmp_path / "outside-session.jsonl")
-        expected = ("sink_path_policy_invalid", "output:main")
-    else:
-        args["nodes"][0]["plugin"] = "rag_retrieval"
-        args["nodes"][0]["options"] = {
-            "provider": "chroma",
-            "provider_config": {"collection": "docs", "persist_directory": str(tmp_path / "outside-session-index")},
-            "query_field": "name",
-            "output_prefix": "rag_",
-            "schema": {"mode": "observed"},
-        }
-        expected = ("provider_config_path_policy_invalid", "node:copy")
+    args["outputs"][0]["options"]["path"] = str(tmp_path / "outside-session.jsonl")
+    expected = ("sink_path_policy_invalid", "output:main")
     context = _trained_context(
         data_dir=tmp_path,
         session_engine=engine,

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import shutil
+import sqlite3
 import time
 from pathlib import Path
 from typing import Any
@@ -55,7 +56,7 @@ class TestEndToEndPipelineExecution:
     """Full lifecycle through the web layer with real engine execution."""
 
     @pytest.mark.asyncio
-    async def test_csv_passthrough_csv(self, work_dir: Path) -> None:
+    async def test_csv_passthrough_csv(self, work_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """
         1. Register + login test user
         2. Create session via REST
@@ -65,6 +66,7 @@ class TestEndToEndPipelineExecution:
         6. Verify results: accounting.source.rows_processed > 0 and accounting.tokens.failed == 0
         7. Verify landscape_run_id links to audit trail
         """
+        from elspeth.contracts import hashing
         from elspeth.web.app import create_app
         from elspeth.web.composer.state import (
             CompositionState,
@@ -75,6 +77,8 @@ class TestEndToEndPipelineExecution:
         from elspeth.web.config import WebSettings
         from elspeth.web.sessions.protocol import CompositionStateData
 
+        patched_version = "sha256-rfc8785-test"
+        monkeypatch.setattr(hashing, "CANONICAL_VERSION", patched_version)
         settings = WebSettings(
             data_dir=work_dir,
             landscape_url=f"sqlite:///{work_dir}/runs/audit.db",
@@ -218,6 +222,9 @@ class TestEndToEndPipelineExecution:
             # 8. Verify audit database exists
             audit_db = work_dir / "runs" / "audit.db"
             assert audit_db.exists()
+            with sqlite3.connect(audit_db) as connection:
+                recorded_versions = connection.execute("SELECT canonical_version FROM runs").fetchall()
+            assert recorded_versions == [(patched_version,)]
 
             # 9. Verify results endpoint
             resp = await client.get(

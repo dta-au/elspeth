@@ -22,7 +22,7 @@ and are admitted if they present an identical `config_hash` (same `settings.yaml
 
 ```
 input.jsonl (10 batches × 20 texts)
-  └─> json_explode ─> 200 READY child items ─> (llm: sentiment)
+  └─> json_explode ─> demonstration_start_barrier ─> 200 child items ─> (llm: sentiment)
                                                 ├─> output/results.json
                                                 └─> output/quarantined.json
 ```
@@ -53,10 +53,10 @@ contract. `chaos_config_faults.yaml` retains the resilience profile separately.
 The script:
 1. Generates a process-scoped audit fingerprint key when the operator has not
    already configured one, then starts ChaosLLM (`--workers 1`) on port 8199.
-2. Backgrounds the **leader** with `elspeth run --settings ... --execute`.
+2. Backgrounds the **leader** through the example entrypoint, which registers the demonstration transform and invokes the ordinary CLI.
 3. Polls the audit DB (read-only) until the run is `RUNNING` with ≥1 claimed
    work item, then launches `WORKERS` **followers** with
-   `elspeth join "$RUN_ID" --settings "$PIPELINE_CONFIG"` (no `--execute` —
+   `start_barrier.py join "$RUN_ID" --settings "$PIPELINE_CONFIG"` (no `--execute` —
    `join` executes unconditionally; `--execute` is only a flag on `elspeth run`).
 4. Tails live `token_work_items` status counts every ~2s while the leader runs.
 5. Reaps all PIDs, renders an ASCII stats card, and asserts that every process
@@ -71,13 +71,9 @@ only to `127.0.0.1`. No real OpenRouter credential or service is used.
 
 ---
 
-## Join-Window Timing
+## Start Barrier
 
-The follower can only attach while the run is `RUNNING`. The script polls for
-`RUNNING ∧ ≥1 leased item` before joining. Each `json_explode` batch creates 20
-claimable children and ChaosLLM latency keeps the window wide enough for
-followers to attach and share them. If timing or admission prevents sharing,
-the final assertion reports the worker counts and exits non-zero.
+The example's start barrier makes the worker-sharing demonstration deterministic; operators running real multi-worker pipelines do not need it. Each worker holds its first exploded row before the first LLM call until all requested workers have active membership and live leased work. The first batch has 20 children, so the launcher rejects more than 19 followers. A missing or exited worker fails explicitly within 60 seconds, shortened when needed to retain a 10-second margin before its actual item lease expires.
 
 ---
 
@@ -85,9 +81,9 @@ the final assertion reports the worker counts and exits non-zero.
 
 | Code | Meaning |
 |------|---------|
-| `0`  | Clean departure — follower worked until the run ended normally |
+| `0`  | Clean departure — the follower left after the run reached a terminal status. This does not mean the run succeeded: the departure message names the status (`run ended with status failed`, for example) |
 | `1`  | JoinRefusedError — admission refused (config-hash mismatch, no live leader, or run not RUNNING) |
-| `2`  | FollowerSeatDeadError — leader died mid-drain; run `elspeth resume <run_id>` |
+| `2`  | FollowerSeatDeadError — no live leader while the run is still running; run `elspeth resume <run_id>` |
 | `3`  | SIGINT / RunWorkerEvictedError |
 | `4`  | Framework / Tier-1 error |
 

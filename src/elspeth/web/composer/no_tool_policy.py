@@ -7,7 +7,8 @@ import re
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, ClassVar, Final, Literal
+from types import MappingProxyType
+from typing import Any, ClassVar, Final, Literal, assert_never
 
 from opentelemetry import metrics
 
@@ -124,11 +125,42 @@ _REVIEW_REPLY_CONTEXT_BUDGET_NOTICE: Final = (
     "is too large for the composer. Start a new session, or shorten your request."
 )
 _REVIEW_REPLY_CONTEXT_BUDGET_SUFFIX = _bare_trusted_suffix(_REVIEW_REPLY_CONTEXT_BUDGET_NOTICE)
-_ADVISOR_REVIEW_BUDGET_NOTICE: Final = (
-    "The reply was withheld because the completion review could not run within the existing request limits. "
-    "Saved draft progress remains available; continue in a new message."
+# The final review could not run. Each cause has one fixed detail sentence;
+# only the recourse depends on whether the draft has content, so the claim
+# "Saved draft progress remains available" is made only when it is true. The
+# blocker card (advisor_policy) uses the same detail and suggestion strings,
+# so the two surfaces cannot drift.
+_ADVISOR_REVIEW_BUDGET_DETAIL: Final = (
+    "The reply was withheld because the completion review could not run within the existing request limits."
 )
+_ADVISOR_REVIEW_COST_UNKNOWN_DETAIL: Final = (
+    "The reply was withheld because the completion review could not run: "
+    "the cost of an earlier model call in this request could not be confirmed."
+)
+_ADVISOR_REVIEW_DRAFT_SUGGESTION: Final = "Saved draft progress remains available; continue in a new message."
+_ADVISOR_REVIEW_NO_DRAFT_SUGGESTION: Final = "Continue in a new message."
+_ADVISOR_REVIEW_BUDGET_NOTICE: Final = f"{_ADVISOR_REVIEW_BUDGET_DETAIL} {_ADVISOR_REVIEW_DRAFT_SUGGESTION}"
 _ADVISOR_REVIEW_BUDGET_SUFFIX = _bare_trusted_suffix(_ADVISOR_REVIEW_BUDGET_NOTICE)
+_ADVISOR_REVIEW_BUDGET_NO_DRAFT_NOTICE: Final = f"{_ADVISOR_REVIEW_BUDGET_DETAIL} {_ADVISOR_REVIEW_NO_DRAFT_SUGGESTION}"
+_ADVISOR_REVIEW_BUDGET_NO_DRAFT_SUFFIX = _bare_trusted_suffix(_ADVISOR_REVIEW_BUDGET_NO_DRAFT_NOTICE)
+_ADVISOR_REVIEW_COST_UNKNOWN_NOTICE: Final = f"{_ADVISOR_REVIEW_COST_UNKNOWN_DETAIL} {_ADVISOR_REVIEW_DRAFT_SUGGESTION}"
+_ADVISOR_REVIEW_COST_UNKNOWN_SUFFIX = _bare_trusted_suffix(_ADVISOR_REVIEW_COST_UNKNOWN_NOTICE)
+_ADVISOR_REVIEW_COST_UNKNOWN_NO_DRAFT_NOTICE: Final = f"{_ADVISOR_REVIEW_COST_UNKNOWN_DETAIL} {_ADVISOR_REVIEW_NO_DRAFT_SUGGESTION}"
+_ADVISOR_REVIEW_COST_UNKNOWN_NO_DRAFT_SUFFIX = _bare_trusted_suffix(_ADVISOR_REVIEW_COST_UNKNOWN_NO_DRAFT_NOTICE)
+# Every review-could-not-run notice, by (reason, draft has content). The
+# recognizer accepts exactly these; the producers below look them up and
+# raise on any other reason.
+_ADVISOR_REVIEW_NOT_RUN_NOTICES: Final[Mapping[tuple[str, bool], tuple[str, str]]] = MappingProxyType(
+    {
+        ("budget_exhausted", True): (_ADVISOR_REVIEW_BUDGET_SUFFIX, _ADVISOR_REVIEW_BUDGET_NOTICE),
+        ("budget_exhausted", False): (_ADVISOR_REVIEW_BUDGET_NO_DRAFT_SUFFIX, _ADVISOR_REVIEW_BUDGET_NO_DRAFT_NOTICE),
+        ("prior_call_cost_unknown", True): (_ADVISOR_REVIEW_COST_UNKNOWN_SUFFIX, _ADVISOR_REVIEW_COST_UNKNOWN_NOTICE),
+        ("prior_call_cost_unknown", False): (
+            _ADVISOR_REVIEW_COST_UNKNOWN_NO_DRAFT_SUFFIX,
+            _ADVISOR_REVIEW_COST_UNKNOWN_NO_DRAFT_NOTICE,
+        ),
+    }
+)
 
 
 def compose_review_reply_unavailable_message(content: str) -> str:
@@ -136,14 +168,29 @@ def compose_review_reply_unavailable_message(content: str) -> str:
     return content + _REVIEW_REPLY_UNAVAILABLE_SUFFIX
 
 
+# Every END block reason, explicitly: a review that could not finish, or one
+# that ran and did not admit the reply. A reason missing here raises rather
+# than claiming the review ran.
+_REVIEW_REPLY_SUFFIX_BY_REASON: Final[Mapping[str, str]] = MappingProxyType(
+    {
+        "unavailable": _REVIEW_REPLY_UNREVIEWED_SUFFIX,
+        "malformed": _REVIEW_REPLY_UNREVIEWED_SUFFIX,
+        "request_rejected": _REVIEW_REPLY_UNREVIEWED_SUFFIX,
+        "budget_exhausted": _REVIEW_REPLY_UNREVIEWED_SUFFIX,
+        "prior_call_cost_unknown": _REVIEW_REPLY_UNREVIEWED_SUFFIX,
+        "publication_withheld": _REVIEW_REPLY_WITHHELD_SUFFIX,
+        "flagged_final_pass": _REVIEW_REPLY_WITHHELD_SUFFIX,
+        "flagged_no_repair": _REVIEW_REPLY_WITHHELD_SUFFIX,
+        "flagged_unrepairable": _REVIEW_REPLY_WITHHELD_SUFFIX,
+    }
+)
+
+
 def compose_review_reply_withheld_message(content: str, *, reason: AdvisorTerminalBlockReason = "publication_withheld") -> str:
     """Disclose withheld prose after the existing graph-status notice."""
-    suffix = (
-        _REVIEW_REPLY_UNREVIEWED_SUFFIX
-        if reason in {"unavailable", "malformed", "request_rejected", "budget_exhausted"}
-        else _REVIEW_REPLY_WITHHELD_SUFFIX
-    )
-    return content + suffix
+    if reason not in _REVIEW_REPLY_SUFFIX_BY_REASON:
+        raise AuditIntegrityError(f"Withheld reply has no notice for END block reason {reason!r}")
+    return content + _REVIEW_REPLY_SUFFIX_BY_REASON[reason]
 
 
 def compose_review_reply_context_budget_message(content: str) -> str:
@@ -163,9 +210,8 @@ _EMPTY_STATE_FINALIZE_SUFFIX_WITH_BLOCKER = _wrapped_diagnostic_template(
     diagnostic_slots="{blocker}",
 )
 
-# A change succeeded this turn and left the pipeline structurally empty (for
-# example the user asked to remove the source and the output). The sentence
-# is true whether or not emptying was the goal, so it asserts no failure.
+# Neutral notice for a structurally empty result after a successful change.
+# A failed composition attempt from an empty start can use the blocker notice.
 _EMPTIED_STATE_NOTICE: Final = "The pipeline is now empty. Add a source and an output to continue."
 _EMPTIED_STATE_FINALIZE_SUFFIX = _bare_trusted_suffix(_EMPTIED_STATE_NOTICE)
 
@@ -684,6 +730,7 @@ def _canonical_base_suffix_segments(suffix: str, *, allow_request_rejection: boo
             ("invalid_request", "retained"),
             ("context_length_exceeded", "retained"),
             ("unsupported_parameter", "retained"),
+            ("request_too_large", "retained"),
             (None, "absent"),
             (None, "unrecognized"),
             (None, "unavailable"),
@@ -692,7 +739,9 @@ def _canonical_base_suffix_segments(suffix: str, *, allow_request_rejection: boo
             rejection = SafeRequestRejection(
                 reason_code=reason_code,
                 reason_disposition=disposition,
-                reason_source="sdk_body" if reason_code is not None else "unavailable",
+                reason_source=(
+                    "unavailable" if reason_code is None else "http_status" if reason_code == "request_too_large" else "sdk_body"
+                ),
             )
             for base in (rejection.public_detail, rejection.handoff_detail):
                 tail = rejection_notice.removeprefix(base)
@@ -705,8 +754,9 @@ def _canonical_base_suffix_segments(suffix: str, *, allow_request_rejection: boo
                         return (*preceding_segments, TrustedSystemNoticeSegment(rejection_notice))
     if suffix == _GRAPH_RECOVERY_REFUSAL_SUFFIX:
         return (TrustedSystemNoticeSegment(_GRAPH_RECOVERY_REFUSAL_NOTICE),)
-    if suffix == _ADVISOR_REVIEW_BUDGET_SUFFIX:
-        return (TrustedSystemNoticeSegment(_ADVISOR_REVIEW_BUDGET_NOTICE),)
+    for not_run_suffix, not_run_notice in _ADVISOR_REVIEW_NOT_RUN_NOTICES.values():
+        if suffix == not_run_suffix:
+            return (TrustedSystemNoticeSegment(not_run_notice),)
     if suffix.endswith(_INTERPRETATION_REVIEW_HANDOFF_FINALIZE_SUFFIX):
         preceding = suffix[: -len(_INTERPRETATION_REVIEW_HANDOFF_FINALIZE_SUFFIX)]
         if preceding:
@@ -1049,7 +1099,10 @@ def compose_advisor_signoff_unverified_message(content: str) -> str:
 
 
 def compose_advisor_signoff_unrendered_pending_message(
-    content: str, *, failure_class: Literal["unavailable", "request_rejected", "malformed", "budget_exhausted"]
+    content: str,
+    *,
+    failure_class: Literal["unavailable", "request_rejected", "malformed", "budget_exhausted", "prior_call_cost_unknown"],
+    draft_has_content: bool,
 ) -> str:
     """GREEN preflight + an UNRENDERED advisory verdict (unavailable/malformed).
 
@@ -1058,19 +1111,25 @@ def compose_advisor_signoff_unrendered_pending_message(
     the verdict class and its remedy (retry, or check the advisor model
     configuration). Fixed prose; nothing from the advisor is interpolated.
     """
-    if failure_class == "budget_exhausted":
-        return _append_advisor_suffix(content, _ADVISOR_REVIEW_BUDGET_SUFFIX)
+    if failure_class == "budget_exhausted" or failure_class == "prior_call_cost_unknown":
+        not_run_suffix, _notice = _ADVISOR_REVIEW_NOT_RUN_NOTICES[(failure_class, draft_has_content)]
+        return _append_advisor_suffix(content, not_run_suffix)
     if failure_class == "request_rejected":
         return content
     if failure_class == "unavailable":
         suffix = _ADVISOR_SIGNOFF_UNAVAILABLE_PENDING_PUBLISHED_FINALIZE_SUFFIX
-    else:
+    elif failure_class == "malformed":
         suffix = _ADVISOR_SIGNOFF_MALFORMED_PENDING_PUBLISHED_FINALIZE_SUFFIX
+    else:
+        assert_never(failure_class)
     return _append_advisor_suffix(content, suffix)
 
 
 def compose_advisor_signoff_unrendered_unverified_message(
-    content: str, *, failure_class: Literal["unavailable", "request_rejected", "malformed", "budget_exhausted"]
+    content: str,
+    *,
+    failure_class: Literal["unavailable", "request_rejected", "malformed", "budget_exhausted", "prior_call_cost_unknown"],
+    draft_has_content: bool,
 ) -> str:
     """ABSENT preflight + an UNRENDERED advisory verdict (unavailable/malformed).
 
@@ -1078,14 +1137,17 @@ def compose_advisor_signoff_unrendered_unverified_message(
     facet B readiness disclosure (no preflight ran, so no pipeline claim), with
     the could-not-be-obtained framing and remedy for the verdict class.
     """
-    if failure_class == "budget_exhausted":
-        return _append_advisor_suffix(content, _ADVISOR_REVIEW_BUDGET_SUFFIX)
+    if failure_class == "budget_exhausted" or failure_class == "prior_call_cost_unknown":
+        not_run_suffix, _notice = _ADVISOR_REVIEW_NOT_RUN_NOTICES[(failure_class, draft_has_content)]
+        return _append_advisor_suffix(content, not_run_suffix)
     if failure_class == "request_rejected":
         return content
     if failure_class == "unavailable":
         suffix = _ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX
-    else:
+    elif failure_class == "malformed":
         suffix = _ADVISOR_SIGNOFF_MALFORMED_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX
+    else:
+        assert_never(failure_class)
     return _append_advisor_suffix(content, suffix)
 
 
@@ -1280,6 +1342,37 @@ def last_mutation_was_pending_proposal(tool_invocations: tuple[ComposerToolInvoc
     return False
 
 
+def _invocation_success_payload(invocation: ComposerToolInvocation) -> object:
+    if invocation.status is ComposerToolStatus.SUCCESS and invocation.result_canonical is not None:
+        return json.loads(invocation.result_canonical)
+    return None
+
+
+def _failed_invocation_blocker(invocation: ComposerToolInvocation, payload: object) -> str | None:
+    if invocation.status is ComposerToolStatus.ARG_ERROR:
+        return f"{invocation.tool_name} failed before mutation ({invocation.error_class}: {invocation.error_message})."
+    if invocation.status is ComposerToolStatus.PLUGIN_CRASH:
+        return f"{invocation.tool_name} crashed before a safe mutation completed ({invocation.error_class}: {invocation.error_message})."
+    if type(payload) is dict and "success" in payload and payload["success"] is False:
+        return f"{invocation.tool_name} returned success=false{_tool_failure_detail(payload)}"
+    return None
+
+
+def failed_composition_blocker(tool_invocations: tuple[ComposerToolInvocation, ...]) -> str | None:
+    """Name the most recent failed composition attempt, if one exists."""
+    for invocation in reversed(tool_invocations):
+        if is_discovery_tool(invocation.tool_name):
+            continue
+        payload = _invocation_success_payload(invocation)
+        match payload:
+            case {"data": {"status": "APPROVAL_REQUIRED"}}:
+                continue
+        blocker = _failed_invocation_blocker(invocation, payload)
+        if blocker is not None:
+            return blocker
+    return None
+
+
 def blocking_result_from_tool_invocations(tool_invocations: tuple[ComposerToolInvocation, ...]) -> str:
     """Name the most recent failed build/edit tool result, if one exists."""
     for invocation in reversed(tool_invocations):
@@ -1289,23 +1382,17 @@ def blocking_result_from_tool_invocations(tool_invocations: tuple[ComposerToolIn
         # Cause and mask the failed build/edit call before it.
         if is_discovery_tool(invocation.tool_name):
             continue
-        if invocation.status is ComposerToolStatus.ARG_ERROR:
-            return f"{invocation.tool_name} failed before mutation ({invocation.error_class}: {invocation.error_message})."
-        if invocation.status is ComposerToolStatus.PLUGIN_CRASH:
-            return (
-                f"{invocation.tool_name} crashed before a safe mutation completed ({invocation.error_class}: {invocation.error_message})."
-            )
-        if invocation.status is ComposerToolStatus.SUCCESS and invocation.result_canonical is not None:
-            payload = json.loads(invocation.result_canonical)
-            if type(payload) is dict and "success" in payload and payload["success"] is False:
-                return f"{invocation.tool_name} returned success=false{_tool_failure_detail(payload)}"
-            if (
-                type(payload) is dict
-                and "success" in payload
-                and payload["success"] is True
-                and invocation.version_after == invocation.version_before
-            ):
-                return f"{invocation.tool_name} succeeded without mutating CompositionState (version stayed {invocation.version_before})."
+        payload = _invocation_success_payload(invocation)
+        blocker = _failed_invocation_blocker(invocation, payload)
+        if blocker is not None:
+            return blocker
+        if (
+            type(payload) is dict
+            and "success" in payload
+            and payload["success"] is True
+            and invocation.version_after == invocation.version_before
+        ):
+            return f"{invocation.tool_name} succeeded without mutating CompositionState (version stayed {invocation.version_before})."
     return "the model ended the turn without calling any build/edit tool."
 
 

@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from elspeth.contracts import ChromaWriteStatistics, DataverseLoadStatistics, RAGRetrievalStatistics
+from elspeth.contracts import DataverseLoadStatistics, RAGRetrievalStatistics
 from elspeth.contracts.events import TelemetryEvent
 from elspeth.telemetry.exporters.azure_monitor import AzureMonitorExporter
 from elspeth.telemetry.exporters.otlp import OTLPExporter
@@ -26,22 +26,14 @@ _RAG = RAGRetrievalStatistics(
     timestamp=_TIMESTAMP,
     run_id="run-statistics",
     node_id="transform-1",
-    plugin_name="rag_retrieval",
-    provider="chroma",
+    plugin_name="azure_ai_search",
+    provider="azure_search",
     total_queries=3,
     total_chunks=5,
     quarantine_count=1,
     score_count=2,
     score_mean=0.75,
     score_std=0.125,
-)
-_CHROMA = ChromaWriteStatistics(
-    timestamp=_TIMESTAMP,
-    run_id="run-statistics",
-    node_id="sink-1",
-    plugin_name="chroma",
-    total_written=7,
-    total_bytes=439,
 )
 
 
@@ -64,7 +56,7 @@ _CHROMA = ChromaWriteStatistics(
             _RAG,
             {
                 "node_id": "transform-1",
-                "plugin_name": "rag_retrieval",
+                "plugin_name": "azure_ai_search",
                 "total_queries": 3,
                 "total_chunks": 5,
                 "quarantine_count": 1,
@@ -74,7 +66,6 @@ _CHROMA = ChromaWriteStatistics(
             },
             id="rag",
         ),
-        pytest.param(_CHROMA, {"node_id": "sink-1", "plugin_name": "chroma", "total_written": 7, "total_bytes": 439}, id="chroma"),
     ],
 )
 def test_statistics_reach_otlp_and_azure_spans(event: TelemetryEvent, expected: dict[str, object]) -> None:
@@ -87,7 +78,7 @@ def test_statistics_reach_otlp_and_azure_spans(event: TelemetryEvent, expected: 
     assert otlp.attributes == common | expected
     azure_expected = common | expected | {"cloud.provider": "azure", "elspeth.exporter": "azure_monitor"}
     if isinstance(event, RAGRetrievalStatistics):
-        azure_expected["provider"] = "chroma"
+        azure_expected["provider"] = "azure_search"
     assert azure.attributes == azure_expected
     assert otlp.start_time == azure.start_time == int(_TIMESTAMP.timestamp() * 1_000_000_000)
 
@@ -103,7 +94,7 @@ def test_no_score_observations_remain_unknown_in_exporters() -> None:
         assert "score_std" not in span.attributes
 
 
-@pytest.mark.parametrize("event", [_DATAVERSE, _RAG, _CHROMA])
+@pytest.mark.parametrize("event", [_DATAVERSE, _RAG])
 def test_statistics_are_frozen(event: TelemetryEvent) -> None:
     with pytest.raises(FrozenInstanceError):
         event.run_id = "mutated"
@@ -115,11 +106,9 @@ def test_statistics_reject_invalid_counters(bad_count: object) -> None:
         replace(_DATAVERSE, rows_rejected=bad_count)
     with pytest.raises((TypeError, ValueError)):
         replace(_RAG, total_queries=bad_count)
-    with pytest.raises((TypeError, ValueError)):
-        replace(_CHROMA, total_bytes=bad_count)
 
 
-@pytest.mark.parametrize("event", [_DATAVERSE, _RAG, _CHROMA])
+@pytest.mark.parametrize("event", [_DATAVERSE, _RAG])
 def test_statistics_require_run_node_and_aware_time(event: TelemetryEvent) -> None:
     with pytest.raises(ValueError, match="node_id"):
         replace(event, node_id="")

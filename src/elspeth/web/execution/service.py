@@ -41,6 +41,7 @@ from sqlalchemy.exc import DBAPIError, DisconnectionError, InterfaceError, Opera
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
 from elspeth.config_loading import load_settings_from_config_dict, load_settings_from_yaml_string
+from elspeth.contracts import hashing
 from elspeth.contracts.audit import SecretResolutionInput
 from elspeth.contracts.aws_s3 import S3ProfiledAuditIdentities
 from elspeth.contracts.aws_textract import TextractProfiledAuditIdentities
@@ -51,7 +52,7 @@ from elspeth.contracts.cli import ProgressEvent
 from elspeth.contracts.enums import CallType, NodeStateStatus, RunStatus, is_llm_authored_creation_modality
 from elspeth.contracts.errors import AuditIntegrityError, GracefulShutdownError, IncompleteSourceResumeError
 from elspeth.contracts.freeze import deep_thaw
-from elspeth.contracts.hashing import CANONICAL_VERSION, stable_hash
+from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.plugin_capabilities import PluginCapability
 from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
 from elspeth.contracts.plugin_semantics import SemanticOutcome, UnknownSemanticPolicy
@@ -119,7 +120,6 @@ from elspeth.web.coordination.approval_authority import (
 from elspeth.web.coordination.contracts import RecoveryRequiredReason, SessionOperationFenceLost
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.coordination.quota_authority import TokenUsageEntry
-from elspeth.web.credential_guard import require_no_credential_material_in_state
 from elspeth.web.execution._semantic_helpers import semantic_affected_component_id
 from elspeth.web.execution._validation_materialization import (
     FILE_INJECT_PLUGIN,
@@ -1586,7 +1586,7 @@ class ExecutionServiceImpl:
         return ApprovalGateInputs(
             evidence=_build_web_plugin_policy_evidence(snapshot=frozen.plugin_snapshot, policy=self._web_plugin_policy),
             config_hash=stable_hash(audit_config),
-            canonical_version=CANONICAL_VERSION,
+            canonical_version=hashing.CANONICAL_VERSION,
             openrouter_catalog_sha256=catalog_sha,
             runtime_val_manifest_sha256=runtime_val_manifest_sha256(),
         )
@@ -1609,14 +1609,6 @@ class ExecutionServiceImpl:
         if record.session_id != session_id:
             raise StateAccessError(str(state_id))
         authored = state_from_record(record)
-        env_ref_names = (
-            frozenset(item.name for item in self._secret_service.list_refs(user_id)) if self._secret_service is not None else frozenset()
-        )
-        require_no_credential_material_in_state(
-            authored,
-            surface="composer_approval_state",
-            env_ref_names=env_ref_names,
-        )
         semantic_errors, _, semantic_contracts = validate_semantic_contracts(authored)
         if semantic_errors:
             raise SemanticContractViolationError(entries=semantic_errors, contracts=semantic_contracts)
@@ -2563,16 +2555,6 @@ class ExecutionServiceImpl:
         # Bridge CompositionStateRecord → CompositionState for generate_yaml().
         # The record stores raw dicts; generate_yaml() needs the typed domain object.
         authored_state = state_from_record(state_record)
-        credential_env_ref_names = (
-            frozenset(item.name for item in self._secret_service.list_refs(user_id))
-            if self._secret_service is not None and user_id is not None
-            else frozenset()
-        )
-        require_no_credential_material_in_state(
-            authored_state,
-            surface="composer_execution_state",
-            env_ref_names=credential_env_ref_names,
-        )
         try:
             completion_gates = parse_completion_gates(state_record.composer_meta)
         except ValueError as exc:
@@ -2686,10 +2668,10 @@ class ExecutionServiceImpl:
                                 f"Sink '{output.name}' {key}='{value}' resolves outside allowed output directories"
                             )
 
-        # Nested transform provider_config path allowlist — RAG retrieval
-        # transforms carry a local Chroma persist_directory under
-        # options.provider_config. It is a read/write target like a sink, so it
-        # is confined to the allowed SINK directories.
+        # Nested transform provider_config path allowlist: a transform may carry
+        # a local persist_directory under options.provider_config (no shipped
+        # plugin does since 0.8.18). It is a read/write target like a sink, so
+        # it is confined to the allowed SINK directories.
         if composition_state.nodes:
             from elspeth.web.paths import (
                 NESTED_LOCAL_PATH_OPTION_KEYS,
@@ -2753,9 +2735,8 @@ class ExecutionServiceImpl:
         # the SAME authoritative state preflight the /validate endpoint uses, BEFORE create_run,
         # and reject with a structured PipelineValidationError when invalid. This catches
         # the Mechanism-A classes (Graph/ValueSource/generic plugin-config) at the server
-        # boundary and closes the tutorial bypass; SchemaConfigModeViolation (post-emission
-        # row check) and the Chroma-SSRF plugin check (deferred network I/O) remain
-        # runtime-only by design.
+        # boundary and closes the tutorial bypass; SchemaConfigModeViolation (a post-emission
+        # row check) remains runtime-only by design.
 
         plugin_snapshot = self._plugin_snapshot_for_user(user_id, operation="execution")
 
@@ -3243,7 +3224,7 @@ class ExecutionServiceImpl:
 
         async def finish_cleanup() -> None:
             if self._blob_service is not None:
-                lease.guard_external_effect()
+                await run_sync_in_worker(lease.guard_external_effect)
                 outcome = await self._blob_service.finalize_run_output_blobs(
                     run_id,
                     success=False,
@@ -3309,7 +3290,6 @@ class ExecutionServiceImpl:
 
     async def _materialize_durable_cancellation(self, run: RunRecord, lease: SessionOperationLease) -> None:
         from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, mint_worker_id
-        from elspeth.contracts.hashing import CANONICAL_VERSION
         from elspeth.core.landscape.run_start_admission import RunStartAdmissionRepository, RunStartAdmissionState
         from elspeth.web.coordination.contracts import StartPermitState
         from elspeth.web.execution.envelope import EnvelopeRecoveryReason
@@ -3346,7 +3326,7 @@ class ExecutionServiceImpl:
                 repositories.run_lifecycle.materialize_cancelled_permit(
                     binding,
                     config,
-                    CANONICAL_VERSION,
+                    hashing.CANONICAL_VERSION,
                     openrouter_catalog_sha256=cancellation.openrouter_catalog_sha256,
                     openrouter_catalog_source=cancellation.openrouter_catalog_source,
                     initiated_by_user_id=cancellation.user_id,
@@ -3647,11 +3627,6 @@ class ExecutionServiceImpl:
             frozenset(self._secret_service.list_refs(user_id)) if self._secret_service is not None and user_id is not None else frozenset()
         )
         env_ref_names = frozenset(item.name for item in secret_inventory)
-        require_no_credential_material_in_state(
-            state,
-            surface="composer_validation_state",
-            env_ref_names=env_ref_names,
-        )
         plugin_snapshot = self._plugin_snapshot_for_user(user_id, operation="validation")
 
         async def _compute(blob_reads: BlobReadLog | None) -> ValidationResult:

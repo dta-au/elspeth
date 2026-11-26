@@ -21,9 +21,9 @@ SINK_LOCAL_PATH_OPTION_KEYS: tuple[str, ...] = ("path", "file", "persist_directo
 SessionFolder = Literal["outputs", "blobs"]
 SESSION_FOLDERS: tuple[SessionFolder, ...] = ("outputs", "blobs")
 # Local filesystem keys to confine inside a transform's
-# ``options["provider_config"]`` dict (RAG retrieval transforms carry a
-# Chroma persist_directory there). Confined like sink paths — persist_directory
-# is a local read/write target.
+# ``options["provider_config"]`` dict. Confined like sink paths: a
+# persist_directory is a local read/write target. No shipped plugin carries
+# one since 0.8.18; the confinement stays so a future one cannot escape it.
 NESTED_LOCAL_PATH_OPTION_KEYS: tuple[str, ...] = ("persist_directory",)
 
 
@@ -47,15 +47,6 @@ def require_mcp_root_context(
 def is_local_path_value(value: object) -> bool:
     """Admit the lexical shape before passing an external value to Path."""
     return type(value) is str and bool(value) and "\x00" not in value
-
-
-def is_absent_sink_path(plugin: object, mode: object, key: str, value: object) -> bool:
-    """Only Chroma client mode permits an explicitly absent local directory.
-
-    Other path keys still require paths, and non-null directories still pass
-    through confinement. The plugin config validates the remaining connection.
-    """
-    return plugin == "chroma_sink" and mode == "client" and key == "persist_directory" and value is None
 
 
 def resolve_data_path(value: str, data_dir: str) -> Path:

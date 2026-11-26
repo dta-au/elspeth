@@ -649,6 +649,16 @@ where the architectural fix landed:
   fan-in producer or a collector on a branch, so it abstains where only the
   build's DAG walk proves the type. Pinned by
   ``TestComposerRuntimeCertainUnionTypeConflictAgreement``.
+* Shape 34 — a node consumer with explicit required fields behind a fan-in
+  (queue or row_union) whose vote abstains, directly or through routing gates
+  (change-risk review 2026-11-22, URGENT 1; no eval session). The build
+  refuses the edge because an abstaining producer guarantees nothing; the
+  composer skipped the check with a warning and stayed valid. Closed in the
+  node loop of ``_check_schema_contracts``; the sink direction and derived or
+  implied requirements are unchanged on both surfaces. Pinned, with the walk's
+  other abstention arms, in
+  ``test_composer_runtime_agreement_fan_in_walk.py``
+  (``TestFanInAbstentionRequiredFieldAgreement``).
 
 Adding a new shape: file the eval-finding issue, land the structural fix,
 then extend this docstring with the shape's number, the originating eval

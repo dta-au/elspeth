@@ -24,7 +24,7 @@ It offers **two authoring surfaces over one runtime assurance model**:
 Both surfaces target the same primitives, plugin contracts, runtime assembly, graph validation, **Landscape** audit trail, and run-accounting model. Validation and audit are core product properties, not after-the-fact diagnostics.
 
 **The mental model is Sense → Decide → Act:**
-- **Sense** (Sources) — load data: CSV, JSON, text/blob, Azure Blob, Dataverse, database, Chroma.
+- **Sense** (Sources) — load data: CSV, JSON, text/blob, Azure Blob, Dataverse, database.
 - **Decide** (Transforms + pure-config Gates) — map, coerce, classify, run LLM queries, evaluate threshold gates, compute batch analytics.
 - **Act** (Sinks) — route rows to outputs: files, database rows, review queues, alerts.
 

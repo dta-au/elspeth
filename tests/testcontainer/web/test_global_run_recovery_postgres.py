@@ -124,6 +124,15 @@ async def _create_running_run(service: SessionServiceImpl, engine: Engine) -> tu
     return run, context
 
 
+def _this_run(run: RunRecord, *batches: list[RunRecord]) -> list[UUID]:
+    """The ids in ``batches`` that are ``run``'s.
+
+    The database is shared by every test in the session, and a recovery sweep
+    settles every recoverable run in it, so each check asks about its own run only.
+    """
+    return [record.id for batch in batches for record in batch if record.id == run.id]
+
+
 @pytest.mark.asyncio
 async def test_recovery_requires_both_fence_and_membership_expiry_and_has_one_winner(deployment) -> None:
     first_engine, _second_engine, first, second = deployment
@@ -131,7 +140,7 @@ async def test_recovery_requires_both_fence_and_membership_expiry_and_has_one_wi
     run, _context = await _create_running_run(first, first_engine)
     _expire_fence(first_engine, run.session_id)
 
-    assert await second.cancel_all_orphaned_run_records(max_age_seconds=0, reason="recovered") == []
+    assert _this_run(run, await second.cancel_all_orphaned_run_records(max_age_seconds=0, reason="recovered")) == []
     assert (await second.get_run(run.id)).status == "running"
 
     _expire_instance(first_engine, first.session_operation_owner_instance_id)
@@ -140,8 +149,42 @@ async def test_recovery_requires_both_fence_and_membership_expiry_and_has_one_wi
         second.cancel_all_orphaned_run_records(max_age_seconds=0, reason="recovered"),
     )
 
-    assert [record.id for batch in contenders for record in batch] == [run.id]
+    assert _this_run(run, *contenders) == [run.id]
     assert (await second.get_run(run.id)).status == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_a_run_whose_lease_ran_out_unreleased_is_offered_to_recovery_only_once_its_owner_process_is_gone(deployment) -> None:
+    """The recovery sweep's own candidate list, for a run thread that ended after its lease lapsed.
+
+    Its release is refused then, so the fence stays unreleased. While the
+    owning process still renews its membership, no sweep in any process is
+    offered the run; once that membership has lapsed, the next sweep is.
+    """
+    first_engine, _second_engine, first, second = deployment
+    _register_live_instance(first_engine, first.session_operation_owner_instance_id)
+    run, _context = await _create_running_run(first, first_engine)
+    try:
+        _expire_fence(first_engine, run.session_id)
+
+        # The database is shared by this file's tests, so each reading asks about this run only.
+        async def offered(service: SessionServiceImpl) -> bool:
+            return run.id in [record.id for record in await service.list_recoverable_run_records()]
+
+        while_the_owner_lives = {"to the owner's own sweep": await offered(first), "to another process's sweep": await offered(second)}
+        _expire_instance(first_engine, first.session_operation_owner_instance_id)
+        after_the_owner_is_gone = await offered(second)
+
+        assert while_the_owner_lives == {"to the owner's own sweep": False, "to another process's sweep": False}
+        assert after_the_owner_is_gone
+        assert (await second.get_run(run.id)).status == "running"
+    finally:
+        # Settle the run even when an assertion fails, so the tests after this one start with nothing
+        # to recover. Recovery settles a run only once its fence and its owner's membership have both
+        # expired; both writes are idempotent, so repeating them here is safe.
+        _expire_fence(first_engine, run.session_id)
+        _expire_instance(first_engine, first.session_operation_owner_instance_id)
+        await second.cancel_all_orphaned_run_records(max_age_seconds=0, reason="recovered")
 
 
 @pytest.mark.asyncio
@@ -150,7 +193,7 @@ async def test_expired_fence_with_missing_membership_fails_closed(deployment) ->
     run, _context = await _create_running_run(first, first_engine)
     _expire_fence(first_engine, run.session_id)
 
-    assert await second.cancel_all_orphaned_run_records(max_age_seconds=0, reason="recovered") == []
+    assert _this_run(run, await second.cancel_all_orphaned_run_records(max_age_seconds=0, reason="recovered")) == []
     assert (await second.get_run(run.id)).status == "running"
 
 
@@ -174,14 +217,13 @@ async def test_new_operation_acquisition_and_recovery_serialize_without_overwrit
     )
     cancelled, successor = await asyncio.gather(cleanup_task, acquire_task)
 
-    if cancelled:
-        assert [record.id for record in cancelled] == [run.id]
+    if _this_run(run, cancelled):
         assert (await second.get_run(run.id)).status == "cancelled"
     else:
         assert (await second.get_run(run.id)).status == "running"
-        assert await second.cancel_all_orphaned_run_records(max_age_seconds=0, reason="recovered") == []
+        assert _this_run(run, await second.cancel_all_orphaned_run_records(max_age_seconds=0, reason="recovered")) == []
 
     second.session_operation_authority.release(successor)
     final = await second.cancel_all_orphaned_run_records(max_age_seconds=0, reason="recovered")
-    assert [record.id for record in [*cancelled, *final]] == [run.id]
+    assert _this_run(run, cancelled, final) == [run.id]
     assert (await second.get_run(run.id)).status == "cancelled"

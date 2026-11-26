@@ -1,6 +1,6 @@
 // src/components/blobs/BlobManager.tsx
 import { useEffect, useId, useLayoutEffect, useRef, useCallback, useMemo, useState } from "react";
-import { useBlobStore } from "@/stores/blobStore";
+import { blobBannerMessages, useBlobStore } from "@/stores/blobStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { AlertBanner, Button, Icon, Input } from "@/components/ui";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
@@ -61,11 +61,15 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
   // `seq` re-keys the pad's alert so a repeated refusal is announced again.
   const [wireSendRefusal, setWireSendRefusal] = useState<{ message: string; seq: number } | null>(null);
   const pending = useInterpretationEventsStore((s) => activeSessionId ? s.pendingBySession[activeSessionId] : undefined);
-  const { blobs, isLoading, error, listLoadFailed, activeSessionId: blobSessionId, loadBlobs, uploadBlob, deleteBlob, downloadBlob } =
+  const { blobs, isLoading, error, listError, listLoadFailed, listCurrent, listStale, activeSessionId: blobSessionId, loadBlobs, uploadBlob, deleteBlob, downloadBlob } =
     useBlobStore();
+  // Read for this activation: a stale list (a turn since the read) still shows
+  // its rows; only a current list can say a file is absent.
+  const listRead = listCurrent || listStale;
+  const bannerMessages = blobBannerMessages(error, listError);
   const revealRequest = useBlobStore((s) => s.revealRequest);
   const focusedBlobId = useBlobStore((s) => s.focusedBlobId);
-  const [missingRevealName, setMissingRevealName] = useState<string | null>(null);
+  const [revealMissMessage, setRevealMissMessage] = useState<string | null>(null);
   const statusRef = useRef<HTMLParagraphElement>(null);
   const previousSelectedNode = useRef(selectedNodeId);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -88,11 +92,12 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
   }, [compositionState, selectedNodeId]);
 
   const listBelongsToSession = blobSessionId === activeSessionId;
+  const listComplete = !isLoading && listBelongsToSession && listCurrent && listError === null;
   const matchedIds = useMemo(
     () => new Set(blobs.filter((blob) => attached.has(blob.id.toLowerCase())).map((blob) => blob.id.toLowerCase())),
     [attached, blobs],
   );
-  const missingCount = !isLoading && listBelongsToSession ? attached.size - matchedIds.size : 0;
+  const missingCount = listComplete ? attached.size - matchedIds.size : 0;
   const promptBindings = useMemo(() => promptFileBindings(compositionState), [compositionState]);
   const wireFile = pendingWire ? blobs.find((blob) => blob.id === pendingWire.blob.id) : undefined;
   const wiringDisabledReason = !composeReady ? COMPOSE_LOADING_SESSION_MESSAGE
@@ -110,7 +115,7 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
     if (previousSelectedNode.current !== selectedNodeId) {
       previousSelectedNode.current = selectedNodeId;
       useBlobStore.setState({ focusedBlobId: null });
-      setMissingRevealName(null);
+      setRevealMissMessage(null);
     }
   }, [selectedNodeId]);
 
@@ -119,11 +124,17 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
   }, [activeSessionId, loadBlobs]);
 
   useLayoutEffect(() => {
+    if (isLoading && listBelongsToSession) setRevealMissMessage(null);
+  }, [isLoading, listBelongsToSession]);
+
+  useLayoutEffect(() => {
     // Read loading from the store, not this render's closure: the mount-time
     // loadBlobs above runs first in this same commit and flips isLoading
     // synchronously. Acting on the stale `false` would focus a cached row the
     // "Loading..." render then unmounts, and consume the request with it.
-    if (!revealRequest || revealRequest.sessionId !== activeSessionId || useBlobStore.getState().isLoading || !listBelongsToSession) return;
+    // An unread list shows "Loading files…" with no rows: wait for the read
+    // instead of consuming the request as a miss.
+    if (!revealRequest || revealRequest.sessionId !== activeSessionId || useBlobStore.getState().isLoading || !listBelongsToSession || !listRead) return;
     const hiddenPane = listRef.current?.closest("[hidden], [inert]");
     if (hiddenPane) {
       const observer = new MutationObserver(() => {
@@ -144,29 +155,34 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
       setFileFilter("");
       return;
     }
+    // A stale list (a turn since the read) may lack a file the turn created:
+    // keep the request until the list is current rather than report a miss.
+    if (!row && !listCurrent) return;
     if (row) {
-      setMissingRevealName(null);
+      setRevealMissMessage(null);
       row.scrollIntoView?.({ block: "nearest" });
       row.focus({ preventScroll: true });
     } else {
-      setMissingRevealName(revealRequest.filename);
+      setRevealMissMessage(listComplete ? `${revealRequest.filename} is no longer in this session` : "File name unavailable");
       useBlobStore.setState({ focusedBlobId: null });
       statusRef.current?.focus({ preventScroll: true });
     }
     useBlobStore.getState().consumeRevealRequest(revealRequest.seq);
-  }, [revealRequest, activeSessionId, isLoading, listBelongsToSession, blobs, fileFilter]);
+  }, [revealRequest, activeSessionId, isLoading, listBelongsToSession, listRead, listCurrent, listComplete, blobs, fileFilter]);
 
   useEffect(() => {
     if (selectedNodeId === null) {
       lastScrolledSelection.current = null;
       return;
     }
-    if (lastScrolledSelection.current === selectedNodeId || isLoading || !listBelongsToSession) return;
+    if (lastScrolledSelection.current === selectedNodeId || isLoading || !listBelongsToSession || !listRead) return;
     const firstRow = Array.from(listRef.current?.querySelectorAll<HTMLElement>(".blob-row-item") ?? [])
       .find((row) => attached.has(row.dataset.blobId?.toLowerCase() ?? ""));
+    // A stale list may lack the attached file a turn just created: scroll once current.
+    if (!firstRow && !listCurrent) return;
     if (firstRow) firstRow.scrollIntoView?.({ block: "nearest", behavior: "auto" });
     lastScrolledSelection.current = selectedNodeId;
-  }, [selectedNodeId, attached, isLoading, listBelongsToSession, blobs]);
+  }, [selectedNodeId, attached, isLoading, listBelongsToSession, listRead, listCurrent, blobs]);
   // Blob queued for deletion, awaiting confirmation. Blobs are pipeline
   // inputs/outputs, so deletion is irreversible data loss (WCAG 3.3.4). We
   // capture the session the blob belongs to alongside the blob: if the active
@@ -256,7 +272,7 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
         {/* No count until the list has been read: "Files (0)" while loading
             or after a failed read would say the session has no files. */}
         <span className="blob-manager-title">
-          Files{!isLoading && !listLoadFailed && ` (${blobs.length})`}
+          Files{!isLoading && listCurrent && !listLoadFailed && ` (${blobs.length})`}
         </span>
         <IdentityStorageTotal refreshKey={`${activeSessionId}:${blobs.map((blob) => `${blob.id}:${blob.size_bytes}`).join(",")}`} />
         {/* Label-only, and its accessible name IS its visible text
@@ -298,15 +314,15 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
       </div>
 
       <p ref={statusRef} tabIndex={-1} className="blob-manager-attached-summary" role="status" aria-live="polite">
-        {missingRevealName ? `${missingRevealName} is no longer in this session` : selectedNodeId && attached.size > 0 && listBelongsToSession ? <>
+        {revealMissMessage ?? (selectedNodeId && attached.size > 0 && listBelongsToSession && listError === null ? <>
           {isLoading ? `Checking files used by ${selectedNodeId}` : `${matchedIds.size} ${matchedIds.size === 1 ? "file" : "files"} used by ${selectedNodeId}`}
           {missingCount > 0 && ` · ${missingCount} attached ${missingCount === 1 ? "file is" : "files are"} not in this session`}
           {focusedBlobId && blobs.find((blob) => blob.id.toLowerCase() === focusedBlobId.toLowerCase()) && ` · Showing ${blobs.find((blob) => blob.id.toLowerCase() === focusedBlobId.toLowerCase())?.filename}.`}
-        </> : ""}
+        </> : "")}
       </p>
 
       {/* Error */}
-      {error && (
+      {bannerMessages.length > 0 && (
         <AlertBanner
           className="blob-manager-error"
           action={listLoadFailed && activeSessionId ? (
@@ -314,7 +330,7 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
             <Button type="button" variant="ghost" compact onClick={() => void loadBlobs(activeSessionId)}>Retry</Button>
           ) : null}
         >
-          {error}
+          {bannerMessages.map((message) => <span key={message} style={{ display: "block" }}>{message}</span>)}
         </AlertBanner>
       )}
 
@@ -327,12 +343,13 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
 
       {/* Categorized file list */}
       <div className="blob-manager-list" ref={listRef}>
-        {isLoading ? (
+        {/* A stale empty list cannot say "No files yet": the turn may have added one. */}
+        {isLoading || !listRead || (blobs.length === 0 && !listCurrent) ? (
           <div className="blob-manager-loading" role="status">
             Loading files…
           </div>
         ) : blobs.length === 0 ? (
-          <div className="blob-manager-empty">
+          listError === null && <div className="blob-manager-empty">
             No files yet. Upload a file to get started.
           </div>
         ) : visibleBlobs.length === 0 ? (
@@ -355,7 +372,7 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
                   const bindings = promptBindings.filter((binding) => binding.blobId === blob.id.toLowerCase());
                   const binding = bindings.find((candidate) => candidate.nodeId === selectedNodeId) ?? bindings[0];
                   const editability = binding ? promptFileEditability({ state: compositionState, blobs, pendingEvents: Object.values(pending ?? {}),
-                    nodeId: binding.nodeId, fieldPath: binding.fieldPath, blobId: blob.id }) : null;
+                    listIncomplete: listBelongsToSession && listError !== null, nodeId: binding.nodeId, fieldPath: binding.fieldPath, blobId: blob.id }) : null;
                   // A refused save still opens the editor read-only with its
                   // reason; only a file with no prompt text to show stays shut.
                   const opensEditor = editability !== null && (editability.editable || editability.opens);
@@ -407,6 +424,7 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
           blob={pendingWire.blob}
           state={compositionState}
           blobs={listBelongsToSession ? blobs : []}
+          listComplete={listComplete}
           disabledReason={wiringDisabledReason}
           sendRefusal={wireSendRefusal}
           onClose={() => setPendingWire(null)}

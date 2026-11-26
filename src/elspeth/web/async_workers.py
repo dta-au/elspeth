@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import logging
 import math
 import threading
 import time
@@ -32,6 +33,8 @@ from elspeth.web.required_executor import (
 )
 from elspeth.web.required_sql_outcomes import RequiredSQLFinishOnce, RequiredSQLRaised, RequiredSQLReturned
 from elspeth.web.required_work import RequiredWorkTicket
+
+logger = logging.getLogger(__name__)
 
 #: Threads in the process-wide worker pool.
 MAX_WORKERS: Final[int] = 16
@@ -468,25 +471,61 @@ async def run_required_sql_finish_once[**P, T](
 
 AUTH_AUDIT_MAX_WORKERS: Final[int] = 2
 AUTH_AUDIT_ADMISSION_CAPACITY: Final[int] = 4
+LEASE_UPKEEP_MAX_WORKERS: Final[int] = 2
+LEASE_UPKEEP_ADMISSION_CAPACITY: Final[int] = 32
 
 
-class _AuthAuditWorkers:
-    """Reserved capacity for must-fire refusals when ordinary workers are full."""
+class _LeaseUpkeepThreadMarker(threading.local):
+    """Per-thread flag that only the lease-upkeep executor's initializer sets."""
 
     def __init__(self) -> None:
+        self.active = False
+
+
+_LEASE_UPKEEP_THREAD = _LeaseUpkeepThreadMarker()
+
+
+def _mark_lease_upkeep_thread() -> None:
+    _LEASE_UPKEEP_THREAD.active = True
+
+
+def on_lease_upkeep_worker() -> bool:
+    """Return whether the current thread was started by the lease-upkeep executor.
+
+    The flag is set by the executor's ``initializer``, so it identifies where a
+    thread came from rather than what it is called.
+    """
+    return _LEASE_UPKEEP_THREAD.active
+
+
+class _ReservedWorkers:
+    """Bounded workers reserved for lifecycle operations."""
+
+    def __init__(
+        self,
+        *,
+        max_workers: int,
+        capacity: int,
+        name: str,
+        initializer: Callable[[], None] | None = None,
+    ) -> None:
         self.lock = threading.Lock()
         self.executor: ThreadPoolExecutor | None = None
         self.outstanding = 0
+        self.max_workers = max_workers
+        self.capacity = capacity
+        self.name = name
+        self.initializer = initializer
 
     def get_executor(self) -> ThreadPoolExecutor:
         with self.lock:
             if self.executor is None:
-                self.executor = ThreadPoolExecutor(max_workers=AUTH_AUDIT_MAX_WORKERS, thread_name_prefix="auth-audit")
+                self.executor = ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix=self.name, initializer=self.initializer)
             return self.executor
 
     def try_admit(self) -> bool:
         with self.lock:
-            if self.outstanding >= AUTH_AUDIT_ADMISSION_CAPACITY:
+            if self.outstanding >= self.capacity:
                 return False
             self.outstanding += 1
             return True
@@ -505,7 +544,18 @@ class _AuthAuditWorkers:
             return executor
 
 
+class _AuthAuditWorkers(_ReservedWorkers):
+    def __init__(self) -> None:
+        super().__init__(max_workers=AUTH_AUDIT_MAX_WORKERS, capacity=AUTH_AUDIT_ADMISSION_CAPACITY, name="auth-audit")
+
+
 _AUTH_AUDIT_WORKERS = _AuthAuditWorkers()
+_LEASE_UPKEEP_WORKERS = _ReservedWorkers(
+    max_workers=LEASE_UPKEEP_MAX_WORKERS,
+    capacity=LEASE_UPKEEP_ADMISSION_CAPACITY,
+    name="lease-upkeep",
+    initializer=_mark_lease_upkeep_thread,
+)
 
 
 class AsyncWorkerAdmissionTimeoutError(TimeoutError):
@@ -570,6 +620,9 @@ async def shutdown_async_workers() -> None:
     audit_executor = _AUTH_AUDIT_WORKERS.detach_executor()
     if audit_executor is not None:
         executors.append(audit_executor)
+    lease_executor = _LEASE_UPKEEP_WORKERS.detach_executor()
+    if lease_executor is not None:
+        executors.append(lease_executor)
     if executors:
         shutdown_pool = ThreadPoolExecutor(max_workers=len(executors), thread_name_prefix="async-worker-shutdown")
         futures: list[tuple[ThreadPoolExecutor, ConcurrentFuture[None]]] = []
@@ -737,6 +790,37 @@ async def run_stream_read_in_worker[**P, T](func: Callable[P, T], *args: P.args,
     return concurrent_future.result()
 
 
+async def run_lease_upkeep_in_worker[**P, T](func: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
+    """Run lease renewal or release and join running work on cancellation."""
+    if _SHARED_SHUTDOWN_STARTED:
+        raise RequiredGenerationUnavailable("Shared executor shutdown has started")
+    await _wait_for_admission(_LEASE_UPKEEP_WORKERS.try_admit, LEASE_UPKEEP_ADMISSION_CAPACITY, "lease upkeep worker")
+    try:
+        if _SHARED_SHUTDOWN_STARTED:
+            raise RequiredGenerationUnavailable("Shared executor shutdown has started")
+        executor = _LEASE_UPKEEP_WORKERS.get_executor()
+        concurrent_future = executor.submit(functools.partial(func, *args, **kwargs))
+    except BaseException:
+        _LEASE_UPKEEP_WORKERS.release()
+        raise
+    concurrent_future.add_done_callback(_LEASE_UPKEEP_WORKERS.release_when_finished)
+    cancelled = False
+    while not concurrent_future.done():
+        try:
+            await asyncio.sleep(0.01)
+        except asyncio.CancelledError:
+            cancelled = True
+            concurrent_future.cancel()
+    if cancelled:
+        if not concurrent_future.cancelled():
+            try:
+                concurrent_future.result()
+            except BaseException as exc:
+                raise asyncio.CancelledError from exc
+        raise asyncio.CancelledError
+    return concurrent_future.result()
+
+
 async def run_auth_audit_in_worker[**P, T](func: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
     """Record a refusal off-loop using capacity reserved from ordinary work.
 
@@ -744,10 +828,15 @@ async def run_auth_audit_in_worker[**P, T](func: Callable[P, T], *args: P.args, 
     unaudited refusal must not be reported as successfully audited. Once
     admitted, audit work survives caller cancellation even while queued.
     Its slot is released by the concurrent future only when work finishes.
+    Once shared shutdown has started, audits are refused like shared work.
     """
-    executor = _AUTH_AUDIT_WORKERS.get_executor()
+    if _SHARED_SHUTDOWN_STARTED:
+        raise RequiredGenerationUnavailable("Shared executor shutdown has started")
     await _wait_for_admission(_AUTH_AUDIT_WORKERS.try_admit, AUTH_AUDIT_ADMISSION_CAPACITY, "auth audit worker")
     try:
+        if _SHARED_SHUTDOWN_STARTED:
+            raise RequiredGenerationUnavailable("Shared executor shutdown has started")
+        executor = _AUTH_AUDIT_WORKERS.get_executor()
         concurrent_future = executor.submit(functools.partial(func, *args, **kwargs))
     except BaseException:
         _AUTH_AUDIT_WORKERS.release()
@@ -757,9 +846,18 @@ async def run_auth_audit_in_worker[**P, T](func: Callable[P, T], *args: P.args, 
 
 
 def _retrieve_abandoned_exception(future: asyncio.Future[Any]) -> None:
-    """Consume the outcome after the audit caller has disconnected."""
+    """Consume the outcome after an ordinary caller has disconnected."""
     if not future.cancelled():
         future.exception()
+
+
+def _report_abandoned_auth_audit_exception(future: asyncio.Future[Any]) -> None:
+    """Report an audit write that failed after its caller disconnected."""
+    if future.cancelled():
+        return
+    original = future.exception()
+    if original is not None:
+        logger.error("Abandoned auth audit failed", exc_info=(type(original), original, original.__traceback__))
 
 
 async def _await_worker_future[T](concurrent_future: ConcurrentFuture[T], *, cancel_queued: bool) -> T:
@@ -801,14 +899,17 @@ async def _await_worker_future[T](concurrent_future: ConcurrentFuture[T], *, can
         # teardown happens once via ``shutdown_async_workers()``.
         if future.done():
             # Completion can win the race with cancellation of the waiter.
-            _retrieve_abandoned_exception(future)
+            if cancel_queued:
+                _retrieve_abandoned_exception(future)
+            else:
+                _report_abandoned_auth_audit_exception(future)
         elif cancel_queued:
             future.cancel()
         else:
             # A refused request already owes this audit. Keep queued work
             # as well as running work; observe any late exception without
             # publishing a second response to a disconnected caller.
-            future.add_done_callback(_retrieve_abandoned_exception)
+            future.add_done_callback(_report_abandoned_auth_audit_exception)
 
 
 async def _finish_joined_shared_future[T](

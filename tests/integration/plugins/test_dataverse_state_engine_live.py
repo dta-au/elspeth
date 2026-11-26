@@ -46,7 +46,7 @@ from tests.integration.plugins._azure_live import (
     run_orchestrated_pipeline,
     write_jsonl,
 )
-from tests.integration.plugins._dataverse_chroma_live import (
+from tests.integration.plugins._dataverse_live import (
     DATAVERSE_AUTH_VARIANTS,
     DATAVERSE_ENTITY_ENV,
     DATAVERSE_ROW_PREFIX_ENV,

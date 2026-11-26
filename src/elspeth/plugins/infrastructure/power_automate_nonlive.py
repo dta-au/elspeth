@@ -15,10 +15,10 @@ from typing import Annotated, ClassVar, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, StrictStr, field_validator, model_validator
 
+from elspeth.contracts import hashing
 from elspeth.contracts.enums import NodeType, RunMode
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
-from elspeth.contracts.hashing import CANONICAL_VERSION
 from elspeth.contracts.json_parser import parse_json_strict
 from elspeth.contracts.security import secret_fingerprint
 from elspeth.core.canonical import stable_hash
@@ -233,14 +233,14 @@ def admit_power_automate_archive(factory: LandscapeReadRepositories, source_run_
     source = factory.run_lifecycle.get_run(source_run_id)
     if source is None or source.status not in (RunStatus.COMPLETED, RunStatus.COMPLETED_WITH_FAILURES, RunStatus.EMPTY):
         raise AuditIntegrityError("power_automate_archive_not_completed")
+    if source.canonical_version != hashing.CANONICAL_VERSION:
+        raise AuditIntegrityError("power_automate_archive_canonical_version_invalid")
     settings, error = parse_json_strict(source.settings_json)
     if error is not None or type(settings) is not dict or stable_hash(settings) != source.config_hash:
         raise AuditIntegrityError("power_automate_archive_settings_invalid")
     archived_mode, archived_replay_from = admit_archived_invocation_settings(settings)
     if archived_mode is not source.run_mode or (archived_mode is not RunMode.LIVE and archived_replay_from != source.replay_from_run_id):
         raise AuditIntegrityError("power_automate_archive_settings_invalid")
-    if source.canonical_version != CANONICAL_VERSION:
-        raise AuditIntegrityError("power_automate_archive_canonical_version_invalid")
     nodes = factory.data_flow.get_nodes(source_run_id)
     lifecycle = factory.run_lifecycle.get_run_source_lifecycle_records(source_run_id)
     source_hashes = factory.run_lifecycle.get_run_source_config_hashes(source_run_id)

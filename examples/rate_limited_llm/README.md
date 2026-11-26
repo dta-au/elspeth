@@ -19,7 +19,7 @@ Start the ChaosLLM server:
 export ELSPETH_FINGERPRINT_KEY="$(
   .venv/bin/python -c 'import secrets; print(secrets.token_hex(32))'
 )"
-chaosllm serve --port 8199 --preset=realistic --workers=1
+chaosllm serve --port 8199 --preset=realistic --workers=1 --no-burst
 ```
 
 `ELSPETH_FINGERPRINT_KEY` protects the audit fingerprint of the fake inline
@@ -38,9 +38,12 @@ elspeth run --settings examples/rate_limited_llm/settings.yaml --execute
 - `output/quarantined.json` — Rows that failed after all retries
 
 The realistic preset is stochastic. Row-level retry exhaustion produces a
-`PARTIAL` run and process exit 1 after error routing. A fault injected during
-runtime preflight can instead stop the run before source ingestion; rerun the
-example to exercise the row-level rate-limited path.
+`PARTIAL` run and process exit 1 after error routing. `--no-burst` turns off
+the preset's opening fault burst (half the requests rate limited for the first
+five seconds), which would otherwise land on runtime preflight and its
+retries. Steady-state faults still reach every call; if all preflight
+attempts fault, the run stops before source ingestion; rerun the example to
+exercise the row-level rate-limited path.
 
 ## Rate Limit Configuration
 

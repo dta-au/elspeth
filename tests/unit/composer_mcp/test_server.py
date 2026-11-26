@@ -525,22 +525,21 @@ class TestDispatchTool:
         assert caught.value.surface == "composer_mcp_tool_arguments"
         assert candidate not in repr(caught.value.to_payload())
 
-    def test_legacy_state_is_refused_before_mcp_disclosure(self, scratch_dir: Path) -> None:
-        candidate = "sk-" + "b" * 24
-        contaminated = CompositionState(
+    def test_the_held_state_is_not_rescanned_before_mcp_dispatch(self, scratch_dir: Path) -> None:
+        # The graph is the session's own data: credential admission runs where text arrives
+        # (the tool arguments), not again on the held state at every dispatch.
+        held = CompositionState(
             source=None,
             nodes=(),
             edges=(),
             outputs=(),
-            metadata=PipelineMetadata(name=candidate),
+            metadata=PipelineMetadata(name="sk-" + "b" * 24),
             version=1,
         )
 
-        with pytest.raises(CredentialMaterialRefused) as caught:
-            _dispatch_tool("list_sources", {}, contaminated, _mock_catalog(), scratch_dir)
+        result = _dispatch_tool("list_sources", {}, held, _mock_catalog(), scratch_dir)
 
-        assert caught.value.surface == "composer_mcp_state"
-        assert candidate not in repr(caught.value.to_payload())
+        assert result["success"] is True
 
     def test_set_source_path_without_configured_authority_fails_closed(self, scratch_dir: Path) -> None:
         # set_source is promoted to a type-driven manifest entry

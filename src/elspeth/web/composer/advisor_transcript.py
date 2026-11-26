@@ -11,6 +11,7 @@ import json
 import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Final, Literal, cast, final, get_args
 from uuid import UUID
 
@@ -206,6 +207,38 @@ class AdvisorTranscriptHistory:
         request: str,
         records: Sequence[ChatMessageRecord],
     ) -> AdvisorTranscriptHistory:
+        """Read the stored history, refusing any row that cannot be accounted for.
+
+        A refusal raised while a stored row is being read names that row: the
+        same refusal recurs on every later turn until the row is repaired.
+        """
+        row_being_read: list[ChatMessageRecord] = []
+        try:
+            return cls._from_records(
+                session_id=session_id,
+                actor_user_id=actor_user_id,
+                current_request_id=current_request_id,
+                request=request,
+                records=records,
+                row_being_read=row_being_read,
+            )
+        except AuditIntegrityError as exc:
+            if not row_being_read:
+                raise
+            row = row_being_read[0]
+            raise AuditIntegrityError(f"{exc} (stored row id={row.id}, sequence_no={row.sequence_no}, role={row.role})") from exc
+
+    @classmethod
+    def _from_records(
+        cls,
+        *,
+        session_id: str,
+        actor_user_id: str,
+        current_request_id: str,
+        request: str,
+        records: Sequence[ChatMessageRecord],
+        row_being_read: list[ChatMessageRecord],
+    ) -> AdvisorTranscriptHistory:
         events: list[dict[str, Any]] = []
         row_ids: set[str] = set()
         prior_sequence: int | None = None
@@ -213,6 +246,8 @@ class AdvisorTranscriptHistory:
         public_call_records: dict[str, tuple[Mapping[str, Any], dict[str, Any]]] = {}
         anchor_calls: list[AdvisorAnchorCall] = []
         for row in records:
+            if type(row) is ChatMessageRecord:
+                row_being_read[:] = [row]
             if type(row) is not ChatMessageRecord or str(row.session_id) != session_id or str(row.id) in row_ids:
                 raise AuditIntegrityError("Advisor history contains a foreign or duplicate session row")
             row_ids.add(str(row.id))
@@ -225,6 +260,10 @@ class AdvisorTranscriptHistory:
                 if row.role != "user" or row.writer_principal not in {"route_user_message", "session_fork"} or row.content != request:
                     raise AuditIntegrityError("Advisor current request lacks authenticated human provenance")
                 found_current = True
+            if any(type(envelope) not in (dict, MappingProxyType) for envelope in row.tool_calls or ()):
+                # Every reader below inspects an entry's keys; one that is not
+                # an object cannot be inspected, so it is refused here.
+                raise AuditIntegrityError("Stored tool_calls entry is not an object")
             control = replay_composer_control_message(
                 stored_role=row.role,
                 writer_principal=row.writer_principal,
@@ -482,6 +521,7 @@ class AdvisorTranscriptHistory:
                 elif not invocation_envelopes and row.tool_calls is not None:
                     raise AuditIntegrityError("Historical tool row has unsupported provenance")
             events.append(event)
+        row_being_read.clear()
         if not found_current:
             raise AuditIntegrityError("Advisor history is missing its exact current human request")
         return cls(

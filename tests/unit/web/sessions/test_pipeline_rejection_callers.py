@@ -46,6 +46,11 @@ from tests.unit.web.sessions.test_pipeline_rejection_required import prepared_re
 
 pytest_plugins = ("tests.unit.web.coordination.test_composer_operation_authority",)
 
+# Bounds a hang in the planner resource-race test. The passing path takes
+# milliseconds; the guard only decides how long a genuine hang runs before the
+# test fails.
+_HANG_GUARD_SECONDS = 20
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("owned", [False, True], ids=["public", "owned"])
@@ -912,7 +917,7 @@ async def test_actual_planner_resource_race_retains_receipts_and_original_cancel
     def park_validator(_conn, _cursor, statement, _parameters, _context, _many):
         if statement.startswith("SELECT blobs.session_id, blobs.status"):
             entered.set()
-            assert release.wait(5)
+            assert release.wait(_HANG_GUARD_SECONDS)
             if fault in {"ValueError", "SQL", "group"}:
                 raise injected[fault]
 
@@ -941,14 +946,14 @@ async def test_actual_planner_resource_race_retains_receipts_and_original_cancel
         )
     )
     try:
-        async with asyncio.timeout(5):
+        async with asyncio.timeout(_HANG_GUARD_SECONDS):
             while not entered.is_set():
                 if task.done():
                     await task
                 await asyncio.sleep(0.01)
         if cancel_creation:
             task.cancel("original failed creation cancellation")
-            async with asyncio.timeout(5):
+            async with asyncio.timeout(_HANG_GUARD_SECONDS):
                 while not deliveries:
                     await asyncio.sleep(0)
             assert not task.done()

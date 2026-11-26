@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import math
 import time
+from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -488,6 +489,67 @@ async def test_the_escape_hatch_request_sheds_its_conversation_context_and_keeps
         assert call.context_budget.shed_hatch_event_indices == ()
 
 
+def _hatch_context_limit() -> BaseException:
+    from litellm.exceptions import ContextWindowExceededError
+
+    return ContextWindowExceededError(message="prompt is too long", model="test/advisor", llm_provider="anthropic")
+
+
+def _hatch_proxy_413() -> BaseException:
+    from tests.unit.web.composer.test_request_too_large import mapped_provider_error
+
+    return mapped_provider_error("openai", 413)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cause", "reason", "source"),
+    [(_hatch_context_limit, "context_length_exceeded", "sdk_class"), (_hatch_proxy_413, "request_too_large", "http_status")],
+    ids=["context-limit", "http-413"],
+)
+async def test_an_escape_hatch_size_rejection_is_resent_once_with_every_earlier_turn_left_out(
+    tmp_path: Path, tool_context: ToolContext, cause: Callable[[], BaseException], reason: str, source: str
+) -> None:
+    context = _context(users={0: "Convert the data."}, assistants={1: "Which format do you want?"})
+    completion = _ScriptedCompletion(
+        _response_with_call_id("state", "get_pipeline_state", {}),
+        _response_with_call_id("sources", "list_sources", {}),
+        cause(),
+        _text_response("Please upload the input for JSON conversion."),
+    )
+    recorder = BufferingRecorder()
+    with pytest.raises(PlannerDeclined):
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            recorder=recorder,
+            intent="The latter.",
+            conversation_context=context,
+            model_overrides={
+                "model_identifier": _UNMARKED,
+                "max_discovery_turns": 1,
+                "escape_hatch_model": "test/advisor",
+                "escape_hatch_provider": "test-provider",
+            },
+        )
+
+    assert [request["model"] for request in completion.requests] == [_UNMARKED, _UNMARKED, "test/advisor", "test/advisor"]
+    rejected, resent = recorder.llm_calls[2], recorder.llm_calls[3]
+    assert rejected.status is ComposerLLMCallStatus.BAD_REQUEST_ERROR
+    assert (rejected.error_message, rejected.rejection_reason_source) == (reason, source)
+    assert rejected.context_budget is not None and resent.context_budget is not None
+    assert rejected.context_budget.surface == resent.context_budget.surface == "hatch"
+    assert rejected.context_budget.shed_history_indices == ()
+    # The resend leaves out every earlier turn; the rejected request is never sent unchanged.
+    assert resent.context_budget.retry_after_provider_rejection is True
+    assert resent.context_budget.shed_history_indices == (0, 1)
+    assert "conversation_context" in _payload(completion.requests[2])
+    sent = _payload(completion.requests[3])["conversation_context"]
+    assert sent["prior_user_requests"] == [] and "prior_assistant_messages" not in sent
+    assert (sent["additional_prior_user_requests_omitted"], sent["prior_assistant_messages_omitted"]) == (1, 1)
+
+
 @pytest.mark.asyncio
 async def test_each_planner_call_persists_its_conservative_rate(tmp_path: Path, tool_context: ToolContext) -> None:
     """Planner and hatch calls record the conservative rate used for admission."""
@@ -513,6 +575,13 @@ async def test_each_planner_call_persists_its_conservative_rate(tmp_path: Path, 
     assert [call.model_requested for call in recorder.llm_calls] == [_UNMARKED, _UNMARKED, "test/advisor"]
     ratios = [call.context_budget.bytes_per_token for call in recorder.llm_calls if call.context_budget is not None]
     assert ratios == [repr(1.0), repr(1.0), repr(1.0)]
+    budgets = [call.context_budget for call in recorder.llm_calls]
+    assert all(budget is not None for budget in budgets)
+    assert [budget.surface for budget in budgets if budget is not None] == ["planner", "planner", "hatch"]
+    # The first planner call has no earlier call to measure. The hatch's model has no call of
+    # its own yet, so it falls back too: another model's tokens are not its own.
+    first, _, hatch = (budget for budget in budgets if budget is not None)
+    assert (first.density_source, hatch.density_source) == ("fallback", "fallback")
 
 
 _CONTEXT_REDUCED_HEADLINE = "Earlier conversation is no longer visible to the composer."
@@ -644,15 +713,27 @@ async def _discovery_run(
     return completion, recorder
 
 
-def _repriced_estimate(budget: ComposerContextBudgetRecord) -> int:
-    """The estimate the shared decision makes, recomputed from the record's own fields.
+def _repriced_estimate(budget: ComposerContextBudgetRecord, previous: ComposerLLMCall) -> int:
+    """The estimate the shared decision makes, recomputed from the records' own fields.
 
-    Every byte costs 3.0 bytes per token, or the previous call's measured density when a
-    plausible provider count (between 1 and 8 bytes per token) is denser. The anchored arm is
-    that count plus one token per byte not shared with it. The smaller arm is the estimate.
+    Every byte costs the byte rate: 0.9 times the previous call's measured density (the wire
+    bytes it sent over the provider's count, when that lies between 1 and 8 bytes per token),
+    else 3.0 bytes per token; the anchor's density replaces it when denser. The anchored arm
+    is the anchor's count plus one token per byte not shared with it. The smaller arm is the
+    estimate.
     """
     assert budget.anchor_prompt_tokens is not None
     rate = 3.0
+    assert previous.context_budget is not None and previous.prompt_tokens is not None
+    measured = previous.context_budget.request_wire_bytes / previous.prompt_tokens
+    if 1 <= measured <= 8:
+        rate = measured * 0.9
+    # The record names where its density came from and the density itself, before the margin.
+    assert budget.surface == "planner"
+    if previous.status is ComposerLLMCallStatus.SUCCESS and 1 <= measured <= 8:
+        assert (budget.density_source, budget.measured_bytes_per_token) == ("live_call", repr(measured))
+    else:
+        assert (budget.density_source, budget.measured_bytes_per_token) == ("fallback", None)
     if budget.anchor_prompt_tokens <= budget.anchor_wire_bytes <= 8 * budget.anchor_prompt_tokens:
         rate = min(rate, budget.anchor_wire_bytes / budget.anchor_prompt_tokens)
     byte_arm = math.ceil(budget.decision_wire_bytes_after / rate)
@@ -712,9 +793,11 @@ async def test_six_producer_schema_results_fit_the_budget_and_labels_do_not_chan
     # "authored_prefix" is the recorded name of the byte arm, which now prices every byte.
     assert budget.pricing_mode == "authored_prefix"
     # Was: unlabelled bytes at one token each and labelled bytes at 3.0 (the authored formula).
-    assert budget.estimated_tokens_after == _repriced_estimate(budget)
+    assert budget.estimated_tokens_after == _repriced_estimate(budget, recorder.llm_calls[0])
     assert budget.estimated_tokens_after <= budget.anchor_prompt_tokens + budget.decision_wire_bytes_after - budget.anchor_shared_bytes
     assert budget.estimated_tokens_after <= policy.max_prompt_tokens
+    # The lookup's count is plausible for its size, so this call was priced from it, and says so.
+    assert budget.density_source == "live_call"
 
     # Was: removing provenance from the same protected results cost more and was refused.
     # Now the labels do not enter the price: the same estimate, and no refusal.
@@ -800,7 +883,14 @@ async def test_six_schema_batch_costs_the_same_with_and_without_producer_labels(
 # rounded down).
 # get_pipeline_state says a page under large diagnostics carries a validation summary (0.8.16): 54,518 measured
 # (+63 = +190 B / 3.0, rounded down).
-@pytest.mark.parametrize(("anchor_tokens", "minimum"), [(100_000, 100_000), (40_000, 54_518)])
+# Bytes priced at 0.9 of the previous call's measured density instead of 3.0 (0.8.18): 49,730 measured. The
+# previous call measured a density above 3.0, so the same request costs fewer tokens; still above the count.
+# Credential-scan teaching and tool descriptions (0.8.18): 49,731 measured. Both requests are 38 B smaller
+# (163,516 decision bytes), and the first call's lower density lowers the rate to 3.2880375, so the estimate
+# rounds up one token higher.
+# Chroma removal (0.8.18): 49,765 measured. A tool description no longer names RAG retrieval or Chroma sinks,
+# so the request shrinks slightly and the repriced estimate rises 34 tokens; the parent commit measures 49,731.
+@pytest.mark.parametrize(("anchor_tokens", "minimum"), [(100_000, 100_000), (40_000, 49_765)])
 async def test_planner_estimate_is_never_below_the_providers_count_and_uses_the_cheaper_arm(
     tmp_path: Path, tool_context: ToolContext, anchor_tokens: int, minimum: int
 ) -> None:
@@ -823,7 +913,7 @@ async def test_planner_estimate_is_never_below_the_providers_count_and_uses_the_
     if anchor_tokens == 100_000:
         assert budget.estimated_tokens_after >= minimum
     else:
-        assert budget.estimated_tokens_after == minimum == _repriced_estimate(budget)
+        assert budget.estimated_tokens_after == minimum == _repriced_estimate(budget, recorder.llm_calls[0])
         assert budget.pricing_mode == "authored_prefix"
 
 
@@ -875,18 +965,20 @@ async def test_planner_anchor_metadata_missing_is_priced_at_provider_density_and
     assert budget.estimated_tokens_after >= 100_000
     assert budget.anchor_status == "authored_evidence_unavailable"
     # Was: missing authored evidence forced the anchored arm. Now the evidence does not select
-    # the arm; what protects the estimate is the provider's own count, whose density (denser
-    # than 3.0 here) replaces the rate. ``authored_refuted`` records that it did.
+    # the arm; what protects the estimate is the provider's own count, whose density replaces
+    # the rate. ``authored_refuted`` records that it did; the cheaper arm is used, as the
+    # recomputation below checks against the record.
     assert budget.authored_refuted is True
-    assert budget.pricing_mode == "authored_prefix"
-    assert budget.estimated_tokens_after == _repriced_estimate(budget)
+    assert budget.estimated_tokens_after == _repriced_estimate(budget, recorder.llm_calls[0])
 
 
 @pytest.mark.asyncio
 async def test_planner_anchored_arm_records_one_byte_growth_rate(tmp_path: Path, tool_context: ToolContext) -> None:
     lookup = _response_with_call_id("schema", "get_plugin_schema", {"plugin_type": "transform", "name": "web_scrape"})
-    # 30,000 (was 40,000): low enough that the count plus the growth is below every byte at 3.0, so the anchored arm is used.
-    lookup.usage = {"prompt_tokens": 30_000, "completion_tokens": 5, "total_tokens": 30_005, "cost": 0.01}
+    # 100,000 (was 30,000): bytes are priced at 0.9 of the previous call's measured density, so the
+    # anchored arm (the count plus the growth) is the cheaper one only when the count is high for
+    # the request's size; at 100,000 the density is low and the anchored arm is used.
+    lookup.usage = {"prompt_tokens": 100_000, "completion_tokens": 5, "total_tokens": 100_005, "cost": 0.01}
     completion = _ScriptedCompletion(lookup, _text_response("Which output format do you want?"))
     recorder = BufferingRecorder()
     with pytest.raises(PlannerDeclined):
@@ -904,7 +996,7 @@ async def test_planner_anchored_arm_records_one_byte_growth_rate(tmp_path: Path,
     assert budget.pricing_mode == "anchored"
     assert budget.bytes_per_token == repr(1.0)
     assert budget.estimated_tokens_after == budget.anchor_prompt_tokens + budget.decision_wire_bytes_after - budget.anchor_shared_bytes
-    assert budget.estimated_tokens_after == _repriced_estimate(budget)
+    assert budget.estimated_tokens_after == _repriced_estimate(budget, recorder.llm_calls[0])
 
 
 @pytest.mark.asyncio
@@ -1331,7 +1423,11 @@ def test_a_planner_refusal_names_the_tool_round_whose_arguments_dominate() -> No
 
 
 def _fit_hatch_request(
-    transcript: AdvisorVisibleTranscript, *, earlier_calls: tuple[ComposerLLMCall, ...], policy: ContextBudgetPolicy | None = None
+    transcript: AdvisorVisibleTranscript,
+    *,
+    earlier_calls: tuple[ComposerLLMCall, ...],
+    policy: ContextBudgetPolicy | None = None,
+    shed_all_history: bool = False,
 ) -> tuple[list[dict[str, Any]], ComposerContextBudgetRecord, ContextBudgetPolicy]:
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": "skill"},
@@ -1346,17 +1442,21 @@ def _fit_hatch_request(
         policy = _context_policy(max_prompt_tokens=math.ceil(size / _FALLBACK_RATIO / 0.7), max_request_bytes=1_000_000)
         assert policy.shed_to * policy.max_prompt_tokens < size / _FALLBACK_RATIO <= policy.shed_above * policy.max_prompt_tokens
     before = deepcopy(messages)
+    # Passed only when set, so the tests that do not set it also run against a base tree.
+    resend: dict[str, bool] = {"shed_all_history": True} if shed_all_history else {}
     applied, record = _fit_planner_context_budget(
         messages=messages,
         tools=[],
         request_conversation_context=None,
         hatch_transcript_index=3,
         hatch_transcript=transcript,
+        surface="hatch",
         policy=policy,
         history=ContextBudgetHistory.empty(),
         model="test/advisor",
         earlier_calls=earlier_calls,
         mark_for_cache=False,
+        **resend,
     )
     assert messages == before  # the caller's messages are never shed in place
     return applied, record, policy
@@ -1400,6 +1500,36 @@ def test_transcript_events_shed_on_an_earlier_call_of_the_request_stay_shed_betw
     assert sticky[3]["content"] == _HATCH_TRANSCRIPT_HEADER + transcript.without_events(frozenset({0, 1})).provider_json
     # The rebuilt message's prompt-guard parts describe the content it now carries.
     assert "".join(part.text for part in sticky[3][PROMPT_GUARD_CONTENT_PARTS_KEY]) == sticky[3]["content"]
+
+
+def test_provider_rejection_refit_leaves_out_every_earlier_hatch_event() -> None:
+    transcript, _ = _hatch_message(_AWKWARD_EVENTS, ["authenticated_persisted_history_not_supplied"])
+
+    applied, record, _ = _fit_hatch_request(transcript, earlier_calls=(), shed_all_history=True)
+
+    assert record.shed_hatch_event_indices == transcript.sheddable_event_indices()
+    assert record.retry_after_provider_rejection is True
+    assert (
+        applied[3]["content"]
+        == _HATCH_TRANSCRIPT_HEADER + transcript.without_events(frozenset(transcript.sheddable_event_indices())).provider_json
+    )
+
+
+@pytest.mark.parametrize("after_rejection", [True, False], ids=["held-after-provider-rejection", "control-released"])
+def test_events_left_out_after_a_provider_rejection_stay_out_for_the_turn_even_when_the_request_fits(after_rejection: bool) -> None:
+    # The provider judged the request with them too large. A later planner call
+    # of the same turn keeps them out, as the compose loop does, even below the
+    # low mark. Control: the same keys shed by an ordinary decision are released.
+    transcript, _ = _hatch_message(_AWKWARD_EVENTS, ["authenticated_persisted_history_not_supplied"])
+    earlier = _earlier_call(("hatch:0", "hatch:1"))
+    assert earlier.context_budget is not None
+    if after_rejection:
+        earlier = replace(earlier, context_budget=replace(earlier.context_budget, retry_after_provider_rejection=True))
+    roomy = _context_policy(max_prompt_tokens=10_000_000, max_request_bytes=1_000_000)
+
+    _, record, _ = _fit_hatch_request(transcript, earlier_calls=(earlier,), policy=roomy)
+
+    assert record.shed_hatch_event_indices == ((0, 1) if after_rejection else ())
 
 
 def test_an_escape_heavy_hatch_event_that_fits_once_shed_is_shed_not_refused() -> None:
@@ -1484,6 +1614,7 @@ def test_a_hatch_message_that_is_not_the_labelled_transcript_is_a_framework_bug(
             request_conversation_context=None,
             hatch_transcript_index=3,
             hatch_transcript=transcript,
+            surface="hatch",
             policy=_context_policy(max_request_bytes=1_000_000),
             history=ContextBudgetHistory.empty(),
             model="test/advisor",

@@ -1,6 +1,6 @@
 """The reply stage after staged review cards, under the context budget.
 
-The reply stage makes one optional provider call once the turn's work is
+The reply stage makes an optional provider call once the turn's work is
 done. These tests drive the real compose loop to that stage and pin three
 behaviours: a context-budget refusal there leaves the finished turn standing
 with the reply unavailable and no provider call; a reply stage that is out of
@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -31,6 +32,7 @@ from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
 from elspeth.web.composer.context_budget import ContextBudgetRefusal
 from elspeth.web.composer.context_budget_apply import latest_round_trip_start, message_wire_split, stubbed_tool_message
 from elspeth.web.composer.protocol import ComposerResult
+from elspeth.web.composer.provider_gateway import _BadRequestLLMError
 from elspeth.web.composer.reply_stage_refusal import (
     COMPOSER_REPLY_STAGE_REFUSAL_KIND,
     ComposeLoopContextBudgetComponent,
@@ -56,6 +58,8 @@ from tests.unit.web.composer.test_compose_loop_interpretation_review_dispatch im
     _ScriptedLLM,
     _set_pipeline_with_pending_interpretation_args,
 )
+from tests.unit.web.composer.test_gateway_capacity_rejection import _other_rejection, _too_long
+from tests.unit.web.composer.test_provider_rejection_retry import _history, _history_in
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 
@@ -113,6 +117,7 @@ class _Turn:
         self.events: list[ComposerProgressEvent] = []
         self.results: list[ComposerResult] = []
         self.latest_event_at_reply_call: list[ComposerProgressEvent] = []
+        self.history = None
         self.llm = _ScriptedLLM(
             [
                 _fake_response_with_tool_call(
@@ -140,6 +145,8 @@ class _Turn:
 
         async def _loop(*args: Any, **kwargs: Any) -> ComposerResult:
             kwargs["progress"] = _sink
+            if self.history is not None:
+                args = (args[0], self.history, *args[2:])
             completed = await original_loop(*args, **kwargs)
             self.results.append(completed)
             return completed
@@ -357,6 +364,86 @@ async def test_control_a_provider_failure_at_the_reply_stage_keeps_its_call_reco
         ComposerLLMCallStatus.TIMEOUT,
     ]
     assert turn.refusal_records() == []
+
+
+def _proxy_413() -> BaseException:
+    from tests.unit.web.composer.test_request_too_large import mapped_provider_error
+
+    return mapped_provider_error("openai", 413)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cause", [_too_long, _proxy_413], ids=["context-limit", "http-413"])
+async def test_reply_stage_resends_size_rejection_without_earlier_turns(
+    tmp_path: Path, sessions: SessionServiceImpl, monkeypatch: pytest.MonkeyPatch, cause: Callable[[], BaseException]
+) -> None:
+    turn = _Turn(tmp_path, sessions, monkeypatch)
+    turn.history = _history()
+    scripted = turn.llm
+    rejected = False
+
+    async def _reply(messages: list[dict[str, Any]], tools: list[dict[str, Any]], **kwargs: Any) -> Any:
+        nonlocal rejected
+        if _is_reply_stage(tools) and not rejected:
+            rejected = True
+            scripted.messages.append(messages)
+            scripted.tools.append(tools)
+            raise _BadRequestLLMError("LLM request rejected") from cause()
+        return await scripted(messages, tools, **kwargs)
+
+    monkeypatch.setattr(turn, "llm", _CallableLLM(_reply, scripted))
+    result = await turn.run()
+
+    assert turn.reply_stage_calls() == 2
+    reply_requests = [messages for messages, tools in zip(scripted.messages, scripted.tools, strict=True) if _is_reply_stage(tools)]
+    assert [_history_in({"messages": request}) for request in reply_requests] == [[row["content"] for row in turn.history], []]
+    assert _REPLY_PROSE in result.assistant_message
+    assert turn.refusal_records() == []
+
+
+@pytest.mark.asyncio
+async def test_reply_stage_second_size_rejection_keeps_unavailable_notice(
+    tmp_path: Path, sessions: SessionServiceImpl, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    turn = _Turn(tmp_path, sessions, monkeypatch)
+    turn.history = _history()
+    scripted = turn.llm
+
+    async def _reply(messages: list[dict[str, Any]], tools: list[dict[str, Any]], **kwargs: Any) -> Any:
+        if _is_reply_stage(tools):
+            scripted.messages.append(messages)
+            scripted.tools.append(tools)
+            raise _BadRequestLLMError("LLM request rejected") from _too_long()
+        return await scripted(messages, tools, **kwargs)
+
+    monkeypatch.setattr(turn, "llm", _CallableLLM(_reply, scripted))
+    result = await turn.run()
+
+    assert turn.reply_stage_calls() == 2
+    assert no_tool_policy._REVIEW_REPLY_UNAVAILABLE_NOTICE in result.assistant_message
+    assert turn.refusal_records() == []
+
+
+@pytest.mark.asyncio
+async def test_reply_stage_non_size_rejection_is_not_resent(
+    tmp_path: Path, sessions: SessionServiceImpl, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    turn = _Turn(tmp_path, sessions, monkeypatch)
+    turn.history = _history()
+    scripted = turn.llm
+
+    async def _reply(messages: list[dict[str, Any]], tools: list[dict[str, Any]], **kwargs: Any) -> Any:
+        if _is_reply_stage(tools):
+            scripted.messages.append(messages)
+            scripted.tools.append(tools)
+            raise _BadRequestLLMError("LLM request rejected") from _other_rejection()
+        return await scripted(messages, tools, **kwargs)
+
+    monkeypatch.setattr(turn, "llm", _CallableLLM(_reply, scripted))
+    result = await turn.run()
+
+    assert turn.reply_stage_calls() == 1
+    assert no_tool_policy._REVIEW_REPLY_UNAVAILABLE_NOTICE in result.assistant_message
 
 
 @pytest.mark.asyncio

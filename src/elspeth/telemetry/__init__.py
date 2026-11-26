@@ -43,7 +43,6 @@ Usage:
 """
 
 from elspeth.contracts.events import (
-    ChromaWriteStatistics,
     DataverseLoadStatistics,
     ExternalCallCompleted,
     FieldResolutionApplied,
@@ -62,7 +61,6 @@ from elspeth.telemetry.manager import TelemetryManager
 from elspeth.telemetry.protocols import ExporterProtocol
 
 __all__ = [
-    "ChromaWriteStatistics",
     "ConsoleExporter",
     "DataverseLoadStatistics",
     "ExporterProtocol",

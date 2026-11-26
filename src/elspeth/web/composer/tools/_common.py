@@ -119,7 +119,6 @@ from elspeth.web.paths import (
     SOURCE_LOCAL_PATH_OPTION_KEYS,
     allowed_sink_directories,
     allowed_source_directories,
-    is_absent_sink_path,
     is_local_path_value,
     require_mcp_root_context,
     resolve_data_path,
@@ -2321,7 +2320,6 @@ def _validate_sink_path(
     data_dir: str | None,
     *,
     session_id: str | None,
-    plugin: str | None = None,
     require_data_dir: bool = False,
     mcp_root_authority: McpConfiguredRootAuthority | None = None,
 ) -> str | None:
@@ -2333,21 +2331,16 @@ def _validate_sink_path(
     ``session_id=None`` grants no Web paths. MCP has separate root authority.
     """
     require_mcp_root_context(mcp_root_authority, data_dir=data_dir, session_id=session_id)
-    mode = options["mode"] if "mode" in options else None
     if mcp_root_authority is not None:
         for key in SINK_LOCAL_PATH_OPTION_KEYS:
             if key in options:
-                if is_absent_sink_path(plugin, mode, key, options[key]):
-                    continue
                 if not is_local_path_value(options[key]):
                     return "Output local path must be a nonempty string without NUL"
                 if not resolve_data_path(options[key], str(mcp_root_authority.root)).is_relative_to(mcp_root_authority.root):
                     return "Output local path is outside the configured data root"
         return None
     if data_dir is None:
-        if require_data_dir and any(
-            key in options and not is_absent_sink_path(plugin, mode, key, options[key]) for key in SINK_LOCAL_PATH_OPTION_KEYS
-        ):
+        if require_data_dir and any(key in options for key in SINK_LOCAL_PATH_OPTION_KEYS):
             return "Output local paths require configured data root authority"
         return None
 
@@ -2355,8 +2348,6 @@ def _validate_sink_path(
 
     for key in SINK_LOCAL_PATH_OPTION_KEYS:
         if key in options:
-            if is_absent_sink_path(plugin, mode, key, options[key]):
-                continue
             if not is_local_path_value(options[key]):
                 return "Output local path must be a nonempty string without NUL"
             resolved = resolve_sink_data_path(options[key], data_dir, session_id=session_id)
@@ -2380,8 +2371,9 @@ def _validate_transform_provider_config_path(
 ) -> str | None:
     """Validate nested provider_config path options are under allowed dirs.
 
-    RAG retrieval transforms carry a local Chroma persist_directory under
-    ``options["provider_config"]``. It is a read/write target like a sink, so
+    A transform may carry a local persist_directory under
+    ``options["provider_config"]`` (no shipped plugin does since 0.8.18). It is
+    a read/write target like a sink, so
     it is confined to the allowed sink directories — including the per-session
     blob confinement (elspeth-bdc17cfdb1): a persist_directory pointed at
     another session's blob subtree would disclose that session's data on read

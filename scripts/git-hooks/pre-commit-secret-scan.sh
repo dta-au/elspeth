@@ -73,7 +73,17 @@ for file in "${files[@]}"; do
         regex="${pattern_entry#*|}"
         # git grep --cached reads the index blob. -I skips binary entries, -n
         # reports line numbers, and -E selects extended regular expressions.
-        matches=$(git grep --cached -InE "$regex" -- "$file" 2>/dev/null || true)
+        # -e marks the regex as a pattern even when it starts with "-". Exit 1
+        # means no match; any higher exit is a scanner failure, which refuses
+        # the commit rather than passing it unchecked.
+        set +e
+        matches=$(git grep --cached -InE -e "$regex" -- "$file")
+        grep_rc=$?
+        set -e
+        if [ "$grep_rc" -gt 1 ]; then
+            printf "${RED}pre-commit-secret-scan: could not check %s for %s (git grep exit %s); refusing the commit${RST}\n" "$file" "$name" "$grep_rc" >&2
+            exit 2
+        fi
         if [ -n "$matches" ]; then
             # Filter out lines marked with the per-line allow comment
             filtered=$(echo "$matches" | grep -v 'secret-scan: allow-this-line' || true)

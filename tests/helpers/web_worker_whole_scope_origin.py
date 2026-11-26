@@ -16,9 +16,11 @@ APP = "src/elspeth/web/app.py"
 WORKER = "src/elspeth/web/sessions/composer_async_worker.py"
 TURN = "src/elspeth/web/sessions/composer_turn.py"
 # The complete app body now mounts the owner-scoped prompt-text router beside
-# the existing blob router; worker construction and admission stay in place.
+# the existing blob router and registers the worker-admission-timeout handler;
+# worker construction and admission stay in place. 0.8.18: the body-size
+# middleware takes max_upload_bytes from settings.
 GRAMMARS = {
-    "_create_app": "eb9ae693fcf5e6151c8f612e8811e9d3e51810b3a302d985d0520f53141dadf4",
+    "_create_app": "8f92107492257403fa7388106be9004867c6ad7852180397aeb5f3a36b295fe8",
     "ComposerAsyncWorker._run_started_under_lease": "daf38d630a65beb59e65af3a81a44ee074492814371c532a285113ad897c2b68",
     "run_composer_turn": "3076e583c646de8005d6b1e20cd0df431c22384cd0ada0e9a96bf79b0aaae07a",
 }

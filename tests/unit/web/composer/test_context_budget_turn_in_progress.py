@@ -490,6 +490,7 @@ def test_tool_keys_carried_from_an_earlier_planner_call_never_stub_a_result_of_t
             request_conversation_context=None,
             hatch_transcript_index=None,
             hatch_transcript=None,
+            surface="hatch",
             policy=policy,
             history=history,
             model="test/advisor",
@@ -602,3 +603,34 @@ def test_a_hatch_transcript_without_a_current_request_reference_has_nothing_to_s
     assert transcript.sheddable_event_indices() == ()
     with pytest.raises(ValueError, match="sheddable"):
         transcript.without_events(frozenset({0}))
+
+
+@pytest.mark.asyncio
+async def test_a_turns_first_call_is_priced_at_the_sessions_stored_density() -> None:
+    # The first call of a turn has no live anchor. The session's stored call (4.4 bytes per
+    # provider token, same model and dialect) prices it, less the 10% margin, so it is judged
+    # as the turn's later calls are and what is shed does not flip at the turn boundary.
+    service, _ = _service(_GENEROUS_TOKENS)
+    dialect = service._planner_dialect
+    stored = _call(total_bytes=44_000, prompt_tokens=10_000, model=service._model)
+    stored["tool_contract_dialect"] = None if dialect is None else dialect.value
+    llm_messages = _two_round_turn(service, "f" * 2_000, "s" * 2_000)
+
+    _selected, record = await _fit_two_round_turn(
+        service,
+        llm_messages,
+        recorder=BufferingRecorder(),
+        history=ContextBudgetHistory.from_records([_audit_row(1, stored)]),
+        reply_stage=False,
+    )
+
+    assert record.anchor_status == "no_previous_call"
+    assert record.bytes_per_token == repr(4.4 * 0.9)
+    # The record says the density came from the session's stored call, as measured.
+    assert (record.surface, record.density_source, record.measured_bytes_per_token) == ("compose_loop", "stored_call", repr(4.4))
+    # Control: with no stored call the same request is priced at the policy's fallback rate.
+    _selected, fallback = await _fit_two_round_turn(
+        service, llm_messages, recorder=BufferingRecorder(), history=ContextBudgetHistory.empty(), reply_stage=False
+    )
+    assert fallback.bytes_per_token == repr(service._context_budget_policy.fallback_bytes_per_token)
+    assert (fallback.density_source, fallback.measured_bytes_per_token) == ("fallback", None)

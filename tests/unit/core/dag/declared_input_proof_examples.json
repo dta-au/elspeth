@@ -120,20 +120,6 @@
   "examples/checkpoint_resume/settings.yaml": {
     "transform:process": []
   },
-  "examples/chroma_rag/settings.yaml": {
-    "transform:rag_0": [
-      "question"
-    ]
-  },
-  "examples/chroma_rag_qa/settings.yaml": {
-    "transform:llm_0": [
-      "question",
-      "sci__rag_context"
-    ],
-    "transform:rag_0": [
-      "question"
-    ]
-  },
   "examples/concurrent_scheduler/settings.yaml": {
     "aggregation:rendezvous": [
       "amount"
@@ -344,7 +330,8 @@
     ],
     "transform:llm_0": [
       "text"
-    ]
+    ],
+    "transform:start_barrier": []
   },
   "examples/multi_worker_showcase/settings.yaml": {
     "transform:explode": [
@@ -352,7 +339,8 @@
     ],
     "transform:llm_0": [
       "text"
-    ]
+    ],
+    "transform:start_barrier": []
   },
   "examples/openrouter_multi_query_assessment/settings.yaml": {
     "transform:llm_0": []

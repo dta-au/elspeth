@@ -22,9 +22,6 @@ Some examples need setup or use multiple configurations:
 | `blob_transforms` (offline) | `./examples/blob_transforms/run.sh` |
 | `pdf_rasterize` | `./examples/pdf_rasterize/run.sh` |
 | `blob_transforms` (hosted fetch) | `./examples/blob_transforms/run_hosted_fetch.sh` |
-| `chroma_rag` | `./examples/chroma_rag/run.sh` |
-| `chroma_rag_qa` (OpenRouter) | `./examples/chroma_rag_qa/run.sh` |
-| `chroma_rag_indexed` | `elspeth run --settings examples/chroma_rag_indexed/query_pipeline.yaml --execute` |
 | `textract_inline` | `python examples/textract_inline/scripts/prepare_document_blobs.py`, then `elspeth run --settings examples/textract_inline/settings.generated.yaml --execute` |
 | `join_refused` | `./examples/join_refused/run.sh` |
 | `replay_verify` | `./examples/replay_verify/run.sh` |
@@ -83,16 +80,14 @@ These examples run locally with no credentials or external services.
 |---------|---------------------|
 | [`threshold_gate_container`](threshold_gate_container/) | The threshold-gate pipeline packaged with `/app/pipeline/` paths for Docker |
 
-### RAG / ChromaDB (requires `chromadb` — no API keys for retrieval-only)
+### RAG retrieval (Azure AI Search)
 
-These examples demonstrate Retrieval-Augmented Generation using ChromaDB as a vector store. Install ChromaDB first: `uv pip install chromadb`.
+Retrieval uses the `azure_ai_search` transform. The Chroma examples were
+removed in 0.8.18 with Chroma support.
 
 | Example | What It Demonstrates |
 |---------|---------------------|
-| [`chroma_rag`](chroma_rag/) | Basic RAG retrieval — `./examples/chroma_rag/run.sh` seeds the collection, then runs retrieval |
-| [`chroma_rag_qa`](chroma_rag_qa/) | RAG + LLM via `./examples/chroma_rag_qa/run.sh` (requires `OPENROUTER_API_KEY`) |
 | [`azure_search_rag`](azure_search_rag/) | RAG retrieval against an existing Azure AI Search index — field mapping, search modes, score ranges, managed identity (requires `AZURE_SEARCH_ENDPOINT`, `AZURE_SEARCH_INDEX`, `AZURE_SEARCH_API_KEY`) |
-| [`chroma_rag_indexed`](chroma_rag_indexed/) | **Pipeline dependencies** — `depends_on` runs an indexing pipeline first, commencement gate verifies the collection, then query pipeline retrieves context. Entry point: `query_pipeline.yaml` |
 
 ### 0.6.0 — Multi-Worker & Concurrent Scheduling
 
@@ -246,8 +241,4 @@ A fresh checkout has no such artifacts and needs no reset.
 | **Docker deployment** | [`threshold_gate_container`](threshold_gate_container/) — containerised pipeline |
 | **Retry under faults** | [`chaosllm_endurance`](chaosllm_endurance/) — 5 retries with exponential backoff against ChaosLLM |
 | **Stress testing** | [`large_scale_test`](large_scale_test/) or [`chaosllm_endurance`](chaosllm_endurance/) |
-| **RAG retrieval** | [`chroma_rag`](chroma_rag/) — basic vector search against ChromaDB |
-| **RAG + LLM** | [`chroma_rag_qa`](chroma_rag_qa/) — retrieval then LLM-generated answers |
 | **RAG against Azure AI Search** | [`azure_search_rag`](azure_search_rag/) — hybrid retrieval from an existing index |
-| **Pipeline dependencies (`depends_on`)** | [`chroma_rag_indexed`](chroma_rag_indexed/) — index → gate → query in one command |
-| **Commencement gates** | [`chroma_rag_indexed`](chroma_rag_indexed/) — go/no-go check before pipeline starts |

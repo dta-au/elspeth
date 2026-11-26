@@ -78,7 +78,7 @@ Nested environment variables use double underscore: `ELSPETH_LANDSCAPE__URL`.
 | `aggregations` | list | No | `[]` | Batch processing configurations |
 | `depends_on` | list | No | `[]` | Pipeline dependencies — run these before the main pipeline |
 | `commencement_gates` | list | No | `[]` | Go/no-go conditions evaluated after dependencies complete |
-| `collection_probes` | list | No | `[]` | Vector store collections to probe for gate context |
+| `collection_probes` | list | No | `[]` | Must be empty or absent since 0.8.18; see [Collection Probes](#collection-probes) |
 | `landscape` | object | No | (defaults) | Audit trail configuration |
 | `concurrency` | object | No | (defaults) | Parallel processing settings |
 | `retry` | object | No | (defaults) | Retry behavior settings |
@@ -610,12 +610,10 @@ about raising the allowance or the deployment's supported retention procedures.
 Do not delete database rows or backing files by hand to alter quota accounting.
 
 Web execution refuses embedded storage that cannot obey these byte reservations:
-local SQLite `database` sinks, `chroma_sink` with `mode: persistent`, and persistent
-Chroma retrieval or collection probes. Existing Web graphs using those modes must
-change before they can run. Remote PostgreSQL sinks and Chroma `client` mode are
-unaffected by this storage restriction, subject to the existing plugin policy and
-security restrictions; this does not relax the Chroma security advisory. Standalone
-CLI plugin behavior is unchanged.
+local SQLite `database` sinks. Existing Web graphs using that mode must change
+before they can run. Remote PostgreSQL sinks are unaffected by this storage
+restriction, subject to the existing plugin policy and security restrictions.
+Standalone CLI plugin behavior is unchanged.
 
 Dormancy applies to both local and SSO identities. Administrator reactivation
 starts a fresh dormancy window: the later of the previous login and activation
@@ -919,7 +917,7 @@ normalized to lowercase identifiers ('Name' -> 'name'). Declare 'name'`):
   violation, ends the run with every token's outcome recorded.
 
 A created name that is not a spelling of an arriving field (`Total`, or
-`sci__rag_context` from an upstream `rag_retrieval`) is unaffected, and so is
+`sci__rag_context` from an upstream `azure_ai_search` with `output_prefix: sci`) is unaffected, and so is
 a rename that removes the field it respells (`field_mapper` `{name: Name}`
 restores the header as the key).
 
@@ -985,7 +983,7 @@ sinks:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `plugin` | string | **Yes** | Plugin name: `csv`, `json`, `text`, `document`, `aws_s3`, `database`, `azure_blob`, `dataverse`, `chroma_sink` |
+| `plugin` | string | **Yes** | Plugin name: `csv`, `json`, `text`, `document`, `aws_s3`, `database`, `azure_blob`, `dataverse` |
 | `on_write_failure` | string | **Yes** | Per-row write failure handling: `discard` to drop with audit record, or a sink name to divert to a failsink |
 | `options` | object | No | Plugin-specific configuration |
 
@@ -1008,7 +1006,9 @@ For local file sinks (`csv`, `json`, `text`), `options.collision_policy` can mak
 | `database` | Write to SQL database |
 | `azure_blob` | Write to Azure Blob Storage |
 | `dataverse` | Write to Microsoft Dataverse via OData v4 REST API |
-| `chroma_sink` | Write to a ChromaDB vector database |
+
+The `chroma_sink` sink was removed in 0.8.18; settings that name it are refused
+as an unknown plugin.
 
 ### Text sink contract
 
@@ -1365,8 +1365,7 @@ The `<response_field>_variables_hash` an LLM node records is the SHA-256 of
 what its template could see: the declared field values (for a query, its
 variables and its `row.source_row`).
 
-**RAG query templates.** A `query_template` on `rag_retrieval` or
-`azure_ai_search` sees `query` (the `query_field` value) and `row`, and the
+**RAG query templates.** A `query_template` on `azure_ai_search` sees `query` (the `query_field` value) and `row`, and the
 rules above apply with one difference: `query_field` is always declared,
 because the node reads it by its own option.
 
@@ -1611,8 +1610,7 @@ hosted server, which is why the web boundary pins `base_url` separately.
 | `aws_textract_document_analysis` | Extract text, tables, forms, and layout from S3-hosted documents through Amazon Textract |
 | `aws_textract_inline_analysis` | Synchronously analyze payload-store documents (managed blobs) through Amazon Textract `AnalyzeDocument` |
 | `pdf_rasterize` | Render each page of a payload-store PDF into a PNG payload, one output row per page — the on-ramp for multipage PDFs into `aws_textract_inline_analysis` |
-| `azure_ai_search` | Azure RAG: enriches rows with ranked, cited context from an existing Azure AI Search index ([example](../../examples/azure_search_rag/README.md)) |
-| `rag_retrieval` | Enriches rows with retrieval-augmented context from a Chroma collection |
+| `azure_ai_search` | Azure RAG: enriches rows with ranked, cited context from an existing Azure AI Search index ([example](../../examples/azure_search_rag/README.md)); the only retrieval transform since 0.8.18 removed the Chroma-backed `rag_retrieval` |
 | `reference_join` | Add named fields through one or several independent lookups against configuration-bound reference tables (`reference_file` on the CLI, an `inline_content` blob on the web) — fixed at run start, never read at row time |
 | `file_inject` | Write the whole content of configuration-bound files into row fields, either every file on every row or one file chosen by a row value (`content_file` on the CLI, an uploaded `inline_content` blob on the web) — fixed at run start, never read at row time ([options](#bound-files-as-row-fields)) |
 
@@ -2743,12 +2741,12 @@ Dependencies are executed in order before the main pipeline starts. Each depende
 
 ## Commencement Gates
 
-Go/no-go conditions evaluated after dependencies complete but before the main pipeline starts. Use these for pre-flight checks (e.g., verifying a vector store is populated).
+Go/no-go conditions evaluated after dependencies complete but before the main pipeline starts. Use these for pre-flight checks (e.g., confirming a dependency run completed).
 
 ```yaml
 commencement_gates:
-  - name: collection_ready
-    condition: "collections['products']['count'] > 0"
+  - name: indexing_done
+    condition: "dependency_runs.get('indexing') is not None"
 ```
 
 | Field | Type | Required | Description |
@@ -2762,14 +2760,13 @@ exists, so `row` is **not** bound. Exactly three names are available:
 
 | Name | Shape | Description |
 |------|-------|-------------|
-| `collections` | `{<collection>: {reachable, count}}` | One entry per [collection probe](#collection-probes) |
+| `collections` | `{<collection>: {reachable, count}}` | One entry per [collection probe](#collection-probes); always empty since 0.8.18, which ships no probe provider |
 | `dependency_runs` | `{<name>: {run_id, settings_hash, duration_ms, indexed_at}}` | One entry per completed [pipeline dependency](#pipeline-dependencies) |
 | `env` | `{<key>: <value>}` | Explicitly supplied non-secret gate environment values |
 
 Because attribute access is forbidden by the grammar, every lookup is a
 subscript or a single-argument `.get()`:
-`collections['products']['count']`, not `collections['products'].count`.
-Nested values are read the same way — `dependency_runs['indexing']['run_id']`.
+`dependency_runs['indexing']['run_id']`, not `dependency_runs['indexing'].run_id`.
 
 Gate failures raise `CommencementGateFailedError` and abort the pipeline. Gate
 passes are recorded in the audit trail; the audited context snapshot includes
@@ -2780,34 +2777,19 @@ from `env`, never its values.
 
 ## Collection Probes
 
-Vector store readiness checks that run after dependencies and populate context for commencement gates.
+No collection probe provider ships since 0.8.18. The only provider probed
+Chroma collections and was removed with the chromadb dependency. The
+`collection_probes` field remains, but it must be empty or absent: a non-empty
+list is refused when settings load with
 
-```yaml
-collection_probes:
-  - collection: products
-    provider: chroma
-    provider_config:
-      persist_directory: ./chroma_data
+```text
+collection_probes is not supported: no collection probe provider ships since 0.8.18 (the Chroma provider was removed with the chromadb dependency). Remove collection_probes from settings.
 ```
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `collection` | string | **Yes** | Collection name to probe |
-| `provider` | string | **Yes** | Provider type (e.g., `chroma`) |
-| `provider_config` | object | No | Provider-specific connection configuration |
-
-Probe results are available to commencement-gate expressions as
-`collections['<collection_name>']`, a mapping with two keys:
-
-| Key | Type | Meaning |
-|-----|------|---------|
-| `reachable` | bool | Whether the probe reached the provider |
-| `count` | int | Documents the probe observed in the collection |
-
-A collection that was never probed is absent from `collections`, and
-subscripting it fails the gate with `Field '<name>' not found in dict` rather
-than reading as zero. Use `collections.get('<name>') is not None` when the probe
-itself is conditional.
+Because nothing is probed, `collections` in a commencement gate is always an
+empty mapping, and a condition that subscripts it fails the gate with
+`CommencementGateFailedError`. Remove gate conditions that read `collections`
+along with the probes.
 
 ---
 

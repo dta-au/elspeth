@@ -699,7 +699,7 @@ class TransformErrorReason(TypedDict):
         violations: Per-violation reason entries (multiple_contract_violations only)
 
     RAG retrieval context:
-        provider: Retrieval provider name (e.g., "azure_search", "chroma")
+        provider: Retrieval provider name (e.g., "azure_search")
         cause: Sub-cause within an error category (e.g., "null_value", "empty_query")
         pattern: Regex pattern string (for no_regex_match/regex_timeout errors)
         skipped_count: Number of candidate hits rejected before final output
@@ -849,7 +849,7 @@ class TransformErrorReason(TypedDict):
     status_code: NotRequired[int]
 
     # RAG retrieval context
-    provider: NotRequired[str]  # Retrieval provider name (e.g., "azure_search", "chroma")
+    provider: NotRequired[str]  # Retrieval provider name (e.g., "azure_search")
     cause: NotRequired[str]  # Sub-cause within error category (e.g., "null_value", "empty_query")
     pattern: NotRequired[str]  # Regex pattern string (for no_regex_match/regex_timeout errors)
     skipped_count: NotRequired[int]  # Candidate hits rejected before final output
@@ -1156,11 +1156,16 @@ class RunMembershipLostError(Exception):
 class RunWorkerEvictedError(Exception):
     """Raised when a worker observes membership loss or leader-seat deposition.
 
-    Latched from the heartbeat CAS miss (slice-4 thread) or raised directly
-    when a membership-fenced verb (``claim_ready`` / ``claim_pending_sink`` /
-    ``enqueue_ready`` / ``heartbeat_lease``, slice 4) refuses with zero rows.
-    The worker abandons in-flight processing without emitting; a returning
-    process mints a fresh worker identity and re-admits.
+    Latched from the heartbeat CAS miss (slice-4 thread); raised by the claim
+    re-probes (``claim_ready_row`` and ``claim_pending_sink``) when a claim
+    statement matches zero rows and the worker is no longer an active member;
+    raised by the claimed-child enqueue's membership precheck, which runs
+    before its insert; and raised by the follower when a
+    membership-fenced verb's :class:`RunMembershipLostError` reaches it while
+    the run is still running. The membership fence that opens every
+    membership-fenced transaction refuses with :class:`RunMembershipLostError`
+    instead (ADR-030 D4). The worker abandons in-flight processing without
+    emitting; a returning process mints a fresh worker identity and re-admits.
 
     Attributes:
         worker_id: The evicted/departed worker identity.
@@ -1169,11 +1174,13 @@ class RunWorkerEvictedError(Exception):
             that observation forward (the heartbeat latch distinguishes "the
             membership fence refused the beat" from "the seat was taken by
             another leader"); ``None`` when it did not, in which case the
-            message is unchanged. All four membership-fenced raise sites pass
-            ``None``, for two different reasons: two probe a boolean
-            ``active_worker_fence_clause`` EXISTS and hold no status to
-            report, while the other two read ``run_workers.status`` to branch
-            on and do not carry the observed value forward. ``None`` therefore
+            message is unchanged. The follower's conversion passes the verb the
+            membership fence refused. The three claim re-probes and the enqueue
+            precheck pass ``None``, for two different reasons: two of them (one
+            claim re-probe and the enqueue precheck) probe a boolean
+            ``active_worker_fence_clause`` EXISTS and hold no status to report,
+            while the other two read ``run_workers.status`` to branch on and do
+            not carry the observed value forward. ``None`` therefore
             asserts only that no observation was supplied — never that none
             was available.
     """
@@ -1209,10 +1216,16 @@ class JoinRefusedError(Exception):
     actionable filesystem-writability failure) without parsing text.
     """
 
-    def __init__(self, run_id: str, reason: str) -> None:
+    def __init__(self, run_id: str, reason: str, *, departure_failure: str | None = None) -> None:
         self.run_id = run_id
         self.reason = reason
+        self.departure_failure = departure_failure
         super().__init__(f"Cannot join run {run_id!r}: {reason}")
+
+
+# TIER-2: Retryable join refusal while the leader is registering the run graph.
+class JoinNotReadyError(JoinRefusedError):
+    """Raised when a follower must retry after graph registration completes."""
 
 
 # ADR-030 §B.1 step 5: leader seat expired while a follower was draining.
@@ -2772,6 +2785,18 @@ class CapacityError(Exception):
             raise ValueError(f"CapacityError.status_code must be a valid HTTP status (100-599), got {status_code}")
         super().__init__(message)
         self.status_code = status_code
+
+
+# Classes the processor records as the row's own failure. Check the live
+# TIER_1_ERRORS registry first: a registered subclass still ends the run.
+ROW_SCOPED_PLUGIN_ERRORS: tuple[type[Exception], ...] = (
+    InterruptedError,
+    PluginRetryableError,
+    ConnectionError,
+    TimeoutError,
+    CapacityError,
+    PluginContractViolation,
+)
 
 
 # TIER-2: telemetry-subsystem configuration/initialization failure.

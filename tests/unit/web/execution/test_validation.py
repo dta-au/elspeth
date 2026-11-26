@@ -1675,15 +1675,10 @@ class TestValidatePipelinePathAllowlist:
             ),
             _make_state(
                 source_options={},
-                nodes=(
-                    _make_node(
-                        plugin="rag_retrieval",
-                        options={
-                            "provider": "chroma",
-                            "provider_config": {"persist_directory": "/outside/chroma"},
-                        },
-                    ),
-                ),
+                # The nested gate is option-shaped (keys on provider_config,
+                # never on the plugin name), so an installed transform carries
+                # the subject now that no shipped plugin declares provider_config.
+                nodes=(_make_node(options={"provider_config": {"persist_directory": "/outside/index"}}),),
             ),
         ],
         ids=("source-path", "sink-path", "nested-transform-persist-directory"),
@@ -3142,43 +3137,39 @@ class TestValidatePipelineSinkPathAllowlist:
 
 
 class TestValidatePipelineTransformProviderConfigPathAllowlist:
-    """Nested transform provider_config path allowlist — RAG retrieval
-    transforms carry a local Chroma persist_directory under
-    options.provider_config; it must be confined like a sink path."""
+    """Nested transform provider_config path allowlist.
+
+    A persist_directory under options.provider_config is a local read/write
+    target and must be confined like a sink path. No shipped plugin declares
+    provider_config since the Chroma retrieval transform was removed; the gate
+    is option-shaped (it never reads the plugin name), so these cases put the
+    option on the installed ``value_transform`` and assert the path_allowlist
+    check itself, which runs before plugin option validation (settings).
+    """
 
     def test_transform_provider_persist_directory_outside_blocked(self) -> None:
-        node = _make_node(
-            plugin="rag_retrieval",
-            options={"provider": "chroma", "provider_config": {"persist_directory": "/etc/cron.d/backdoor"}},
-        )
+        node = _make_node(options={"provider_config": {"persist_directory": "/etc/cron.d/backdoor"}})
         state = _make_state(source_options={}, nodes=(node,))
         settings = _make_settings(data_dir="/tmp/test_data")
         mock_yaml_gen = MagicMock(spec=YamlGenerator)
         result = validate_pipeline_for_trained_operator(state, settings, mock_yaml_gen)
         assert result.is_valid is False
+        _assert_complete_failure_ledger(result, "path_allowlist")
         assert any("Path traversal" in e.message for e in result.errors)
         assert any(e.component_type == "transform" for e in result.errors)
         assert any("persist_directory" in e.message for e in result.errors)
 
     def test_transform_provider_persist_directory_traversal_blocked(self) -> None:
-        node = _make_node(
-            plugin="rag_retrieval",
-            options={
-                "provider": "chroma",
-                "provider_config": {"persist_directory": "/tmp/test_data/outputs/../../etc/secret"},
-            },
-        )
+        node = _make_node(options={"provider_config": {"persist_directory": "/tmp/test_data/outputs/../../etc/secret"}})
         state = _make_state(source_options={}, nodes=(node,))
         settings = _make_settings(data_dir="/tmp/test_data")
         mock_yaml_gen = MagicMock(spec=YamlGenerator)
         result = validate_pipeline_for_trained_operator(state, settings, mock_yaml_gen)
         assert result.is_valid is False
+        _assert_complete_failure_ledger(result, "path_allowlist")
 
     def test_transform_provider_persist_directory_under_outputs_passes(self) -> None:
-        node = _make_node(
-            plugin="rag_retrieval",
-            options={"provider": "chroma", "provider_config": {"persist_directory": "/tmp/test_data/outputs/test-session/chroma"}},
-        )
+        node = _make_node(options={"provider_config": {"persist_directory": "/tmp/test_data/outputs/test-session/index"}})
         state = _make_state(source_options={}, nodes=(node,))
         settings = _make_settings(data_dir="/tmp/test_data")
         mock_yaml_gen = MagicMock(spec=YamlGenerator)
@@ -6908,3 +6899,63 @@ class TestEdgeContractSourceAndStructuralProducerRemedies:
         # No unnamed executable call is offered.
         assert "patch_source_options(patch=" not in suggestion
         assert "COMPLETE claim" in suggestion
+
+
+class TestValidatePipelineRemovedChromaPlugins:
+    """A saved session naming a plugin removed in 0.8.18 is refused, not crashed.
+
+    ``chroma_sink`` and ``rag_retrieval`` left with the chromadb dependency. A
+    composition persisted before the upgrade still names them. Each one is
+    poisoned onto the green base of ``TestValidatePipelineStateShapeMaterialization``
+    (whose control test proves the base validates), and the real YAML generator
+    and validation pipeline must return a blocked result attributed to it.
+    """
+
+    @pytest.fixture
+    def state_dict_and_settings(self, tmp_path: Path) -> tuple[dict[str, Any], WebSettings]:
+        blob_dir = tmp_path / "blobs" / "test-session"
+        blob_dir.mkdir(parents=True)
+        source_csv = blob_dir / "in.csv"
+        source_csv.write_text("a,b\n1,2\n")
+        return TestValidatePipelineStateShapeMaterialization._base_state_dict(str(source_csv)), _make_settings(data_dir=str(tmp_path))
+
+    @staticmethod
+    def _poison(state_dict: dict[str, Any], plugin: str) -> None:
+        if plugin == "rag_retrieval":
+            node = state_dict["nodes"][0]
+            node["plugin"] = "rag_retrieval"
+            node["options"] = {
+                "output_prefix": "kb",
+                "query_field": "a",
+                "provider": "chroma",
+                "provider_config": {"collection": "docs", "mode": "ephemeral"},
+                "schema": {"mode": "observed"},
+            }
+        else:
+            output = state_dict["outputs"][0]
+            output["plugin"] = "chroma_sink"
+            output["options"] = {
+                "collection": "docs",
+                "mode": "ephemeral",
+                "field_mapping": {"document_field": "a", "id_field": "b", "metadata_fields": []},
+                "schema": {"mode": "observed"},
+            }
+
+    @pytest.mark.parametrize("plugin", ["rag_retrieval", "chroma_sink"])
+    @pytest.mark.parametrize("principal", ["web", "trained_operator"])
+    def test_removed_plugin_blocks_validation_with_an_attributed_error(
+        self,
+        state_dict_and_settings: tuple[dict[str, Any], WebSettings],
+        plugin: str,
+        principal: str,
+    ) -> None:
+        state_dict, settings = state_dict_and_settings
+        self._poison(state_dict, plugin)
+        state = CompositionState.from_dict(state_dict)
+
+        validate = validate_pipeline_for_web_principal if principal == "web" else validate_pipeline_for_trained_operator
+        result = validate(state, settings, yaml_generator_module)
+
+        assert result.is_valid is False
+        messages = [error.message for error in result.errors]
+        assert any(plugin in message for message in messages), messages

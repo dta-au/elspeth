@@ -41,6 +41,7 @@ from elspeth.contracts import (
 from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
 from elspeth.contracts.enums import BatchStatus, NodeType
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.hashing import CANONICAL_VERSION
 from elspeth.contracts.results import SourceRow
 from elspeth.contracts.schema_contract import FieldContract, SchemaContract
 from elspeth.contracts.types import AggregationName, NodeID
@@ -1550,7 +1551,7 @@ class TestAggregationRecoveryIntegration:
 
         run = factory.run_lifecycle.begin_run(
             config={"aggregation": {"trigger": {"count": 3}}},
-            canonical_version="sha256-rfc8785-v1",
+            canonical_version=CANONICAL_VERSION,
         )
 
         # Register nodes using raw SQL to avoid schema_config requirement
@@ -1652,7 +1653,7 @@ class TestAggregationRecoveryIntegration:
 
         run = factory.run_lifecycle.begin_run(
             config={"aggregations": ["sum", "count"]},
-            canonical_version="sha256-rfc8785-v1",
+            canonical_version=CANONICAL_VERSION,
         )
 
         # Register multiple aggregation nodes
@@ -1736,7 +1737,7 @@ class TestAggregationRecoveryIntegration:
 
         run = factory.run_lifecycle.begin_run(
             config={"test": "order_preservation"},
-            canonical_version="sha256-rfc8785-v1",
+            canonical_version=CANONICAL_VERSION,
         )
 
         self._register_nodes_raw(db, run.run_id)
@@ -1800,7 +1801,7 @@ class TestAggregationRecoveryIntegration:
 
         run = factory.run_lifecycle.begin_run(
             config={"test": "retry_validation"},
-            canonical_version="sha256-rfc8785-v1",
+            canonical_version=CANONICAL_VERSION,
         )
 
         self._register_nodes_raw(db, run.run_id)
@@ -1960,7 +1961,7 @@ class TestAggregationRecoveryIntegration:
 
         run = factory.run_lifecycle.begin_run(
             config={"aggregation": {"trigger": {"timeout_seconds": 60}}},
-            canonical_version="sha256-rfc8785-v1",
+            canonical_version=CANONICAL_VERSION,
             leader_worker_id="seeder",
         )
 

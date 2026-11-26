@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 import weakref
+from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
@@ -126,6 +127,7 @@ from elspeth.web.coordination.rate_limit_authority import RepositoryRateLimitAut
 from elspeth.web.coordination.repository import PostgresSessionOperationRepository
 from elspeth.web.coordination.review_authority import RepositoryReviewAuthority
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
+from elspeth.web.coordination.upkeep_engine import create_lease_upkeep_engine
 from elspeth.web.coordination.websocket_ticket_authority import RepositorySessionWebsocketTicketAuthority
 from elspeth.web.coordination.workflow_scope_reader import RepositoryWorkflowScopeReader
 from elspeth.web.credential_guard import CredentialMaterialRefused
@@ -267,9 +269,33 @@ _RETRYABLE_STORAGE_ERRNOS: frozenset[int] = frozenset(
 )
 
 
-def _dispose_session_engine(engine: Engine) -> None:
-    """Dispose the sessions DB pool for app instances that never run lifespan."""
-    engine.dispose()
+def _dispose_session_engine(engine: Engine, lease_upkeep_engine: Engine | None) -> None:
+    """Dispose the sessions DB pools: the lease-upkeep pool, then the main pool.
+
+    The main pool is disposed even when disposing the upkeep pool raises; if
+    both fail, the main failure carries the upkeep failure as its context.
+    """
+    try:
+        if lease_upkeep_engine is not None:
+            lease_upkeep_engine.dispose()
+    finally:
+        engine.dispose()
+
+
+def _create_lease_upkeep_engine(session_engine: Engine, *, connect_timeout_seconds: int | None = None) -> Engine | None:
+    """Build the dedicated lease-upkeep pool on the database ``session_engine`` targets.
+
+    Returns ``None`` for an in-memory SQLite database, which a second engine
+    cannot share; upkeep then uses the main engine. On failure the already
+    built main engine is disposed before the error propagates.
+    """
+    try:
+        return create_lease_upkeep_engine(
+            session_engine.url.render_as_string(hide_password=False), connect_timeout_seconds=connect_timeout_seconds
+        )
+    except BaseException:
+        session_engine.dispose()
+        raise
 
 
 def _run_session_engine_finalizer(
@@ -394,7 +420,8 @@ async def _reconcile_pending_landscape_runs(
     create_tables: bool,
 ) -> None:
     candidates = await session_service.list_pending_landscape_reconciliations()
-    complete_run_ids, absent_run_ids = _finalize_orphaned_landscape_runs(
+    complete_run_ids, absent_run_ids = await run_sync_in_worker(
+        _finalize_orphaned_landscape_runs,
         landscape_url,
         candidates,
         create_tables=create_tables,
@@ -1246,20 +1273,80 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
         raise BaseExceptionGroup("Application lifecycle obligations failed", failures) from None
 
 
+_MIB = 1024 * 1024
+# The one route class whose body may exceed the default ceiling: the multipart
+# blob upload, ``POST /api/sessions/{session_id: UUID}/blobs`` (blobs/routes.py).
+# A full match on the exact path; the inline route and every other path keep
+# the default ceiling.
+_BLOB_UPLOAD_PATH = re.compile(r"/api/sessions/[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}/blobs")
+
+
+@dataclass(slots=True)
+class _LargeBodyClaim:
+    """Whether one request holds a large-body slot; released in the caller's ``finally``."""
+
+    held: bool = False
+
+
 class _BodySizeLimitMiddleware:
     """Bound HTTP bodies before routing, authentication, or JSON parsing.
 
     Content-Length permits early rejection, but the received bytes enforce
     the ceiling even when that header is absent or understates the body.
     Buffer at most 10 MiB within 30 seconds, then replay through the normal ASGI path.
-    No downstream response has begun when an oversized stream is refused.
+    A multipart blob upload may instead buffer ``max_upload_bytes`` plus a 1 MiB
+    multipart envelope, within a deadline scaled to keep the same minimum rate
+    (30 seconds per 10 MiB); the route still enforces ``max_upload_bytes`` on
+    the file itself. At most ``_MAX_LARGE_BODIES`` bodies over the default
+    ceiling are held at once, from the moment one is declared or read past it
+    until the downstream app returns; another is refused with 503 before it
+    is read further. A large body is replayed chunk by chunk as received, and
+    each chunk is released as the downstream app consumes it. No downstream
+    response has begun when an oversized stream is refused.
     """
 
-    _MAX_BODY_BYTES = 10 * 1024 * 1024  # 10 MB
+    _MAX_BODY_BYTES = 10 * _MIB  # every request except a multipart blob upload
     _MAX_BODY_READ_SECONDS = 30.0
+    _UPLOAD_ENVELOPE_BYTES = _MIB
+    _MAX_LARGE_BODIES = 4
+    _LARGE_BODY_RETRY_SECONDS = 30
 
-    def __init__(self, app: ASGIApp) -> None:
+    def __init__(self, app: ASGIApp, *, max_upload_bytes: int | None = None) -> None:
         self.app = app
+        # None: no upload class; every request takes the default ceiling.
+        self._upload_body_bytes = None if max_upload_bytes is None else max_upload_bytes + self._UPLOAD_ENVELOPE_BYTES
+        # Bodies over the default ceiling currently held. Claimed and released
+        # without an await in between, so the event loop needs no lock.
+        self._large_bodies = 0
+
+    def _claim_large_body(self) -> bool:
+        if self._large_bodies >= self._MAX_LARGE_BODIES:
+            return False
+        self._large_bodies += 1
+        return True
+
+    def _busy(self) -> StarletteResponse:
+        return StarletteResponse(
+            content='{"error": "Too many large uploads in progress; retry shortly"}',
+            status_code=503,
+            media_type="application/json",
+            headers={"Retry-After": str(self._LARGE_BODY_RETRY_SECONDS), "Connection": "close"},
+        )
+
+    def _limits(self, scope: Scope) -> tuple[int, float]:
+        """The byte ceiling and read deadline for this request's route class."""
+        limit = self._MAX_BODY_BYTES
+        if self._upload_body_bytes is not None and scope["method"] == "POST" and _BLOB_UPLOAD_PATH.fullmatch(scope["path"]):
+            limit = max(limit, self._upload_body_bytes)
+        seconds = max(self._MAX_BODY_READ_SECONDS, self._MAX_BODY_READ_SECONDS * limit / self._MAX_BODY_BYTES)
+        return limit, seconds
+
+    @staticmethod
+    def _too_large(limit: int) -> StarletteResponse:
+        shown = f"{limit // _MIB} MB" if limit % _MIB == 0 else f"{limit} bytes"
+        return StarletteResponse(
+            content=f'{{"error": "Request body too large (max {shown})"}}', status_code=413, media_type="application/json"
+        )
 
     @trust_boundary(
         tier=3,
@@ -1269,7 +1356,8 @@ class _BodySizeLimitMiddleware:
         source_param="scope",
         suppresses=("R1",),
         invariant="a malformed Content-Length returns 400 before reading; declared or received "
-        "bytes over _MAX_BODY_BYTES return 413 before downstream dispatch; absent headers do not "
+        "bytes over the route class's ceiling return 413 before downstream dispatch; a body over the default "
+        "ceiling beyond the concurrent large-body limit returns 503 before downstream dispatch; absent headers do not "
         "bypass received-byte accounting; an incomplete body returns 408 within the "
         "overall read deadline before downstream dispatch",
         non_raising=True,
@@ -1278,6 +1366,17 @@ class _BodySizeLimitMiddleware:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
+        claim = _LargeBodyClaim()
+        try:
+            await self._bounded(scope, receive, send, claim)
+        finally:
+            # Every exit, including a raising downstream app and cancellation.
+            if claim.held:
+                self._large_bodies -= 1
+
+    async def _bounded(self, scope: Scope, receive: Receive, send: Send, claim: _LargeBodyClaim) -> None:
+        """Read, bound and dispatch one HTTP request, recording any large-body slot it takes on ``claim``."""
+        max_body_bytes, read_seconds = self._limits(scope)
         content_length = Headers(scope=scope).get("content-length")
         if content_length is not None:
             if not content_length.isascii() or not content_length.isdecimal():
@@ -1290,16 +1389,19 @@ class _BodySizeLimitMiddleware:
                 response = StarletteResponse(content='{"error": "Invalid Content-Length"}', status_code=400, media_type="application/json")
                 await response(scope, receive, send)
                 return
-            if content_length_bytes > self._MAX_BODY_BYTES:
-                response = StarletteResponse(
-                    content='{"error": "Request body too large (max 10 MB)"}', status_code=413, media_type="application/json"
-                )
-                await response(scope, receive, send)
+            if content_length_bytes > max_body_bytes:
+                await self._too_large(max_body_bytes)(scope, receive, send)
                 return
+            if content_length_bytes > self._MAX_BODY_BYTES:
+                if not self._claim_large_body():
+                    await self._busy()(scope, receive, send)
+                    return
+                claim.held = True
 
-        body = bytearray()
+        chunks: deque[bytes] = deque()
+        received = 0
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + self._MAX_BODY_READ_SECONDS
+        deadline = loop.time() + read_seconds
         while True:
             # Empty immediately-ready chunks still yield to cancellation
             # and other requests; awaiting receive alone need not yield.
@@ -1322,28 +1424,35 @@ class _BodySizeLimitMiddleware:
             if message["type"] == "http.disconnect":
                 return
             chunk = message.get("body", b"")
-            if len(chunk) > self._MAX_BODY_BYTES - len(body):
-                response = StarletteResponse(
-                    content='{"error": "Request body too large (max 10 MB)"}', status_code=413, media_type="application/json"
-                )
-                await response(scope, receive, send)
+            if len(chunk) > max_body_bytes - received:
+                await self._too_large(max_body_bytes)(scope, receive, send)
                 return
-            body.extend(chunk)
+            received += len(chunk)
+            if not claim.held and received > self._MAX_BODY_BYTES:
+                if not self._claim_large_body():
+                    await self._busy()(scope, receive, send)
+                    return
+                claim.held = True
+            if chunk:
+                chunks.append(chunk)
             if not message.get("more_body", False):
                 break
 
-        pending_body: bytes | None = bytes(body)
-        del body
+        if not claim.held:
+            # A default-class body is replayed whole, as one message.
+            chunks = deque([b"".join(chunks)])
+        replay_done = False
 
         async def receive_bounded_body() -> Message:
-            nonlocal pending_body
-            if pending_body is not None:
-                payload = pending_body
-                pending_body = None
-                return {"type": "http.request", "body": payload, "more_body": False}
+            nonlocal replay_done
+            if not replay_done:
+                payload = chunks.popleft() if chunks else b""
+                replay_done = not chunks
+                return {"type": "http.request", "body": payload, "more_body": not replay_done}
             return await receive()
 
         await self.app(scope, receive_bounded_body, send)
+        return
 
 
 # The browser only ever talks to ELSPETH itself: the SSO code exchange is the
@@ -1956,7 +2065,7 @@ def _create_app(
     # id — by design the check fires before RequestIdMiddleware — which
     # is acceptable: the response carries the standard 413 semantics and
     # a body-too-large rejection has no useful pairing to a slog event.
-    app.add_middleware(_BodySizeLimitMiddleware)
+    app.add_middleware(_BodySizeLimitMiddleware, max_upload_bytes=settings.max_upload_bytes)
     app.add_middleware(_BrowserDocumentHeadersMiddleware)
     # Instance identity registered after every other middleware so it runs
     # OUTERMOST: every response — the body-size 413, the request-id
@@ -1971,6 +2080,7 @@ def _create_app(
     app.state.platform_identity = platform_identity
 
     external_session_engine: Engine | None = None
+    lease_upkeep_engine: Engine | None = None
     if settings.auth_provider == "local" and external_state:
         from elspeth.web.auth.local import validate_existing_local_auth_store
 
@@ -1987,9 +2097,10 @@ def _create_app(
                 connect_args={"connect_timeout": _CONNECT_TIMEOUT_SECONDS},
                 **postgres_engine_kwargs(raw_session_url),
             )
+            lease_upkeep_engine = _create_lease_upkeep_engine(external_session_engine, connect_timeout_seconds=_CONNECT_TIMEOUT_SECONDS)
         except (SQLAlchemyError, ImportError):
             raise profile.session_engine_not_ready_error() from None
-        session_engine_finalizer = weakref.finalize(app, _dispose_session_engine, external_session_engine)
+        session_engine_finalizer = weakref.finalize(app, _dispose_session_engine, external_session_engine, lease_upkeep_engine)
         register_session_engine_finalizer(session_engine_finalizer)
         app.state._session_engine_finalizer = session_engine_finalizer
         profile.validate_only_schema_or_raise(settings, external_session_engine)
@@ -2043,13 +2154,20 @@ def _create_app(
     else:
         session_db_url = settings.get_session_db_url()
         session_engine = create_session_engine(session_db_url, **postgres_engine_kwargs(session_db_url))
-        session_engine_finalizer = weakref.finalize(app, _dispose_session_engine, session_engine)
+        lease_upkeep_engine = _create_lease_upkeep_engine(session_engine)
+        session_engine_finalizer = weakref.finalize(app, _dispose_session_engine, session_engine, lease_upkeep_engine)
         register_session_engine_finalizer(session_engine_finalizer)
         app.state._session_engine_finalizer = session_engine_finalizer
         initialize_session_schema(session_engine)
         session_db_path = session_engine.url.database
         if session_engine.dialect.name == "sqlite" and session_db_path not in (None, ":memory:"):
             session_engine.dispose()
+            if lease_upkeep_engine is not None:
+                lease_upkeep_engine.dispose()
+    # Lease renewal, plain release and the heartbeat check out from this pool,
+    # never from the main one; in-memory SQLite shares the main engine.
+    lease_upkeep_bind = session_engine if lease_upkeep_engine is None else lease_upkeep_engine
+    app.state.lease_upkeep_engine = lease_upkeep_engine
 
     # Build the sessions-telemetry container ONCE per process and share it
     # across every consumer (SessionServiceImpl, ExecutionServiceImpl, and
@@ -2141,12 +2259,22 @@ def _create_app(
             session_engine,
             quota_exceeded_recorder=audit_recorder.record_quota_exceeded,
             approval_supersession_recorder=audit_recorder.record_approval_superseded,
+            lease_upkeep_authority=SQLiteLocalSessionOperationAuthority(
+                lease_upkeep_bind,
+                quota_exceeded_recorder=audit_recorder.record_quota_exceeded,
+                approval_supersession_recorder=audit_recorder.record_approval_superseded,
+            ),
         )
     elif session_engine.dialect.name == "postgresql":
         session_operation_authority = PostgresSessionOperationRepository(
             session_engine,
             quota_exceeded_recorder=audit_recorder.record_quota_exceeded,
             approval_supersession_recorder=audit_recorder.record_approval_superseded,
+            lease_upkeep_authority=PostgresSessionOperationRepository(
+                lease_upkeep_bind,
+                quota_exceeded_recorder=audit_recorder.record_quota_exceeded,
+                approval_supersession_recorder=audit_recorder.record_approval_superseded,
+            ),
         )
     else:
         raise NotImplementedError(f"Session operation authority is not implemented for dialect {session_engine.dialect.name}")
@@ -2285,7 +2413,10 @@ def _create_app(
     web_instance_membership: WebInstanceMembership
     if session_engine.dialect.name == "postgresql":
         web_instance_membership = RegisteredWebInstanceMembership(
-            RepositoryWebInstanceMembershipAuthority(session_engine),
+            RepositoryWebInstanceMembershipAuthority(
+                session_engine,
+                lease_upkeep_authority=RepositoryWebInstanceMembershipAuthority(lease_upkeep_bind),
+            ),
             web_instance_identity_from_settings(settings, instance_id=session_service.session_operation_owner_instance_id),
             lease_seconds=session_service.session_operation_lease_seconds,
             process_recovery=process_recovery,
@@ -2584,6 +2715,35 @@ def _create_app(
         request_id = _request_id(request)
         _handler_slog.error(
             "http_required_generation_unavailable",
+            path=request.url.path,
+            method=request.method,
+            request_id=request_id,
+            exc_class=type(exc).__name__,
+        )
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": "Database is currently unavailable. Please retry in a moment.",
+                "error_type": "database_unavailable",
+                "request_id": request_id,
+            },
+        )
+
+    # ``AsyncWorkerAdmissionTimeoutError`` is a ``TimeoutError`` and so an
+    # ``OSError``. Without this exact-class key, Starlette's MRO lookup hands
+    # it to ``handle_storage_unavailable``, which re-raises it (its errno is
+    # None) and the request ends as a 500. A full shared worker pool is a
+    # supported, retryable refusal: answer it with the same 503
+    # ``database_unavailable`` body ``project_composer_operation_error`` gives
+    # it on the composer paths. WebSocket scopes keep the previous outcome:
+    # the exception propagates unchanged.
+    @app.exception_handler(AsyncWorkerAdmissionTimeoutError)
+    async def handle_worker_admission_timeout(request: Request, exc: AsyncWorkerAdmissionTimeoutError) -> JSONResponse:
+        if request.scope["type"] != "http":
+            raise exc
+        request_id = _request_id(request)
+        _handler_slog.error(
+            "http_worker_admission_timeout",
             path=request.url.path,
             method=request.method,
             request_id=request_id,

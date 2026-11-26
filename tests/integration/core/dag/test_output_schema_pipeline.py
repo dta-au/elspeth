@@ -5,7 +5,7 @@ Tests the full production path:
   from_plugin_instances() → DAG builder → NodeInfo propagation →
   validate_edge_compatibility() field resolution.
 
-Group 1: Real RAGRetrievalTransform proves end-to-end contract propagation.
+Group 1: Real AzureAISearchTransform proves end-to-end contract propagation.
 Group 2: Mock transforms exercise edge validation scenarios.
 
 Prerequisite: Output schema contract enforcement (Tasks 1-3 from the
@@ -28,7 +28,7 @@ from elspeth.contracts.schema_contract import OutputFieldDeclaration
 from elspeth.core.config import SourceSettings, TransformSettings
 from elspeth.core.dag import ExecutionGraph, GraphValidationError
 from elspeth.core.dag.wiring import WiredTransform
-from elspeth.plugins.transforms.rag.transform import RAGRetrievalTransform
+from elspeth.plugins.transforms.azure.ai_search import AzureAISearchTransform
 
 
 class MockSource:
@@ -144,12 +144,13 @@ class TestRealTransformPropagation:
         from tests.fixtures.factories import wire_transforms
         from tests.fixtures.plugins import CollectSink, ListSource
 
-        rag = RAGRetrievalTransform(
+        rag = AzureAISearchTransform(
             {
                 "output_prefix": "sci",
                 "query_field": "question",
-                "provider": "chroma",
-                "provider_config": {"collection": "test-col", "mode": "ephemeral"},
+                "endpoint": "https://invariant.example.search.windows.net",
+                "index": "test-index",
+                "api_key": "probe-key",
                 "schema_config": {"mode": "observed"},
             }
         )
@@ -179,7 +180,7 @@ class TestRealTransformPropagation:
         )
 
         # Find the RAG transform node
-        rag_nodes = [n for n in graph.get_nodes() if n.plugin_name == "rag_retrieval"]
+        rag_nodes = [n for n in graph.get_nodes() if n.plugin_name == "azure_ai_search"]
         assert len(rag_nodes) == 1
         node_info = rag_nodes[0]
 

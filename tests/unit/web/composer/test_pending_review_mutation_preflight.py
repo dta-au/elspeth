@@ -107,6 +107,7 @@ async def test_mutation_feedback_checks_real_graph_while_reviews_pending(
         result = await service._completion._surface_and_finalize_no_tools(
             assistant_message=_admit_composer_llm_completion(_fake_llm_response(content="The pipeline is ready.")).message,
             state=state,
+            turn_start_state=state,
             session_id=session_id,
             current_state_id=str(uuid4()),
             progress=None,

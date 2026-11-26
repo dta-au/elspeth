@@ -1488,8 +1488,8 @@ class TestEnvPlaceholderGuardIsDerived:
     @pytest.mark.parametrize(
         ("section_name", "plugin_name", "option_name"),
         [
-            ("transforms", "rag_retrieval", "output_prefix"),
-            ("transforms", "rag_retrieval", "context_separator"),
+            ("transforms", "azure_ai_search", "output_prefix"),
+            ("transforms", "azure_ai_search", "context_separator"),
             ("transforms", "batch_classifier_metrics", "actual_field"),
             ("transforms", "batch_classifier_metrics", "predicted_field"),
             ("transforms", "batch_outlier_annotator", "value_field"),

@@ -50,10 +50,12 @@ from elspeth.web.composer.protocol import ComposerPluginCrashError, ComposerResu
 from elspeth.web.composer.provider_errors import ProviderRequestFailure
 from elspeth.web.composer.state import CompositionState, ValidationSummary
 from elspeth.web.composer.tools._common import ToolResult
+from elspeth.web.credential_guard import CredentialMaterialRefused
 from elspeth.web.sessions._persist_payload import AuditOutcome, RedactedToolRow
 
 if TYPE_CHECKING:
     from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointVerdict
+    from elspeth.web.composer.turn_effects import BlobDeliveryAttempt
 
 _ToolOutcomeResponse = ToolResult | Mapping[str, Any] | None
 
@@ -267,13 +269,16 @@ class _ToolOutcome:
 class _CallModelOutcome:
     """Result of one LLM call in the compose loop (Phase P1).
 
-    The sole field is the frozen completion admitted before the provider
+    ``completion`` is the frozen completion admitted before the provider
     object leaves the Tier-3 boundary. P2 reads its owned message, P3 consumes
     its already-admitted tool batch and provider metadata, and P5's B-4D-3
-    last-chance path consumes the same carrier directly.
+    last-chance path consumes the same carrier directly. ``delivery`` is set
+    only for that last-chance call; its caller confirms the delivery itself,
+    and only when the reply carries no tool calls.
     """
 
     completion: _AdmittedLLMCompletion
+    delivery: BlobDeliveryAttempt | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -310,12 +315,24 @@ class _TerminateOutcome:
 
 
 @dataclass(frozen=True, slots=True)
+class _PluginCrash:
+    """A tool-handler crash together with the exception that caused it.
+
+    The two always travel as one value: there is no crash without its cause,
+    so the driver has no "cause missing" case to handle.
+    """
+
+    error: ComposerPluginCrashError
+    cause: BaseException
+
+
+@dataclass(frozen=True, slots=True)
 class _DispatchOutcome:
     """Result of dispatching one tool batch (Phase P3 → P4 → P5).
 
     Replaces the per-iteration scratch locals (``turn_has_mutation``,
     ``turn_has_discovery``, ``all_cache_hits``, ``tool_outcomes``,
-    ``plugin_crash``, ``plugin_crash_cause``, ``pre_state_id``,
+    ``plugin_crash``, ``pre_state_id``,
     ``decoded_args_by_call_id``) with a single visible boundary.
 
     State mutation happens *inside* P3 (every successful tool call
@@ -349,13 +366,18 @@ class _DispatchOutcome:
     all_cache_hits: bool
 
     # Plugin-crash carrier — P4 must propagate this AFTER persist
-    plugin_crash: ComposerPluginCrashError | None
-    plugin_crash_cause: BaseException | None
+    plugin_crash: _PluginCrash | None
 
     # First-party advisor failure — unlike plugin_crash this keeps the
     # original exception type, but follows the same persist-before-propagate
     # discipline so the request_advisor_hint row is never left OPEN.
     advisor_failure: Exception | None
+
+    # The dispatcher's credential scan refused a call's arguments. The call's
+    # value-free ARG_ERROR row is already recorded; like plugin_crash, the
+    # driver raises this only after P4 has persisted the turn, so earlier
+    # calls' rows and state stay durable.
+    credential_refusal: CredentialMaterialRefused | None
 
     # Advisor-tool compose timeout — the tool envelope is already closed in
     # P3, but P4 must persist/redact the current assistant+tool turn before the

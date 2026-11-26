@@ -228,7 +228,6 @@ allowed_dict_patterns:
   - "src/elspeth/plugins/transforms/aws/textract_inline_analysis.py:AWSTextractInlineAnalysis.probe_config:return"
   - "src/elspeth/plugins/transforms/llm/transform.py:LLMTransform.probe_config:return"
   - "src/elspeth/plugins/sources/llm/source.py:LLMSource.probe_config:return"
-  - "src/elspeth/plugins/transforms/rag/transform.py:RAGRetrievalTransform.probe_config:return"
   - "src/elspeth/plugins/transforms/azure/ai_search.py:AzureAISearchTransform.probe_config:return"
   # Sink probe_config, same contract as the transform hook above: a sink that
   # declares input_semantic_requirements() must be instantiable in isolation
@@ -239,8 +238,6 @@ allowed_dict_patterns:
   - "src/elspeth/plugins/sinks/power_automate.py:PowerAutomateSink.probe_config:return"
 
   # Plugin implementations - config input
-  - "src/elspeth/plugins/sinks/chroma_sink.py:ChromaSink.__init__:config"
-  - "src/elspeth/plugins/sinks/chroma_sink.py:ChromaSink.write:rows (list)"
   - "src/elspeth/plugins/sinks/database_sink.py:DatabaseSink.__init__:config"
   - "src/elspeth/plugins/sinks/csv_sink.py:CSVSink.__init__:config"
   - "src/elspeth/plugins/sinks/json_sink.py:JSONSink.__init__:config"
@@ -479,7 +476,6 @@ allowed_dict_patterns:
   - "src/elspeth/plugins/transforms/llm/transform.py:LLMTransform.__init__:config"
 
   # RAG retrieval transform (config is user YAML — Tier 3 boundary, parsed into RAGRetrievalConfig)
-  - "src/elspeth/plugins/transforms/rag/transform.py:RAGRetrievalTransform.__init__:config"
   # Shared retrieval core — forwards the same raw plugin config to BaseTransform
   - "src/elspeth/plugins/transforms/rag/core.py:RetrievalTransformBase.__init__:config"
   # Azure AI Search transform (config is user YAML — Tier 3 boundary, parsed into AzureAISearchConfig)

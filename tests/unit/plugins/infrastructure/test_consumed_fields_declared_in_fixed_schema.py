@@ -225,15 +225,16 @@ class TestProvenanceIsAttributedHonestly:
         assert "'doc_url' (named by source_field)" in str(excinfo.value)
 
     def test_rag_names_query_field(self) -> None:
-        from elspeth.plugins.transforms.rag.transform import RAGRetrievalTransform
+        from elspeth.plugins.transforms.azure.ai_search import AzureAISearchTransform
 
         with pytest.raises(PluginConfigError) as excinfo:
-            RAGRetrievalTransform(
+            AzureAISearchTransform(
                 {
                     "query_field": "q",
                     "output_prefix": "rag",
-                    "provider": "chroma",
-                    "provider_config": {"collection": "ragcoll", "persist_directory": "/tmp/rag-probe"},
+                    "endpoint": "https://ragcoll.search.windows.net",
+                    "index": "ragcoll",
+                    "api_key": "test-key",
                     "schema": {"mode": "fixed", "fields": ["id: str"]},
                 }
             )

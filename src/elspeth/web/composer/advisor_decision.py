@@ -14,6 +14,7 @@ class AdvisorBlockCause(StrEnum):
     MESSAGE_REJECTED = "message_rejected"
     PUBLICATION_REJECTED = "publication_rejected"
     BUDGET_EXHAUSTED = "budget_exhausted"
+    PRIOR_CALL_COST_UNKNOWN = "prior_call_cost_unknown"
 
 
 @dataclass(frozen=True, slots=True)

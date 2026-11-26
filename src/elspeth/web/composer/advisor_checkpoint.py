@@ -9,6 +9,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Literal, cast
 
 from openai import OpenAIError
@@ -26,7 +27,7 @@ from elspeth.contracts.prompt_guard import (
     PromptGuardTrust,
     detach_prompt_guard_evidence,
 )
-from elspeth.contracts.provider_rejection import SafeRequestRejection
+from elspeth.contracts.provider_rejection import ReasonSource, SafeRequestRejection
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.composer import advisor_context as _advisor_context
@@ -112,7 +113,11 @@ from elspeth.web.composer.prompt_guard import (
 )
 from elspeth.web.composer.protocol import ComposerResult, ComposerSettings, ToolArgumentError
 from elspeth.web.composer.provider_context import capture_provider_context
-from elspeth.web.composer.provider_errors import ProviderRequestFailure, classify_provider_failure, is_context_length_rejection
+from elspeth.web.composer.provider_errors import (
+    ProviderRequestFailure,
+    classify_provider_failure,
+    request_size_rejection,
+)
 from elspeth.web.composer.provider_gateway import (
     _capture_composer_llm_completion_fields,
     _MalformedLLMResponseError,
@@ -251,6 +256,36 @@ def _parse_advisor_checkpoint_guidance(guidance: str, *, phase: AdvisorCheckpoin
         email_redactions=sanitized.email_redactions,
         publication_verdict=response.publication_verdict if isinstance(response, AdvisorEndResponse) else None,
     )
+
+
+# Unrendered-verdict class for each END block reason, written out for every
+# member: a reason missing here raises instead of being silently relabelled
+# "malformed". Rendered reasons (publication_withheld and the flagged ones)
+# carry an ok verdict and do not reach the unrendered composers; they keep the
+# value the previous fall-through gave them.
+_UNRENDERED_FAILURE_CLASS_BY_REASON: Final[
+    Mapping[str, Literal["unavailable", "request_rejected", "malformed", "budget_exhausted", "prior_call_cost_unknown"]]
+] = MappingProxyType(
+    {
+        "unavailable": "unavailable",
+        "request_rejected": "request_rejected",
+        "malformed": "malformed",
+        "budget_exhausted": "budget_exhausted",
+        "prior_call_cost_unknown": "prior_call_cost_unknown",
+        "publication_withheld": "malformed",
+        "flagged_final_pass": "malformed",
+        "flagged_no_repair": "malformed",
+        "flagged_unrepairable": "malformed",
+    }
+)
+
+
+def _unrendered_failure_class(
+    reason: AdvisorTerminalBlockReason,
+) -> Literal["unavailable", "request_rejected", "malformed", "budget_exhausted", "prior_call_cost_unknown"]:
+    if reason not in _UNRENDERED_FAILURE_CLASS_BY_REASON:
+        raise AuditIntegrityError(f"END block reason {reason!r} has no unrendered verdict class")
+    return _UNRENDERED_FAILURE_CLASS_BY_REASON[reason]
 
 
 class AdvisorCheckpointOwner:
@@ -488,6 +523,8 @@ class AdvisorCheckpointOwner:
         on_provider_dispatch: Callable[[], None] | None = None,
         provider_custody: ProviderCallCustody | None = None,
         continuation_budget: PlannerContinuationBudget | None = None,
+        leave_out_all_earlier: bool = False,
+        on_earlier_turn_sent: Callable[[bool], None] | None = None,
     ) -> tuple[str, dict[str, Any]]:
         """Phone the configured advisor (frontier) model for a hint.
 
@@ -592,7 +629,11 @@ class AdvisorCheckpointOwner:
                     detach_prompt_guard_evidence([message for index, message in enumerate(messages) if index != 1]).messages, None
                 )[2].total_bytes,
                 recorder=recorder,
+                leave_out_all_earlier=leave_out_all_earlier,
             )
+            if on_earlier_turn_sent is not None:
+                counts = sent_transcript.history_by_age
+                on_earlier_turn_sent(counts is not None and counts.whole + counts.request_only > 0)
             if sent_transcript is not transcript:
                 key, value = bound(sent_transcript)
                 arguments = {**unshaped, key: value}
@@ -612,6 +653,7 @@ class AdvisorCheckpointOwner:
         response_metadata: _AdmittedLLMProviderMetadata | None = None
         error_class: str | None = None
         error_message: str | None = None
+        rejection_reason_source: ReasonSource | None = None
         kwargs: dict[str, Any] = build_advisor_request_options(
             model=advisor_model,
             temperature=self._settings.composer_temperature,
@@ -720,8 +762,10 @@ class AdvisorCheckpointOwner:
             failure = classify_provider_failure(exc)
             status = failure.audit_status if failure is not None else ComposerLLMCallStatus.API_ERROR
             error_class = type(exc).__name__
-            # As the provider gateway records it: a context-length rejection is named.
-            error_message = "context_length_exceeded" if is_context_length_rejection(exc) else error_class
+            # As the provider gateway records it: a size rejection is named, with what recognised it.
+            size_rejection = request_size_rejection(exc)
+            error_message = error_class if size_rejection is None else size_rejection.reason_code
+            rejection_reason_source = None if size_rejection is None else size_rejection.reason_source
             raise
         except _MalformedLLMResponseError as exc:
             status = ComposerLLMCallStatus.MALFORMED_RESPONSE
@@ -769,6 +813,7 @@ class AdvisorCheckpointOwner:
                             response_metadata=response_metadata,
                             error_class=error_class,
                             error_message=error_message,
+                            rejection_reason_source=rejection_reason_source,
                             max_completion_tokens_requested=max_completion,
                             credential_surface="composer_advisor_response",
                             provider_custody=provider_custody,
@@ -798,6 +843,7 @@ class AdvisorCheckpointOwner:
         render: Callable[[AdvisorVisibleTranscript], str],
         fixed_bytes: int,
         recorder: BufferingRecorder | None,
+        leave_out_all_earlier: bool = False,
     ) -> AdvisorVisibleTranscript:
         """The transcript to send: earlier turns by age, priced; under pressure fewer.
 
@@ -830,9 +876,12 @@ class AdvisorCheckpointOwner:
             )
 
         shaped = transcript.by_age()
+        if leave_out_all_earlier and shaped.history_by_age is not None:
+            maximum = shaped.history_by_age
+            shaped = transcript.by_age(older_left_out=maximum.request_only, whole_left_out=maximum.whole)
         estimate = priced(shaped)
         counts = shaped.history_by_age
-        if estimate.anchored and estimate.tokens > limit and counts is not None:
+        if not leave_out_all_earlier and estimate.anchored and estimate.tokens > limit and counts is not None:
             # Leaving out one more request or turn only ever shrinks the request,
             # so the fewest steps that fit are found by bisection.
             older = counts.request_only
@@ -865,6 +914,8 @@ class AdvisorCheckpointOwner:
         structured_output: bool = False,
         on_provider_dispatch: Callable[[], None] | None = None,
         continuation_budget: PlannerContinuationBudget | None = None,
+        leave_out_all_earlier: bool = False,
+        on_earlier_turn_sent: Callable[[bool], None] | None = None,
     ) -> tuple[str, dict[str, Any]]:
         return await self._call_advisor_with_audit_body(
             arguments,
@@ -873,6 +924,8 @@ class AdvisorCheckpointOwner:
             structured_output=structured_output,
             on_provider_dispatch=on_provider_dispatch,
             continuation_budget=continuation_budget,
+            leave_out_all_earlier=leave_out_all_earlier,
+            on_earlier_turn_sent=on_earlier_turn_sent,
         )
 
     async def _call_advisor_with_audit(
@@ -885,6 +938,8 @@ class AdvisorCheckpointOwner:
         on_provider_dispatch: Callable[[], None] | None = None,
         provider_owner: ProviderInvocationOwner | None = None,
         continuation_budget: PlannerContinuationBudget | None = None,
+        leave_out_all_earlier: bool = False,
+        on_earlier_turn_sent: Callable[[bool], None] | None = None,
     ) -> tuple[str, dict[str, Any]]:
         if provider_owner is None:
             return await self._call_advisor_with_audit_legacy(
@@ -894,6 +949,8 @@ class AdvisorCheckpointOwner:
                 structured_output=structured_output,
                 on_provider_dispatch=on_provider_dispatch,
                 continuation_budget=continuation_budget,
+                leave_out_all_earlier=leave_out_all_earlier,
+                on_earlier_turn_sent=on_earlier_turn_sent,
             )
         provider_custody = self._new_advisor_custody(provider_owner)
         async with provider_call_scope(provider_custody):
@@ -905,6 +962,8 @@ class AdvisorCheckpointOwner:
                 on_provider_dispatch=on_provider_dispatch,
                 provider_custody=provider_custody,
                 continuation_budget=continuation_budget,
+                leave_out_all_earlier=leave_out_all_earlier,
+                on_earlier_turn_sent=on_earlier_turn_sent,
             )
 
     def _build_checkpoint_arguments(
@@ -1146,6 +1205,7 @@ class AdvisorCheckpointOwner:
             "request_rejected": AdvisorBlockCause.REQUEST_REJECTED,
             "malformed": AdvisorBlockCause.MALFORMED,
             "budget_exhausted": AdvisorBlockCause.BUDGET_EXHAUSTED,
+            "prior_call_cost_unknown": AdvisorBlockCause.PRIOR_CALL_COST_UNKNOWN,
             "publication_withheld": AdvisorBlockCause.PUBLICATION_REJECTED,
             "flagged_unrepairable": AdvisorBlockCause.MESSAGE_REJECTED,
             "flagged_final_pass": AdvisorBlockCause.GRAPH_REJECTED,
@@ -1156,6 +1216,9 @@ class AdvisorCheckpointOwner:
             rejection is not None and reason not in {"request_rejected", "budget_exhausted"}
         ):
             raise AuditIntegrityError("Request rejection lost its owned safe descriptor")
+        # Typed draft fact for the review-not-run notices: they claim saved
+        # draft progress only when the draft has content.
+        draft_has_content = not state_is_structurally_empty(state)
         detail, suggestion = _advisor_policy.advisor_signoff_blocked_wording(
             reason=reason,
             findings=verdict.findings_text,
@@ -1163,6 +1226,7 @@ class AdvisorCheckpointOwner:
             category=verdict.category,
             step_ids=step_ids,
             request_rejection=rejection,
+            draft_has_content=draft_has_content,
         )
         decision = AdvisorGateBlocked(
             fact=AdvisorSignoffGateFact(
@@ -1184,6 +1248,7 @@ class AdvisorCheckpointOwner:
                 category=verdict.category,
                 step_ids=step_ids,
                 note=note,
+                draft_has_content=draft_has_content,
             )
             # Same verdict-class split as the red arm below: did-not-clear is
             # true only for a rendered FLAG; an unrendered verdict names its
@@ -1194,13 +1259,8 @@ class AdvisorCheckpointOwner:
             else:
                 augmented = compose_advisor_signoff_unrendered_pending_message(
                     raw_content,
-                    failure_class="budget_exhausted"
-                    if reason == "budget_exhausted"
-                    else "unavailable"
-                    if reason == "unavailable"
-                    else "request_rejected"
-                    if reason == "request_rejected"
-                    else "malformed",
+                    failure_class=_unrendered_failure_class(reason),
+                    draft_has_content=draft_has_content,
                 )
         elif runtime_preflight is not None and is_pending_interpretation_handoff(runtime_preflight):
             # Matches the discriminator EXACTLY, not merely ``not is_valid``:
@@ -1225,19 +1285,15 @@ class AdvisorCheckpointOwner:
                 category=verdict.category,
                 step_ids=step_ids,
                 note=note,
+                draft_has_content=draft_has_content,
             )
             if verdict.ok:
                 augmented = compose_advisor_signoff_unverified_message(raw_content)
             else:
                 augmented = compose_advisor_signoff_unrendered_unverified_message(
                     raw_content,
-                    failure_class="budget_exhausted"
-                    if reason == "budget_exhausted"
-                    else "unavailable"
-                    if reason == "unavailable"
-                    else "request_rejected"
-                    if reason == "request_rejected"
-                    else "malformed",
+                    failure_class=_unrendered_failure_class(reason),
+                    draft_has_content=draft_has_content,
                 )
         else:
             runtime_result = _advisor_policy.advisor_signoff_blocked_validation(
@@ -1247,6 +1303,7 @@ class AdvisorCheckpointOwner:
                 category=verdict.category,
                 step_ids=step_ids,
                 note=note,
+                draft_has_content=draft_has_content,
             )
             # elspeth-b61894d93d: the chat copy is composed from the turn's
             # ACTUAL red preflight, never from the synthesized
@@ -1452,7 +1509,7 @@ class AdvisorCheckpointOwner:
                 findings_text="Final review cannot be admitted within the existing planner budget.",
                 failure_class="budget_exhausted",
                 provider_failure=provider_failure,
-                retryable=provider_failure is None,
+                retryable=provider_failure is None and last_failure_retryable,
             )
 
         first_attempt_schema_valid: bool | None = None
@@ -1553,16 +1610,34 @@ class AdvisorCheckpointOwner:
                 and continuation_budget.policy.max_completion_tokens < self._settings.composer_advisor_max_completion_tokens,
             )
 
+        # Whether the current attempt reached the provider (set at dispatch).
+        attempt_dispatched = False
+
         def provider_dispatched() -> None:
-            nonlocal provider_attempts, format_reprompt_sent
+            nonlocal provider_attempts, format_reprompt_sent, last_request_failure, last_failure_retryable, attempt_dispatched
             if continuation_budget is not None:
                 continuation_budget.check_dispatch(now=_compose_deadline_time())
             # Quota admission is awaited before the physical provider call.
             # A timeout there must not fabricate a call or a sent re-prompt.
             provider_attempts += 1
             format_reprompt_sent = format_reprompt_sent or format_reprompt_pending
+            attempt_dispatched = True
+            # The final verdict describes the last attempt that went. A rejection
+            # of an earlier, different request (a size resend sheds history) must
+            # not be reported for this attempt once it goes; until it goes (the
+            # guard, quota admission or the continuation budget can stop it), the
+            # last call's outcome stands, rejection and retryability alike.
+            last_request_failure = None
+            last_failure_retryable = True
 
-        for _ in range(attempts):
+        normal_attempts_used = 0
+        size_resend_pending = False
+        leave_out_all_earlier = False
+        while normal_attempts_used < attempts or size_resend_pending:
+            if size_resend_pending:
+                size_resend_pending = False
+            else:
+                normal_attempts_used += 1
             if format_reprompt_pending:
                 # The format instruction can change rendered budget overhead.
                 # Refit the same complete saved graph, never a fitted prefix.
@@ -1576,7 +1651,8 @@ class AdvisorCheckpointOwner:
                     "_elspeth_advisor_summary_parts": summary_parts,
                 }
             if continuation_budget is not None and not continuation_budget.reserve_attempt(now=_compose_deadline_time()):
-                return continuation_withheld()
+                # Withheld before this attempt went: the last call that did go keeps its rejection.
+                return continuation_withheld(provider_failure=last_request_failure)
             remaining: float | None = None
             if deadline is not None:
                 remaining = deadline - _compose_deadline_time()
@@ -1591,7 +1667,16 @@ class AdvisorCheckpointOwner:
                     if last_exc is None and not last_response_unparseable:
                         raise _AdvisorCheckpointComposeDeadlineExpired
                     break
+            attempt_dispatched = False
             attempt_call_offset = len(recorder.llm_calls) if recorder is not None else 0
+            # A size resend repeats this request, format instruction included, with the earlier turns left out.
+            sent_arguments, sent_format_reprompt = call_arguments, format_reprompt_pending
+            sent_earlier_turn = False
+
+            def note_earlier_turn_sent(sent: bool) -> None:
+                nonlocal sent_earlier_turn
+                sent_earlier_turn = sent
+
             try:
                 if remaining is None:
                     guidance, _meta = await self._call_advisor_with_audit(
@@ -1601,6 +1686,8 @@ class AdvisorCheckpointOwner:
                         on_provider_dispatch=provider_dispatched,
                         provider_owner=provider_owner,
                         continuation_budget=continuation_budget,
+                        leave_out_all_earlier=leave_out_all_earlier,
+                        on_earlier_turn_sent=note_earlier_turn_sent,
                     )
                 else:
                     guidance, _meta = await self._call_advisor_with_audit(
@@ -1611,13 +1698,16 @@ class AdvisorCheckpointOwner:
                         on_provider_dispatch=provider_dispatched,
                         provider_owner=provider_owner,
                         continuation_budget=continuation_budget,
+                        leave_out_all_earlier=leave_out_all_earlier,
+                        on_earlier_turn_sent=note_earlier_turn_sent,
                     )
             except PromptGuardRefused as exc:
                 raise exc.with_evidence(
                     state=state, initial_version=state.version, llm_calls=recorder.llm_calls if recorder is not None else ()
                 ) from exc
             except PlannerContinuationUnavailable:
-                return continuation_withheld()
+                # Withheld at dispatch: this attempt did not go, so the last call that did go keeps its rejection.
+                return continuation_withheld(provider_failure=last_request_failure)
             except _MalformedLLMResponseError as exc:
                 if continuation_budget is not None and not continuation_budget.has_cost_headroom():
                     return continuation_withheld()
@@ -1631,8 +1721,15 @@ class AdvisorCheckpointOwner:
                     if provider_attempts == 1:
                         first_attempt_schema_valid = False
                         first_attempt_accepted = False
-                    call_arguments = _advisor_policy.advisor_arguments_with_format_reprompt(arguments, schema_valid=False)
-                    format_reprompt_pending = True
+                    # The format re-prompt answers rejected text of the first attempt.
+                    # Text first seen on a later call (after the first was rejected
+                    # for size) gets a plain retry, so the pass record stays true.
+                    format_reprompt_pending = first_attempt_accepted is False
+                    call_arguments = (
+                        _advisor_policy.advisor_arguments_with_format_reprompt(arguments, schema_valid=False)
+                        if format_reprompt_pending
+                        else arguments
+                    )
                 else:
                     call_arguments = arguments
                     format_reprompt_pending = False
@@ -1640,20 +1737,30 @@ class AdvisorCheckpointOwner:
             except provider_failures as exc:
                 # Only declared provider failures become provider verdicts.
                 # Audit failures and defects in controlled code must propagate.
-                # Retain exceptions only to classify the final outcome.
-                last_exc = exc
-                last_response_unparseable = False
-                last_cut_off_cap = None
                 call_arguments = arguments
                 format_reprompt_pending = False
                 failure = classify_provider_failure(exc)
-                if failure is not None and failure.request_rejection is not None:
-                    last_request_failure = self._retain_request_failure(
-                        exc, failure.request_rejection, recorder=recorder, attempt_call_offset=attempt_call_offset
-                    )
+                # Only a dispatched request replaces the previous outcome. If
+                # none has dispatched yet, keep the current admission failure.
+                if attempt_dispatched or provider_attempts == 0:
+                    last_exc = exc
+                    last_response_unparseable = False
+                    last_cut_off_cap = None
+                    if failure is not None and failure.request_rejection is not None:
+                        last_request_failure = self._retain_request_failure(
+                            exc, failure.request_rejection, recorder=recorder, attempt_call_offset=attempt_call_offset
+                        )
+                    if attempt_dispatched:
+                        # Review retries are immediate: a provider 429 would
+                        # land inside the provider's own wait.
+                        last_failure_retryable = failure is None or (failure.retryable and not failure.rate_limited)
                 if continuation_budget is not None and not continuation_budget.has_cost_headroom():
                     return continuation_withheld(provider_failure=last_request_failure)
-                last_failure_retryable = failure is None or failure.retryable
+                if request_size_rejection(exc) is not None and sent_earlier_turn and not leave_out_all_earlier:
+                    leave_out_all_earlier = True
+                    size_resend_pending = True
+                    call_arguments, format_reprompt_pending = sent_arguments, sent_format_reprompt
+                    continue
                 if not last_failure_retryable:
                     # The primary path uses this same value-free policy.
                     # Repeating an unchanged rejected request cannot repair it.
@@ -1679,10 +1786,13 @@ class AdvisorCheckpointOwner:
             last_exc = None
             last_response_unparseable = True
             last_cut_off_cap = cut_off_cap(attempt_call_offset)
-            call_arguments = _advisor_policy.advisor_arguments_with_format_reprompt(
-                arguments, schema_valid=verdict.response_schema_valid is True
+            # As for malformed text above: the re-prompt answers the first attempt's rejected text only.
+            format_reprompt_pending = first_attempt_accepted is False
+            call_arguments = (
+                _advisor_policy.advisor_arguments_with_format_reprompt(arguments, schema_valid=verdict.response_schema_valid is True)
+                if format_reprompt_pending
+                else arguments
             )
-            format_reprompt_pending = True
         if last_response_unparseable:
             # The advisor was REACHABLE on the final attempt and still returned
             # no verdict. That is MALFORMED, not unavailable — the distinction

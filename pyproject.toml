@@ -1,6 +1,6 @@
 [project]
 name = "elspeth"
-version = "0.8.17"
+version = "0.8.18"
 description = "Auditable Sense/Decide/Act pipelines for high-reliability systems"
 readme = "README.md"
 requires-python = ">=3.14"
@@ -87,12 +87,7 @@ dependencies = [
     # an incomplete catalog and let a Tier-3 crossing escape the audit
     # PR-discoverability gesture. The rule: if a non-optional unit
     # test references a plugin, that plugin's deps live here.
-    # Exact pin: chroma_sink calls chromadb's private upsert path
-    # (Collection._validate_and_prepare_upsert_request, then _client._upsert)
-    # so it can divert only pre-dispatch rejections. A bump must re-read
-    # Collection.upsert and pass tests/unit/plugins/sinks/test_chroma_sink.py.
-    "chromadb==1.5.5",  # backs chroma_sink + rag_retrieval plugins
-    "fsspec>=2026.6.0",  # Chroma tokenizer dependency: fixes CVE-2026-104851 template execution
+    "fsspec>=2026.6.0",  # floor for the tokenizers -> huggingface-hub chain (litellm extras): fixes CVE-2026-104851 template execution
     "html2text>=2024.2.26",  # backs web_scrape + web_scrape_extraction transforms
     "beautifulsoup4>=4.14,<5",  # paired with html2text in web_scrape
     "pypdfium2>=5.13,<6",  # backs the pdf_rasterize transform (imported only inside its worker subprocess)
@@ -521,7 +516,6 @@ markers = [
     "live_provider: marks protected tests that cross a real remote-provider boundary",
     "live_azure: marks protected tests that cross a real Azure service boundary",
     "live_dataverse: marks protected tests that cross a real Dataverse boundary",
-    "live_chroma: marks protected tests that cross a real Chroma service boundary",
     "terraform: marks tests that shell out to the terraform binary (deselect with '-m \"not terraform\"')",
 ]
 # Load .env file for integration tests (API keys)

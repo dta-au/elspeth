@@ -4,7 +4,7 @@ Tests each stop-condition arm of the follower drain loop plus the
 construction contract:
 
 1. ``run_terminal`` — run status leaves RUNNING; follower departs and returns.
-2. ``seat_dead`` — live_leader returns None or seat_live=False; follower
+2. ``seat_dead`` — seat_holder returns None or seat_live=False; follower
    departs and returns (no exception propagated).
 3. ``evicted`` — heartbeat latches coordination_lost; RunWorkerEvictedError
    propagates out of run() after a best-effort depart.
@@ -19,7 +19,7 @@ construction contract:
 Heartbeat is driven synchronously via ``_StubHeartbeat`` (no real threads).
 All sleeps are suppressed via injected ``wait_fn``.  The follower carries no
 clock (ADR-047: seat liveness is the Landscape database's verdict).
-``live_leader`` and ``_run_is_terminal`` are controlled via the stub
+``seat_holder`` and ``_run_is_terminal`` are controlled via the stub
 coordination repo and stub factory.
 
 Disposition arm note
@@ -57,7 +57,7 @@ from elspeth.contracts.coordination import (
     WorkerMembershipToken,
 )
 from elspeth.contracts.enums import RunStatus
-from elspeth.contracts.errors import AuditIntegrityError, FollowerSeatDeadError, RunWorkerEvictedError
+from elspeth.contracts.errors import AuditIntegrityError, FollowerSeatDeadError, RunMembershipLostError, RunWorkerEvictedError
 from elspeth.contracts.plugin_capabilities import WebConfigAuthority
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.engine.orchestrator.follower import FollowerProcessor, _SeatDeadError
@@ -234,7 +234,7 @@ class _StubHeartbeat:
 class _StubRunCoordRepo:
     """Stub of RunCoordinationRepository for FollowerProcessor tests.
 
-    Controls what live_leader() returns and records depart_worker() calls.
+    Controls what seat_holder() returns and records depart_worker() calls.
     """
 
     def __init__(
@@ -248,16 +248,16 @@ class _StubRunCoordRepo:
         self._seat_present = seat_present
         self._lifecycle_events = lifecycle_events
         self.depart_calls: list[dict[str, Any]] = []
-        self.live_leader_calls: list[dict[str, Any]] = []
+        self.seat_holder_calls: list[dict[str, Any]] = []
         self.worker_heartbeat_calls: list[dict[str, Any]] = []
 
         # Override per-call via a list (pops first element each call)
-        self.live_leader_results: list[LeaderInfo | None] = []
+        self.seat_holder_results: list[LeaderInfo | None] = []
 
-    def live_leader(self, *, run_id: str) -> LeaderInfo | None:
-        self.live_leader_calls.append({"run_id": run_id})
-        if self.live_leader_results:
-            return self.live_leader_results.pop(0)
+    def seat_holder(self, *, run_id: str) -> LeaderInfo | None:
+        self.seat_holder_calls.append({"run_id": run_id})
+        if self.seat_holder_results:
+            return self.seat_holder_results.pop(0)
         if not self._seat_present:
             return None
         return LeaderInfo(
@@ -474,9 +474,9 @@ class TestFollowerSeatDead:
     """
 
     def test_seat_absent_raises_follower_seat_dead(self) -> None:
-        """live_leader returns None -> FollowerSeatDeadError propagated after depart."""
+        """seat_holder returns None -> FollowerSeatDeadError propagated after depart."""
         processor = _CountingDrainProcessor()
-        coord_repo = _StubRunCoordRepo(seat_present=False)  # live_leader returns None
+        coord_repo = _StubRunCoordRepo(seat_present=False)  # seat_holder returns None
         factory = _StubFactory(running=True)
         heartbeat = _StubHeartbeat()
 
@@ -587,7 +587,7 @@ class TestFollowerSeatDead:
             follower.run(ctx=_ctx())
 
         assert processor.claim_checks == 3
-        assert len(coord_repo.live_leader_calls) == 4
+        assert len(coord_repo.seat_holder_calls) == 4
         assert len(coord_repo.depart_calls) == 1
 
     def test_seat_dead_between_hot_claims_stops_follower_drain_inside_throttle_interval(self) -> None:
@@ -607,7 +607,7 @@ class TestFollowerSeatDead:
 
         processor = _CallbackDrainProcessor()
         coord_repo = _StubRunCoordRepo()
-        coord_repo.live_leader_results = [
+        coord_repo.seat_holder_results = [
             LeaderInfo(
                 run_id=RUN_ID,
                 leader_worker_id=f"worker:{RUN_ID}:leader",
@@ -626,8 +626,8 @@ class TestFollowerSeatDead:
         ]
         factory = _StubFactory(running=True)
         run_result_running = _RunStatusRecord(status=RunStatus.RUNNING)
-        run_result_completed = _RunStatusRecord(status=RunStatus.COMPLETED)
-        factory.run_lifecycle.get_run_results = [run_result_running, run_result_completed]
+        # The loop-top read, then the dead-seat recheck: the run is still running when the seat is gone.
+        factory.run_lifecycle.get_run_results = [run_result_running, run_result_running]
         heartbeat = _StubHeartbeat()
         member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         follower = FollowerProcessor(
@@ -646,7 +646,8 @@ class TestFollowerSeatDead:
             follower.run(ctx=_ctx())
 
         assert processor.claim_checks == 1
-        assert len(coord_repo.live_leader_calls) == 3
+        assert factory.run_lifecycle.get_run_results == []
+        assert len(coord_repo.seat_holder_calls) == 3
         assert len(coord_repo.depart_calls) == 1
 
     def test_seat_dead_between_claims_stops_follower_drain(self) -> None:
@@ -666,7 +667,7 @@ class TestFollowerSeatDead:
 
         processor = _CallbackDrainProcessor()
         coord_repo = _StubRunCoordRepo()
-        coord_repo.live_leader_results = [
+        coord_repo.seat_holder_results = [
             LeaderInfo(
                 run_id=RUN_ID,
                 leader_worker_id=f"worker:{RUN_ID}:leader",
@@ -702,7 +703,7 @@ class TestFollowerSeatDead:
             follower.run(ctx=_ctx())
 
         assert processor.claim_checks == 1
-        assert len(coord_repo.live_leader_calls) == 3
+        assert len(coord_repo.seat_holder_calls) == 3
         assert len(coord_repo.depart_calls) == 1
 
 
@@ -746,7 +747,7 @@ class TestFollowerEvicted:
         assert heartbeat.stop_called
 
     def test_eviction_before_any_drain_pass(self) -> None:
-        """check_and_raise fires before first live_leader poll; no drain calls."""
+        """check_and_raise fires before first seat_holder poll; no drain calls."""
         processor = _CountingDrainProcessor()
         coord_repo = _StubRunCoordRepo()
         factory = _StubFactory(running=True)
@@ -887,6 +888,361 @@ class TestFollowerEvictionFinalizeDepartureRace:
         assert exc_info.value.run_id == RUN_ID
 
         # Depart still called (best-effort).
+        assert len(coord_repo.depart_calls) == 1
+
+
+class _MidDrainFenceRefusingProcessor:
+    """Refuses the first drain pass the way a departed member's claim_ready does.
+
+    ``test_real_follower_claiming_after_finalize_departed_it_exits_cleanly`` in
+    tests/e2e/recovery/test_follower_join_and_drain.py drives the real
+    ``claim_ready`` refusal through the real follower processor; this stub
+    covers the RUNNING (true eviction) arm that the real path cannot reach
+    without a housekeeping sweep.
+    """
+
+    def __init__(self) -> None:
+        self.drain_calls = 0
+
+    def drain_follower_ready_work(self, ctx: PluginContext, *, before_claim: object = None) -> list[object]:
+        self.drain_calls += 1
+        raise RunMembershipLostError(run_id=RUN_ID, worker_id=WORKER_ID, verb="claim_ready")
+
+
+class TestFollowerMembershipFenceRefusalMidDrain:
+    """A membership-fence refusal raised inside a drain pass is discriminated like an eviction.
+
+    The membership fence of every fenced verb refuses with
+    RunMembershipLostError, not RunWorkerEvictedError. With the run terminal
+    (finalize-departure) the follower departs cleanly (CLI exit 0); with the
+    run still RUNNING it is a true eviction (CLI exit 3), never an unknown
+    framework error (CLI exit 4).
+    """
+
+    def test_fence_refusal_with_terminal_run_returns_cleanly(self) -> None:
+        processor = _MidDrainFenceRefusingProcessor()
+        coord_repo = _StubRunCoordRepo()
+        heartbeat = _StubHeartbeat(evicted=False)
+        factory = _StubFactory(running=True)
+        # Top-of-loop read: RUNNING. Recheck after the refusal: COMPLETED.
+        factory.run_lifecycle.get_run_results = [
+            _RunStatusRecord(status=RunStatus.RUNNING),
+            _RunStatusRecord(status=RunStatus.COMPLETED),
+        ]
+        follower = FollowerProcessor(
+            processor=processor,
+            member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID),
+            run_coordination=coord_repo,
+            factory=factory,
+            wait_fn=lambda _: None,
+        )
+
+        with patch("elspeth.engine.orchestrator.follower.RunHeartbeatThread", return_value=heartbeat):
+            follower.run(ctx=_ctx())
+
+        assert processor.drain_calls == 1
+        assert len(coord_repo.depart_calls) == 1
+        assert coord_repo.depart_calls[0]["worker_id"] == WORKER_ID
+        assert heartbeat.stop_called
+
+    def test_fence_refusal_with_running_run_is_reported_as_eviction(self) -> None:
+        processor = _MidDrainFenceRefusingProcessor()
+        coord_repo = _StubRunCoordRepo()
+        heartbeat = _StubHeartbeat(evicted=False)
+        follower = FollowerProcessor(
+            processor=processor,
+            member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID),
+            run_coordination=coord_repo,
+            factory=_StubFactory(running=True),
+            wait_fn=lambda _: None,
+        )
+
+        with (
+            patch("elspeth.engine.orchestrator.follower.RunHeartbeatThread", return_value=heartbeat),
+            pytest.raises(RunWorkerEvictedError) as exc_info,
+        ):
+            follower.run(ctx=_ctx())
+
+        assert exc_info.value.worker_id == WORKER_ID
+        assert exc_info.value.run_id == RUN_ID
+        cause = exc_info.value.__cause__
+        assert type(cause) is RunMembershipLostError
+        assert cause.verb == "claim_ready"
+        assert len(coord_repo.depart_calls) == 1
+
+
+class _TierOneThenMembershipLossProcessor:
+    """A drain pass whose processing raised a Tier-1 error and then lost membership.
+
+    ``link="context"`` mirrors the drain's failure bookkeeping: the
+    membership-fenced failure write refuses, and the refusal carries the
+    Tier-1 error only as its ``__context__`` plus a note, exactly as
+    scheduler_drain re-raises it. ``link="cause"`` names the Tier-1 error only
+    as the refusal's ``__cause__``, with an unrelated ``__context__``.
+
+    The Tier-1 error has its own lower-level error, as a recorder error
+    wrapping a database error does: as its explicit cause
+    (``lower_link="cause"``) or as its implicit context
+    (``lower_link="context"``).
+    """
+
+    def __init__(self, *, signal: type[Exception], link: str, lower_link: str = "cause") -> None:
+        self.lower_level_error = SQLAOperationalError("UPDATE run_workers", {}, Exception("connection reset"))
+        self.tier_1_error = AuditIntegrityError("claimed token's ledger row disagrees with the work item")
+        self._signal = signal
+        self._link = link
+        self._lower_link = lower_link
+        self.drain_calls = 0
+
+    def _raise_tier_1_error(self) -> None:
+        raise self.tier_1_error
+
+    def _process(self) -> None:
+        if self._lower_link == "cause":
+            raise self.tier_1_error from self.lower_level_error
+        try:
+            raise self.lower_level_error
+        except SQLAOperationalError:
+            self._raise_tier_1_error()
+
+    def _fenced_failure_write(self) -> None:
+        if self._signal is RunMembershipLostError:
+            raise RunMembershipLostError(run_id=RUN_ID, worker_id=WORKER_ID, verb="mark_failed")
+        raise RunWorkerEvictedError(worker_id=WORKER_ID, run_id=RUN_ID, reason="claim re-probe found the member departed")
+
+    def _refusal_caused_by(self, processing_error: BaseException) -> None:
+        try:
+            raise ValueError("failure bookkeeping could not be prepared")
+        except ValueError:
+            try:
+                self._fenced_failure_write()
+            except (RunMembershipLostError, RunWorkerEvictedError) as refusal:
+                raise refusal from processing_error
+
+    def drain_follower_ready_work(self, ctx: PluginContext, *, before_claim: object = None) -> list[object]:
+        self.drain_calls += 1
+        try:
+            self._process()
+        except AuditIntegrityError as processing_exc:
+            if self._link == "context":
+                try:
+                    self._fenced_failure_write()
+                except (RunMembershipLostError, RunWorkerEvictedError) as refusal:
+                    refusal.add_note(f"processing exception {type(processing_exc).__name__} was superseded by the eviction refusal")
+                    raise
+            processing_error = processing_exc
+        self._refusal_caused_by(processing_error)
+        return []
+
+
+class _LoopingChainMembershipLossProcessor:
+    """A membership refusal whose cause chain loops back on itself and holds no Tier-1 error."""
+
+    def drain_follower_ready_work(self, ctx: PluginContext, *, before_claim: object = None) -> list[object]:
+        refusal = RunMembershipLostError(run_id=RUN_ID, worker_id=WORKER_ID, verb="mark_failed")
+        middle = ValueError("plugin failure")
+        middle.__cause__ = refusal
+        refusal.__cause__ = middle
+        raise refusal
+
+
+class _FinalBeatFailsHeartbeat(_StubHeartbeat):
+    """Latches a fatal failure from the final beat taken at stop(), as a failed final heartbeat write would."""
+
+    def __init__(self, final_beat_error: BaseException) -> None:
+        super().__init__(evicted=False)
+        self._final_beat_error = final_beat_error
+
+    def stop(self, *, final_beat: bool = True) -> None:
+        super().stop(final_beat=final_beat)
+        if final_beat:
+            self.fatal_error = self._final_beat_error
+
+
+class TestFollowerTierOneErrorOutranksMembershipLoss:
+    """A Tier-1 error raised in processing leaves the follower as itself.
+
+    It is raised even when membership was lost at the same moment, whatever the
+    run's status, so ``elspeth join`` reports it as a framework failure (exit 4
+    with its traceback) instead of a clean departure or an eviction.
+    """
+
+    @pytest.mark.parametrize("link", ["context", "cause"])
+    @pytest.mark.parametrize("signal", [RunMembershipLostError, RunWorkerEvictedError])
+    @pytest.mark.parametrize("run_terminal", [True, False], ids=["run-terminal", "run-running"])
+    def test_tier_1_error_carried_by_the_membership_loss_is_raised(self, signal: type[Exception], run_terminal: bool, link: str) -> None:
+        processor = _TierOneThenMembershipLossProcessor(signal=signal, link=link)
+        coord_repo = _StubRunCoordRepo()
+        heartbeat = _StubHeartbeat(evicted=False)
+        factory = _StubFactory(running=True)
+        factory.run_lifecycle.get_run_results = [
+            _RunStatusRecord(status=RunStatus.RUNNING),
+            _RunStatusRecord(status=RunStatus.COMPLETED if run_terminal else RunStatus.RUNNING),
+        ]
+        follower = FollowerProcessor(
+            processor=processor,
+            member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID),
+            run_coordination=coord_repo,
+            factory=factory,
+            wait_fn=lambda _: None,
+        )
+
+        with (
+            patch("elspeth.engine.orchestrator.follower.RunHeartbeatThread", return_value=heartbeat),
+            pytest.raises(AuditIntegrityError) as exc_info,
+        ):
+            follower.run(ctx=_ctx())
+
+        assert exc_info.value is processor.tier_1_error
+        # Its own chain is left as the processing raised it, and the membership loss is noted on it.
+        tier_1_error = exc_info.value
+        assert (tier_1_error.__cause__, tier_1_error.__context__, tier_1_error.__suppress_context__) == (
+            processor.lower_level_error,
+            None,
+            True,
+        )
+        loss_notes = [note for note in tier_1_error.__notes__ if note.startswith(f"follower {WORKER_ID!r} lost its run membership")]
+        assert len(loss_notes) == 1
+        assert f": {signal.__name__}: " in loss_notes[0]
+        assert len(coord_repo.depart_calls) == 1
+
+    def test_cleanup_failure_after_the_tier_1_error_carries_it_as_context(self) -> None:
+        processor = _TierOneThenMembershipLossProcessor(signal=RunMembershipLostError, link="context", lower_link="context")
+        coord_repo = _StubRunCoordRepo()
+        final_beat_error = AuditIntegrityError("final heartbeat write found the coordination ledger corrupt")
+        heartbeat = _FinalBeatFailsHeartbeat(final_beat_error)
+        follower = FollowerProcessor(
+            processor=processor,
+            member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID),
+            run_coordination=coord_repo,
+            factory=_StubFactory(running=True),
+            wait_fn=lambda _: None,
+        )
+
+        with (
+            patch("elspeth.engine.orchestrator.follower.RunHeartbeatThread", return_value=heartbeat),
+            pytest.raises(AuditIntegrityError) as exc_info,
+        ):
+            follower.run(ctx=_ctx())
+
+        # The processing ran, and the final beat's fatal failure latched only at cleanup.
+        assert processor.drain_calls == 1
+        assert heartbeat.stop_final_beats == [True]
+        # The heartbeat's fatal failure still wins, and still carries the processing error.
+        assert exc_info.value is final_beat_error
+        tier_1_error = exc_info.value.__context__
+        assert tier_1_error is processor.tier_1_error
+        assert (tier_1_error.__cause__, tier_1_error.__context__, tier_1_error.__suppress_context__) == (
+            None,
+            processor.lower_level_error,
+            False,
+        )
+        assert any(note.startswith(f"follower {WORKER_ID!r} lost its run membership") for note in tier_1_error.__notes__)
+        assert len(coord_repo.depart_calls) == 1
+
+    def test_looping_chain_without_tier_1_error_is_still_an_eviction(self) -> None:
+        coord_repo = _StubRunCoordRepo()
+        follower = FollowerProcessor(
+            processor=_LoopingChainMembershipLossProcessor(),
+            member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID),
+            run_coordination=coord_repo,
+            factory=_StubFactory(running=True),
+            wait_fn=lambda _: None,
+        )
+
+        with (
+            patch("elspeth.engine.orchestrator.follower.RunHeartbeatThread", return_value=_StubHeartbeat(evicted=False)),
+            pytest.raises(RunWorkerEvictedError) as exc_info,
+        ):
+            follower.run(ctx=_ctx())
+
+        assert type(exc_info.value.__cause__) is RunMembershipLostError
+        assert len(coord_repo.depart_calls) == 1
+
+
+_TERMINAL_STATUSES = [status for status in RunStatus if status is not RunStatus.RUNNING]
+
+
+class TestFollowerReturnsTheTerminalStatusItRead:
+    """A clean follower exit returns the terminal run status it read, so join can report it.
+
+    ``test_real_follower_probing_after_finalize_and_seat_release_exits_cleanly``
+    and ``test_real_follower_probing_a_released_seat_of_a_running_run_reports_seat_dead``
+    in tests/e2e/recovery/test_follower_join_and_drain.py drive the before-claim
+    leader probe on the real path; these cover the top-of-loop probe and every
+    terminal status.
+    """
+
+    @pytest.mark.parametrize("status", _TERMINAL_STATUSES, ids=lambda status: status.value)
+    def test_terminal_run_at_loop_top_returns_its_status(self, status: RunStatus) -> None:
+        processor = _CountingDrainProcessor()
+        factory = _StubFactory(running=True)
+        factory.run_lifecycle.get_run_results = [_RunStatusRecord(status=status)]
+        follower = FollowerProcessor(
+            processor=processor,
+            member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID),
+            run_coordination=_StubRunCoordRepo(),
+            factory=factory,
+            wait_fn=lambda _: None,
+        )
+
+        with patch("elspeth.engine.orchestrator.follower.RunHeartbeatThread", return_value=_StubHeartbeat(evicted=False)):
+            outcome = follower.run(ctx=_ctx())
+
+        assert outcome is status
+        assert processor.drain_calls == []
+
+    def test_absent_run_returns_no_status(self) -> None:
+        factory = _StubFactory(running=True)
+        factory.run_lifecycle.get_run_results = [None]
+        follower = FollowerProcessor(
+            processor=_CountingDrainProcessor(),
+            member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID),
+            run_coordination=_StubRunCoordRepo(),
+            factory=factory,
+            wait_fn=lambda _: None,
+        )
+
+        with patch("elspeth.engine.orchestrator.follower.RunHeartbeatThread", return_value=_StubHeartbeat(evicted=False)):
+            assert follower.run(ctx=_ctx()) is None
+
+    @pytest.mark.parametrize("status", _TERMINAL_STATUSES, ids=lambda status: status.value)
+    def test_dead_seat_with_terminal_run_returns_its_status(self, status: RunStatus) -> None:
+        coord_repo = _StubRunCoordRepo(seat_present=False)
+        factory = _StubFactory(running=True)
+        # Top-of-loop read: RUNNING; the loop-top leader probe then finds no seat.
+        # Recheck after the dead seat: terminal.
+        factory.run_lifecycle.get_run_results = [_RunStatusRecord(status=RunStatus.RUNNING), _RunStatusRecord(status=status)]
+        follower = FollowerProcessor(
+            processor=_CountingDrainProcessor(),
+            member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID),
+            run_coordination=coord_repo,
+            factory=factory,
+            wait_fn=lambda _: None,
+        )
+
+        with patch("elspeth.engine.orchestrator.follower.RunHeartbeatThread", return_value=_StubHeartbeat(evicted=False)):
+            outcome = follower.run(ctx=_ctx())
+
+        assert outcome is status
+        assert len(coord_repo.depart_calls) == 1
+
+    def test_dead_seat_with_running_run_is_still_seat_dead(self) -> None:
+        coord_repo = _StubRunCoordRepo(seat_present=False)
+        follower = FollowerProcessor(
+            processor=_CountingDrainProcessor(),
+            member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID),
+            run_coordination=coord_repo,
+            factory=_StubFactory(running=True),
+            wait_fn=lambda _: None,
+        )
+
+        with (
+            patch("elspeth.engine.orchestrator.follower.RunHeartbeatThread", return_value=_StubHeartbeat(evicted=False)),
+            pytest.raises(FollowerSeatDeadError),
+        ):
+            follower.run(ctx=_ctx())
+
         assert len(coord_repo.depart_calls) == 1
 
 

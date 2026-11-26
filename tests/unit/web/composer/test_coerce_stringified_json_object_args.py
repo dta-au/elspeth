@@ -21,7 +21,6 @@ from elspeth.web.composer.redaction import (
     SetSourceArgumentsModel,
     SetSourceFromBlobArgumentsModel,
 )
-from elspeth.web.credential_guard import CredentialMaterialRefused
 from tests.unit.web.composer.test_tools import _empty_state, _mock_catalog, execute_tool
 
 
@@ -65,16 +64,16 @@ def test_public_dispatch_rejects_object_strings_safely(value: str) -> None:
     assert value not in str(caught.value)
 
 
-def test_public_dispatch_refuses_an_over_bound_object_string_before_schema_validation() -> None:
+def test_public_dispatch_refuses_an_over_bound_object_string_at_schema_validation() -> None:
+    # The string is past the credential scan's string limit, so that scan stops (best effort);
+    # the schema then refuses a string where an object is declared, without echoing it.
     value = '{"a":' * 100000 + "1" + "}" * 100000
     arguments = {"plugin": "csv", "on_success": "rows", "on_validation_failure": "discard", "options": value}
 
-    with pytest.raises(CredentialMaterialRefused) as caught:
+    with pytest.raises(ToolArgumentError) as caught:
         execute_tool("set_source", arguments, _empty_state(), _mock_catalog())
 
-    assert caught.value.surface == "composer_tool_arguments"
-    assert caught.value.finding.category == "traversal_limit"
-    assert value not in repr(caught.value.to_payload())
+    assert value not in str(caught.value)
 
 
 def test_outer_tool_argument_json_still_decodes_objects() -> None:

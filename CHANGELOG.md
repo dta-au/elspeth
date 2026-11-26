@@ -8,6 +8,320 @@ The full history is in the repository's releases and commit history.
 
 ---
 
+## 0.8.18 - 2026-11-26
+
+Canonical form v2 for new runs, worker coordination and recovery fixes in the
+engine and the web server, a credential check on prompt files and each model
+message, Web Composer request-size and validation fixes, a release image whose
+web server starts, and the removal of the Chroma plugins. The session
+epoch stays at 79 and the Landscape epoch at 51, so 0.8.17 session and
+Landscape stores open unchanged. Runs started under 0.8.17 cannot be
+continued after the upgrade; see the upgrade notes. The dated entry does not
+establish qualification, a published tag or an image.
+
+### Upgrade notes
+
+- **No schema epoch change.** The session epoch stays at 79 and the Landscape
+  epoch at 51, and no table, column or CHECK changes, so 0.8.17 session and
+  Landscape stores open unchanged. This authorizes no migration, reset,
+  restamping or downgrade.
+- **Upgrading from 0.8.16 or earlier: apply the 0.8.17 and 0.8.16 upgrade
+  notes first.**
+- **Breaking: Chroma support is removed.** The `chroma_sink` sink, the
+  `rag_retrieval` transform (whose only retrieval provider was Chroma) and the
+  Chroma collection readiness probe are gone, with the `chromadb` dependency.
+  A pipeline, saved Composer session or web run that names `chroma_sink` or
+  `rag_retrieval` is refused because the plugin is not registered, and
+  pipeline settings with a non-empty `collection_probes` list are refused at
+  load. Remove those nodes and the `collection_probes` entries before
+  upgrading. Retrieval from Azure AI Search (`azure_ai_search`) is unaffected.
+  Existing Chroma collections are not touched; read or export them with your
+  own Chroma tooling. Audit records of earlier runs that used these plugins
+  stay readable with `elspeth explain`.
+- **Web file uploads now accept files up to 50 MiB by default.** The default
+  `max_upload_bytes` (`ELSPETH_WEB__MAX_UPLOAD_BYTES`) moves from 104857600
+  to 52428800 bytes. No deployment loses capacity: every request body was
+  already refused above 10 MiB before it reached the upload route, so 10 MiB
+  was the effective limit whatever the setting said. A deployment that sets
+  `max_upload_bytes` now gets that limit for file uploads. A reverse proxy in
+  front of the server must also allow bodies of that size; the bundled nginx
+  configuration allows 100 MiB.
+- **Finish runs before upgrading (canonical form v2).** New runs record the
+  canonical version `sha256-rfc8785-v2`: byte values are hashed as base64 text
+  and mappings that use reserved keys are no longer wrapped. A run recorded
+  under an earlier canonical version cannot be continued:
+  - `elspeth resume` exits 1 with the `not_resumable` event and the reason
+    `canonical_version_changed`.
+  - `elspeth join` on such a run exits 1 with `join_refused`, naming the
+    version change.
+  - A replay or verify run whose source run has an earlier canonical version
+    is refused as an audit-integrity error (exit 4).
+  - `elspeth explain` still reads earlier runs, checks stored payloads against
+    their recorded SHA-256 and keeps their recorded hashes. Export keeps each
+    run's recorded canonical version.
+
+  Let CLI runs finish before upgrading, or run them again afterwards.
+- **Finish interrupted web runs before upgrading.** This release changes the
+  application code a web run is bound to, so a web run admitted under 0.8.17
+  is refused on resume as `IMPLEMENTATION_CHANGED` (implementation drift).
+- **Sessions database: up to 12 connections per application process.** Each
+  web process now has a second session-database pool of 2 connections, with
+  no overflow, for lease renewal and release and the membership heartbeat.
+  The main pool is unchanged (5 plus 5 overflow). On PostgreSQL, size
+  `max_connections` for 12 per process across all replicas, plus Landscape,
+  Jobs, probes and operator connections. These pools have no sizing setting.
+  In-memory SQLite shares one engine and needs no action.
+- **Changed:** when processing a row raises an audit-integrity or framework
+  (Tier-1) error and the worker's claim lease, run membership or run
+  leadership is found lost while that error propagates, or the membership
+  fence refuses the failure bookkeeping for that row, `elspeth run`,
+  `elspeth resume` and `elspeth join` exit 4 and print that error's
+  traceback, with the coordination loss noted on it. No disposition is
+  written for the abandoned claim.
+- **Changed:** `elspeth join` refuses with `join_not_ready` (exit 1) while the
+  run's graph registration is incomplete; retry once the leader has
+  registered the graph. Before and after admission, join now checks the run's
+  whole graph: its nodes, edges and plugin identities.
+- **Changed:** the composer's credential check uses detector version 2. It is
+  best effort: it matches known credential patterns. It checks each message
+  sent to the model individually and checks prompt-file text before it is
+  saved, as well as text entered into the pipeline. A prompt-file save
+  containing credential-shaped text is refused with 422
+  `credential_material_rejected`. A refusal says whether the text came from
+  the model's output or from the user's or session's own content, and keeps
+  the tool results and changes made earlier in the turn. Stored detector
+  evidence written by this release records version `"2"`.
+- **Changed:** a credential-refused composer MCP tool call is recorded as
+  `ARG_ERROR` with category `credential_material` and a fixed refusal message.
+  Its failed-argument evidence keeps a redaction marker, the exception class
+  and the field count, and leaves out argument names and values. MCP sidecars
+  written before this release are not rewritten.
+- **Changed:** accepting a pipeline proposal that binds a prompt file over the
+  inline limit answers 413 with `error_code` `prompt_file_too_large`, naming
+  the node and the limit, and keeps the proposal pending. It used to answer
+  500.
+- **Changed:** a model call that a fence refuses its ordinary `calls` row (a
+  lost item claim, membership or leadership) is recorded in the fence-refusal
+  event's `context.refused_call`, with its identity, hashes, status, token
+  usage and latency. Audit consumers that count attempted calls should read
+  these refusal events as well as `calls`.
+- **Changed:** the Composer's context-budget policy is now
+  `composer.context-budget.v5`. Earlier turns already left out of an existing
+  session stay out until the request is below 60% of the limit at the new
+  rate. A model or tool dialect with no successful call yet is priced at 3.0
+  bytes per token. `authored_refuted` now means the rate used differs from the
+  fallback rate. Advisor review records may carry up to 3 `provider_attempts`
+  (one size resend). With the byte maximum derived from the token limit (next
+  entry), a token limit below 122,880 gives a byte maximum below the former
+  fixed 983,040 bytes (960 KiB).
+- **Changed:** `elspeth join` exits 0 when the leader finishes the run while
+  the follower is still working. Before this release it could exit 4, or exit
+  2 with "The run is incomplete", although the run had finished. Exit 2 now
+  means there is no live leader while the run is still running. A follower
+  that loses its run membership while the run is still running now exits 3,
+  the eviction code in the exit-code table, where it previously exited 4. A
+  script that read exit 4 from `elspeth join` as an eviction should check for 3.
+- **Changed:** when `elspeth join` departs cleanly it names the run status it
+  read: `run ended with status failed`, for example, where it always said
+  `run completed`. The JSON `departed` event gains a `run_status` field; its
+  existing field names are kept, and its `message` text changes as described.
+  Exit 0 still means only that the follower departed cleanly, for any terminal
+  status, so a script that needs the run's outcome should read `run_status`.
+- **Changed (design change):** a pipeline that previously passed composer
+  validation with only a "Contract check skipped" warning, but then failed
+  when the run started, now fails composer validation. No pipeline that could
+  run before is refused. Only pipelines the runtime was already refusing at
+  run start are now refused earlier, at validation.
+- **Changed:** when `ELSPETH_WEB__COMPOSER_PLANNER_MAX_REQUEST_BYTES` is not
+  set, the Composer's request byte maximum is now derived from
+  `ELSPETH_WEB__COMPOSER_CONTEXT_MAX_PROMPT_TOKENS` (8 bytes per token:
+  1,600,000 bytes for a 200,000-token limit) instead of the fixed 983,040.
+  An explicit value is used as set. If a proxy in front of your model gateway
+  limits request bodies (nginx's default is 1 MiB), set the byte maximum
+  below that limit.
+- **Changed:** a request that a provider or proxy refuses with HTTP 413 is
+  now a size rejection: it is sent once more with earlier turns left out and
+  is never resent unchanged. This includes a 413 that the client library
+  reports under another status: a 429 rate limit on the OpenAI route, or a
+  400 on the direct Anthropic route. A 429 or 400 without an underlying 413
+  is handled as before.
+- **Changed:** a request a provider or proxy refuses as too large is now
+  reported as too large, without a Retry button; an administrator can raise
+  that limit.
+- **Changed:** the Composer's context budget now prices a request at the
+  bytes per token measured on the newest successful call to the same model
+  and tool dialect (a call earlier in the same turn first, otherwise the
+  session's stored calls), less a 10% margin, and at 3.0 when there is no
+  such call. Before, it used 3.0. In both, the rate is lowered to the density
+  the provider counted on an earlier call in the same turn, when that is
+  lower. A recognised size
+  rejection (over the context limit, or HTTP 413) is now resent once with
+  earlier turns left out for planner, optional reply, advisor review and
+  last-composition requests too, not only the compose loop. If the resend is
+  rejected again, a compose-loop or planner turn is refused as too large,
+  the reply is reported unavailable as before, and the review is recorded as
+  a rejected request.
+- **Added:** each Composer call's audit record now says what recognised a
+  size rejection: a structured code, the HTTP status, the client library's
+  context-window exception (which it can assign from the provider's message)
+  or a fixed provider wording. Each context-budget record names the call it
+  was made for (compose loop, reply, planner or escape hatch) and where the
+  bytes-per-token density it was priced at came from. Advisor review calls
+  have no context-budget record, so they carry neither. Records written
+  before this release carry none of these fields; their absence means
+  unknown.
+- **Changed:** when a provider call fails, the composer's main loop and planner
+  decide whether a retry's wait plus 5 s still fits before the deadline (the
+  request's, or the planner's own time limit when that is earlier), and retry
+  only if it does. This also applies to the failures they already retried,
+  including a provider 503 and LiteLLM's general API error (see the 429 entry
+  under Fixed). Below, "a 503" means any of these. When the retry does not
+  fit, the main loop reports the provider failure at once. The planner, after a
+  503 whose retry does not fit, waits until the deadline and reports a time-out
+  instead of making one last call; after a 429 whose retry does not fit, it
+  reports the provider failure at once. When the failed call used the last call
+  the budget allows and another attempt remains, the planner reports a
+  call-budget refusal at once, after a 503 or after a 429 whose retry would
+  fit. On an escape-hatch turn, the planner reports the hatch's original
+  exhaustion in place of the provider failure or the call-budget refusal, as
+  it did before this release; the time-out still stands. The completion review
+  keeps its existing immediate retry and does not retry a 429.
+- **Do not enable a composer token quota yet.** With one configured, a failed
+  provider call's usage is recorded as unknown, and that refuses the user's
+  later model calls ("Token accounting is unavailable") until usage is
+  reconciled. A retry after a transient failure is refused the same way. Since
+  a 429 is now retried, a rate-limited turn with a quota configured waits for
+  the retry delay, up to 30 s, before that refusal; before this release the 429
+  was reported at once.
+
+### Removed
+
+- The `chroma_sink` sink, the `rag_retrieval` transform and the Chroma
+  collection readiness probe, with the `chromadb` package and the fifteen
+  packages only it required. `chromadb` carries a critical vulnerability with
+  no fixed release (CVE-2026-45829) and three more, so the release image
+  failed its vulnerability scan. `collection_probes` stays in the settings
+  model and must be empty; no probe provider ships.
+- The `chroma_rag`, `chroma_rag_indexed` and `chroma_rag_qa` examples and
+  their examples-gate cases.
+- The `.trivyignore.yaml` exceptions and the matching pip-audit
+  `--ignore-vuln` entries, which existed only for `chromadb`. The release
+  image scans and the dependency audit now take no exceptions.
+
+### Fixed
+
+- Web file uploads honour `max_upload_bytes`. The request-body guard that runs
+  before routing refused every body over 10 MiB, so a file between 10 MiB and
+  the configured upload limit was refused with "Request body too large (max
+  10 MB)" before the upload route could check it. Multipart file uploads
+  (`POST /api/sessions/{id}/blobs`) now take a ceiling of `max_upload_bytes`
+  plus 1 MiB for the multipart envelope, and their read deadline scales with
+  that ceiling at the same minimum transfer rate. At most four request bodies
+  over 10 MiB are read at once; another is refused with 503 and a
+  `Retry-After` header, and the browser asks the user to try again. Every
+  other request, including inline blob creation, keeps the 10 MiB ceiling
+  and 30 second deadline. Image and PDF uploads keep their 5 MiB ceiling.
+
+- The release container image can start the web server again. Since 0.8.14,
+  `elspeth web` in the published image stopped with `AttributeError: module
+  'os' has no attribute 'pidfd_open'`, because the CPython 3.14.5 build that
+  the pinned uv 0.11.15 installs lacks `os.pidfd_open` and
+  `signal.pidfd_send_signal`, which the web process watchdog needs. The image
+  now installs CPython 3.14.10 with uv 0.13.10, whose build has both, and the
+  image build refuses an interpreter that lacks either. The gateway image uses
+  the same uv. CLI pipelines and installs from source were not affected.
+
+- The release image no longer ships the bundled interpreter's own pip, which
+  nothing in the image uses and whose vendored setuptools 70.3.0 the image
+  scan reported (CVE-2025-47273). The runtime base moves to the current
+  distroless Debian 13.8 image, which carries the fixed zstd library.
+
+- Composer validation now refuses a step that requires named fields when it
+  sits behind a queue or row_union whose inputs do not all guarantee them. The
+  runtime build already refused these pipelines; the composer reported them
+  valid with a "Contract check skipped" warning, so the failure appeared only
+  at run start.
+- If the runtime check behind `diff_pipeline` failed internally after an
+  earlier tool call in the same turn had changed the pipeline, that change was
+  dropped instead of being saved with the failed turn. It is now saved, as it
+  already was when a tool handler crashed.
+- When a stored conversation row fails the composer's history integrity
+  check, the error now names the row (id, sequence number, role), so the
+  damaged row can be found.
+- The composer's main loop and planner now retry a provider 429 within the
+  request's deadline, after 1 s and then 2 s. Where LiteLLM keeps the
+  provider's Retry-After header, which was measured only on Bedrock, they wait
+  for the longer of that header and the 1 s or 2 s step, when the header is
+  30 s or less; a longer Retry-After is not retried. A quota or credit refusal
+  arrives as an ordinary 429, so it is retried within the same bound before it
+  is reported. On the OpenAI and Anthropic routes a provider 500 and connection
+  failures are still not retried, because LiteLLM reports a failure to read an
+  already billed response the same way. On the OpenRouter route LiteLLM
+  reports all of these as a general API error, which was already retried
+  before this release and still is. On the Anthropic and Bedrock routes a 403
+  in the composer's main loop now tells the user to check provider access; the
+  planner still reports it as the provider being unavailable. On the OpenAI and
+  OpenRouter routes LiteLLM reports a 403 as a general API error, so it is
+  still retried and reported as unavailable.
+- When a planner reply was withheld because the cost of an earlier model call
+  in the same request could not be confirmed, the notice blamed "the existing
+  request limits". It now names that cause. The withheld-reply notice also no
+  longer claims "Saved draft progress remains available" when the pipeline
+  draft is empty. Both corrections also apply to the existing withhold after a
+  provider 503.
+- A batch attempt that had already timed out and been evicted no longer stops
+  later processing when its row fails late: the ordinary late failure is
+  discarded and the row keeps its original disposition. A late Tier-1 error
+  still stops the run.
+- When a sink or failsink boundary check fails during a re-drive, only the
+  batch's fresh rows fail. Rows recovered from an earlier attempt keep their
+  recorded effects and outcomes.
+- Web recovery treats a run whose leader seat has expired like a released
+  one, so a dead owner's run is no longer held back from recovery.
+- Lease renewal and the composer's poll, reap and claim loop retry a
+  transient database error while another attempt still fits the lease
+  window, up to five in a row, before giving up.
+- A closing session operation releases its own fence after its renewal fails
+  or expires, once its work has stopped, without waiting for recovery. The
+  composer reaper settles its own lapsed job the same way.
+- An expired fork or revert receipt no longer blocks archiving a session.
+  Rejoining an archived fork parent answers 404, and the confirmation says
+  archived sessions cannot be reopened.
+- When an authentication audit write fails after its HTTP caller has
+  disconnected, the server logs `Abandoned auth audit failed` at ERROR with
+  the original exception.
+- A turn that starts with an empty pipeline and fails to build no longer
+  reports that the pipeline was emptied; it reports the failed build.
+- The file list no longer claims a file is missing, or that the list is
+  empty, before the session's list has been read. A list that failed to load
+  or was cut short shows "File name unavailable". A refused upload, delete or
+  download no longer disables Edit file, and the list's Retry stays with the
+  list failure.
+- The composer's splice refusals tell errors the insertion introduced apart
+  from standing errors whose wording changed. The composer instructions and
+  the `splice_transform` description say that a set or splice must leave the
+  whole pipeline valid.
+
+### Examples
+
+- The `multi_worker` and `multi_worker_showcase` examples hold each worker's
+  first row until every requested worker has joined and holds live work, for
+  at most 60 seconds (less if the lease would expire sooner). `WORKERS + 1`
+  must fit in the first fan-out, and a launcher stops a worker that does not
+  respond to TERM within a few seconds. Run them through their `run.sh`.
+- The `rate_limited_llm` example's ChaosLLM command passes `--no-burst`.
+- `scripts/examples-gate.sh` runs every offline example in a sandbox without
+  network access (it needs bubblewrap) and checks each documented result.
+
+### Publication and acceptance
+
+Automatic image publication from main remains held. The 0.8.18 tag and
+container publication follow successful required checks and the protected
+merge. Operator signing, live-provider acceptance and deployment remain
+separate steps.
+
+---
+
 ## 0.8.17 - 2026-11-23
 
 A hotfix for 0.8.16: three Web Composer fixes for large pipelines and
