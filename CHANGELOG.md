@@ -38,6 +38,14 @@ establish qualification, a published tag or an image.
   Existing Chroma collections are not touched; read or export them with your
   own Chroma tooling. Audit records of earlier runs that used these plugins
   stay readable with `elspeth explain`.
+- **Web file uploads now accept files up to 50 MiB by default.** The default
+  `max_upload_bytes` (`ELSPETH_WEB__MAX_UPLOAD_BYTES`) moves from 104857600
+  to 52428800 bytes. No deployment loses capacity: every request body was
+  already refused above 10 MiB before it reached the upload route, so 10 MiB
+  was the effective limit whatever the setting said. A deployment that sets
+  `max_upload_bytes` now gets that limit for file uploads. A reverse proxy in
+  front of the server must also allow bodies of that size; the bundled nginx
+  configuration allows 100 MiB.
 - **Finish runs before upgrading (canonical form v2).** New runs record the
   canonical version `sha256-rfc8785-v2`: byte values are hashed as base64 text
   and mappings that use reserved keys are no longer wrapped. A run recorded
@@ -201,6 +209,18 @@ establish qualification, a published tag or an image.
   image scans and the dependency audit now take no exceptions.
 
 ### Fixed
+
+- Web file uploads honour `max_upload_bytes`. The request-body guard that runs
+  before routing refused every body over 10 MiB, so a file between 10 MiB and
+  the configured upload limit was refused with "Request body too large (max
+  10 MB)" before the upload route could check it. Multipart file uploads
+  (`POST /api/sessions/{id}/blobs`) now take a ceiling of `max_upload_bytes`
+  plus 1 MiB for the multipart envelope, and their read deadline scales with
+  that ceiling at the same minimum transfer rate. At most four request bodies
+  over 10 MiB are read at once; another is refused with 503 and a
+  `Retry-After` header, and the browser asks the user to try again. Every
+  other request, including inline blob creation, keeps the 10 MiB ceiling
+  and 30 second deadline. Image and PDF uploads keep their 5 MiB ceiling.
 
 - The release container image can start the web server again. Since 0.8.14,
   `elspeth web` in the published image stopped with `AttributeError: module
