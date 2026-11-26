@@ -137,26 +137,6 @@ examples:
     table: "AGENTS.md L34"
     configs:
       settings.yaml: {class: NON-NETWORK, case: checkpoint_resume, note: "clean run only; interruption/resume is not exercised"}
-  chroma_rag:
-    class: NON-NETWORK
-    table: "AGENTS.md L220 (embedded ChromaDB)"
-    configs:
-      settings.yaml: {class: NON-NETWORK, covered_by: chroma_rag, note: "needs chromadb and a cached default embedding model"}
-    launchers:
-      run.sh: {class: NON-NETWORK, case: chroma_rag}
-  chroma_rag_indexed:
-    class: NON-NETWORK
-    table: "AGENTS.md L221"
-    configs:
-      index_pipeline.yaml: {class: NON-NETWORK, covered_by: chroma_rag_indexed, note: "run as the query pipeline's dependency"}
-      query_pipeline.yaml: {class: NON-NETWORK, case: chroma_rag_indexed}
-  chroma_rag_qa:
-    class: NETWORK
-    table: "AGENTS.md L222"
-    configs:
-      settings.yaml: {class: NETWORK, note: "OpenRouter LLM (public API)"}
-    launchers:
-      run.sh: {class: NETWORK, note: "uses API credits"}
   concurrent_scheduler:
     class: NON-NETWORK
     table: "AGENTS.md L302"
@@ -1157,34 +1137,3 @@ cases:
     configs: [examples/fixed_web_search/settings_fixture_detail.yaml]
     expectation_source: "AGENTS.md L210-L212: zero/one/multiple candidates, lineage, offline replay, live verify"
     log_markers: ["live: 3 search requests, 3 detail requests", "replay: 6 calls without network"]
-
-  # ---- Chroma RAG (embedded; AGENTS.md L214-L222) ----------------------------
-  - id: chroma_rag
-    example: chroma_rag
-    command: ./examples/chroma_rag/run.sh
-    expect_exit: [0]
-    configs: [examples/chroma_rag/settings.yaml]
-    requires: &chroma_requires
-      python_modules: [chromadb]
-      home_ro: [.cache/chroma/onnx_models/all-MiniLM-L6-v2]
-      files:
-        - ~/.cache/chroma/onnx_models/all-MiniLM-L6-v2/onnx/model.onnx
-        - ~/.cache/chroma/onnx_models/all-MiniLM-L6-v2/onnx/config.json
-        - ~/.cache/chroma/onnx_models/all-MiniLM-L6-v2/onnx/tokenizer.json
-        - ~/.cache/chroma/onnx_models/all-MiniLM-L6-v2/onnx/tokenizer_config.json
-        - ~/.cache/chroma/onnx_models/all-MiniLM-L6-v2/onnx/special_tokens_map.json
-        - ~/.cache/chroma/onnx_models/all-MiniLM-L6-v2/onnx/vocab.txt
-    expectation_source: "AGENTS.md L220: 8 rows"
-    audit:
-      - {db: examples/chroma_rag/runs/audit.db, runs: 1, status: [completed], source_rows: 8}
-
-  - id: chroma_rag_indexed
-    example: chroma_rag_indexed
-    command: elspeth run --settings examples/chroma_rag_indexed/query_pipeline.yaml --execute
-    expect_exit: [0]
-    configs: [examples/chroma_rag_indexed/index_pipeline.yaml, examples/chroma_rag_indexed/query_pipeline.yaml]
-    requires: *chroma_requires
-    expectation_source: "AGENTS.md L221: 10 index + 5 query rows (index runs as the declared dependency)"
-    audit:
-      - {label: index, db: examples/chroma_rag_indexed/runs/audit.db, runs: 2, run_index: 0, status: [completed], source_rows: 10}
-      - {label: query, db: examples/chroma_rag_indexed/runs/audit.db, runs: 2, run_index: 1, status: [completed], source_rows: 5}

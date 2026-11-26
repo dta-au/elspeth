@@ -14,7 +14,6 @@ describe("pluginDisplayName", () => {
   it("uses curated overrides where plain title-casing would mislead", () => {
     expect(pluginDisplayName("azure_blob")).toBe("Azure Blob Storage");
     expect(pluginDisplayName("dataverse")).toBe("Microsoft Dataverse");
-    expect(pluginDisplayName("chroma_sink")).toBe("Chroma Vector Store");
     expect(pluginDisplayName("batch_top_k")).toBe("Batch Top-K");
     // The id names the product; the label says what it is for.
     expect(pluginDisplayName("azure_ai_search")).toBe("Azure AI Search (RAG)");

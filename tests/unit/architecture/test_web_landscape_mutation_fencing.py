@@ -979,7 +979,20 @@ _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
 # site left and the per-record undecodable-bytes quarantine arrived in its place.
 # Arrival measured on the lane against 10d56017; merged with the dataverse-chroma
 # landing 20584836, scripts/fencing_inventory.py reports live 285 and digest below.
-_EXPECTED_CALL_COUNT = 285
+# 0.8.18 Chroma removal (2026-11-26): 285 -> 274. Arrived 0, departed 11, moved 0.
+# Departed with plugins/infrastructure/clients/retrieval/chroma.py:
+# ChromaSearchProvider._replay_search -> self._execution.allocate_call_index#1 and
+# record_call#1; ChromaSearchProvider.search -> self._execution.allocate_call_index#1,
+# record_call#1 and record_call#2; ChromaSearchProvider.runtime_preflight ->
+# self._execution.allocate_operation_call_index#1, record_operation_call#1 and
+# record_operation_call#2; ChromaSearchProvider._record_error ->
+# self._execution.record_call#1; ChromaSearchProvider._record_operation_error ->
+# self._execution.record_operation_call#1 (the P3 dataverse-chroma arrival above).
+# Departed with plugins/transforms/rag/transform.py:
+# RAGRetrievalTransform._record_readiness_check -> ctx.record_readiness_check#1.
+# Measured by scripts/fencing_inventory.py --baseline against a git archive of
+# f094597ac; the other four inventories and every violation set are unchanged.
+_EXPECTED_CALL_COUNT = 274
 # Release integration retains the ACA callers and the Dataverse lifecycle
 # wrapper: six validation writes move from load() to _load_rows().
 # AGG-ERROR-EDGE: 0b7a9382… -> d82c45a5…, the one caller added above.
@@ -1000,9 +1013,11 @@ _EXPECTED_CALL_COUNT = 285
 # _EXPECTED_CALL_COUNT.
 # P3 dataverse-chroma: 87f23b4e… -> 9a8cb7c5…, the one arrival named at
 # _EXPECTED_CALL_COUNT.
-# P3 cloud-blob (#19): 9a8cb7c5… -> the value below, the one arrival named at
+# P3 cloud-blob (#19): 9a8cb7c5… -> 9b4ad473…, the one arrival named at
 # _EXPECTED_CALL_COUNT.
-_EXPECTED_PRODUCTION_CALLER_SHA256 = "9b4ad47309d8766f7769c2787f0bae58ca9fdcf35aaeabb2b95820b8f6f59fe9"
+# 0.8.18 Chroma removal (2026-11-26): 9b4ad473… -> the value below, the eleven
+# departures named at _EXPECTED_CALL_COUNT.
+_EXPECTED_PRODUCTION_CALLER_SHA256 = "9e9a57ec82269c713cb647328975caf74db8fee7b709c9b8cca6f3ccc1fe2192"
 # C4 (recorded FAILED verdict): 138 -> 143, d3b83b4c… -> the value below. Arrived:
 # ExecutionRepository.complete_aggregation_failure -> insert_batch_transform_errors_on,
 # -> NodeStateRepository.record_routing_event_on, -> NodeStateRepository.complete_node_state_on,

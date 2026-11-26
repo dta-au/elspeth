@@ -2668,10 +2668,10 @@ class ExecutionServiceImpl:
                                 f"Sink '{output.name}' {key}='{value}' resolves outside allowed output directories"
                             )
 
-        # Nested transform provider_config path allowlist — RAG retrieval
-        # transforms carry a local Chroma persist_directory under
-        # options.provider_config. It is a read/write target like a sink, so it
-        # is confined to the allowed SINK directories.
+        # Nested transform provider_config path allowlist: a transform may carry
+        # a local persist_directory under options.provider_config (no shipped
+        # plugin does since 0.8.18). It is a read/write target like a sink, so
+        # it is confined to the allowed SINK directories.
         if composition_state.nodes:
             from elspeth.web.paths import (
                 NESTED_LOCAL_PATH_OPTION_KEYS,
@@ -2735,9 +2735,8 @@ class ExecutionServiceImpl:
         # the SAME authoritative state preflight the /validate endpoint uses, BEFORE create_run,
         # and reject with a structured PipelineValidationError when invalid. This catches
         # the Mechanism-A classes (Graph/ValueSource/generic plugin-config) at the server
-        # boundary and closes the tutorial bypass; SchemaConfigModeViolation (post-emission
-        # row check) and the Chroma-SSRF plugin check (deferred network I/O) remain
-        # runtime-only by design.
+        # boundary and closes the tutorial bypass; SchemaConfigModeViolation (a post-emission
+        # row check) remains runtime-only by design.
 
         plugin_snapshot = self._plugin_snapshot_for_user(user_id, operation="execution")
 

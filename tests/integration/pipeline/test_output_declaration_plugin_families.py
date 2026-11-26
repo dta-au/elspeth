@@ -13,7 +13,7 @@ families:
 - batch annotation (``batch_outlier_annotator`` under ``aggregations:``,
   ``output_mode: transform`` — it is not passthrough-capable, since it skips
   rows whose value is null or non-finite): the whole batch follows ``on_error``;
-- per-row retrieval (``rag_retrieval``, whose core ``azure_ai_search`` shares):
+- per-row retrieval (``azure_ai_search``):
   the row follows the transform's ``on_error``;
 - per-row LLM structured output (``llm``): the declaration of each
   ``output_fields`` entry is BOUND to its ``OutputFieldConfig.type`` and the
@@ -49,13 +49,13 @@ from elspeth.contracts.token_usage import TokenUsage
 from elspeth.engine.executors.declared_output_types import verify_created_output_types, verify_produced_output_types
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.clients.retrieval.types import RetrievalChunk
+from elspeth.plugins.transforms.azure.ai_search import AzureAISearchTransform
 from elspeth.plugins.transforms.batch_outlier_annotator import BatchOutlierAnnotator
 from elspeth.plugins.transforms.llm import validation as llm_validation
 from elspeth.plugins.transforms.llm.provider import FinishReason, LLMProvider, LLMQueryResult
 from elspeth.plugins.transforms.llm.transform import LLMTransform
 from elspeth.plugins.transforms.rag import core as rag_core
 from elspeth.plugins.transforms.rag.formatter import FormattedContext
-from elspeth.plugins.transforms.rag.transform import RAGRetrievalTransform
 from elspeth.testing import make_pipeline_row
 from tests.integration.pipeline.test_output_declaration_routing import (
     _audit_cells_containing,
@@ -204,20 +204,32 @@ class _StubSearcher:
         return None
 
 
+def _stub_retrieval_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run ``azure_ai_search`` against ``_StubSearcher`` instead of a live index.
+
+    ``runtime_preflight`` is the Azure index count probe; it accepts only a
+    real ``AzureSearchProvider`` and is covered in
+    ``tests/unit/plugins/transforms/azure/test_ai_search.py``.
+    """
+    monkeypatch.setattr(AzureAISearchTransform, "_build_searcher", lambda self, ctx: _StubSearcher())
+    monkeypatch.setattr(AzureAISearchTransform, "runtime_preflight", lambda self, ctx: None)
+
+
 def _rag_transforms() -> dict[str, Any]:
     return {
         "transforms": [
             {
                 "name": "retrieve",
-                "plugin": "rag_retrieval",
+                "plugin": "azure_ai_search",
                 "input": "rows",
                 "on_success": "out",
                 "on_error": "quarantine",
                 "options": {
                     "output_prefix": "policy",
                     "query_field": "question",
-                    "provider": "chroma",
-                    "provider_config": {"collection": "stub", "mode": "ephemeral"},
+                    "endpoint": "https://invariant.example.search.windows.net",
+                    "index": "stub",
+                    "api_key": "probe-key",
                     "schema": {"mode": "observed"},
                 },
             }
@@ -226,8 +238,8 @@ def _rag_transforms() -> dict[str, Any]:
 
 
 def test_a_retrieval_transform_computing_the_wrong_type_routes_the_row_value_free(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """rag_retrieval's ``rag_context`` is declared ``str``; a formatter returning a non-str routes the row."""
-    monkeypatch.setattr(RAGRetrievalTransform, "_build_searcher", lambda self, ctx: _StubSearcher())
+    """azure_ai_search's ``rag_context`` is declared ``str``; a formatter returning a non-str routes the row."""
+    _stub_retrieval_backend(monkeypatch)
     monkeypatch.setattr(rag_core, "format_context", lambda *args, **kwargs: FormattedContext(text=[SENTINEL], truncated=False))
     _write_jsonl(tmp_path / "in.jsonl", [{"id": 1, "question": "What is the policy?"}])
 
@@ -244,7 +256,7 @@ def test_a_retrieval_transform_computing_the_wrong_type_routes_the_row_value_fre
 
 
 def test_the_same_retrieval_completes_with_the_declared_types_recorded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(RAGRetrievalTransform, "_build_searcher", lambda self, ctx: _StubSearcher())
+    _stub_retrieval_backend(monkeypatch)
     _write_jsonl(tmp_path / "in.jsonl", [{"id": 1, "question": "What is the policy?"}])
 
     result = _run(_settings_file(tmp_path, _rag_transforms()))
@@ -457,7 +469,6 @@ def test_the_declaration_roster_reaches_every_swept_family() -> None:
         "batch_classifier_metrics",
         "batch_outlier_annotator",
         "report_assemble",
-        "rag_retrieval",
         "azure_ai_search",
         "aws_textract_document_analysis",
         "aws_textract_inline_analysis",

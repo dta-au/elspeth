@@ -699,7 +699,7 @@ class TransformErrorReason(TypedDict):
         violations: Per-violation reason entries (multiple_contract_violations only)
 
     RAG retrieval context:
-        provider: Retrieval provider name (e.g., "azure_search", "chroma")
+        provider: Retrieval provider name (e.g., "azure_search")
         cause: Sub-cause within an error category (e.g., "null_value", "empty_query")
         pattern: Regex pattern string (for no_regex_match/regex_timeout errors)
         skipped_count: Number of candidate hits rejected before final output
@@ -849,7 +849,7 @@ class TransformErrorReason(TypedDict):
     status_code: NotRequired[int]
 
     # RAG retrieval context
-    provider: NotRequired[str]  # Retrieval provider name (e.g., "azure_search", "chroma")
+    provider: NotRequired[str]  # Retrieval provider name (e.g., "azure_search")
     cause: NotRequired[str]  # Sub-cause within error category (e.g., "null_value", "empty_query")
     pattern: NotRequired[str]  # Regex pattern string (for no_regex_match/regex_timeout errors)
     skipped_count: NotRequired[int]  # Candidate hits rejected before final output

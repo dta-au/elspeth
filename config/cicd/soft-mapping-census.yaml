@@ -358,8 +358,6 @@ files:
     dict[str, Any]: 7
   src/elspeth/plugins/infrastructure/clients/retrieval/base.py:
     dict[str, Any]: 1
-  src/elspeth/plugins/infrastructure/clients/retrieval/chroma.py:
-    dict[str, Any]: 4
   src/elspeth/plugins/infrastructure/clients/retrieval/types.py:
     dict[str, Any]: 1
   src/elspeth/plugins/infrastructure/clients/vendor_logging.py:
@@ -380,8 +378,6 @@ files:
   src/elspeth/plugins/infrastructure/power_automate_nonlive.py:
     Mapping[str, object]: 5
     dict[str, object]: 1
-  src/elspeth/plugins/infrastructure/probe_factory.py:
-    Mapping[str, Any]: 1
   src/elspeth/plugins/infrastructure/runtime_factory.py:
     Mapping[str, object]: 1
     boundary: 2
@@ -415,10 +411,6 @@ files:
   src/elspeth/plugins/sinks/azure_blob_sink.py:
     Mapping[str, object]: 1
     dict[str, Any]: 9
-  src/elspeth/plugins/sinks/chroma_sink.py:
-    Mapping[str, object]: 2
-    dict[str, Any]: 4
-    dict[str, object]: 9
   src/elspeth/plugins/sinks/csv_sink.py:
     Mapping[str, object]: 1
     dict[str, Any]: 3
@@ -621,12 +613,8 @@ files:
     dict[str, Any]: 2
   src/elspeth/plugins/transforms/pdf_rasterize.py:
     dict[str, Any]: 4
-  src/elspeth/plugins/transforms/rag/config.py:
-    dict[str, Any]: 1
   src/elspeth/plugins/transforms/rag/core.py:
     dict[str, Any]: 4
-  src/elspeth/plugins/transforms/rag/transform.py:
-    dict[str, Any]: 2
   src/elspeth/plugins/transforms/reference_join.py:
     Mapping[str, Any]: 1
     Mapping[str, object]: 4
@@ -1123,10 +1111,10 @@ files:
   src/elspeth/web/shareable_reviews/service.py:
     dict[str, object]: 1
 totals:
-  Mapping[str, Any]: 819
-  Mapping[str, object]: 321
+  Mapping[str, Any]: 818
+  Mapping[str, object]: 319
   MutableMapping[str, Any]: 9
   boundary: 70
-  dict[str, Any]: 1124
-  dict[str, object]: 406
-  soft: 2679
+  dict[str, Any]: 1113
+  dict[str, object]: 397
+  soft: 2656

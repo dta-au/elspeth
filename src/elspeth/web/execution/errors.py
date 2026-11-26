@@ -58,8 +58,7 @@ class PipelineValidationError(ValueError):
     ``execute()`` directly with no pre-run validation).
 
     Not every failure class is preflightable: ``SchemaConfigModeViolation`` is a
-    post-emission row check and the Chroma SSRF check is deliberately deferred network
-    I/O — those remain runtime failures by design.
+    post-emission row check, so it remains a runtime failure by design.
 
     Subclasses ValueError for back-compat with existing ``except ValueError`` paths;
     new callers catch this type to access ``errors`` / ``readiness``.

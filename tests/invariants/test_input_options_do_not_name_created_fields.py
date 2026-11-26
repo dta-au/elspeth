@@ -1,7 +1,7 @@
 """An input-naming config option must never resolve to a field the plugin creates.
 
 Several transforms take an option that names the column they READ —
-``web_scrape.url_field``, ``rag_retrieval.query_field``,
+``web_scrape.url_field``, ``azure_ai_search.query_field``,
 ``aws_textract_document_analysis.key_field``,
 ``azure_document_intelligence.source_field`` — and then write their created
 fields back onto the same row. Pointing one at the other makes the transform
@@ -100,13 +100,18 @@ from elspeth.plugins.infrastructure.manager import PluginManager
 # were already closed natively when the defect was found (``blob_fetch``,
 # ``blob_csv_expand``); the other four were the live repros. If a refactor drops
 # one out of scope, coverage of the original defect has been lost silently.
+# 0.8.18 Chroma removal (2026-11-26): the retrieval repro was ``rag_retrieval``,
+# which left with Chroma. ``azure_ai_search`` takes its place as the retrieval
+# anchor: it reads ``query_field`` through the same ``RetrievalOutputConfig``
+# (``plugins/transforms/rag/core.py``). It was not itself one of the measured
+# repros.
 _MEASURED_DEFECT_ANCHORS = frozenset(
     {
         "aws_textract_document_analysis",
+        "azure_ai_search",
         "azure_document_intelligence",
         "blob_csv_expand",
         "blob_fetch",
-        "rag_retrieval",
         "web_scrape",
     }
 )

@@ -4,7 +4,7 @@ Retrieves ranked context for each question from an existing Azure AI Search
 index with the `azure_ai_search` transform. It does not
 build the index and it does not generate an answer: populate the index with
 Azure's own indexer, and add an `llm` transform after retrieval when an answer
-is required (see [`chroma_rag_qa`](../chroma_rag_qa/) for that shape).
+is required.
 
 ## Run
 

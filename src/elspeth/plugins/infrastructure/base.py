@@ -2265,8 +2265,7 @@ class BaseSink(ABC, SinkEffectContract):
         governs (operator ruling 2026-09-25, ``contracts.field_spelling``): the
         ``schema.fields`` names (the declared input model's fields, keyed as
         written), ``declared_required_fields`` (which folds in the options a
-        sink writes FROM: text/document ``field``, chroma ``id_field`` and
-        ``document_field``), and every other option naming a row column
+        sink writes FROM, such as the text/document ``field``), and every other option naming a row column
         (``config_named_input_columns``). Each is compared to row keys as
         written, so a header spelling of it never meets the field it means.
 
@@ -2283,8 +2282,7 @@ class BaseSink(ABC, SinkEffectContract):
         aws_s3, azure_blob): ``apply_display_headers`` matches them to row keys
         as written, and a row field no key matches is a write-time error. A
         sink whose other options key output by row field names (dataverse
-        ``field_mapping``) extends this. Chroma's ``metadata_fields`` need no
-        entry: its config requires each to be a declared schema field.
+        ``field_mapping``) extends this.
         """
         mapping = self._headers_custom_mapping
         return frozenset() if mapping is None else frozenset(mapping)

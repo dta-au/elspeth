@@ -78,7 +78,6 @@ EXPECTED_BUILTIN_IDENTITIES = frozenset(
         "transform:llm",
         "transform:passthrough",
         "transform:pdf_rasterize",
-        "transform:rag_retrieval",
         "transform:reference_join",
         "transform:report_assemble",
         "transform:truncate",
@@ -87,7 +86,6 @@ EXPECTED_BUILTIN_IDENTITIES = frozenset(
         "transform:web_scrape",
         "sink:aws_s3",
         "sink:azure_blob",
-        "sink:chroma_sink",
         "sink:csv",
         "sink:database",
         "sink:dataverse",
@@ -239,11 +237,11 @@ def _operator_profile_registry() -> OperatorProfileRegistry:
 
 
 def test_registry_contains_the_exact_accepted_builtin_inventory() -> None:
-    assert len(REFERENCES) == 62
+    assert len(REFERENCES) == 60
     assert Counter(reference.kind for reference in REFERENCES) == {
         "source": 10,
-        "transform": 42,
-        "sink": 10,
+        "transform": 41,
+        "sink": 9,
     }
     assert {_identity(reference) for reference in REFERENCES} == EXPECTED_BUILTIN_IDENTITIES
 
@@ -282,7 +280,10 @@ def test_operator_profiled_exception_set_is_fixed_and_exhaustive() -> None:
             profiled_examples.add(_identity(reference))
 
     assert profiled_examples == WEB_PROFILE_EXAMPLE_IDENTITIES
-    assert len(DIRECT_CONFIG_REFERENCES) == 58
+    # 0.8.18 Chroma removal (2026-11-26): 58 -> 56. transform:rag_retrieval and
+    # sink:chroma_sink were both direct-config references (neither was operator
+    # profiled); 60 built-ins less the 4 web-profile examples.
+    assert len(DIRECT_CONFIG_REFERENCES) == 56
 
 
 @pytest.mark.parametrize("reference", DIRECT_CONFIG_REFERENCES, ids=_identity)

@@ -73,7 +73,14 @@ ENV UV_PYTHON_INSTALL_DIR=/opt/python \
     UV_PYTHON_PREFERENCE=only-managed \
     UV_PYTHON_DOWNLOADS=manual
 ARG PYTHON_VERSION="3.14.10"
-RUN uv python install "$PYTHON_VERSION"
+# The interpreter's own pip is never used: uv builds and fills the venv, and
+# the runtime installs nothing. It vendors an old setuptools that image scans
+# report, so it is removed before /opt/python is copied into the runtime.
+RUN uv python install "$PYTHON_VERSION" && \
+    for d in /opt/python/cpython-"$PYTHON_VERSION"-*; do \
+        rm -rf "$d"/lib/python3.*/site-packages/pip "$d"/lib/python3.*/site-packages/pip-*.dist-info "$d"/bin/pip "$d"/bin/pip3 "$d"/bin/pip3.*; \
+    done && \
+    ! ls -d /opt/python/cpython-*/lib/python3.*/site-packages/pip 2>/dev/null
 
 # Set up working directory
 WORKDIR /build
@@ -168,7 +175,7 @@ RUN groupadd --gid 1654 elspeth && \
 # =============================================================================
 # Stage 3: Runtime
 # =============================================================================
-FROM gcr.io/distroless/cc-debian13:debug-nonroot@sha256:c69d16acb50ae6ee26adfb0645467b507753c0eb91c389afad87914cd2ecf6de AS runtime
+FROM gcr.io/distroless/cc-debian13:debug-nonroot@sha256:36978857457484568ebc541e7b47b291c30ffa2ae292d3d15ea5d294c0247f27 AS runtime
 
 ARG INSTALL_EXTRAS
 ARG RDS_CA_BUNDLE_SHA256

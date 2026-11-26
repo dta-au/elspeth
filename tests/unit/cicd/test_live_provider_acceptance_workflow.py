@@ -25,7 +25,6 @@ JOBS_TO_LANES = {
     "live_aws": "live-aws",
     "live_azure": "live-azure",
     "live_dataverse": "live-dataverse",
-    "live_chroma": "live-chroma",
     "live_provider": "live-provider",
 }
 ACTION_PINS = {
@@ -272,7 +271,7 @@ def test_workflow_matrix_is_the_exact_collision_free_external_case_inventory() -
                 assert lane_id.startswith("protected-live-")
             assert lane_id not in observed_lane_ids
             observed_lane_ids.add(lane_id)
-    assert len(observed_lane_ids) == 40
+    assert len(observed_lane_ids) == 35
 
 
 def _selector(path: Path) -> None:

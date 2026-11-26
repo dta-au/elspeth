@@ -133,7 +133,7 @@ _SHAPE_TOKEN_ALIASES: dict[str, frozenset[str]] = {
     # ever satisfy a fork chain/kind criterion (verified 2026-08-16).
     "fork": frozenset({"gate"}),
     "json": frozenset({"jsonl"}),
-    "rag": frozenset({"chroma"}),
+    "rag": frozenset({"azure_ai_search"}),
 }
 
 

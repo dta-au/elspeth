@@ -6,7 +6,6 @@ import copy
 import json
 import re
 import tomllib
-from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -28,7 +27,6 @@ _SETUP_UV_PREFIX = "astral-sh/setup-uv@"
 _TRIVY_ACTION_RE = re.compile(r"aquasecurity/trivy-action@[0-9a-f]{40}")
 TRIVY_IGNOREFILE = REPO_ROOT / ".trivyignore.yaml"
 CI_WORKFLOW = WORKFLOW_DIR / "ci.yaml"
-_MAIN_SCAN_IGNOREFILE = "${{ env.CI_CHECKOUT_PATH }}/.trivyignore.yaml"
 _IGNORE_VULN_RE = re.compile(r"--ignore-vuln\s+(\S+)")
 
 _MAIN_SCAN_CASES = (
@@ -102,7 +100,7 @@ def _assert_main_release_scan_contract(job: dict[str, Any]) -> None:
             assert step["with"]["severity"] == "CRITICAL,HIGH"
             assert step["with"]["ignore-unfixed"] is False
             assert step["with"]["exit-code"] == "1"
-            assert step["with"].get("trivyignores") == _MAIN_SCAN_IGNOREFILE, f"{name} must use only the version-scoped exception file"
+            assert "trivyignores" not in step["with"], f"{name} must take no vulnerability exceptions"
             report = f"main-vulnerabilities-{file_label}-linux-{architecture}.txt"
             assert report in step["with"]["output"]
             assert _step_index(job, build_name) < _step_index(job, name) < _step_index(job, sign_name)
@@ -132,7 +130,6 @@ def _compliant_main_release_job() -> dict[str, Any]:
                         "severity": "CRITICAL,HIGH",
                         "ignore-unfixed": False,
                         "exit-code": "1",
-                        "trivyignores": _MAIN_SCAN_IGNOREFILE,
                     },
                 }
             )
@@ -184,56 +181,47 @@ def test_main_release_scan_validator_rejects_missing_rebound_late_or_unretained_
     with pytest.raises(AssertionError, match="must retain"):
         _assert_main_release_scan_contract(unretained)
 
-    widened = copy.deepcopy(job)
-    _one_step(widened, "Scan published main GHCR arm64 digest")["with"]["trivyignores"] = ".trivyignore"
-    with pytest.raises(AssertionError, match="version-scoped exception file"):
-        _assert_main_release_scan_contract(widened)
-
-    unscoped = copy.deepcopy(job)
-    del _one_step(unscoped, "Scan published main ACR-only amd64 digest")["with"]["trivyignores"]
-    with pytest.raises(AssertionError, match="version-scoped exception file"):
-        _assert_main_release_scan_contract(unscoped)
+    excepted = copy.deepcopy(job)
+    _one_step(excepted, "Scan published main GHCR arm64 digest")["with"]["trivyignores"] = ".trivyignore.yaml"
+    with pytest.raises(AssertionError, match="no vulnerability exceptions"):
+        _assert_main_release_scan_contract(excepted)
 
 
-def _pinned_requirement_version(package: str) -> str:
-    project = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
-    pins = [dep.split("==", 1)[1].strip() for dep in project["dependencies"] if dep.split("==", 1)[0].strip() == package]
-    assert len(pins) == 1, f"expected exactly one exact pin for {package}, found {pins}"
-    return pins[0]
-
-
-def _pip_audit_ignored_vulns() -> set[str]:
+def _pip_audit_runs() -> list[str]:
     ci = _workflow(CI_WORKFLOW)
-    ignored: set[str] = set()
-    for _job_name, job in _executable_jobs(ci):
-        for step in job.get("steps", []):
-            run = step.get("run", "")
-            if "pip-audit" in run:
-                ignored.update(_IGNORE_VULN_RE.findall(run))
-    assert ignored, "found no pip-audit --ignore-vuln entries in ci.yaml; the instrument matched nothing"
-    return ignored
+    runs = [
+        step.get("run", "")
+        for _job_name, job in _executable_jobs(ci)
+        for step in job.get("steps", [])
+        if "pip-audit" in step.get("run", "")
+    ]
+    assert runs, "found no pip-audit step in ci.yaml; the instrument matched nothing"
+    return runs
 
 
-def test_trivy_exceptions_are_version_scoped_expiring_and_already_accepted_by_pip_audit() -> None:
-    entries = yaml.safe_load(TRIVY_IGNOREFILE.read_text(encoding="utf-8"))["vulnerabilities"]
-    assert entries, "the exception file exists but lists nothing"
-    chromadb_purl = f"pkg:pypi/chromadb@{_pinned_requirement_version('chromadb')}"
-    accepted = _pip_audit_ignored_vulns()
+def test_pip_audit_and_image_scans_take_no_vulnerability_exceptions() -> None:
+    """chromadb, the only excepted package, left the dependency set in 0.8.18.
 
-    for entry in entries:
-        vuln_id = entry["id"]
-        assert entry["purls"] == [chromadb_purl], f"{vuln_id} must be scoped to the pinned {chromadb_purl}"
-        assert isinstance(entry["expired_at"], date), f"{vuln_id} must carry an expiry date"
-        assert entry["statement"].strip(), f"{vuln_id} must state why it does not apply"
-        assert vuln_id in accepted, f"{vuln_id} is not an accepted pip-audit exception in ci.yaml"
-    assert len({entry["id"] for entry in entries}) == len(entries)
+    Its four server-side CVEs were the sole pip-audit ``--ignore-vuln`` entries
+    and the sole ``.trivyignore.yaml`` entries. With the package gone, any new
+    exception is a fresh decision, not an inherited one.
+    """
+    for run in _pip_audit_runs():
+        assert _IGNORE_VULN_RE.findall(run) == [], "pip-audit must take no --ignore-vuln exceptions"
+    assert not TRIVY_IGNOREFILE.exists(), "no image scan takes exceptions, so no Trivy ignore file is kept"
+    locked = tomllib.loads((REPO_ROOT / "uv.lock").read_text(encoding="utf-8"))["package"]
+    assert "chromadb" not in {package["name"] for package in locked}
+
+
+def test_pip_audit_exception_instrument_detects_an_ignore() -> None:
+    assert _IGNORE_VULN_RE.findall("pip-audit --strict \\\n  --ignore-vuln CVE-2026-0001 \\\n") == ["CVE-2026-0001"]
 
 
 def test_gateway_image_scans_take_no_exceptions() -> None:
     build = _workflow(BUILD_WORKFLOW)["jobs"]["build-push"]
     for architecture in _PLATFORMS:
         step = _one_step(build, f"Scan published gateway {architecture} digest")
-        assert "trivyignores" not in step["with"], "the gateway image ships no chromadb and takes no exceptions"
+        assert "trivyignores" not in step["with"], "the gateway image takes no exceptions"
 
 
 def _assert_container_is_digest_pinned(job_name: str, job: dict[str, Any]) -> None:

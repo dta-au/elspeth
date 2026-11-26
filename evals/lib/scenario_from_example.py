@@ -105,7 +105,7 @@ def _shape_token(plugin: str | None) -> str | None:
     if p == "landscape_journal":
         return "landscape_journal"
     # Transforms
-    if "rag" in p or "chroma" in p:
+    if "rag" in p or p == "azure_ai_search":
         return "rag"
     if p in {"web_scrape"} or "web_scrape" in p:
         return "web_scrape"

@@ -72,10 +72,6 @@ EXTERNAL_CASE_IDS_BY_JOB = {
         "source:dataverse@managed_identity",
         "source:dataverse@service_principal",
     ),
-    "live_chroma": (
-        "sink:chroma_sink@client",
-        "sink:chroma_sink@persistent",
-    ),
     "live_provider": (
         "source:llm@azure",
         "source:llm@bedrock",
@@ -87,9 +83,6 @@ EXTERNAL_CASE_IDS_BY_JOB = {
         "transform:llm@bedrock",
         "transform:llm@gateway",
         "transform:llm@openrouter",
-        "transform:rag_retrieval@chroma-client",
-        "transform:rag_retrieval@chroma-ephemeral",
-        "transform:rag_retrieval@chroma-persistent",
     ),
 }
 _EXTERNAL_CASE_IDS = frozenset(case_id for case_ids in EXTERNAL_CASE_IDS_BY_JOB.values() for case_id in case_ids)

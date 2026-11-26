@@ -32,11 +32,10 @@ import elspeth.plugins.infrastructure.clients.llm as llm_module
 from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.enums import RunMode
-from elspeth.core.security.web import SSRFBlockedError, SSRFRefusalKind
+from elspeth.core.security.web import SSRFRefusalKind
 from elspeth.plugins.infrastructure.base import BaseSink, BaseSource, BaseTransform
 from elspeth.plugins.infrastructure.clients.llm import AuditedLLMClient, ContentPolicyError, LLMClientError
 from elspeth.plugins.infrastructure.clients.retrieval.azure_search import AzureSearchProviderConfig
-from elspeth.plugins.infrastructure.clients.retrieval.connection import ChromaConnectionConfig, _host_url, _validate_chroma_http_target
 from elspeth.plugins.infrastructure.config_base import PluginConfig
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.plugins.infrastructure.run_mode_capabilities import precheck_nonlive_plugin_names_from_raw
@@ -63,7 +62,6 @@ from elspeth.plugins.transforms.llm.providers.bedrock import BedrockConfig
 from elspeth.plugins.transforms.llm.providers.gateway import GatewayConfig, _validate_gateway_success_response
 from elspeth.plugins.transforms.llm.providers.openrouter import OpenRouterConfig, _validate_chat_completion_response
 from elspeth.plugins.transforms.llm.tracing import AzureAITracingConfig, LangfuseTracingConfig
-from elspeth.plugins.transforms.rag.config import RAGRetrievalConfig
 from elspeth.plugins.transforms.web_scrape import WebScrapeConfig
 from tests.fixtures.mock_audit import mock_audit_authority
 from tests.unit.plugins.llm.test_provider_azure import _LEADER_TOKEN as _AZURE_LEADER_TOKEN
@@ -796,7 +794,7 @@ _NOT_SECRET = re.compile(
 
 def _credential_carrier(model: type, name: str) -> bool:
     """URL, endpoint, host and connection fields can carry userinfo or query secrets."""
-    if (model is WebScrapeConfig and name in {"query", "headers"}) or (model is RAGRetrievalConfig and name == "provider_config"):
+    if model is WebScrapeConfig and name in {"query", "headers"}:
         return True
     if name.startswith("field_") or name.endswith(("_field", "_fingerprint", "_ip_field")) or name == "allowed_hosts":
         return False
@@ -817,7 +815,7 @@ def test_every_plugin_credential_field_hides_its_value() -> None:
     seen: set[type] = set()
     manager = get_shared_plugin_manager()
     plugins = (*manager.get_sources(), *manager.get_transforms(), *manager.get_sinks())
-    assert len(plugins) >= 62
+    assert len(plugins) >= 60
     registry_models = {
         model
         for plugin in plugins
@@ -853,7 +851,6 @@ def test_every_plugin_credential_field_hides_its_value() -> None:
     assert _credential_carrier(LangfuseTracingConfig, "host")
     assert _credential_carrier(WebScrapeConfig, "query")
     assert _credential_carrier(WebScrapeConfig, "headers")
-    assert _credential_carrier(RAGRetrievalConfig, "provider_config")
     assert leaking == [], "\n".join(leaking)
 
 
@@ -981,26 +978,6 @@ class TestConfigErrorsCarryNoAuthoredInput:
         assert "credentials" in configured_url_refusal_message("credentials_in_url")
         assert "hostname" in configured_url_refusal_message("missing_hostname")
 
-    def test_chroma_network_refusal_never_echoes_host(self) -> None:
-        secret = "p5-network-" + "runtime-secret"
-        with patch(
-            "elspeth.plugins.infrastructure.clients.retrieval.connection.validate_url_for_ssrf",
-            side_effect=SSRFBlockedError("external refusal", kind="blocked_range"),
-        ):
-            raised = _raised_by(lambda: _validate_chroma_http_target(f"{secret}.example.test", 8000, ssl=True))
-        assert isinstance(raised, ValueError)
-        assert secret not in "".join(traceback.format_exception(raised))
-
-    def test_chroma_loopback_resolution_refusal_never_echoes_host(self) -> None:
-        host = "local" + "host"
-        with patch(
-            "elspeth.plugins.infrastructure.clients.retrieval.connection.validate_url_for_ssrf",
-            return_value=SimpleNamespace(resolved_ip="8.8.8.8"),
-        ):
-            raised = _raised_by(lambda: _validate_chroma_http_target(host, 8000, ssl=False))
-        assert isinstance(raised, ValueError)
-        assert host not in "".join(traceback.format_exception(raised))
-
     @pytest.mark.parametrize(
         "endpoint",
         [
@@ -1014,23 +991,6 @@ class TestConfigErrorsCarryNoAuthoredInput:
         raised = _raised_by(lambda: AzureSearchProviderConfig.model_validate({"endpoint": endpoint.format(secret)}))
         assert raised is not None
         assert "endpoint" in str(raised)
-        assert secret not in "".join(traceback.format_exception(raised))
-
-    @pytest.mark.parametrize(
-        ("host", "ssl"),
-        [("{}example.test", False), ("10.0.0.1", True)],
-    )
-    def test_chroma_config_refusal_never_echoes_host(self, host: str, ssl: bool) -> None:
-        secret = "p5-host-" + "runtime-secret"
-        raised = _raised_by(
-            lambda: ChromaConnectionConfig.model_validate(
-                {"collection": "test-index", "mode": "client", "host": host.format(secret), "ssl": ssl}
-            )
-        )
-        assert raised is not None
-        assert "host" in str(raised)
-        if "{}" not in host:
-            assert host not in str(raised)
         assert secret not in "".join(traceback.format_exception(raised))
 
     @pytest.mark.parametrize("model", [WebScrapeConfig, BlobFetchConfig])
@@ -1069,53 +1029,6 @@ class TestConfigErrorsCarryNoAuthoredInput:
         assert secret not in "".join(traceback.format_exception(raised))
         for chained in (raised.__cause__, raised.__context__):
             assert chained is None or secret not in "".join(traceback.format_exception(chained))
-
-    @pytest.mark.parametrize("pattern", ["https://{}", "{}/path", "{}?sig=1", "{}#fragment", "{}\\path", "user:pass@{}"])
-    def test_chroma_refused_host_forms_use_static_error(self, pattern: str) -> None:
-        host = pattern.format("p5-host-" + "runtime-secret")
-        raised = _raised_by(lambda: _host_url(host, 8000, ssl=True))
-        assert isinstance(raised, ValueError)
-        assert host not in str(raised)
-        assert host not in repr(raised)
-        assert host not in "".join(traceback.format_exception(raised))
-
-    @pytest.mark.parametrize("plugin_name", ["chroma_sink", "rag_retrieval"])
-    @pytest.mark.parametrize("qualified", [False, True])
-    def test_chroma_userinfo_rejected_without_credential_in_chain(self, plugin_name: str, qualified: bool) -> None:
-        secret = "p5-chroma-" + "runtime-password"
-        host = f"user:{secret}@example.test"
-        if qualified:
-            host = "https://" + host
-        manager = get_shared_plugin_manager()
-        plugin = manager.get_sink_by_name(plugin_name) if plugin_name == "chroma_sink" else manager.get_transform_by_name(plugin_name)
-        config_model = cast(type[BaseSink] | type[BaseTransform], plugin).config_model
-        assert config_model is not None
-        if plugin_name == "chroma_sink":
-            raw = {
-                "collection": "test-index",
-                "mode": "client",
-                "host": host,
-                "field_mapping": {"document_field": "text", "id_field": "id"},
-                "schema": {"mode": "observed"},
-            }
-        else:
-            raw = {
-                "output_prefix": "policy",
-                "query_field": "question",
-                "provider": "chroma",
-                "provider_config": {"collection": "test-index", "mode": "client", "host": host},
-                "schema": {"mode": "observed"},
-            }
-        raised = _raised_by(lambda: config_model.from_dict(raw))
-        assert raised is not None
-        assert secret not in str(raised)
-        assert secret not in repr(raised)
-        assert secret not in "".join(traceback.format_exception(raised))
-        cause = raised.__cause__
-        while cause is not None:
-            assert secret not in str(cause)
-            assert secret not in repr(cause)
-            cause = cause.__cause__
 
     def test_database_url_password_is_hidden_but_retained(self) -> None:
         password = "p5-db-" + "runtime-password"

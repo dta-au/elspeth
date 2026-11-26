@@ -63,7 +63,7 @@ distinction does not have to be rediscovered.)
     they read blob-backed external bytes and cross the parser trust
     boundary into row data.
   - EXTERNAL_CALL determinism (automated): ``blob_fetch``, ``web_scrape``,
-    ``rag_retrieval``, ``azure_content_safety``, ``azure_prompt_shield``.
+    ``azure_ai_search``, ``azure_content_safety``, ``azure_prompt_shield``.
     These plugins declare ``Determinism.EXTERNAL_CALL`` and the runtime
     predicate picks them up automatically.
   - Manual curation (LLM-class, NON_DETERMINISTIC): ``llm``. The plugin
@@ -183,7 +183,6 @@ EXPECTED_SOURCE_DETERMINISMS: dict[str, Determinism] = {
 EXPECTED_SINK_DETERMINISMS: dict[str, Determinism] = {
     "aws_s3": Determinism.IO_WRITE,
     "azure_blob": Determinism.IO_WRITE,
-    "chroma_sink": Determinism.IO_WRITE,
     "csv": Determinism.IO_WRITE,
     "database": Determinism.IO_WRITE,
     "dataverse": Determinism.EXTERNAL_CALL,
@@ -231,7 +230,6 @@ EXPECTED_TRANSFORM_DETERMINISMS: dict[str, Determinism] = {
     "llm": Determinism.NON_DETERMINISTIC,  # manual curation (LLM API boundary)
     "passthrough": Determinism.DETERMINISTIC,
     "pdf_rasterize": Determinism.IO_READ,
-    "rag_retrieval": Determinism.EXTERNAL_CALL,
     "azure_ai_search": Determinism.EXTERNAL_CALL,
     # DETERMINISTIC, not IO_READ: reference_join's table is materialized into its
     # config at load, so the transform opens nothing at row time.

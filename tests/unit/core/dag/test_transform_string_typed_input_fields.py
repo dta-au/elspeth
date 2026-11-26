@@ -475,7 +475,6 @@ class TestTruncateBuildPath:
         ("web_scrape", "web_scrape_probe_url"),
         ("aws_textract_inline_analysis", "blob_ref"),
         ("aws_textract_document_analysis", "document_key"),
-        ("rag_retrieval", "rag_probe_query"),
         ("azure_ai_search", "rag_probe_query"),
     ],
 )
@@ -543,8 +542,6 @@ def test_string_only_sibling_rejects_fixed_non_string_producer(plugin: str, targ
             "header_value",
             "web_scrape_probe_url",
         ),
-        ("rag_retrieval", {}, (), "rag_probe_query", "unused"),
-        ("rag_retrieval", {"query_template": "{{ query }}"}, (), None, "rag_probe_query"),
         ("azure_ai_search", {}, (), "rag_probe_query", "unused"),
         ("azure_ai_search", {"query_template": "{{ query }}"}, (), None, "rag_probe_query"),
     ],

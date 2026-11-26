@@ -421,11 +421,11 @@ class AzureSearchProvider:
         )
         chunks, skipped_items = self._parse_response(response_data, min_score)
         # "Record what we didn't get" — skipped items are audit evidence.
-        # Store on instance so callers (RAGRetrievalTransform) can include
+        # Store on instance so callers (AzureAISearchTransform) can include
         # skip counts in their audit success_reason metadata, which flows
         # into the Landscape audit trail.
         # "Record what we didn't get" — skipped items are audit evidence.
-        # Stored on instance for the caller (RAGRetrievalTransform) to include
+        # Stored on instance for the caller (AzureAISearchTransform) to include
         # in the Landscape audit trail via success_reason metadata.
         # No logger.debug — per logging policy, pipeline activity belongs
         # in the Landscape, not in logs.

@@ -211,16 +211,6 @@ in a temporary directory; it is not part of the offline fixture check.
 search-to-detail pipeline on port 8215. It checks zero, one, and multiple
 candidate outcomes, source-to-output lineage, offline replay, and live verify.
 
-### Chroma RAG (embedded, no external server)
-
-ChromaDB runs embedded — no server setup needed, but requires `chromadb` package.
-
-| Example | Rows | Notes |
-|---------|------|-------|
-| `chroma_rag` | 8 | Vector retrieval only; run `./examples/chroma_rag/run.sh` to seed and query |
-| `chroma_rag_indexed` | 10 index + 5 query | Dependency-managed indexing and retrieval; run `elspeth run --settings examples/chroma_rag_indexed/query_pipeline.yaml --execute` |
-| `chroma_rag_qa` | 8 | RAG + OpenRouter LLM QA; run `./examples/chroma_rag_qa/run.sh` (~19s, uses API credits) |
-
 ### OpenRouter (real API, costs money)
 
 These call real LLM APIs via OpenRouter. Requires `OPENROUTER_API_KEY` in `.env`.

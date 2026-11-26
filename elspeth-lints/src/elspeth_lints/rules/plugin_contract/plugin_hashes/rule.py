@@ -44,7 +44,7 @@ EXCLUDED_FILES = frozenset(
         "provider.py",
     }
 )
-EXPECTED_PLUGIN_COUNT = 62
+EXPECTED_PLUGIN_COUNT = 60
 _HASH_LINE_PATTERN = re.compile(rb'(\s*source_file_hash\s*(?::[^=]+=\s*|=\s*))"sha256:[^"]+"')
 _NORMALIZED_HASH_VALUE = b'"sha256:0000000000000000"'
 _PLUGIN_BASE_CLASS_NAMES = frozenset(

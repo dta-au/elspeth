@@ -18,9 +18,9 @@ import pytest
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.core.dag.builder import _validate_output_schema_contract
 from elspeth.plugins.infrastructure.manager import PluginManager
+from elspeth.plugins.transforms.azure.ai_search import AzureAISearchTransform
 from elspeth.plugins.transforms.field_mapper import FieldMapper
 from elspeth.plugins.transforms.json_explode import JSONExplode
-from elspeth.plugins.transforms.rag.transform import RAGRetrievalTransform
 
 # The six transforms the hand-written Invariant 2 roster named. They are anchors,
 # not the roster: discovery must keep reaching them, and a name may only leave
@@ -31,7 +31,7 @@ _LITERAL_ROSTER_ANCHORS = frozenset(
         "batch_stats",
         "field_mapper",
         "json_explode",
-        "rag_retrieval",
+        "azure_ai_search",
         "web_scrape",
     }
 )
@@ -75,12 +75,12 @@ def _invariant2_transforms():
     return discovered
 
 
-def _make_rag_transform(*, output_prefix: str = "sci", query_field: str = "q") -> RAGRetrievalTransform:
-    """Construct RAG with the base-install provider path, not optional extras."""
-    config = RAGRetrievalTransform.probe_config()
+def _make_rag_transform(*, output_prefix: str = "sci", query_field: str = "q") -> AzureAISearchTransform:
+    """Construct the retrieval transform from its no-network probe config."""
+    config = AzureAISearchTransform.probe_config()
     config["output_prefix"] = output_prefix
     config["query_field"] = query_field
-    return RAGRetrievalTransform(config)
+    return AzureAISearchTransform(config)
 
 
 class TestContractInvariantsAcrossAllTransforms:

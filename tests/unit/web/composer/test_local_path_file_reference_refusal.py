@@ -29,14 +29,15 @@ from tests.unit.web.composer import test_deferred_contract_notice as graphs
 _REFUSAL = "must be a string path; an attached file cannot stand there."
 
 # The registered plugins whose config declares each key; a key no plugin
-# declares (``file`` today) is still confined, so it is exercised on csv.
+# declares (``file``, ``persist_directory`` and the nested
+# ``provider_config.persist_directory`` today) is still confined, so it is
+# exercised on csv, or on passthrough for the nested key (the nested rule
+# reads only ``options.provider_config``, never the plugin name).
 _OWNERS: dict[tuple[str, str], tuple[str, ...]] = {
     ("source", "path"): ("csv", "json", "text"),
     ("sink", "path"): ("csv", "document", "json", "text"),
-    ("sink", "persist_directory"): ("chroma_sink",),
-    ("nested", "persist_directory"): ("rag_retrieval",),
 }
-_UNOWNED_PLUGIN = {"source": "csv", "sink": "csv", "nested": "rag_retrieval"}
+_UNOWNED_PLUGIN = {"source": "csv", "sink": "csv", "nested": "passthrough"}
 
 _POSITIONS: list[tuple[str, str, str]] = [
     (side, key, plugin)
@@ -66,30 +67,18 @@ def _graph(tmp_path: Path, side: str, key: str, plugin: str, value: object) -> C
         options: dict[str, Any] = {key: value, "schema": graphs.OBSERVED}
         if plugin in {"text", "document"}:
             options["field"] = "k"
-        if plugin == "chroma_sink":
-            options.update({"collection": "rows", "mode": "persistent", "document_field": "k", "id_field": "id"})
         output = OutputSpec(name="output", plugin=plugin, options=options, on_write_failure="discard")
         return CompositionState(sources=base.sources, nodes=base.nodes, edges=(), outputs=(output,), metadata=PipelineMetadata(), version=1)
-    rag = _transform(
-        "rag",
-        plugin,
-        {
-            "provider": "chroma",
-            "provider_config": {"collection": "rows", "mode": "persistent", key: value},
-            "query_field": "k",
-            "output_prefix": "rag",
-            "schema": graphs.OBSERVED,
-        },
-    )
-    return CompositionState(sources=base.sources, nodes=(rag,), edges=(), outputs=base.outputs, metadata=PipelineMetadata(), version=1)
+    nested = _transform("nested", plugin, {"provider_config": {"collection": "rows", key: value}, "schema": graphs.OBSERVED})
+    return CompositionState(sources=base.sources, nodes=(nested,), edges=(), outputs=base.outputs, metadata=PipelineMetadata(), version=1)
 
 
 def _component(side: str) -> str:
-    return {"source": "source", "sink": "output:output", "nested": "node:rag"}[side]
+    return {"source": "source", "sink": "output:output", "nested": "node:nested"}[side]
 
 
 def _subject(side: str, key: str) -> str:
-    return {"source": f"Source 'source' {key}", "sink": f"Sink 'output' {key}", "nested": f"Transform 'rag' provider_config.{key}"}[side]
+    return {"source": f"Source 'source' {key}", "sink": f"Sink 'output' {key}", "nested": f"Transform 'nested' provider_config.{key}"}[side]
 
 
 def _refusals(summary: ValidationSummary) -> list[tuple[str, str | None, str]]:
@@ -128,7 +117,11 @@ def test_the_owner_table_matches_the_live_registry() -> None:
     live = {
         **{("source", key): tuple(sorted(sources[key])) for key in SOURCE_LOCAL_PATH_OPTION_KEYS if key in sources},
         **{("sink", key): tuple(sorted(sinks[key])) for key in SINK_LOCAL_PATH_OPTION_KEYS if key in sinks},
-        **{("nested", key): tuple(sorted(transforms["provider_config"])) for key in NESTED_LOCAL_PATH_OPTION_KEYS},
+        **{
+            ("nested", key): tuple(sorted(transforms["provider_config"]))
+            for key in NESTED_LOCAL_PATH_OPTION_KEYS
+            if "provider_config" in transforms
+        },
     }
     assert live == _OWNERS
 
@@ -172,7 +165,7 @@ def test_a_file_reference_at_a_sink_field_still_defers_with_its_notice(tmp_path:
 
 @pytest.mark.parametrize(
     ("side", "plugin", "key"),
-    [("source", "csv", "delimiter"), ("sink", "chroma_sink", "collection"), ("nested", "rag_retrieval", "collection")],
+    [("source", "csv", "delimiter"), ("sink", "csv", "delimiter"), ("nested", "passthrough", "collection")],
 )
 def test_a_file_reference_at_a_non_path_key_of_the_same_plugin_is_not_refused_by_this_rule(
     tmp_path: Path, side: str, plugin: str, key: str
@@ -193,7 +186,7 @@ def test_a_file_reference_at_a_non_path_key_of_the_same_plugin_is_not_refused_by
             version=1,
         )
     elif side == "sink":
-        state = _graph(tmp_path, side, "persist_directory", plugin, str(tmp_path / "outputs" / str(graphs.SESSION_ID) / "chroma"))
+        state = _graph(tmp_path, side, "path", plugin, str(tmp_path / "outputs" / str(graphs.SESSION_ID) / "out.csv"))
         output = state.outputs[0]
         state = CompositionState(
             sources=state.sources,
@@ -204,12 +197,12 @@ def test_a_file_reference_at_a_non_path_key_of_the_same_plugin_is_not_refused_by
             version=1,
         )
     else:
-        state = _graph(tmp_path, side, "persist_directory", plugin, str(tmp_path / "outputs" / str(graphs.SESSION_ID) / "chroma"))
-        rag = state.nodes[0]
-        provider_config = {**rag.options["provider_config"], key: marker}
+        state = _graph(tmp_path, side, "persist_directory", plugin, str(tmp_path / "outputs" / str(graphs.SESSION_ID) / "index"))
+        nested = state.nodes[0]
+        provider_config = {**nested.options["provider_config"], key: marker}
         state = CompositionState(
             sources=state.sources,
-            nodes=(_transform("rag", plugin, {**rag.options, "provider_config": provider_config}),),
+            nodes=(_transform("nested", plugin, {**nested.options, "provider_config": provider_config}),),
             edges=(),
             outputs=state.outputs,
             metadata=PipelineMetadata(),

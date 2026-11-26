@@ -306,7 +306,6 @@ real/
 examples/retention_purge/payloads/*
 examples/**/output/*
 examples/**/runs/*
-examples/**/chroma_data/*
 !examples/*/output/
 !examples/*/runs/
 !examples/*/output/.gitkeep

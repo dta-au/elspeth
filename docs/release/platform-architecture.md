@@ -109,7 +109,7 @@ ELSPETH integrates with external systems through plugins and clients, including:
 - Azure Blob Storage;
 - Azure Document Intelligence;
 - Microsoft Dataverse;
-- ChromaDB;
+- Azure AI Search, for retrieval;
 - Azure OpenAI;
 - Amazon Bedrock and Bedrock Guardrails;
 - OpenRouter;

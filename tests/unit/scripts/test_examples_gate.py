@@ -1517,6 +1517,7 @@ def test_shared_binds_are_checked_again_but_not_walked_again(tmp_path: Path, cap
 
 def test_a_bind_check_that_exits_zero_early_is_no_verdict(tmp_path: Path) -> None:
     _fixture(tmp_path)
+    env, marker = _marking_bwrap(tmp_path)
     driver = tmp_path / "driver"
     driver.mkdir()
     shutil.copy2(GATE, driver / "examples-gate.sh")
@@ -1534,10 +1535,12 @@ def test_a_bind_check_that_exits_zero_early_is_no_verdict(tmp_path: Path) -> Non
         str(log_dir),
         "--min-mem-gb",
         "0",
+        env=env,
         gate=driver / "examples-gate.sh",
     )
     assert result.returncode == 2, (result.stdout, result.stderr)
     assert "REFUSED: shared sandbox bind check ended without a result (exit 0)" in result.stderr
+    assert not marker.exists()
 
 
 def test_a_same_filesystem_bind_mount_is_missed_by_device_and_caught_by_the_mount_table(tmp_path: Path) -> None:

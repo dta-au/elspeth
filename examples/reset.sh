@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Reset every shipped example to a clean baseline: remove the local audit
-# trails and embedded vector stores that accumulate across runs.
+# trails that accumulate across runs.
 #
 # ELSPETH is pre-1.0 and does NOT migrate audit databases in place, so a stale
 # runs/audit.db written under an earlier schema epoch makes a bare `elspeth run`
@@ -19,7 +19,4 @@ find . -type d -name runs -prune -print0 | while IFS= read -r -d '' d; do
   rm -f "$d"/*.db "$d"/*.db-wal "$d"/*.db-shm
 done
 
-# Embedded ChromaDB vector stores (chroma_rag* examples).
-find . -type d -name chroma_data -prune -exec rm -rf {} +
-
-echo "Examples reset: cleared runs/*.db* and chroma_data/ under $SCRIPT_DIR"
+echo "Examples reset: cleared runs/*.db* under $SCRIPT_DIR"
