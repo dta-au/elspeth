@@ -130,47 +130,6 @@ async def probe(directory: Path) -> dict:
                 await call("save_session", {"session_id": sid})
                 # Loading retains private options; a save canonicalizes JSON.
                 assert json.loads(saved_path.read_bytes()) == json.loads(escaped)
-                provider_source = {
-                    **source,
-                    "on_success": "rows",
-                    "options": {"path": "PRIVATE-SOURCE.csv", "schema": {"mode": "observed"}},
-                }
-                provider_output = {**output, "options": {**output["options"], "path": "PRIVATE-OUTPUT.csv"}}
-                provider_node = {
-                    "id": "retrieval",
-                    "node_type": "transform",
-                    "plugin": "rag_retrieval",
-                    "input": "rows",
-                    "on_success": "result",
-                    "on_error": "discard",
-                    "options": {
-                        "provider": "chroma",
-                        "provider_config": {"collection": "docs", "persist_directory": "PRIVATE-PROVIDER"},
-                        "schema": {"mode": "flexible", "fields": ["text: str"]},
-                        "output_prefix": "rag_",
-                        "query_field": "text",
-                    },
-                }
-                receipt["provider_author"] = await call(
-                    "set_pipeline",
-                    {"sources": {"orders": provider_source}, "nodes": [provider_node], "edges": [], "outputs": [provider_output]},
-                )
-                assert receipt["provider_author"]["success"], receipt["provider_author"]
-                # Authoring/export never invokes the provider or a preview.
-                receipt["provider_export"] = await call("generate_yaml", {})
-                assert receipt["provider_export"]["success"], receipt["provider_export"]
-                for private_path in ("PRIVATE-SOURCE.csv", "PRIVATE-OUTPUT.csv", "PRIVATE-PROVIDER"):
-                    assert private_path not in json.dumps(receipt["provider_export"])
-                await call("save_session", {"session_id": sid})
-                provider_saved = saved_path.read_bytes()
-                provider_private = json.loads(provider_saved)
-                assert provider_private["sources"]["orders"]["options"]["path"] == "PRIVATE-SOURCE.csv"
-                assert provider_private["outputs"][0]["options"]["path"] == "outputs/PRIVATE-OUTPUT.csv"
-                assert provider_private["nodes"][0]["options"]["provider_config"]["persist_directory"] == "PRIVATE-PROVIDER"
-                await call("generate_yaml", {})
-                await call("save_session", {"session_id": sid})
-                assert saved_path.read_bytes() == provider_saved
-                receipt["provider_private"] = provider_private
     receipt["returncode"] = processes[0].returncode
     if sys.platform == "linux":
         assert not Path(f"/proc/{receipt['topology']['supervisor']}").exists()

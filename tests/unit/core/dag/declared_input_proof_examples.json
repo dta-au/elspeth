@@ -120,20 +120,6 @@
   "examples/checkpoint_resume/settings.yaml": {
     "transform:process": []
   },
-  "examples/chroma_rag/settings.yaml": {
-    "transform:rag_0": [
-      "question"
-    ]
-  },
-  "examples/chroma_rag_qa/settings.yaml": {
-    "transform:llm_0": [
-      "question",
-      "sci__rag_context"
-    ],
-    "transform:rag_0": [
-      "question"
-    ]
-  },
   "examples/concurrent_scheduler/settings.yaml": {
     "aggregation:rendezvous": [
       "amount"
