@@ -28,6 +28,18 @@ make_service = checkpoint_fixtures.make_service
 physical_advisor = checkpoint_fixtures.physical_advisor
 simple_state = checkpoint_fixtures.simple_state
 
+# Each advisor attempt's window in the quota-admission conformance test. The
+# first attempt in a fresh process under branch coverage measured about 0.43 s
+# to reach dispatch (0.014 s without coverage), so a 0.2 s window cut it before
+# admission. 3 s leaves about 7x that, and stays below the fixture's 60 s
+# advisor timeout so the window, not that timeout, still cuts a blocked
+# admission.
+_ATTEMPT_WINDOW_SECONDS = 3.0
+# Bounds the whole checkpoint call in that test: above two attempt windows,
+# below the 60 s advisor timeout, so a checkpoint that stopped honouring its
+# deadline fails here instead of passing once that timeout cuts each attempt.
+_HANG_GUARD_SECONDS = 30.0
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("retryable", [False, True])
@@ -479,9 +491,16 @@ async def test_conformance_counts_only_physical_dispatch_after_quota_admission(
 
     service = make_service()
     fenced = physical_advisor.bind(service)
+    attempts = 0
     admissions = 0
     physical_calls = 0
     original_admit = ProviderCallCustody.admit
+    original_gateway = provider_gateway._litellm_acompletion
+
+    async def gateway(**kwargs):
+        nonlocal attempts
+        attempts += 1
+        return await original_gateway(**kwargs)
 
     async def admission(custody: ProviderCallCustody, *, model: str) -> None:
         nonlocal admissions
@@ -505,17 +524,23 @@ async def test_conformance_counts_only_physical_dispatch_after_quota_admission(
         )
 
     monkeypatch.setattr(ProviderCallCustody, "admit", admission)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", gateway)
     monkeypatch.setattr(litellm, "acompletion", complete)
     # Keep each attempt's admission timeout independent of earlier work.
     monkeypatch.setattr(advisor_checkpoint_module, "_compose_deadline_time", lambda: 0.0)
     with structlog.testing.capture_logs() as events, prompt_guard_user_scope(""):
-        verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
-            phase="early",
-            state=simple_state,
-            recorder=None,
-            deadline=0.2,
-            **fenced,
-        )
+        async with asyncio.timeout(_HANG_GUARD_SECONDS):
+            verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
+                phase="early",
+                state=simple_state,
+                recorder=None,
+                deadline=_ATTEMPT_WINDOW_SECONDS,
+                **fenced,
+            )
+    # Every attempt that started reached its admission: none was cut before it,
+    # so each scenario's admission outcome is the one it scripted.
+    expected_attempts = 1 if scenario == "clean" else 2
+    assert (attempts, admissions) == (expected_attempts, expected_attempts)
     expected_calls = 0 if scenario == "blocked-first" else 1
     assert physical_calls == expected_calls
     record = service._sessions_service.add_message.await_args_list[0].kwargs["tool_calls"][0]["pass"]
