@@ -24,7 +24,6 @@ from tests.fixtures.catalog_reference import (
 EXPECTED_SINK_TAGS = {
     "aws_s3": ("aws", "s3", "cloud", "object-storage"),
     "azure_blob": ("azure", "blob", "cloud", "object-storage"),
-    "chroma_sink": ("chroma", "vector-store", "embedding", "rag"),
     "csv": ("csv", "file", "batch", "tabular"),
     "database": ("database", "sql", "tabular", "exactly-once"),
     "dataverse": ("dataverse", "odata", "crm", "upsert"),
@@ -72,14 +71,6 @@ def _assert_plugin_specific_example_contract(reference: BuiltinReference) -> Non
         assert options["overwrite"] is False
         assert "run_id" in cast(str, options["blob_path"])
         assert not {"connection_string", "sas_token", "client_secret"} & options.keys()
-    elif name == "chroma_sink":
-        assert options["mode"] == "persistent"
-        assert options["on_duplicate"] == "overwrite"
-        _assert_relative_output_path(options["persist_directory"])
-        field_mapping = cast(Mapping[str, Any], options["field_mapping"])
-        assert field_mapping["id_field"] == "document_id"
-        assert field_mapping["document_field"] == "body"
-        assert field_mapping["metadata_fields"] == ["category"]
     elif name == "csv":
         assert options["collision_policy"] == "auto_increment"
         assert cast(Mapping[str, Any], options["schema"])["mode"] == "observed"

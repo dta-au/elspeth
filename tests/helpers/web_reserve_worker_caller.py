@@ -25,7 +25,8 @@ REVIEWED_GRAMMARS = {
     "ComposerAsyncWorker._job": "4c85b90fa2ff8974753ae8359226a9fba7648eca3b53b800437f31cb69814da1",
     "ComposerAsyncWorker._run_started": "3bac6518c02e38c7556a14d4b2db4d98d07fe26f623486fd93d158f8af13804f",
     "ComposerAsyncWorker._run_started_under_lease": "daf38d630a65beb59e65af3a81a44ee074492814371c532a285113ad897c2b68",
-    "_create_app": "6eca125420e774652afecd25703c81295644f2291220ae77eaf78501aeee16dd",
+    # 0.8.18: the body-size middleware takes max_upload_bytes from settings.
+    "_create_app": "53d880107258c84d60ac57fe2be683ad9c4cabceda26ae762e501fbec1bffdd6",
     "run_composer_turn": "3076e583c646de8005d6b1e20cd0df431c22384cd0ada0e9a96bf79b0aaae07a",
 }
 SELECTED = (

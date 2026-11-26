@@ -3627,40 +3627,18 @@ class TestPatchOutputPathSecurity:
 class TestTransformProviderConfigPathSecurity:
     """S2: nested transform provider_config persist_directory must be confined.
 
-    RAG retrieval transforms carry a local Chroma persist_directory under
-    options.provider_config. Mirrors the sink-path guard: confined to the
-    allowed output directories.
+    No installed plugin carries ``options.provider_config`` since the Chroma
+    retrieval transform was removed, and composer writers refuse an unknown
+    plugin or option before the nested path check runs. The kept control is
+    therefore proved at the helper level (below plugin admission), plus the
+    Azure AI Search profile/identity refusals that share this class.
     """
-
-    @staticmethod
-    def _catalog_with_rag() -> MagicMock:
-        catalog = _mock_catalog()
-        catalog.list_transforms.return_value = [
-            *catalog.list_transforms.return_value,
-            PluginSummary(
-                name="rag_retrieval",
-                description="RAG retrieval transform",
-                plugin_type="transform",
-                config_fields=[],
-            ),
-        ]
-        return catalog
-
-    @staticmethod
-    def _rag_options(persist_directory: str) -> dict[str, Any]:
-        return {
-            "provider": "chroma",
-            "provider_config": {"persist_directory": persist_directory, "collection": "docs"},
-            "schema": {"mode": "observed"},
-            "output_prefix": "rag_",
-            "query_field": "text",
-        }
 
     def test_helper_rejects_persist_directory_outside_allowed(self) -> None:
         from elspeth.web.composer.tools._common import _validate_transform_provider_config_path
 
         error = _validate_transform_provider_config_path(
-            {"provider": "chroma", "provider_config": {"persist_directory": "/tmp/elspeth-outside"}},
+            {"provider_config": {"persist_directory": "/tmp/elspeth-outside"}},
             data_dir="/data",
             session_id=None,
         )
@@ -3671,7 +3649,7 @@ class TestTransformProviderConfigPathSecurity:
         from elspeth.web.composer.tools._common import _validate_transform_provider_config_path
 
         error = _validate_transform_provider_config_path(
-            {"provider": "chroma", "provider_config": {"persist_directory": "/data/outputs/test-session/chroma"}},
+            {"provider_config": {"persist_directory": "/data/outputs/test-session/index"}},
             data_dir="/data",
             session_id="test-session",
         )
@@ -3682,7 +3660,7 @@ class TestTransformProviderConfigPathSecurity:
         from elspeth.web.composer.tools._common import _validate_transform_provider_config_path
 
         error = _validate_transform_provider_config_path(
-            {"provider": "chroma", "provider_config": {"persist_directory": "/data/blobs/sess-a/chroma"}},
+            {"provider_config": {"persist_directory": "/data/blobs/sess-a/index"}},
             data_dir="/data",
             session_id="sess-a",
         )
@@ -3694,7 +3672,7 @@ class TestTransformProviderConfigPathSecurity:
         from elspeth.web.composer.tools._common import _validate_transform_provider_config_path
 
         error = _validate_transform_provider_config_path(
-            {"provider": "chroma", "provider_config": {"persist_directory": "/data/blobs/sess-b/chroma"}},
+            {"provider_config": {"persist_directory": "/data/blobs/sess-b/index"}},
             data_dir="/data",
             session_id="sess-a",
         )
@@ -3705,10 +3683,7 @@ class TestTransformProviderConfigPathSecurity:
         from elspeth.web.composer.tools._common import _validate_transform_provider_config_path
 
         error = _validate_transform_provider_config_path(
-            {
-                "provider": "chroma",
-                "provider_config": {"persist_directory": "/data/outputs/victim-session/chroma"},
-            },
+            {"provider_config": {"persist_directory": "/data/outputs/victim-session/index"}},
             data_dir="/data",
             session_id="attacker-session",
         )
@@ -3716,7 +3691,7 @@ class TestTransformProviderConfigPathSecurity:
         assert error is not None
         assert "persist_directory" in error
 
-    def test_helper_skips_non_rag_transform(self) -> None:
+    def test_helper_skips_transform_without_provider_config(self) -> None:
         from elspeth.web.composer.tools._common import _validate_transform_provider_config_path
 
         error = _validate_transform_provider_config_path({"some_field": "value"}, data_dir="/data", session_id=None)
@@ -3729,7 +3704,7 @@ class TestTransformProviderConfigPathSecurity:
         from elspeth.web.composer.tools._common import _validate_transform_provider_config_path
 
         error = _validate_transform_provider_config_path(
-            {"provider": "chroma", "provider_config": {"persist_directory": None, "collection": "docs"}},
+            {"provider_config": {"persist_directory": None, "collection": "docs"}},
             data_dir="/data",
             session_id=None,
         )
@@ -3787,50 +3762,6 @@ class TestTransformProviderConfigPathSecurity:
         assert result.success is False
         assert result.updated_state is state
         assert result.validation.errors[0].error_code == "profile_unavailable"
-
-    def test_patch_node_options_cannot_repoint_rag_retrieval_at_azure_search(self) -> None:
-        # rag_retrieval used to reach Azure through provider="azure_search"; that arm is gone,
-        # so a patch can no longer move an admitted Chroma node onto the server's identity.
-        state = _empty_state()
-        catalog = self._catalog_with_rag()
-        created = execute_tool(
-            "upsert_node",
-            {
-                "id": "rag",
-                "node_type": "transform",
-                "plugin": "rag_retrieval",
-                "input": "rows",
-                "on_success": "retrieved",
-                "on_error": "discard",
-                "options": self._rag_options("/data/outputs/test-session/chroma"),
-            },
-            state,
-            catalog,
-            data_dir="/data",
-        )
-        assert created.success is True
-
-        result = execute_tool(
-            "patch_node_options",
-            {
-                "node_id": "rag",
-                "patch": {
-                    "provider": "azure_search",
-                    "provider_config": {
-                        "endpoint": "https://tenant-b.search.windows.net",
-                        "index": "payroll",
-                        "use_managed_identity": True,
-                    },
-                },
-            },
-            created.updated_state,
-            catalog,
-            data_dir="/data",
-        )
-
-        assert result.success is False
-        assert result.updated_state is created.updated_state
-        assert "provider: Input should be 'chroma'" in result.validation.errors[0].message
 
     def test_set_pipeline_rejects_raw_azure_ai_search_managed_identity(self) -> None:
         state = _empty_state()
@@ -4036,116 +3967,6 @@ class TestTransformProviderConfigPathSecurity:
 
         assert result.success is False
         assert result.updated_state is created.updated_state
-
-    def test_upsert_node_rejects_persist_directory_outside_allowed(self) -> None:
-        state = _empty_state()
-        catalog = self._catalog_with_rag()
-        result = execute_tool(
-            "upsert_node",
-            {
-                "id": "rag",
-                "node_type": "transform",
-                "plugin": "rag_retrieval",
-                "input": "rows",
-                "on_success": "retrieved",
-                "on_error": "discard",
-                "options": self._rag_options("/etc/cron.d/backdoor"),
-            },
-            state,
-            catalog,
-            data_dir="/data",
-        )
-        assert result.success is False
-        assert "persist_directory" in result.validation.errors[0].message
-
-    def test_upsert_node_accepts_persist_directory_under_outputs(self) -> None:
-        state = _empty_state()
-        catalog = self._catalog_with_rag()
-        result = execute_tool(
-            "upsert_node",
-            {
-                "id": "rag",
-                "node_type": "transform",
-                "plugin": "rag_retrieval",
-                "input": "rows",
-                "on_success": "retrieved",
-                "on_error": "discard",
-                "options": self._rag_options("/data/outputs/test-session/chroma"),
-            },
-            state,
-            catalog,
-            data_dir="/data",
-        )
-        assert result.success is True
-
-    def test_patch_node_options_rejects_persist_directory_outside_allowed(self) -> None:
-        state = _empty_state()
-        catalog = self._catalog_with_rag()
-        created = execute_tool(
-            "upsert_node",
-            {
-                "id": "rag",
-                "node_type": "transform",
-                "plugin": "rag_retrieval",
-                "input": "rows",
-                "on_success": "retrieved",
-                "on_error": "discard",
-                "options": self._rag_options("/data/outputs/test-session/chroma"),
-            },
-            state,
-            catalog,
-            data_dir="/data",
-        )
-        assert created.success is True
-        result = execute_tool(
-            "patch_node_options",
-            {
-                "node_id": "rag",
-                "patch": {"provider_config": {"persist_directory": "/etc/passwd", "collection": "docs"}},
-            },
-            created.updated_state,
-            catalog,
-            data_dir="/data",
-        )
-        assert result.success is False
-        assert "persist_directory" in result.validation.errors[0].message
-
-    def test_set_pipeline_rejects_persist_directory_outside_allowed(self) -> None:
-        """Parity: a bulk set_pipeline must reject an escaping transform path,
-        not just escaping sink paths."""
-        state = _empty_state()
-        catalog = self._catalog_with_rag()
-        args = {
-            "source": {
-                "plugin": "csv",
-                "on_success": "source_out",
-                "options": {"path": "/data/blobs/test-session/in.csv", "schema": {"mode": "observed"}},
-                "on_validation_failure": "quarantine",
-            },
-            "nodes": [
-                {
-                    "id": "rag",
-                    "node_type": "transform",
-                    "plugin": "rag_retrieval",
-                    "input": "source_out",
-                    "on_success": "main",
-                    "on_error": "discard",
-                    "options": self._rag_options("/etc/cron.d/backdoor"),
-                }
-            ],
-            "edges": [{"id": "e1", "from_node": "source", "to_node": "rag", "edge_type": "on_success", "label": None}],
-            "outputs": [
-                {
-                    "sink_name": "main",
-                    "plugin": "csv",
-                    "options": {"path": "/data/outputs/test-session/out.csv", "schema": {"mode": "observed"}},
-                    "on_write_failure": "discard",
-                }
-            ],
-        }
-        result = execute_tool("set_pipeline", args, state, catalog, data_dir="/data")
-        assert result.success is False
-        assert "persist_directory" in result.validation.errors[0].message
 
 
 class TestTransformLlmRetryBudgetPolicy:

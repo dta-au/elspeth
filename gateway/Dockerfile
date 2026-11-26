@@ -16,7 +16,7 @@ RUN test -n "$GATEWAY_REVISION"
 
 # The binary comes from the same digest-pinned source as the root release
 # image. A mutable uv tag must never participate in this build.
-COPY --from=ghcr.io/astral-sh/uv@sha256:e590846f4776907b254ac0f44b5b380347af5d90d668138ca7938d1b0c2f98d3 /uv /usr/local/bin/uv
+COPY --from=ghcr.io/astral-sh/uv@sha256:a3ea1357342c1a4bf9a0c53a3deb1b55379aefa037338d8113d5771efa01774f /uv /usr/local/bin/uv
 
 ENV UV_PYTHON_DOWNLOADS=never
 

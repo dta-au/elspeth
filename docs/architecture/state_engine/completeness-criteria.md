@@ -163,9 +163,9 @@ on the three SQLite execution profiles from a local run in which the
 provider's **client object** is replaced by a contract fake at the SDK-client
 seam. The seam is the object the plugin would otherwise obtain from the
 provider SDK or HTTP client factory (for example a boto3 client, an Azure SDK
-client, the Dataverse HTTP session, a Chroma client, or an LLM provider
-client). The plugin's own `on_start`, read/write/flush, `on_complete`, and
-`close` code runs unmodified; the fake records the ordered calls it receives
+client, the Dataverse HTTP session, or an LLM provider client). The plugin's
+own `on_start`, read/write/flush, `on_complete`, and `close` code runs
+unmodified; the fake records the ordered calls it receives
 and answers with the provider's documented contract shapes.
 
 What this admits: the plugin lifecycle contract of PB-09 (fresh, resume,

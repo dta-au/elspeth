@@ -1,20 +1,20 @@
-"""Shared support for the protected live-Dataverse and live-Chroma lanes (PB-09).
+"""Shared support for the protected live-Dataverse lanes (PB-09).
 
 Not a test module: helpers only.  The generic production-boundary assembly
 (``run_orchestrated_pipeline``: settings YAML -> ``instantiate_plugins_from_config``
 -> ``ExecutionGraph`` -> runtime preflight -> public ``Orchestrator.run`` with a
 real Landscape database, plus its Landscape evidence read-back) is reused from
 ``tests.integration.plugins._azure_live``, which pins those conventions for the
-live-Azure lanes.  This module owns only what those lanes do not:
+live-Azure lanes.  This module owns only what the Dataverse lanes add:
 
-- the closed Dataverse/Chroma live-resource vocabulary
+- the closed Dataverse live-resource vocabulary
   (``scripts.state_engine_assessment_lib.selectors``: ``DATAVERSE_RESOURCES`` +
-  ``CHROMA_RESOURCES`` + ``COMMON_LIVE_RESOURCES``) — reading a name outside
+  ``COMMON_LIVE_RESOURCES``) — reading a name outside
   that vocabulary is a hard error, and a missing value is a fixture-level
   ``pytest.skip``;
-- the PB-09 variant inventories, pinned against the production Pydantic
-  discriminators (``DataverseAuthConfig.method`` and ``ChromaConnectionMode``
-  are the authority; the golden matrix mirrors them);
+- the PB-09 variant inventory, pinned against the production Pydantic
+  discriminator (``DataverseAuthConfig.method`` is the authority; the golden
+  matrix mirrors it);
 - Dataverse per-variant auth options.  The ``service_principal`` variant reads
   the azure-identity ambient credential trio (``AZURE_TENANT_ID`` /
   ``AZURE_CLIENT_ID`` / ``AZURE_CLIENT_SECRET``) — azure-identity's
@@ -32,41 +32,27 @@ from typing import get_args
 
 import pytest
 from scripts.state_engine_assessment_lib.selectors import (
-    CHROMA_RESOURCES,
     COMMON_LIVE_RESOURCES,
     DATAVERSE_RESOURCES,
 )
 
 from elspeth.plugins.infrastructure.clients.dataverse import DataverseAuthConfig
-from elspeth.plugins.infrastructure.clients.retrieval.connection import ChromaConnectionMode
 
-# PB-09 variant inventories, pinned against the production discriminators.
+# PB-09 variant inventory, pinned against the production discriminator.
 DATAVERSE_AUTH_VARIANTS: tuple[str, ...] = get_args(DataverseAuthConfig.model_fields["method"].annotation)
 if DATAVERSE_AUTH_VARIANTS != ("service_principal", "managed_identity"):
     raise AssertionError(f"DataverseAuthConfig.method discriminator drifted: {DATAVERSE_AUTH_VARIANTS}")
-
-CHROMA_SINK_MODE_VARIANTS: tuple[str, ...] = get_args(ChromaConnectionMode)
-if CHROMA_SINK_MODE_VARIANTS != ("persistent", "client"):
-    raise AssertionError(f"ChromaConnectionMode discriminator drifted: {CHROMA_SINK_MODE_VARIANTS}")
 
 # Closed live-resource vocabulary (selectors.py is the single source of truth).
 DATAVERSE_URL_ENV = "ELSPETH_TEST_DATAVERSE_URL"
 DATAVERSE_ENTITY_ENV = "ELSPETH_TEST_DATAVERSE_ENTITY"
 DATAVERSE_ROW_PREFIX_ENV = "ELSPETH_TEST_DATAVERSE_ROW_PREFIX"
-CHROMA_HOST_ENV = "ELSPETH_TEST_CHROMA_HOST"
-CHROMA_PORT_ENV = "ELSPETH_TEST_CHROMA_PORT"
-CHROMA_SSL_ENV = "ELSPETH_TEST_CHROMA_SSL"
-CHROMA_COLLECTION_PREFIX_ENV = "ELSPETH_TEST_CHROMA_COLLECTION_PREFIX"
 
-_CLOSED_RESOURCE_VOCABULARY = frozenset(DATAVERSE_RESOURCES) | frozenset(CHROMA_RESOURCES) | frozenset(COMMON_LIVE_RESOURCES)
+_CLOSED_RESOURCE_VOCABULARY = frozenset(DATAVERSE_RESOURCES) | frozenset(COMMON_LIVE_RESOURCES)
 for _resource_name in (
     DATAVERSE_URL_ENV,
     DATAVERSE_ENTITY_ENV,
     DATAVERSE_ROW_PREFIX_ENV,
-    CHROMA_HOST_ENV,
-    CHROMA_PORT_ENV,
-    CHROMA_SSL_ENV,
-    CHROMA_COLLECTION_PREFIX_ENV,
 ):
     if _resource_name not in _CLOSED_RESOURCE_VOCABULARY:
         raise AssertionError(f"{_resource_name} is not in the closed live-resource vocabulary")

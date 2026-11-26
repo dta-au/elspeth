@@ -16,8 +16,6 @@ from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.discovery_cache import serialize_tool_result
 from elspeth.web.composer.pipeline_planner import _allowlisted_candidate_feedback
 from elspeth.web.composer.protocol import ComposerPluginCrashError
-from elspeth.web.composer.redaction import redact_tool_call_response
-from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.composer.service import ComposerAvailability
 from elspeth.web.composer.state import (
     CompositionState,
@@ -435,43 +433,6 @@ def test_transform_unknown_authored_provider_remains_options_repair(surface: Sur
         ("transform", "llm"),
     )
     assert "not_an_authored_provider" in entry.message
-
-
-@pytest.mark.parametrize("surface", ["handler", "dispatch"])
-@pytest.mark.parametrize("operation", ["upsert", "patch", "splice", "replay"])
-def test_transform_provider_path_is_static_in_response_history_redaction_and_planner(
-    tmp_path: Path, surface: Surface, operation: Operation
-) -> None:
-    private_root = tmp_path / "PRIVATE-TRANSFORM-ROOT-CANARY"
-    options = {
-        "provider": "chroma",
-        "provider_config": {"persist_directory": "/outside-session/authored-chroma", "collection": "docs"},
-        "schema": {"mode": "observed"},
-        "output_prefix": "rag_",
-        "query_field": "text",
-    }
-    raw = transforms._validate_transform_provider_config_path(options, str(private_root), session_id="test-session")
-    assert raw is not None and str(private_root) in raw
-    tool, args, state = _operation(operation, plugin="rag_retrieval", options=options)
-    context = _context(data_dir=str(private_root), session_id="test-session")
-    assert context.catalog.unavailable_reason(PluginId("transform", "rag_retrieval")) is None
-    result = _invoke(surface, tool, args, state, context)
-    entry = result.validation.errors[0]
-    assert not result.success and result.updated_state is state
-    assert (entry.error_code, entry.rejected_component) == (
-        "provider_config_path_policy_invalid",
-        "node:after" if operation in {"upsert", "patch"} else "node:inserted",
-    )
-    feedback = _allowlisted_candidate_feedback(result)
-    assert "detail" not in feedback["validation"]["errors"][0]
-    redacted = redact_tool_call_response(tool, result.to_dict(), telemetry=NoopRedactionTelemetry())
-    assert redacted["validation"]["errors"][0]["error_code"] == "provider_config_path_policy_invalid"
-    for payload in (repr(result.to_dict()), serialize_tool_result(result), repr(feedback), repr(redacted)):
-        assert "PRIVATE-TRANSFORM-ROOT-CANARY" not in payload
-    assert (
-        entry.message
-        == "Node options.provider_config.persist_directory is outside this session's permitted locations. Use an authorized session-local directory."
-    )
 
 
 @pytest.mark.parametrize("finalized", [False, True])

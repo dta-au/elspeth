@@ -23,8 +23,6 @@
     "examples/chaosllm_sentiment/settings.yaml": "4a5a0fe864f0b2b57fb38ec3424c101bb7f9f35656e80d1aeaa345ba8446c893",
     "examples/chaosweb/settings.yaml": "d0da5ea54c765d08b223351e3bace66ce4c49043399e93b8a291169d950a7b0c",
     "examples/checkpoint_resume/settings.yaml": "9a4a512491496571675308929593637b1673308918020f8dd19a44323f10fbac",
-    "examples/chroma_rag/settings.yaml": "c1e37c192f488fda880602062a2f10bb1ce7a388eeadbd73910821cb6643f9b4",
-    "examples/chroma_rag_qa/settings.yaml": "6ce3d12139b8839a76590c9a73937763cf2b13f00b900ebc9e445b23ff36470a",
     "examples/concurrent_scheduler/settings.yaml": "0482ca62e6142db5916c9177233af6602988bda75b0d0618248803fc35f97f2e",
     "examples/database_sink/settings.yaml": "cd0af32a7e1fcd1263d5745685afc2142c22c0ac593d2d9e1e8cfd876dd85efc",
     "examples/deaggregation/settings.yaml": "61ed4d766d47f511a32fdfefa337df4f9614de6a8eb8deaf15317e19f17f82c0",

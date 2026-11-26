@@ -10,8 +10,8 @@ silently exempt from the rule — the inert-declaration defect the rule exists t
 close — so these sweeps construct every registered plugin from the live
 registry and require each declaration surface to land there.
 
-The sink sweep covers the four sinks no local run can reach (aws_s3,
-azure_blob, chroma_sink, dataverse): they share the schema-model construction
+The sink sweep covers the sinks no local run can reach (aws_s3, azure_blob,
+dataverse): they share the schema-model construction
 the runnable sinks do, and this is the proof their declarations are seen.
 """
 
@@ -31,7 +31,7 @@ from elspeth.plugins.infrastructure.preflight import plugin_preflight_mode
 from elspeth.web.composer.state import _probe_sink_declarations
 from tests.unit.web.composer.test_sink_required_fields_parity import _minimal_sink_configs
 
-# 'id' and 'body' keep chroma_sink constructible (its id/document fields must be declared).
+# 'id' and 'body' keep power_automate constructible: its selected fields must be declared.
 _HEADER_SCHEMA: dict[str, Any] = {"mode": "flexible", "fields": ["Name: int?", "id: str", "body: str"]}
 # Sinks whose custom ``headers`` mapping is keyed by row field names.
 _CUSTOM_HEADER_SINKS = frozenset({"aws_s3", "azure_blob", "csv", "json"})

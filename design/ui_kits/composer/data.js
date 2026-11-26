@@ -9,7 +9,6 @@ window.ELSPETH_KIT = {
       { name: "Azure Blob", kind: "azure_blob", type: "source", description: "Stream rows from an Azure Blob container. Malformed rows are quarantined with an audit record.", audit: [{ label: "strict parsing", tone: "positive" }, { label: "quarantine on error", tone: "informational" }] },
       { name: "Dataverse", kind: "dataverse", type: "source", description: "Query rows from a Microsoft Dataverse table.", audit: [{ label: "typed schema", tone: "positive" }] },
       { name: "JSON", kind: "json", type: "source", description: "Read records from a JSON or JSONL file.", audit: [] },
-      { name: "Chroma", kind: "chroma", type: "source", description: "Retrieve documents from a Chroma vector store for RAG.", audit: [{ label: "provenance tracked", tone: "informational" }] },
     ],
     transforms: [
       { name: "LLM query", kind: "llm", type: "transform", description: "Azure OpenAI / OpenRouter query with provider pooling and multi-query.", audit: [{ label: "fingerprinted secrets", tone: "positive" }, { label: "rate-limited", tone: "attention" }] },

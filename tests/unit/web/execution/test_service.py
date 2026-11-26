@@ -5335,10 +5335,13 @@ class TestTransformProviderConfigPathRestriction:
     """Nested transform provider_config persist_directory must be confined to
     the allowed output directories.
 
-    RAG retrieval transforms carry a local Chroma persist_directory under
-    options.provider_config. Without this, a client can set it to an arbitrary
-    absolute or ../ path and /execute will read/write Chroma files there —
-    escaping the data_dir sandbox.
+    A persist_directory under options.provider_config is a local read/write
+    target; without this gate a client could set it to an arbitrary absolute
+    or ../ path and escape the data_dir sandbox. No shipped plugin declares
+    provider_config since the Chroma retrieval transform was removed. The gate
+    keys on the option, never the plugin name, so these cases carry it on the
+    installed ``value_transform`` (the accepting case must also clear the
+    runtime plugin-policy check that follows the path gate).
     """
 
     @staticmethod
@@ -5395,12 +5398,11 @@ class TestTransformProviderConfigPathRestriction:
             {
                 "id": "rag",
                 "node_type": "transform",
-                "plugin": "rag_retrieval",
+                "plugin": "value_transform",
                 "input": "transform_in",
                 "on_success": "results",
                 "on_error": "discard",
                 "options": {
-                    "provider": "chroma",
                     "provider_config": {"persist_directory": "/etc/cron.d/backdoor"},
                 },
             }
@@ -5429,12 +5431,11 @@ class TestTransformProviderConfigPathRestriction:
             {
                 "id": "rag",
                 "node_type": "transform",
-                "plugin": "rag_retrieval",
+                "plugin": "value_transform",
                 "input": "transform_in",
                 "on_success": "results",
                 "on_error": "discard",
                 "options": {
-                    "provider": "chroma",
                     "provider_config": {"persist_directory": "/tmp/elspeth_data/outputs/../../etc/secret"},
                 },
             }
@@ -5464,13 +5465,12 @@ class TestTransformProviderConfigPathRestriction:
             {
                 "id": "rag",
                 "node_type": "transform",
-                "plugin": "rag_retrieval",
+                "plugin": "value_transform",
                 "input": "transform_in",
                 "on_success": "results",
                 "on_error": "discard",
                 "options": {
-                    "provider": "chroma",
-                    "provider_config": {"persist_directory": f"/tmp/elspeth_data/outputs/{session_id}/chroma"},
+                    "provider_config": {"persist_directory": f"/tmp/elspeth_data/outputs/{session_id}/index"},
                 },
             }
         ]
@@ -5504,24 +5504,22 @@ class TestTransformProviderConfigPathRestriction:
             {
                 "id": "rag-malformed",
                 "node_type": "transform",
-                "plugin": "rag_retrieval",
+                "plugin": "value_transform",
                 "input": "transform_in",
                 "on_success": "results",
                 "on_error": "discard",
                 "options": {
-                    "provider": "chroma",
                     "provider_config": "/etc/cron.d/backdoor",
                 },
             },
             {
                 "id": "rag-escaping",
                 "node_type": "transform",
-                "plugin": "rag_retrieval",
+                "plugin": "value_transform",
                 "input": "transform_in",
                 "on_success": "results",
                 "on_error": "discard",
                 "options": {
-                    "provider": "chroma",
                     "provider_config": {"persist_directory": "/etc/cron.d/backdoor"},
                 },
             },
@@ -6737,6 +6735,8 @@ class TestResolveYamlPaths:
         assert "/srv/data/output/results.csv" in result
 
     def test_sink_persist_directory_relative_path_rewritten(self) -> None:
+        # The rewrite walks SINK_LOCAL_PATH_OPTION_KEYS on every sink regardless
+        # of plugin name, so the key is carried on an ordinary sink here.
         from elspeth.web.execution.preflight import resolve_runtime_yaml_paths as _resolve_yaml_paths
 
         yaml_str = (
@@ -6745,14 +6745,13 @@ class TestResolveYamlPaths:
             "  options:\n"
             "    path: /abs/in.csv\n"
             "sinks:\n"
-            "  chroma:\n"
-            "    plugin: chroma_sink\n"
+            "  store:\n"
+            "    plugin: json\n"
             "    options:\n"
-            "      mode: persistent\n"
-            "      persist_directory: outputs/chroma-store\n"
+            "      persist_directory: outputs/store\n"
         )
         result = _resolve_yaml_paths(yaml_str, "/srv/data", session_id="sess-a")
-        assert "/srv/data/outputs/sess-a/chroma-store" in result
+        assert "/srv/data/outputs/sess-a/store" in result
 
     def test_transform_provider_persist_directory_relative_path_rewritten(self) -> None:
         from elspeth.web.execution.preflight import resolve_runtime_yaml_paths as _resolve_yaml_paths
@@ -6763,30 +6762,28 @@ class TestResolveYamlPaths:
             "  options:\n"
             "    path: /abs/in.csv\n"
             "transforms:\n"
-            "  - name: rag\n"
-            "    plugin: rag_retrieval\n"
+            "  - name: vt\n"
+            "    plugin: value_transform\n"
             "    options:\n"
-            "      provider: chroma\n"
             "      provider_config:\n"
-            "        persist_directory: outputs/chroma-index\n"
+            "        persist_directory: outputs/index\n"
         )
         result = _resolve_yaml_paths(yaml_str, "/srv/data", session_id="sess-a")
-        assert "/srv/data/outputs/sess-a/chroma-index" in result
+        assert "/srv/data/outputs/sess-a/index" in result
 
     def test_transform_provider_persist_directory_absolute_path_unchanged(self) -> None:
         from elspeth.web.execution.preflight import resolve_runtime_yaml_paths as _resolve_yaml_paths
 
         yaml_str = (
             "transforms:\n"
-            "  - name: rag\n"
-            "    plugin: rag_retrieval\n"
+            "  - name: vt\n"
+            "    plugin: value_transform\n"
             "    options:\n"
-            "      provider: chroma\n"
             "      provider_config:\n"
-            "        persist_directory: /srv/data/outputs/chroma-index\n"
+            "        persist_directory: /srv/data/outputs/index\n"
         )
         result = _resolve_yaml_paths(yaml_str, "/srv/data")
-        assert "/srv/data/outputs/chroma-index" in result
+        assert "/srv/data/outputs/index" in result
 
     def test_non_rag_transform_without_provider_config_is_noop(self) -> None:
         from elspeth.web.execution.preflight import resolve_runtime_yaml_paths as _resolve_yaml_paths

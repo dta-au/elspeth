@@ -73,7 +73,6 @@ _TRANSFORM_CLASSES = {
     "llm": ("elspeth.plugins.transforms.llm.transform", "LLMTransform"),
     "passthrough": ("elspeth.plugins.transforms.passthrough", "PassThrough"),
     "pdf_rasterize": ("elspeth.plugins.transforms.pdf_rasterize", "PDFRasterize"),
-    "rag_retrieval": ("elspeth.plugins.transforms.rag.transform", "RAGRetrievalTransform"),
     "reference_join": ("elspeth.plugins.transforms.reference_join", "ReferenceJoin"),
     "report_assemble": ("elspeth.plugins.transforms.report_assemble", "ReportAssemble"),
     "truncate": ("elspeth.plugins.transforms.truncate", "Truncate"),
@@ -131,7 +130,6 @@ def _admit_nonlive_llm_tracing(options: object) -> None:
 _SINK_CLASSES = {
     "aws_s3": ("elspeth.plugins.sinks.aws_s3_sink", "AWSS3Sink"),
     "azure_blob": ("elspeth.plugins.sinks.azure_blob_sink", "AzureBlobSink"),
-    "chroma_sink": ("elspeth.plugins.sinks.chroma_sink", "ChromaSink"),
     "csv": ("elspeth.plugins.sinks.csv_sink", "CSVSink"),
     "database": ("elspeth.plugins.sinks.database_sink", "DatabaseSink"),
     "dataverse": ("elspeth.plugins.sinks.dataverse", "DataverseSink"),

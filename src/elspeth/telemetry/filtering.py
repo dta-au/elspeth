@@ -11,7 +11,6 @@ used by TelemetryManager to decide which events to emit.
 
 from elspeth.contracts.enums import TelemetryGranularity
 from elspeth.contracts.events import (
-    ChromaWriteStatistics,
     DataverseLoadStatistics,
     EngineSpanCompleted,
     EngineSpanName,
@@ -70,7 +69,7 @@ def should_emit(event: TelemetryEvent, granularity: TelemetryGranularity) -> boo
 
         # Per-invocation operational summaries remain available at lifecycle
         # granularity. They do not assert successful run completion.
-        case DataverseLoadStatistics() | RAGRetrievalStatistics() | ChromaWriteStatistics():
+        case DataverseLoadStatistics() | RAGRetrievalStatistics():
             return True
 
         # Lifecycle events: always emit at any granularity

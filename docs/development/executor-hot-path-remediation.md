@@ -4084,6 +4084,11 @@ a 10-row run).
 
 #### L4-4 — Keep heavy SDK imports out of plugin module import
 
+**Note (2026-11-26).** 0.8.18 removed chromadb and both chromadb modules named
+below (`clients/retrieval/chroma.py`, `sinks/chroma_sink.py`), so the chromadb
+part of this item and of its expected saving is moot. Re-measure discovery
+before sizing the remaining Azure provider work.
+
 **Finding.** Prior review finding 8 (plugin discovery 15%); recon Appendix E
 § C.1.
 

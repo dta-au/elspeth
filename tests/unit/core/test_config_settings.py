@@ -122,40 +122,40 @@ class TestElspethSettings:
         )
         assert settings.retry.max_attempts == 5
 
-    def test_rejects_duplicate_collection_probes(self) -> None:
-        """Duplicate probe collections are rejected at config time, before any probe runs.
+    @pytest.mark.parametrize(
+        "probes",
+        [
+            [{"collection": "docs", "provider": "chroma"}],
+            [{"collection": "docs", "provider": "chroma"}, {"collection": "images", "provider": "chroma"}],
+        ],
+    )
+    def test_refuses_any_collection_probe(self, probes: list[dict[str, str]]) -> None:
+        """No collection probe provider ships since 0.8.18 (Chroma was removed).
 
-        Regression for elspeth-b657daab02: probe results are keyed by collection
-        in the commencement gate context, so two probes for the same collection
-        collide. The old guard fired only in resolve_preflight, AFTER each
-        probe.probe() had already run, and raised FrameworkBugError.
+        A settings file that still declares probes is refused at load with a
+        message naming the field, rather than failing later in the factory.
         """
         from pydantic import ValidationError
 
         from elspeth.core.config import ElspethSettings
 
-        with pytest.raises(ValidationError, match="duplicate collection_probes"):
+        with pytest.raises(ValidationError, match="collection_probes is not supported") as caught:
             ElspethSettings(
                 sources={"primary": {"plugin": "csv", "on_success": "output"}},
                 sinks={"output": {"plugin": "csv", "on_write_failure": "discard"}},
-                collection_probes=[
-                    {"collection": "docs", "provider": "chroma"},
-                    {"collection": "docs", "provider": "chroma"},
-                ],
+                collection_probes=probes,
             )
+        assert [error["loc"] for error in caught.value.errors()] == [("collection_probes",)]
 
-    def test_accepts_distinct_collection_probes(self) -> None:
+    def test_accepts_absent_or_empty_collection_probes(self) -> None:
         from elspeth.core.config import ElspethSettings
 
-        settings = ElspethSettings(
-            sources={"primary": {"plugin": "csv", "on_success": "output"}},
-            sinks={"output": {"plugin": "csv", "on_write_failure": "discard"}},
-            collection_probes=[
-                {"collection": "docs", "provider": "chroma"},
-                {"collection": "images", "provider": "chroma"},
-            ],
-        )
-        assert len(settings.collection_probes) == 2
+        base = {
+            "sources": {"primary": {"plugin": "csv", "on_success": "output"}},
+            "sinks": {"output": {"plugin": "csv", "on_write_failure": "discard"}},
+        }
+        assert ElspethSettings(**base).collection_probes == []
+        assert ElspethSettings(**base, collection_probes=[]).collection_probes == []
 
 
 class TestSourceSettings:

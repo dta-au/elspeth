@@ -309,74 +309,6 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with: {name: "state-engine-live-${{ steps.lane.outputs.lane_id }}", path: "${{ runner.temp }}/state-engine-evidence", if-no-files-found: error, retention-days: 7}
 
-  live_chroma:
-    if: github.event_name == 'workflow_dispatch' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && github.ref_protected
-    name: live-chroma / ${{ matrix.case_id }}
-    environment: state-engine-live-chroma
-    strategy:
-      fail-fast: false
-      matrix:
-        case_id:
-          - sink:chroma_sink@client
-          - sink:chroma_sink@persistent
-    runs-on: [self-hosted, Linux, X64, ephemeral, aws-ecs, postgresql-16-rds, state-engine-live-provider]
-    timeout-minutes: 90
-    env:
-      STATE_ENGINE_CASE_ID: ${{ matrix.case_id }}
-      STATE_ENGINE_PROFILE_CASE: postgresql-16-aws-single-leader-landscape
-      STATE_ENGINE_RUNNER_IMAGE: aws-ecs-postgresql16
-      AWS_REGION: ${{ vars.AWS_REGION }}
-      ELSPETH_STATE_ENGINE_AWS_POSTGRES_URL: ${{ secrets.ELSPETH_STATE_ENGINE_AWS_POSTGRES_URL }}
-      ELSPETH_STATE_ENGINE_AWS_DEPLOYMENT_PROVENANCE: ${{ vars.ELSPETH_STATE_ENGINE_AWS_DEPLOYMENT_PROVENANCE }}
-      ELSPETH_TEST_CHROMA_HOST: ${{ vars.ELSPETH_TEST_CHROMA_HOST }}
-      ELSPETH_TEST_CHROMA_PORT: ${{ vars.ELSPETH_TEST_CHROMA_PORT }}
-      ELSPETH_TEST_CHROMA_SSL: ${{ vars.ELSPETH_TEST_CHROMA_SSL }}
-      ELSPETH_TEST_CHROMA_TENANT: ${{ vars.ELSPETH_TEST_CHROMA_TENANT }}
-      ELSPETH_TEST_CHROMA_DATABASE: ${{ vars.ELSPETH_TEST_CHROMA_DATABASE }}
-      ELSPETH_TEST_CHROMA_COLLECTION_PREFIX: ${{ vars.ELSPETH_TEST_CHROMA_COLLECTION_PREFIX }}
-    steps:
-      - name: Checkout frozen baseline
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with: {ref: "${{ github.sha }}", persist-credentials: false}
-      - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
-        with: {python-version: "3.14"}
-      - name: Set up uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
-        with: {version: "0.10.2", enable-cache: false, prune-cache: true}
-      - name: Assert protected default-branch baseline
-        run: |
-          set -euo pipefail
-          test "$GITHUB_REF" = "refs/heads/${{ github.event.repository.default_branch }}"
-          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          test -z "$(git status --porcelain --untracked-files=no)"
-          echo "STATE_ENGINE_HEAD_SHA=$GITHUB_SHA" >> "$GITHUB_ENV"
-      - name: Install frozen acceptance dependencies
-        run: uv sync --frozen --all-extras
-      - name: Create scrub canaries
-        run: |
-          python - <<'PY'
-          import os, secrets
-          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as target:
-              target.write(f"ELSPETH_STATE_ENGINE_CREDENTIAL_CANARY=credential-{secrets.token_hex(32)}\n")
-              target.write(f"ELSPETH_STATE_ENGINE_PROVIDER_PAYLOAD_CANARY=provider-{secrets.token_hex(32)}\n")
-          PY
-      - name: Resolve exact selector lane
-        id: lane
-        run: python scripts/state_engine_live_provider_artifact.py lane-id --case-id "$STATE_ENGINE_CASE_ID" >> "$GITHUB_OUTPUT"
-      - name: Run and seal exact live-provider lane
-        run: |
-          set -uo pipefail
-          artifact_dir="$RUNNER_TEMP/state-engine-evidence"; stdout_path="$RUNNER_TEMP/pytest.stdout"
-          stderr_path="$RUNNER_TEMP/pytest.stderr"; argv_path="$RUNNER_TEMP/pytest.argv.json"; metadata_path="$RUNNER_TEMP/run-metadata.json"
-          lane_id="${{ steps.lane.outputs.lane_id }}"
-          PYTHONPATH="$PWD/src:$PWD" uv run python scripts/state_engine_live_provider_artifact.py run-pytest --selector-manifest docs/architecture/state_engine/proof-catalog/v3/evidence_selectors.json --lane "$lane_id" --artifact-dir "$artifact_dir" --stdout "$stdout_path" --stderr "$stderr_path" --argv-output "$argv_path" --run-metadata-output "$metadata_path" --timeout-seconds 4800 > "$RUNNER_TEMP/pytest.stdout" 2> "$RUNNER_TEMP/pytest.stderr"
-          pytest_status="$?"
-          PYTHONPATH="$PWD/src:$PWD" uv run python scripts/state_engine_live_provider_artifact.py seal --selector-manifest docs/architecture/state_engine/proof-catalog/v3/evidence_selectors.json --lane "$lane_id" --catalog docs/architecture/state_engine/proof-catalog/v3/catalog.json --workflow .github/workflows/state-engine-live-provider.yml --artifact-dir "$artifact_dir" --stdout "$stdout_path" --stderr "$stderr_path" --argv "$argv_path" --run-metadata "$metadata_path" --pytest-exit-code "$pytest_status" --secret-env ELSPETH_STATE_ENGINE_AWS_POSTGRES_URL
-      - name: Upload closed evidence envelope
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with: {name: "state-engine-live-${{ steps.lane.outputs.lane_id }}", path: "${{ runner.temp }}/state-engine-evidence", if-no-files-found: error, retention-days: 7}
-
   live_provider:
     if: github.event_name == 'workflow_dispatch' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && github.ref_protected
     name: live-provider / ${{ matrix.case_id }}
@@ -395,9 +327,6 @@ jobs:
           - transform:llm@bedrock
           - transform:llm@gateway
           - transform:llm@openrouter
-          - transform:rag_retrieval@chroma-client
-          - transform:rag_retrieval@chroma-ephemeral
-          - transform:rag_retrieval@chroma-persistent
     runs-on: [self-hosted, Linux, X64, ephemeral, aws-ecs, postgresql-16-rds, state-engine-live-provider]
     timeout-minutes: 90
     env:
@@ -419,12 +348,6 @@ jobs:
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
       GATEWAY_BEARER: ${{ secrets.GATEWAY_BEARER }}
       AZURE_SEARCH_API_KEY: ${{ secrets.AZURE_SEARCH_API_KEY }}
-      ELSPETH_TEST_CHROMA_HOST: ${{ vars.ELSPETH_TEST_CHROMA_HOST }}
-      ELSPETH_TEST_CHROMA_PORT: ${{ vars.ELSPETH_TEST_CHROMA_PORT }}
-      ELSPETH_TEST_CHROMA_SSL: ${{ vars.ELSPETH_TEST_CHROMA_SSL }}
-      ELSPETH_TEST_CHROMA_TENANT: ${{ vars.ELSPETH_TEST_CHROMA_TENANT }}
-      ELSPETH_TEST_CHROMA_DATABASE: ${{ vars.ELSPETH_TEST_CHROMA_DATABASE }}
-      ELSPETH_TEST_CHROMA_COLLECTION_PREFIX: ${{ vars.ELSPETH_TEST_CHROMA_COLLECTION_PREFIX }}
       AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
       AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
     steps:

@@ -515,7 +515,7 @@ def undeclared_row_fields(row_fields: Iterable[str], declared_fields: Iterable[s
     ``extract_jinja2_field_usage``) and the names the node declared, and gets
     back the sorted shortfall it may honestly report. Shared by
     ``LLMConfig._validate_template_variable_bindings``, the multi-query column
-    check, ``RAGRetrievalConfig`` and the composer's twins so the authoring
+    check and the composer's twins so the authoring
     surfaces cannot drift (elspeth-a9ba80cb0b).
 
     A read is covered when it names a declared field by EITHER spelling

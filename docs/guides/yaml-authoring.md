@@ -134,7 +134,7 @@ For another small complete example, see
 | `landscape` | The audit database connection. |
 | `payload_store`, `checkpoint` | Retained row/blob payloads and recovery settings. Keep them with the audit store if you need resume. |
 | `concurrency`, `retry`, `rate_limit` | Scheduling, transient retry, and service rate controls. |
-| `depends_on`, `collection_probes`, `commencement_gates` | Other pipelines and readiness checks that run before row processing. |
+| `depends_on`, `commencement_gates` | Other pipelines and readiness checks that run before row processing. `collection_probes` must be empty or absent: no probe provider ships since 0.8.18. |
 
 See the [Configuration Reference](../reference/configuration.md) for field
 defaults and operational sections. Unknown top-level or node-envelope fields
@@ -252,13 +252,13 @@ the example links contain complete settings files and prerequisite notes.
 | Cloud/business input | Sources `aws_s3`, `azure_blob`, `dataverse`, `power_automate` | Object/table/flow identity, credentials, schema, and bounded transfer controls. [S3 contract](../reference/configuration.md#available-source-plugins), [Power Automate](../../examples/power_automate/README.md). |
 | Rename, calculate, normalize | Transforms `field_mapper`, `value_transform`, `type_coerce`, `truncate`, `passthrough` | `mapping`/`select_only`, `operations`, `conversions`, or `fields`. [Reference enrichment and calculations](../../examples/reference_join/README.md). |
 | Filter or expand rows | Transforms `keyword_filter`, `json_explode`, `line_explode`; batch plugin `batch_replicate` | Content patterns, array/text fields, or copies field. Use a gate for expression routing; use a scope/collector for per-parent expansion results. [JSON explode](../../examples/json_explode/README.md), [deaggregation](../../examples/deaggregation/README.md). |
-| Lookup or fetch context | Transforms `reference_join`, `file_inject`, `web_scrape`, `rag_retrieval`, `azure_ai_search` | Reference table and match key, bound files and their formats, URL/query field, or retrieval provider/index. [Reference joins](../../examples/reference_join/README.md), [whole files on rows](../../examples/file_inject/README.md), [web scraping](../reference/web-scrape-transform.md), [Chroma](../../examples/chroma_rag/README.md). Network/retrieval plugins have extra prerequisites. |
+| Lookup or fetch context | Transforms `reference_join`, `file_inject`, `web_scrape`, `azure_ai_search` | Reference table and match key, bound files and their formats, URL/query field, or search index. [Reference joins](../../examples/reference_join/README.md), [whole files on rows](../../examples/file_inject/README.md), [web scraping](../reference/web-scrape-transform.md), [Azure AI Search](../../examples/azure_search_rag/README.md). Network/retrieval plugins have extra prerequisites. |
 | LLM generation | Source `llm` for one authored prompt; transform `llm` for a prompt per arriving row | Provider/profile, prompt, input declarations, response shape, capacity controls. [LLM source](../../examples/llm_source/README.md) and [queries below](#author-llm-queries). |
 | Document extraction | `pdf_rasterize`, `azure_document_intelligence`, `azure_content_understanding`, `aws_textract_document_analysis`, `aws_textract_inline_analysis` | Managed blobs or service document references, page/extraction options. [PDF rasterization](../../examples/pdf_rasterize/README.md), [Textract](../../examples/textract_inline/README.md). Service extraction is billable. |
 | Content controls | `azure_content_safety`, `azure_prompt_shield`, `aws_bedrock_content_safety`, `aws_bedrock_prompt_shield` | Declared text fields, service credentials, thresholds or guardrail identity. [Required controls](../reference/configuration.md#required-controls-and-error-routing). |
 | Batch statistics/comparison | `batch_stats`, `batch_rank`, `batch_classifier_metrics`, `batch_data_quality_report`, `batch_distribution_profile`, `batch_drift_compare`, `batch_effect_size`, `batch_experiment_compare`, `batch_outlier_annotator`, `batch_paired_preference`, `batch_threshold_summary`, `batch_top_k` | Put batch-aware plugins in `aggregations` or a bound `collector`, then select value/group/variant fields. [Statistics examples](../../examples/statistical_batch_plugins/README.md). |
 | Reports and local output | Batch transform `report_assemble`; sinks `csv`, `json`, `text`, `document` | File path, schema, collision policy; text/document select one string field. `text` writes LF-delimited records; `document` writes one whole field value. The Web Composer refuses `report_assemble` feeding a `text` sink directly; add `line_explode` between them. [Report assembly](../../examples/report_assemble/README.md). |
-| Database, cloud, or integration output | Sinks `database`, `aws_s3`, `azure_blob`, `chroma_sink`, `dataverse`, `power_automate` | Table/object/collection/flow identity and credentials. Check the plugin's execution and resume contracts. [Database sink](../../examples/database_sink/README.md), [Power Automate](../../examples/power_automate/README.md). |
+| Database, cloud, or integration output | Sinks `database`, `aws_s3`, `azure_blob`, `dataverse`, `power_automate` | Table/object/flow identity and credentials. Check the plugin's execution and resume contracts. [Database sink](../../examples/database_sink/README.md), [Power Automate](../../examples/power_automate/README.md). |
 
 For a small mapping node, this fragment consumes `selected_in` and sends a
 record containing only `transaction_id` and `amount` to an existing `output` sink:
@@ -585,16 +585,16 @@ closers. The default supported nesting depth is five. See the
 
 ### Before the run: dependencies and commencement gates
 
-`depends_on` runs named pipeline settings files before the main pipeline.
-`collection_probes` checks vector collections; `commencement_gates` evaluates
-go/no-go expressions after dependencies/probes. These gates have no row and use
-`collections`, `dependency_runs`, and explicitly supplied `env` context.
+`depends_on` runs named pipeline settings files before the main pipeline;
+`commencement_gates` evaluates go/no-go expressions after dependencies. These
+gates have no row and use `collections`, `dependency_runs`, and explicitly
+supplied `env` context. `collection_probes` must be empty or absent: its only
+provider, Chroma, was removed in 0.8.18, so a non-empty list is refused when
+settings load and `collections` is empty.
 
-For example, the [indexed Chroma workflow](../../examples/chroma_rag_indexed/README.md)
-runs indexing before queries and checks collection readiness. See
-[pipeline dependencies](../reference/configuration.md#pipeline-dependencies)
-for the configuration. Dependencies and probes are execution prerequisites;
-config validation does not prove their live readiness.
+See [pipeline dependencies](../reference/configuration.md#pipeline-dependencies)
+for the configuration. Dependencies are execution prerequisites; config
+validation does not prove their live readiness.
 
 ## Choose what happens to failures
 

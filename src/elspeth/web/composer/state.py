@@ -2452,7 +2452,7 @@ def _sink_probe_defers(output: OutputSpec) -> bool:
 # A file reference where a local path stands can never run. The save path
 # (``web/execution/_validation_authoring.py``) and run admission
 # (``web/execution/service.py``) confine the keys in ``web/paths.py`` and admit
-# only a non-empty string there (or Chroma's explicit ``None``); a reference
+# only a non-empty string there; a reference
 # is neither, so the reference alone decides it here, over the same keys.
 def _local_path_file_reference_entry(component: str, subject: str, key: str) -> ValidationEntry:
     return ValidationEntry(

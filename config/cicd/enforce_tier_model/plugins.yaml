@@ -81,14 +81,6 @@ per_file_rules:
     replacement by precise signed dispositions in 0.8.1.
   expires: '2026-10-06'
   max_hits: 6
-- pattern: plugins/sinks/chroma_sink.py
-  rules:
-  - R4
-  reason: R4 broad except in on_complete() post-audit telemetry emission — best-effort
-    operational visibility after writes+audit; must not fail completion (Tier-1 errors
-    re-raise first). Same pattern as plugins/sinks/dataverse.py. (elspeth-ee69831e4c)
-  expires: null
-  max_hits: 1
 - pattern: plugins/infrastructure/clients/llm.py
   rules:
   - R5
@@ -578,44 +570,6 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[41]/body[2]/body[2]/handlers[2]'
   judge_metadata_signature: 'hmac-sha256:v2:be8b644e1fd9da20b3e1c98064cd57301026f70ae9959f42f9dd8a37b18686c1'
-- key: plugins/infrastructure/clients/retrieval/connection.py:R6:_host_url:fp=e0a7778bdc527de0
-  owner: john
-  reason: |-
-    ipaddress.ip_address() raises ValueError on a non-IP-literal host; the except falls back to using the Tier-3 host string as a hostname (IPv6 bracket normalization applies only to successfully parsed IPs). Explicit branch selection on external input, not error suppression -- host shape was already validated above (rejects scheme/path/query).
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T10:34:28.396744+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
-  judge_rationale: |-
-    RULE MISFIRES — the caught ValueError is the documented discriminator between an IP literal and a hostname, not a swallowed failure under a fixed contract. The Tier-3 host is preserved unchanged on the hostname branch, while only successfully parsed IP literals receive normalization; the visible precheck rejects URL syntax before this branch. R6 therefore does not describe silent recovery, coercion, or fabrication at this site.
-  judge_signature_version: 2
-  scope_fingerprint: c61f192f8181bd41acf992d1f25a4d21e577a1776bc86b23f39411d19aa2ad7b
-  judge_transport: codex_cli
-  ast_path: 'body[14]/body[1]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:b92aebb9d1004a40ded7b5976b123d1f34b62ecd587bb183e852a63e997776bb'
-- key: plugins/infrastructure/clients/retrieval/connection.py:R6:_is_loopback_host:fp=413fe7a0e494514b
-  owner: john
-  reason: |-
-    ipaddress.ip_address() raises ValueError when the Tier-3 host string is not an IP literal (e.g. a hostname). The except returns False = 'not a loopback IP' -- an explicit, meaning-preserving classification, not a swallowed error. The actual SSRF allow/deny decision is made by the caller (_validate_chroma_http_target).
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T10:34:42.709333+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
-  judge_rationale: |-
-    RULE MISFIRES — the caught ValueError is the documented negative branch of IP-literal discrimination, and returning False explicitly means the host is not a recognized loopback literal rather than concealing a failed integrity check. The named control, _validate_chroma_http_target, is visible at lines 64–77 and always routes the host through validate_url_for_ssrf after using this classification solely to select allowed loopback ranges; its SSRF and network failures are converted into an explicit chained ValueError. The excerpt therefore verifies the control-location claim and shows that the exception does not bypass the actual SSRF allow/deny gate. R6 is not eligible for the trust-boundary decorator.
-  judge_signature_version: 2
-  scope_fingerprint: a04a2c257fb9c62ba6a661bc2a1875d644d5833ced11b1131b41555986d93554
-  judge_transport: codex_cli
-  ast_path: 'body[13]/body[2]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:eb95a2b40ac7c2f1dfdc598ad4f8de023a14ba49a934abe12d2fd1ba37064ad5'
 - key: plugins/infrastructure/base.py:R5:BaseTransform:__init_subclass__:fp=98e79dff2714f143
   owner: john
   reason: |-
@@ -1205,25 +1159,6 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[66]/body[3]/body[3]/handlers[0]'
   judge_metadata_signature: 'hmac-sha256:v2:651ef437073028a698c5c572c239dc97bb2e1cfc52c0cca2acf2fe546048bc32'
-- key: plugins/sinks/chroma_sink.py:R6:ChromaSink:_member_effect_material:fp=b99d4caaca3f0716
-  owner: john
-  reason: |-
-    except ValueError as exc around _extract_effect_member appends (member.ordinal, str(exc)) to diversions, and that append IS the explicit error result: the member is left out of ids/documents/metadata and the descriptor row_count, its ordinal is returned in the diversions tuple and lands in diverted_ordinals and diversion_attribution of the plan evidence, and prepare_effect routes every entry through self._divert_row, which fails closed with FrameworkBugError when no on_write_failure policy is configured. The value is Tier-2 pipeline row data whose field types are not guaranteed by the member contract; per ADR-020 an invalid member diverts individually with its exact reason instead of aborting the plan and blocking valid siblings (elspeth-32bf1a9b63). The divert call cannot live inside this handler because _member_effect_material is recomputed on commit and reconcile to re-bind the plan hash, and the live diversion must be logged exactly once at prepare. No path lets the member count as written.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T14:00:34.245997+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
-  judge_rationale: |-
-    PRESCRIBED FORM — the caught ValueError is converted into an explicit quarantine result: `_member_effect_material` records the member ordinal and exact reason in `diversions`, excludes that member from the published payload and descriptor row count, and returns the diversions at `chroma_sink.py:423-478`. The named control is verified: `ChromaSink.prepare_effect` routes every returned diversion through `_divert_row` and records `diversion_attribution` and `diverted_ordinals` in plan evidence at `chroma_sink.py:505-553`. `BaseSink._divert_row` fails closed with `FrameworkBugError` when no write-failure policy exists and otherwise records a `RowDiversion` at `base.py:1922-1946`, so the exception is neither silently swallowed nor allowed to count the invalid member as written.
-  judge_signature_version: 2
-  scope_fingerprint: f24ff38d4b8b44b759e2ca3a93e4e411adfc9dea85a26997ba1594f61834d0ba
-  judge_transport: codex_cli
-  ast_path: 'body[34]/body[23]/body[3]/body[0]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:72f99f47e4c60d0a53be041e5354d805fd36408d8ac414c23fd41944168c6cf5'
 - key: plugins/sinks/database_sink.py:R6:DatabaseSink:_insert_effect_rows:fp=55fdb514cb135538
   owner: john
   reason: |-
@@ -1996,44 +1931,6 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[13]/body[5]/body[1]/handlers[1]'
   judge_metadata_signature: 'hmac-sha256:v2:4ca1560581ec007df2cd13f239c935196ac85dda2cca24dca44a82ca679328c9'
-- key: plugins/transforms/rag/transform.py:R5:RAGRetrievalTransform:_configured_collection_name:fp=4103942b8e2bd3a8
-  owner: john
-  reason: |-
-    After exact dispatch to `azure_search`, the nominal `AzureSearchProviderConfig` check fails closed with `FrameworkBugError` on any wrong variant, then reads only the owned `index` field. Unknown provider names also raise; no structural object is admitted.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-12-07'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-09-08T01:09:26.164286+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
-  judge_rationale: |-
-    PRESCRIBED FORM — after exact nominal dispatch on `provider_name`, the `isinstance` check rejects a mismatched first-party configuration variant with the correctly framed `FrameworkBugError`; it neither coerces, defaults, nor admits a structural impostor. The visible code then accesses only the variant-specific owned `index` field, while unknown provider names also fail closed, so this is the policy-prescribed offensive check that makes a contract violation maximally informative. This is an internal nominal-contract enforcement point rather than a Tier-3 boundary function, so the trust-boundary decorator does not apply.
-  judge_signature_version: 2
-  scope_fingerprint: b83a72ed14393010da398c819cee06bacaeba342a6a4f2859b888f7ab3c64a91
-  judge_transport: codex_cli
-  ast_path: 'body[23]/body[19]/body[2]/body[1]/test/operand'
-  judge_metadata_signature: 'hmac-sha256:v2:db7a68fbd59817dbee0d3436c1fce4a4f839ad125cd4b876df35af8761807c67'
-- key: plugins/transforms/rag/transform.py:R5:RAGRetrievalTransform:_configured_collection_name:fp=e95a5bfb3b7067b7
-  owner: john
-  reason: |-
-    After the exact provider-name dispatch selects `chroma`, this nominal check validates the ELSPETH-owned `ChromaSearchProviderConfig` variant. A mismatch raises `FrameworkBugError` before any readiness identity is read; it cannot authorize or coerce an impostor.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-12-07'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-09-08T01:09:43.041354+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.97
-  judge_rationale: |-
-    PRESCRIBED FORM — after exact provider-name discrimination, the nominal `isinstance` check enforces the corresponding ELSPETH-owned concrete configuration variant and raises a typed, informative `FrameworkBugError` on mismatch. The visible code neither coerces nor admits the wrong object and reads `collection` only after successful discrimination, matching the policy’s offensive wrong-type-to-crash form for an unknown-type internal boundary. This is not Tier-3 external input and therefore is not a structural `@trust_boundary` decorator case.
-  judge_signature_version: 2
-  scope_fingerprint: b83a72ed14393010da398c819cee06bacaeba342a6a4f2859b888f7ab3c64a91
-  judge_transport: codex_cli
-  ast_path: 'body[23]/body[19]/body[1]/body[1]/test/operand'
-  judge_metadata_signature: 'hmac-sha256:v2:131f9f00d429c64c715edcd81bfe18464978ac295e430ccc3022aed594370d86'
 - key: plugins/infrastructure/telemetry.py:R6:emit_resource_cleanup_failed:fp=814c11050e1d9462
   owner: john
   reason: |-

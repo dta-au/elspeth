@@ -12,7 +12,8 @@ The full history is in the repository's releases and commit history.
 
 Canonical form v2 for new runs, worker coordination and recovery fixes in the
 engine and the web server, a credential check on prompt files and each model
-message, and Web Composer request-size and validation fixes. The session
+message, Web Composer request-size and validation fixes, a release image whose
+web server starts, and the removal of the Chroma plugins. The session
 epoch stays at 79 and the Landscape epoch at 51, so 0.8.17 session and
 Landscape stores open unchanged. Runs started under 0.8.17 cannot be
 continued after the upgrade; see the upgrade notes. The dated entry does not
@@ -26,6 +27,25 @@ establish qualification, a published tag or an image.
   restamping or downgrade.
 - **Upgrading from 0.8.16 or earlier: apply the 0.8.17 and 0.8.16 upgrade
   notes first.**
+- **Breaking: Chroma support is removed.** The `chroma_sink` sink, the
+  `rag_retrieval` transform (whose only retrieval provider was Chroma) and the
+  Chroma collection readiness probe are gone, with the `chromadb` dependency.
+  A pipeline, saved Composer session or web run that names `chroma_sink` or
+  `rag_retrieval` is refused because the plugin is not registered, and
+  pipeline settings with a non-empty `collection_probes` list are refused at
+  load. Remove those nodes and the `collection_probes` entries before
+  upgrading. Retrieval from Azure AI Search (`azure_ai_search`) is unaffected.
+  Existing Chroma collections are not touched; read or export them with your
+  own Chroma tooling. Audit records of earlier runs that used these plugins
+  stay readable with `elspeth explain`.
+- **Web file uploads now accept files up to 50 MiB by default.** The default
+  `max_upload_bytes` (`ELSPETH_WEB__MAX_UPLOAD_BYTES`) moves from 104857600
+  to 52428800 bytes. No deployment loses capacity: every request body was
+  already refused above 10 MiB before it reached the upload route, so 10 MiB
+  was the effective limit whatever the setting said. A deployment that sets
+  `max_upload_bytes` now gets that limit for file uploads. A reverse proxy in
+  front of the server must also allow bodies of that size; the bundled nginx
+  configuration allows 100 MiB.
 - **Finish runs before upgrading (canonical form v2).** New runs record the
   canonical version `sha256-rfc8785-v2`: byte values are hashed as base64 text
   and mappings that use reserved keys are no longer wrapped. A run recorded
@@ -44,8 +64,6 @@ establish qualification, a published tag or an image.
 - **Finish interrupted web runs before upgrading.** This release changes the
   application code a web run is bound to, so a web run admitted under 0.8.17
   is refused on resume as `IMPLEMENTATION_CHANGED` (implementation drift).
-  The ChromaDB sink's declared identity also changes, so where `chroma_sink`
-  is an authorized plugin the plugin policy changes too.
 - **Sessions database: up to 12 connections per application process.** Each
   web process now has a second session-database pool of 2 connections, with
   no overflow, for lease renewal and release and the membership heartbeat.
@@ -87,11 +105,6 @@ establish qualification, a published tag or an image.
   event's `context.refused_call`, with its identity, hashes, status, token
   usage and latency. Audit consumers that count attempted calls should read
   these refusal events as well as `calls`.
-- **Changed:** the ChromaDB retriever and sink read a collection's distance
-  function from its configuration (`hnsw` or `spann`) and reconcile it with
-  the older `hnsw:space` metadata. A collection whose distance function is
-  missing, malformed or in conflict refuses startup; `distance_function` in
-  your settings must still match it.
 - **Changed:** the Composer's context-budget policy is now
   `composer.context-budget.v5`. Earlier turns already left out of an existing
   session stay out until the request is below 60% of the limit at the new
@@ -181,7 +194,47 @@ establish qualification, a published tag or an image.
   the retry delay, up to 30 s, before that refusal; before this release the 429
   was reported at once.
 
+### Removed
+
+- The `chroma_sink` sink, the `rag_retrieval` transform and the Chroma
+  collection readiness probe, with the `chromadb` package and the fifteen
+  packages only it required. `chromadb` carries a critical vulnerability with
+  no fixed release (CVE-2026-45829) and three more, so the release image
+  failed its vulnerability scan. `collection_probes` stays in the settings
+  model and must be empty; no probe provider ships.
+- The `chroma_rag`, `chroma_rag_indexed` and `chroma_rag_qa` examples and
+  their examples-gate cases.
+- The `.trivyignore.yaml` exceptions and the matching pip-audit
+  `--ignore-vuln` entries, which existed only for `chromadb`. The release
+  image scans and the dependency audit now take no exceptions.
+
 ### Fixed
+
+- Web file uploads honour `max_upload_bytes`. The request-body guard that runs
+  before routing refused every body over 10 MiB, so a file between 10 MiB and
+  the configured upload limit was refused with "Request body too large (max
+  10 MB)" before the upload route could check it. Multipart file uploads
+  (`POST /api/sessions/{id}/blobs`) now take a ceiling of `max_upload_bytes`
+  plus 1 MiB for the multipart envelope, and their read deadline scales with
+  that ceiling at the same minimum transfer rate. At most four request bodies
+  over 10 MiB are read at once; another is refused with 503 and a
+  `Retry-After` header, and the browser asks the user to try again. Every
+  other request, including inline blob creation, keeps the 10 MiB ceiling
+  and 30 second deadline. Image and PDF uploads keep their 5 MiB ceiling.
+
+- The release container image can start the web server again. Since 0.8.14,
+  `elspeth web` in the published image stopped with `AttributeError: module
+  'os' has no attribute 'pidfd_open'`, because the CPython 3.14.5 build that
+  the pinned uv 0.11.15 installs lacks `os.pidfd_open` and
+  `signal.pidfd_send_signal`, which the web process watchdog needs. The image
+  now installs CPython 3.14.10 with uv 0.13.10, whose build has both, and the
+  image build refuses an interpreter that lacks either. The gateway image uses
+  the same uv. CLI pipelines and installs from source were not affected.
+
+- The release image no longer ships the bundled interpreter's own pip, which
+  nothing in the image uses and whose vendored setuptools 70.3.0 the image
+  scan reported (CVE-2025-47273). The runtime base moves to the current
+  distroless Debian 13.8 image, which carries the fixed zstd library.
 
 - Composer validation now refuses a step that requires named fields when it
   sits behind a queue or row_union whose inputs do not all guarantee them. The

@@ -2,20 +2,14 @@
 
 from __future__ import annotations
 
-from typing import get_args
-
 import pytest
 from pydantic import ValidationError
 
 from elspeth.plugins.infrastructure.azure_auth import AzureAuthConfig
-from elspeth.plugins.infrastructure.clients.retrieval import connection
 from elspeth.plugins.infrastructure.clients.retrieval.azure_search import AzureSearchProviderConfig
-from elspeth.plugins.infrastructure.clients.retrieval.chroma import ChromaSearchProviderConfig
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.sinks.azure_blob_sink import AzureBlobSinkConfig
-from elspeth.plugins.sinks.chroma_sink import ChromaSinkConfig
 from elspeth.plugins.sources.azure_blob_source import AzureBlobSourceConfig
-from elspeth.plugins.transforms.rag.config import RAGRetrievalConfig
 
 _ACCOUNT_URL = "https://account.blob.core.windows.net"
 _SEARCH_ENDPOINT = "https://service.search.windows.net"
@@ -187,17 +181,3 @@ def test_azure_search_rejects_explicit_mode_that_disagrees_with_credentials() ->
             auth_mode="managed_identity",
             api_key="key",
         )
-
-
-def test_rag_provider_schema_is_the_owned_closed_product_vocabulary() -> None:
-    # One registered provider: pydantic renders a single-member Literal as ``const``, not ``enum``.
-    provider_schema = RAGRetrievalConfig.model_json_schema()["properties"]["provider"]
-    assert provider_schema["const"] == "chroma"
-    assert "enum" not in provider_schema
-
-
-def test_chroma_modes_are_central_owned_vocabularies_reused_by_configs() -> None:
-    assert get_args(connection.ChromaConnectionMode) == ("persistent", "client")
-    assert get_args(connection.ChromaSearchMode) == ("ephemeral", "persistent", "client")
-    assert ChromaSearchProviderConfig.model_json_schema()["properties"]["mode"]["enum"] == list(get_args(connection.ChromaSearchMode))
-    assert ChromaSinkConfig.model_json_schema()["properties"]["mode"]["enum"] == list(get_args(connection.ChromaConnectionMode))

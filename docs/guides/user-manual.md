@@ -234,12 +234,10 @@ TRANSFORMS:
   azure_document_intelligence - Enrich rows with Azure Document Intelligence extraction (async analyze LRO).
   azure_prompt_shield  - Detect jailbreak attempts and prompt injection using Azure Prompt Shield.
   llm                  - Unified LLM transform with provider dispatch and strategy selection.
-  rag_retrieval        - Enriches rows with retrieval-augmented context from search providers.
 
 SINKS:
   aws_s3               - Write bounded cumulative CSV, JSON, or JSONL objects to AWS S3.
   azure_blob           - Write rows to Azure Blob Storage.
-  chroma_sink          - Write pipeline rows into a ChromaDB collection.
   csv                  - Write rows to a CSV file.
   database             - Write rows to a database table.
   dataverse            - Write rows to Microsoft Dataverse via OData v4 REST API.
@@ -516,7 +514,7 @@ elspeth health --json
   "checks": {
     "version": {"status": "ok", "value": "0.8.0"},
     "commit": {"status": "ok", "value": "abc123f"},
-    "python": {"status": "ok", "value": "3.14.5"},
+    "python": {"status": "ok", "value": "3.14.10"},
     "database": {"status": "ok", "value": "connected"},
     "config_dir": {"status": "ok", "value": "./config"},
     "output_dir": {"status": "ok", "value": "./output"},

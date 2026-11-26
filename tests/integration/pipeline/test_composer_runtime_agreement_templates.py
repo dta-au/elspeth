@@ -16,6 +16,17 @@ from elspeth.core.config import ElspethSettings, SinkSettings, SourceSettings, T
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 
 
+def _retrieval_options(**fields: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+    """(composer options, runtime options) for one ``azure_ai_search`` node.
+
+    The retrieval template contract lives in the shared ``RetrievalOutputConfig``
+    core, which ``azure_ai_search`` runs on both surfaces. The composer side
+    carries the key as a secret reference, the runtime side as a literal.
+    """
+    common: dict[str, Any] = {"endpoint": "https://agreement.search.windows.net", "index": "agreement", **fields}
+    return {**common, "api_key": {"secret_ref": "AZURE_SEARCH_API_KEY"}}, {**common, "api_key": "test-key"}
+
+
 class TestComposerRuntimeTemplateLiteralAgreement:
     """Shape 30 — a template whose own literals fail on every row (elspeth-5887fb7928 S3).
 
@@ -23,14 +34,14 @@ class TestComposerRuntimeTemplateLiteralAgreement:
     upsert_node / set_pipeline run); the runtime side is plugin instantiation
     from settings, as ``elspeth validate`` does. Both must refuse the same
     template text with the same template message, for ``llm`` and
-    ``rag_retrieval``; a template whose failure depends on the row is admitted
+    ``azure_ai_search``; a template whose failure depends on the row is admitted
     by both.
 
     Bug verification protocol: removing the ``_check_configuration_literals``
     call from ``_BoundedEnvironment.parse`` makes every rejection case fail on
     both sides (the composer returns None, the runtime DID NOT RAISE);
     removing ``RetrievalOutputConfig.validate_query_template`` fails the
-    ``rag_retrieval`` composer assertions only (the runtime still refuses at
+    ``azure_ai_search`` composer assertions only (the runtime still refuses at
     QueryBuilder construction) — the pre-fix disagreement.
     """
 
@@ -89,17 +100,14 @@ class TestComposerRuntimeTemplateLiteralAgreement:
                 "schema": {"mode": "observed"},
             }
             return {**common, "api_key": {"secret_ref": "OPENROUTER_API_KEY"}}, {**common, "api_key": "sk-test-key"}
-        rag = {
-            "query_field": "q",
-            "query_template": template,
+        return _retrieval_options(
+            query_field="q",
+            query_template=template,
             # The template reads row.n: declared, as the llm arm does (Shape 32).
-            "required_input_fields": ["q", "n"],
-            "output_prefix": "sci",
-            "provider": "chroma",
-            "provider_config": {"collection": "agreement", "mode": "ephemeral"},
-            "schema": {"mode": "observed"},
-        }
-        return rag, rag
+            required_input_fields=["q", "n"],
+            output_prefix="sci",
+            schema={"mode": "observed"},
+        )
 
     @staticmethod
     def _runtime(tmp_path: Path, plugin: str, options: dict[str, Any]) -> None:
@@ -126,7 +134,7 @@ class TestComposerRuntimeTemplateLiteralAgreement:
         )
         instantiate_plugins_from_config(config)
 
-    @pytest.mark.parametrize("plugin", ["llm", "rag_retrieval"])
+    @pytest.mark.parametrize("plugin", ["llm", "azure_ai_search"])
     @pytest.mark.parametrize(("template", "message"), _REFUSED)
     def test_both_refuse_a_template_its_literals_fail(self, tmp_path: Path, plugin: str, template: str, message: str) -> None:
         from elspeth.web.composer.tools._common import _prevalidate_transform
@@ -138,7 +146,7 @@ class TestComposerRuntimeTemplateLiteralAgreement:
         with pytest.raises(PluginConfigError, match=re.escape(message)):
             self._runtime(tmp_path, plugin, runtime_options)
 
-    @pytest.mark.parametrize("plugin", ["llm", "rag_retrieval"])
+    @pytest.mark.parametrize("plugin", ["llm", "azure_ai_search"])
     @pytest.mark.parametrize(
         "template",
         [
@@ -194,18 +202,16 @@ class TestComposerRuntimeRagQueryTemplateAgreement:
     )
 
     @staticmethod
-    def _options(template: str, required_input_fields: list[str] | None) -> dict[str, Any]:
-        options: dict[str, Any] = {
+    def _options(template: str, required_input_fields: list[str] | None) -> tuple[dict[str, Any], dict[str, Any]]:
+        fields: dict[str, Any] = {
             "query_field": "q",
             "query_template": template,
             "output_prefix": "sci",
-            "provider": "chroma",
-            "provider_config": {"collection": "agreement", "mode": "ephemeral"},
             "schema": {"mode": "observed"},
         }
         if required_input_fields is not None:
-            options["required_input_fields"] = required_input_fields
-        return options
+            fields["required_input_fields"] = required_input_fields
+        return _retrieval_options(**fields)
 
     @pytest.mark.parametrize(("template", "required_input_fields", "message"), _REFUSED)
     def test_both_refuse_a_read_outside_the_declaration(
@@ -213,12 +219,12 @@ class TestComposerRuntimeRagQueryTemplateAgreement:
     ) -> None:
         from elspeth.web.composer.tools._common import _prevalidate_transform
 
-        options = self._options(template, required_input_fields)
-        composer = _prevalidate_transform("rag_retrieval", options)
+        composer_options, runtime_options = self._options(template, required_input_fields)
+        composer = _prevalidate_transform("azure_ai_search", composer_options)
         assert composer is not None
         assert message in composer, composer
         with pytest.raises(PluginConfigError, match=re.escape(message)):
-            TestComposerRuntimeTemplateLiteralAgreement._runtime(tmp_path, "rag_retrieval", options)
+            TestComposerRuntimeTemplateLiteralAgreement._runtime(tmp_path, "azure_ai_search", runtime_options)
 
     @pytest.mark.parametrize(
         ("template", "required_input_fields"),
@@ -232,9 +238,9 @@ class TestComposerRuntimeRagQueryTemplateAgreement:
     def test_both_admit_a_read_the_declaration_covers(self, tmp_path: Path, template: str, required_input_fields: list[str] | None) -> None:
         from elspeth.web.composer.tools._common import _prevalidate_transform
 
-        options = self._options(template, required_input_fields)
-        assert _prevalidate_transform("rag_retrieval", options) is None
-        TestComposerRuntimeTemplateLiteralAgreement._runtime(tmp_path, "rag_retrieval", options)
+        composer_options, runtime_options = self._options(template, required_input_fields)
+        assert _prevalidate_transform("azure_ai_search", composer_options) is None
+        TestComposerRuntimeTemplateLiteralAgreement._runtime(tmp_path, "azure_ai_search", runtime_options)
 
 
 class TestComposerRuntimeTemplateRowApiAgreement:
@@ -242,7 +248,7 @@ class TestComposerRuntimeTemplateRowApiAgreement:
 
     A retired row-API name, a call on a row field and an uncalled ``row.get``
     are refused under every declaration, ``[]`` included, for ``llm`` (its
-    ``row`` and a query's ``row.source_row``) and ``rag_retrieval``; a field
+    ``row`` and a query's ``row.source_row``) and ``azure_ai_search``; a field
     read and every whole-row filter are admitted by both. The composer side is
     its mutation gate (``_prevalidate_transform``); the runtime side is plugin
     instantiation from settings, as ``elspeth validate`` does.
@@ -281,18 +287,15 @@ class TestComposerRuntimeTemplateRowApiAgreement:
                 "schema": {"mode": "observed"},
             }
             return {**multi, "api_key": {"secret_ref": "OPENROUTER_API_KEY"}}, {**multi, "api_key": "sk-test-key"}
-        rag = {
-            "query_field": "q",
-            "query_template": "{{ query }} " + template,
-            "required_input_fields": required_input_fields,
-            "output_prefix": "sci",
-            "provider": "chroma",
-            "provider_config": {"collection": "agreement", "mode": "ephemeral"},
-            "schema": {"mode": "observed"},
-        }
-        return rag, rag
+        return _retrieval_options(
+            query_field="q",
+            query_template="{{ query }} " + template,
+            required_input_fields=required_input_fields,
+            output_prefix="sci",
+            schema={"mode": "observed"},
+        )
 
-    @pytest.mark.parametrize("plugin", ["llm", "llm-multi-query", "rag_retrieval"])
+    @pytest.mark.parametrize("plugin", ["llm", "llm-multi-query", "azure_ai_search"])
     @pytest.mark.parametrize("required_input_fields", [pytest.param(["q", "n"], id="list"), pytest.param([], id="opt-out")])
     @pytest.mark.parametrize(("template", "message"), _REFUSED)
     def test_both_refuse_the_row_used_as_an_object(
@@ -310,7 +313,7 @@ class TestComposerRuntimeTemplateRowApiAgreement:
         with pytest.raises(PluginConfigError, match=re.escape(message)):
             TestComposerRuntimeTemplateLiteralAgreement._runtime(tmp_path, registered, runtime_options)
 
-    @pytest.mark.parametrize("plugin", ["llm", "llm-multi-query", "rag_retrieval"])
+    @pytest.mark.parametrize("plugin", ["llm", "llm-multi-query", "azure_ai_search"])
     @pytest.mark.parametrize("required_input_fields", [pytest.param(["q", "n"], id="list"), pytest.param([], id="opt-out")])
     @pytest.mark.parametrize(
         "template",

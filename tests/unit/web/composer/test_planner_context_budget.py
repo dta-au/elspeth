@@ -888,7 +888,9 @@ async def test_six_schema_batch_costs_the_same_with_and_without_producer_labels(
 # Credential-scan teaching and tool descriptions (0.8.18): 49,731 measured. Both requests are 38 B smaller
 # (163,516 decision bytes), and the first call's lower density lowers the rate to 3.2880375, so the estimate
 # rounds up one token higher.
-@pytest.mark.parametrize(("anchor_tokens", "minimum"), [(100_000, 100_000), (40_000, 49_731)])
+# Chroma removal (0.8.18): 49,765 measured. A tool description no longer names RAG retrieval or Chroma sinks,
+# so the request shrinks slightly and the repriced estimate rises 34 tokens; the parent commit measures 49,731.
+@pytest.mark.parametrize(("anchor_tokens", "minimum"), [(100_000, 100_000), (40_000, 49_765)])
 async def test_planner_estimate_is_never_below_the_providers_count_and_uses_the_cheaper_arm(
     tmp_path: Path, tool_context: ToolContext, anchor_tokens: int, minimum: int
 ) -> None:

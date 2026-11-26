@@ -733,7 +733,7 @@ def test_web_scrape_fed_llm_keeps_untrusted_content_drafts_verbatim() -> None:
     [
         ("blob_fetch", "blob_text_expand"),
         ("azure_document_intelligence", None),
-        ("rag_retrieval", None),
+        ("azure_ai_search", None),
         ("llm", None),
     ],
 )
@@ -785,7 +785,7 @@ def test_untrusted_producers_use_provenance_neutral_content_draft(
     message = next(message for component, message in warning_pairs if component == "node:classify")
     assert "untrusted or externally controlled upstream content" in message
     assert f"produced by {producer_plugin}" in message
-    if producer_plugin in {"azure_document_intelligence", "rag_retrieval", "llm"}:
+    if producer_plugin in {"azure_document_intelligence", "azure_ai_search", "llm"}:
         assert all(term not in message.casefold() for term in ("fetch", "internet", "remote"))
 
 

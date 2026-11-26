@@ -15,6 +15,8 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
+from pydantic import BaseModel
+
 from elspeth.config_loading import load_settings_from_yaml_string
 from elspeth.contracts.types import CollectorName
 from elspeth.core.template_materialization import FILE_BACKED_TEMPLATE_OPTION_REGISTRY
@@ -120,8 +122,33 @@ def test_collector_materialization_exclusions_have_live_registry_triggers() -> N
     )
 
 
+class _ProviderConfigOwnerConfig(BaseModel):
+    provider_config: dict[str, Any]
+
+
+class _ProviderConfigOwnerStandIn:
+    """A plugin-shaped stand-in whose config declares ``provider_config``.
+
+    No registered transform declares ``provider_config`` since the Chroma
+    retrieval transform was removed, so the registry offers no known-positive
+    for that family; this stand-in is the scan's positive control.
+    """
+
+    name = "provider_config_owner_stand_in"
+
+    @staticmethod
+    def get_config_model() -> type[BaseModel]:
+        return _ProviderConfigOwnerConfig
+
+
 def test_collector_exclusion_trigger_detects_current_non_batch_owners() -> None:
-    """Positive control: prove the registry scan detects both option families."""
+    """Positive control: prove the registry scan detects both option families.
+
+    The file-materialized content family is controlled against its live
+    (non-batch) owners. The ``provider_config`` family has no live owner, so
+    the registry pin is that it stays empty, and the stand-in proves the scan
+    would detect an owner (a scan that matched nothing also reports empty).
+    """
     transforms = tuple(get_shared_plugin_manager().get_transforms())
     content_conflicts, provider_config_plugins = _collector_exclusion_conflicts(transforms)
     detected_content_keys = {field for fields in content_conflicts.values() for field in fields}
@@ -136,7 +163,9 @@ def test_collector_exclusion_trigger_detects_current_non_batch_owners() -> None:
     assert "tables.<name>.reference_content" in registered_content_keys
     assert detected_content_keys == registered_content_keys
     assert NESTED_LOCAL_PATH_OPTION_KEYS
-    assert provider_config_plugins
+    assert provider_config_plugins == ()
+    _stand_in_content, stand_in_owners = _collector_exclusion_conflicts((_ProviderConfigOwnerStandIn,))
+    assert stand_in_owners == (_ProviderConfigOwnerStandIn.name,)
 
 
 def test_preflight_admits_a_collector_bearing_bundle() -> None:

@@ -579,7 +579,7 @@ class WebSettings(BaseModel):
     secret_key: str = (
         "change-me-in-production"  # Security rule S3 (seam-contracts.md): Sub-2 startup guard enforces non-default in production
     )
-    max_upload_bytes: int = Field(default=100 * 1024 * 1024, ge=1)
+    max_upload_bytes: int = Field(default=50 * 1024 * 1024, ge=1)
     max_blob_storage_per_session_bytes: int = Field(default=500 * 1024 * 1024, ge=1)
     server_secret_allowlist: tuple[str, ...] = (
         "OPENROUTER_API_KEY",

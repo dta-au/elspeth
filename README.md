@@ -19,17 +19,6 @@ Landscape audit trail.
 > **AI-generated code:** ELSPETH is a rapid prototype, generated and reviewed by AI,
 > that is in active development with major systems subject to change. Limited user
 > testing has been conducted on a small set of use cases.
->
-> **Chroma security advisory:** Do not use Chroma with ELSPETH until upstream
-> publishes a fixed release and ELSPETH adopts and verifies it. This includes
-> the `rag_retrieval` transform with `provider: chroma`, the `chroma_sink` sink,
-> and Chroma examples in all connection modes. ChromaDB has unresolved
-> code-execution vulnerabilities in every release up to and including 1.5.9,
-> the latest at the time of writing, including the 1.5.5 that ELSPETH locks;
-> no fixed release exists. See the
-> [pre-authentication advisory](https://github.com/advisories/GHSA-f4j7-r4q5-qw2c),
-> [collection-update advisory](https://github.com/advisories/GHSA-36p7-vc44-83pf),
-> and [upstream server and client issue](https://github.com/chroma-core/chroma/issues/6717).
 
 ## What it does
 
@@ -106,6 +95,10 @@ describe what is exported and how to configure it.
 and recovery, and fixes several Web Composer validation, request-size and
 credential-check paths. See the [release notes](CHANGELOG.md) for the specific
 behaviour and upgrade actions.
+
+0.8.18 removes Chroma support: the `chroma_sink` sink, the `rag_retrieval`
+transform and Chroma collection probes. Settings and saved pipelines that use
+them are refused after upgrading; `azure_ai_search` is the retrieval transform.
 
 Session epoch 79 and Landscape epoch 51 are unchanged from 0.8.17; this release
 adds no schema-epoch cutover, and existing 0.8.17 session and Landscape stores

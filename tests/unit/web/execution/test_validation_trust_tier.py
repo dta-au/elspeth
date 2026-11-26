@@ -56,7 +56,9 @@ _EXPECTED_SUPPRESSION_OBSERVATIONS = {
         {
             "R1:lower_plugin_policy": 1,
             "R5:lower_plugin_policy": 1,
-            "R1:validate_path_policy": 2,
+            # One of the two R1 `.get()` reads left with the chroma_sink
+            # absent-path skip (`output.options.get("mode")`) in 0.8.18.
+            "R1:validate_path_policy": 1,
             "R5:validate_path_policy": 1,
             "R5:validate_web_network_policy": 3,
             "R5:validate_web_resource_policy": 1,

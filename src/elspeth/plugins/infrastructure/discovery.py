@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 # Import roots that ship ONLY in optional extras. A plugin file that fails to
 # import one of these is skipped with a warning. Anything that is a core
-# [project] dependency (chromadb, bs4, html2text, ...) must NOT be listed: a
+# [project] dependency (bs4, html2text, ...) must NOT be listed: a
 # missing core dependency is a broken installation and has to crash rather
 # than silently drop plugins from the catalog (see pyproject.toml's core
 # dependency comment). jinja2 ships only in the [llm]/[azure]/[aws] extras.

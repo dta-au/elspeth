@@ -109,12 +109,6 @@ def _describe_plugin_node(node: NodeSpec) -> str:
             f"response time, and response body hash. Bytes are stored "
             f"under the payload retention policy."
         )
-    if plugin == "rag_retrieval":
-        return (
-            f"- {name} (RAG retrieval) — for each query: the retrieval "
-            f"request and top-k result hashes recorded. External call to "
-            f"the configured vector store."
-        )
     if plugin == "azure_ai_search":
         return (
             f"- {name} (Azure AI Search RAG retrieval) — for each query: the "

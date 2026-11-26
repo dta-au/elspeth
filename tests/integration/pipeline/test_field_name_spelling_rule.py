@@ -232,8 +232,8 @@ def _provisioned_sqlite_target(path: Path) -> str:
     return url
 
 
-# The runnable sinks' file suffixes; aws_s3, azure_blob, chroma_sink and
-# dataverse cannot run locally and are pinned by
+# The runnable sinks' file suffixes; aws_s3, azure_blob and dataverse cannot
+# run locally and are pinned by
 # tests/invariants/test_declared_field_spelling_surfaces.py.
 _SINK_SUFFIX = {"json": "jsonl", "csv": "csv", "text": "txt", "document": "docx"}
 
@@ -346,12 +346,13 @@ def test_a_blob_ref_field_by_header_routes(tmp_path: Path) -> None:
 def test_a_rag_query_field_by_header_is_refused_at_build_behind_a_closed_upstream(tmp_path: Path) -> None:
     """Sweep §2.4 sibling / §2.7: the header-spelled ``query_field`` never reaches the query builder's raw dict."""
     rag = _transform(
-        "rag_retrieval",
+        "azure_ai_search",
         {
             "query_field": "Question",
             "output_prefix": "sci",
-            "provider": "chroma",
-            "provider_config": {"collection": "col", "mode": "persistent", "persist_directory": str(tmp_path / "chroma")},
+            "endpoint": "https://invariant.example.search.windows.net",
+            "index": "invariant-probe",
+            "api_key": "probe-key",
             "schema": _OBSERVED,
         },
     )

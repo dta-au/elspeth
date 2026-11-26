@@ -91,14 +91,19 @@ _EXPECTED_MUTATION_REJECTIONS = frozenset(
 # Plugins that shipped with ``_schema_config`` unset AND have a demotable field
 # under their probe config. They anchor the roster: if a refactor drops one out
 # of scope, coverage of the original defect has been lost silently.
+# 0.8.18 Chroma removal (2026-11-26): the measured retrieval plugin was
+# ``rag_retrieval``, which left with Chroma. ``azure_ai_search`` takes its place
+# as the retrieval anchor: it builds its schemas through the same
+# ``RetrievalTransformBase`` (``plugins/transforms/rag/core.py``). It was not
+# itself one of the measured plugins.
 _MEASURED_REGRESSION_ANCHORS = frozenset(
     {
         "aws_textract_document_analysis",
+        "azure_ai_search",
         "azure_document_intelligence",
         "blob_csv_expand",
         "blob_fetch",
         "llm",
-        "rag_retrieval",
         "web_scrape",
     }
 )
