@@ -204,9 +204,10 @@ establish qualification, a published tag or an image.
   model and must be empty; no probe provider ships.
 - The `chroma_rag`, `chroma_rag_indexed` and `chroma_rag_qa` examples and
   their examples-gate cases.
-- The `.trivyignore.yaml` exceptions and the matching pip-audit
-  `--ignore-vuln` entries, which existed only for `chromadb`. The release
-  image scans and the dependency audit now take no exceptions.
+- The `chromadb` entries in `.trivyignore.yaml` and the matching pip-audit
+  `--ignore-vuln` entries. The dependency audit now takes no exceptions. The
+  main image scans take only the two base-image OpenSSL exceptions described
+  under Publication and acceptance.
 
 ### Fixed
 
@@ -319,6 +320,15 @@ Automatic image publication from main remains held. The 0.8.18 tag and
 container publication follow successful required checks and the protected
 merge. Operator signing, live-provider acceptance and deployment remain
 separate steps.
+
+The main image scans accept two High findings that have no fixed package:
+CVE-2026-107494 and CVE-2026-124709, denial-of-service defects in OpenSSL's
+QUIC implementation, in the distroless base image's Debian 13 `libssl3t64`
+3.5.9-1~deb13u1. The exceptions in `.trivyignore.yaml` cover only that package
+version, on both architectures, and expire on 2027-02-28. Nothing in the image
+links the system `libssl`, the bundled Python uses its own OpenSSL with no
+QUIC interface, and ELSPETH has no QUIC or HTTP/3 dependency. The gateway
+image scans take no exceptions.
 
 ---
 

@@ -590,8 +590,9 @@ The workflow then performs the following sequence [EV-626]:
   contracts. A successful GitHub run remains required to prove that a
   particular gateway digest and its evidence exist in the registry.
 - **Main-image scan evidence.** Before either registry digest is signed, Trivy
-  scans its amd64 and arm64 platform images with a zero High/Critical threshold
-  and retains the available registry reports for 90 days [EV-709] [EV-724]. A
+  scans its amd64 and arm64 platform images with a zero High/Critical threshold,
+  apart from the two version-scoped, expiring base-image OpenSSL exceptions in
+  `.trivyignore.yaml`, and retains the available registry reports for 90 days [EV-709] [EV-724]. A
   successful publication run remains required to prove that a particular
   digest passed those source-enforced gates.
 
