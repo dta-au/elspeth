@@ -20,7 +20,7 @@ from unittest.mock import patch
 import pytest
 
 from elspeth.contracts import RowResult, TokenInfo
-from elspeth.contracts.enums import FrameKind, GroupSettlementReason, TerminalOutcome, TerminalPath
+from elspeth.contracts.enums import CollectorGroupFailureReason, FrameKind, GroupSettlementReason, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import OrchestrationInvariantError, SchedulerLeaseLostError
 from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.plugin_context import PluginContext
@@ -235,8 +235,13 @@ class _Recorder:
         self.staged: list[GroupLossSpec] = []
         # ONE ordered log across every recorded seam (C3 review I-1): the
         # seam-before-fire ordering is the whole reason item 14 exists, and
-        # separate per-seam lists cannot see an interleaving change.
+        # separate per-seam lists cannot see an interleaving change. Completion
+        # telemetry is logged here too, so an emission ahead of the durable
+        # fire is visible as an ordering change.
         self.sequence: list[str] = []
+        # Raised by complete_collector_fire after it is logged: the journal
+        # transition failing (a lost lease inside complete_barrier).
+        self.fire_error: Exception | None = None
 
     def record_group_member_terminals(self, consumed_tokens: tuple[TokenInfo, ...], **kwargs: object) -> list[RowResult]:
         self.sequence.append("seam")
@@ -246,6 +251,8 @@ class _Recorder:
     def complete_collector_fire(self, **kwargs: object) -> None:
         self.sequence.append("fire")
         self.fire_calls.append(dict(kwargs))
+        if self.fire_error is not None:
+            raise self.fire_error
 
     def route_collector_release(self, **kwargs: object) -> CollectorRelease:
         self.sequence.append("route")
@@ -253,6 +260,7 @@ class _Recorder:
         return self.release
 
     def emit_token_completed(self, token: TokenInfo, *, outcome: TerminalOutcome, path: TerminalPath, sink_name: str | None = None) -> None:
+        self.sequence.append("completed")
         self.completed.append((token.token_id, outcome, path))
 
     def take_pending_group_losses(self) -> tuple[GroupLossSpec, ...]:
@@ -306,11 +314,128 @@ def _coordinator(
     )
 
 
-def _released(*members: TokenInfo, released: tuple[TokenInfo, ...] = ()) -> CollectorOutcome:
-    return CollectorOutcome(held=False, released_tokens=released, consumed_tokens=members, collector_name="stitch", group_id="eg-1")
+def _released(*members: TokenInfo, released: tuple[TokenInfo, ...] = (), quarantined: tuple[TokenInfo, ...] = ()) -> CollectorOutcome:
+    """A successful flush: every consumed member not in ``quarantined`` survived."""
+    quarantined_ids = {token.token_id for token in quarantined}
+    return CollectorOutcome(
+        held=False,
+        released_tokens=released,
+        consumed_tokens=members,
+        surviving_tokens=tuple(token for token in members if token.token_id not in quarantined_ids),
+        quarantined_tokens=quarantined,
+        collector_name="stitch",
+        group_id="eg-1",
+    )
 
 
 class TestDispatchRelease:
+    @pytest.mark.parametrize("sink_release", [False, True], ids=["continuation", "terminal-sink"])
+    def test_quarantined_member_is_reported_after_fire_in_both_release_arms(self, sink_release: bool) -> None:
+        quarantined = _member("tok-q")
+        survivor = _member("tok-a")
+        released = _member("tok-out", path=(OUTER_FORK,))
+        sink_result = RowResult(
+            token=released,
+            final_data=released.row_data,
+            outcome=TerminalOutcome.SUCCESS,
+            path=TerminalPath.DEFAULT_FLOW,
+            sink_name="out",
+        )
+        continuation = WorkItem(token=released, current_node_id=NodeID("after"))
+        recorder = _Recorder(
+            release=CollectorRelease(items=() if sink_release else (continuation,), sink_results=(sink_result,) if sink_release else ())
+        )
+        coordinator = _coordinator(
+            scheduler=RecordingScheduler(pending=[]),
+            executor=object(),
+            recorder=recorder,
+            data_flow=_RecordingDataFlow(terminal_token_ids=frozenset({"tok-q"})),
+        )
+        outcome = CollectorOutcome(
+            held=False,
+            released_tokens=(released,),
+            consumed_tokens=(quarantined, survivor),
+            surviving_tokens=(survivor,),
+            quarantined_tokens=(quarantined,),
+            collector_name="stitch",
+            group_id="eg-1",
+        )
+
+        disposition = coordinator._dispose_collector_outcome(outcome, scope_row_id="row-1")
+
+        assert disposition is not None
+        # The quarantine completion is published only after the journal fire.
+        assert recorder.sequence == ["seam", "route", "fire", "completed"]
+        assert recorder.completed == [("tok-q", TerminalOutcome.FAILURE, TerminalPath.QUARANTINED_AT_SOURCE)]
+        assert recorder.seam_calls[0]["consumed"] == ("tok-a",)
+        [quarantine_result] = [result for result in disposition.results if result.token.token_id == "tok-q"]
+        assert (quarantine_result.outcome, quarantine_result.path, quarantine_result.scheduler_pending_sink) == (
+            TerminalOutcome.FAILURE,
+            TerminalPath.QUARANTINED_AT_SOURCE,
+            False,
+        )
+        if sink_release:
+            assert disposition.kind is BarrierIntakeDispositionKind.PENDING_SINK
+            assert [(result.token.token_id, result.scheduler_pending_sink) for result in disposition.results] == [
+                ("tok-q", False),
+                ("tok-out", True),
+            ]
+        else:
+            assert disposition.kind is BarrierIntakeDispositionKind.READY_CONTINUATION
+            assert disposition.child_items == (continuation,)
+
+    @pytest.mark.parametrize(
+        ("consumed", "survivors", "quarantined", "message"),
+        [
+            pytest.param(("tok-a", "tok-b"), ("tok-b",), ("tok-a", "tok-a"), "duplicate quarantined token", id="duplicate-quarantined"),
+            pytest.param(("tok-a", "tok-b"), ("tok-a", "tok-a"), ("tok-b",), "duplicate surviving token", id="duplicate-surviving"),
+            pytest.param(
+                ("tok-a", "tok-b"), ("tok-a", "tok-b"), ("tok-x",), "quarantined token outside consumed", id="quarantined-outside-consumed"
+            ),
+            pytest.param(
+                ("tok-a", "tok-b"), ("tok-a", "tok-x"), ("tok-b",), "surviving token outside consumed", id="surviving-outside-consumed"
+            ),
+            pytest.param(("tok-a", "tok-b"), ("tok-a",), ("tok-a",), "quarantined token overlaps survivor", id="overlap-survivor"),
+            pytest.param(("tok-a", "tok-b", "tok-c"), ("tok-a",), ("tok-b",), "do not partition", id="member-in-neither"),
+            # The shape a release built without its partition takes: the
+            # coordinator would then report no quarantined member at all.
+            pytest.param(("tok-a", "tok-q"), (), (), "do not partition", id="no-partition"),
+        ],
+    )
+    def test_successful_flush_partition_refuses_invalid_members(
+        self, consumed: tuple[str, ...], survivors: tuple[str, ...], quarantined: tuple[str, ...], message: str
+    ) -> None:
+        with pytest.raises(OrchestrationInvariantError, match=message):
+            CollectorOutcome(
+                held=False,
+                consumed_tokens=tuple(_member(token_id) for token_id in consumed),
+                surviving_tokens=tuple(_member(token_id) for token_id in survivors),
+                quarantined_tokens=tuple(_member(token_id) for token_id in quarantined),
+                collector_name="stitch",
+                group_id="eg-1",
+            )
+
+    @pytest.mark.parametrize("shape", ["held", "group-failure", "plugin-free-close"])
+    @pytest.mark.parametrize("arm", ["surviving", "quarantined"])
+    def test_only_a_successful_flush_carries_a_partition(self, shape: str, arm: str) -> None:
+        member = _member("tok-a")
+
+        def build(partitioned: bool) -> CollectorOutcome:
+            return CollectorOutcome(
+                held=shape == "held",
+                consumed_tokens=(member,),
+                surviving_tokens=(member,) if partitioned and arm == "surviving" else (),
+                quarantined_tokens=(member,) if partitioned and arm == "quarantined" else (),
+                collector_name="stitch",
+                group_id="eg-1",
+                failure_reason=CollectorGroupFailureReason.COLLECTOR_MISSING_MEMBERS if shape == "group-failure" else None,
+                closed_without_plugin=GroupSettlementReason.ALL_MEMBERS_LOST.value if shape == "plugin-free-close" else None,
+            )
+
+        build(partitioned=False)  # control: the same outcome without a partition is valid
+        with pytest.raises(OrchestrationInvariantError, match="only a successful flush carries"):
+            build(partitioned=True)
+
     def test_only_unterminalized_members_reach_the_seam_and_the_fire_rides_after(self) -> None:
         survivors = (_member("tok-a"), _member("tok-b"))
         quarantined = _member("tok-q")
@@ -328,7 +453,7 @@ class TestDispatchRelease:
         )
 
         disposition = coordinator._dispose_collector_outcome(
-            _released(survivors[0], quarantined, survivors[1], released=(released_token,)), scope_row_id="row-1"
+            _released(survivors[0], quarantined, survivors[1], released=(released_token,), quarantined=(quarantined,)), scope_row_id="row-1"
         )
 
         assert recorder.seam_calls == [
@@ -352,10 +477,33 @@ class TestDispatchRelease:
         assert [spec.closer_name for spec in fire["group_losses"]] == ["merge_outer"]
         # The uq_group_records_opener sustainer: member terminals land BEFORE
         # the journal transition consumes the rows (coalesce_tokens' order).
-        assert recorder.sequence == ["seam", "route", "fire"]
+        assert recorder.sequence == ["seam", "route", "fire", "completed"]
         assert disposition is not None
         assert disposition.kind is BarrierIntakeDispositionKind.READY_CONTINUATION
         assert disposition.child_items == (continuation,)
+
+    def test_a_raising_fire_publishes_no_quarantine_completion(self) -> None:
+        """The journal transition failing (a lost lease inside complete_barrier)
+        propagates: no quarantine completion event escapes and no disposition
+        is returned, so nothing is counted for a release that did not commit."""
+        quarantined = _member("tok-q")
+        released = _member("tok-out", path=(OUTER_FORK,))
+        recorder = _Recorder(release=CollectorRelease(items=(WorkItem(token=released, current_node_id=NodeID("after")),), sink_results=()))
+        recorder.fire_error = SchedulerLeaseLostError(work_item_id="wi-q", lease_owner="leader-1", run_id="run-1")
+        coordinator = _coordinator(
+            scheduler=RecordingScheduler(pending=[]),
+            executor=object(),
+            recorder=recorder,
+            data_flow=_RecordingDataFlow(terminal_token_ids=frozenset({"tok-q"})),
+        )
+
+        with pytest.raises(SchedulerLeaseLostError):
+            coordinator._dispose_collector_outcome(
+                _released(_member("tok-a"), quarantined, released=(released,), quarantined=(quarantined,)), scope_row_id="row-1"
+            )
+
+        assert recorder.sequence == ["seam", "route", "fire"]
+        assert recorder.completed == []
 
     def test_terminal_collector_release_is_a_pending_sink_disposition(self) -> None:
         released_token = make_token_info(row_id="row-1", token_id="tok-out")
@@ -464,6 +612,35 @@ class TestLossReplayArm:
             loss_id="loss-1", closer_name="stitch", group_id="eg-1", member_key="m2", reason="quarantined", token_id="tok-lost"
         )
 
+    def test_loss_replay_release_reports_quarantined_member(self) -> None:
+        quarantined = _member("tok-q")
+        released = _member("tok-out", path=(OUTER_FORK,))
+        outcome = CollectorOutcome(
+            held=False,
+            consumed_tokens=(_member("tok-a"), quarantined),
+            surviving_tokens=(_member("tok-a"),),
+            quarantined_tokens=(quarantined,),
+            released_tokens=(released,),
+            collector_name="stitch",
+            group_id="eg-1",
+        )
+        executor = _LossReplayExecutor(outcome=outcome)
+        recorder = _Recorder(release=CollectorRelease(items=(WorkItem(token=released, current_node_id=NodeID("after")),), sink_results=()))
+        coordinator = _coordinator(
+            scheduler=RecordingScheduler(pending=[], losses=[self._loss()]),
+            executor=executor,
+            recorder=recorder,
+            data_flow=_RecordingDataFlow(terminal_token_ids=frozenset({"tok-q"})),
+        )
+
+        pass_outcome = coordinator.run_intake_pass(PluginContext(run_id="run-1", config={}, landscape=None))
+
+        [disposition] = pass_outcome.dispositions
+        assert disposition.kind is BarrierIntakeDispositionKind.READY_CONTINUATION
+        assert [(result.token.token_id, result.path) for result in disposition.results] == [("tok-q", TerminalPath.QUARANTINED_AT_SOURCE)]
+        assert recorder.completed == [("tok-q", TerminalOutcome.FAILURE, TerminalPath.QUARANTINED_AT_SOURCE)]
+        assert recorder.sequence == ["seam", "route", "fire", "completed"]
+
     def test_replay_notifies_with_the_intake_ctx_and_disposes_the_outcome(self) -> None:
         members = (_member("tok-a"),)
         outcome = CollectorOutcome(
@@ -545,6 +722,36 @@ class TestPostRestoreFlushSweep:
             group_id=group_id,
             failure_reason="collector_missing_members",
         )
+
+    def test_restored_close_release_reports_quarantined_member(self) -> None:
+        quarantined = _member("tok-q")
+        released = _member("tok-out", path=(OUTER_FORK,))
+        outcome = CollectorOutcome(
+            held=False,
+            consumed_tokens=(_member("tok-a"), quarantined),
+            surviving_tokens=(_member("tok-a"),),
+            quarantined_tokens=(quarantined,),
+            released_tokens=(released,),
+            collector_name="stitch",
+            group_id="eg-1",
+        )
+        executor = _SweepExecutor(script=[(outcome,)])
+        recorder = _Recorder(release=CollectorRelease(items=(WorkItem(token=released, current_node_id=NodeID("after")),), sink_results=()))
+        coordinator = _coordinator(
+            scheduler=RecordingScheduler(pending=[]),
+            executor=executor,
+            recorder=recorder,
+            data_flow=_RecordingDataFlow(terminal_token_ids=frozenset({"tok-q"})),
+            resume_checkpoint_id="ckpt-1",
+        )
+
+        pass_outcome = coordinator.run_intake_pass(PluginContext(run_id="run-1", config={}, landscape=None))
+
+        [disposition] = pass_outcome.dispositions
+        assert disposition.kind is BarrierIntakeDispositionKind.READY_CONTINUATION
+        assert [(result.token.token_id, result.path) for result in disposition.results] == [("tok-q", TerminalPath.QUARANTINED_AT_SOURCE)]
+        assert recorder.completed == [("tok-q", TerminalOutcome.FAILURE, TerminalPath.QUARANTINED_AT_SOURCE)]
+        assert recorder.sequence == ["seam", "route", "fire", "completed"]
 
     def test_sweep_runs_once_and_disposes_through_the_seam(self) -> None:
         executor = _SweepExecutor(script=[(self._failure(),)])
