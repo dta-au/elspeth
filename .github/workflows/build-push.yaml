@@ -810,12 +810,15 @@ jobs:
             --execute
 
           # Sinks write their files 0600 as uid 1654. Let the owner (the image
-          # user) open them to the runner so the next step can verify them and
-          # later cleanup can remove them.
+          # user) open them read-only so the next step can verify them. Each
+          # side changes modes only on what it owns: output/ and runs/ belong to
+          # the runner, so chmod on them from the container fails (EPERM). Never
+          # make image-owned directories group/world-writable: the payload store
+          # refuses such a directory. The final step deletes these files.
           docker run --rm \
             -v "$PWD/examples/threshold_gate_container:/app/pipeline:rw" \
             --entrypoint /bin/sh "$IMAGE" -c \
-            'chmod -R a+rwX /app/pipeline/output /app/pipeline/runs'
+            'find /app/pipeline/output /app/pipeline/runs -mindepth 1 -user 1654 -exec chmod a+rX {} +'
 
           echo "=== Pipeline execution completed ==="
 
@@ -879,9 +882,15 @@ jobs:
 
           echo "=== Test 6: Run representative no-secret examples ==="
           # The whole checkout is mounted at /app; the image user (uid 1654)
-          # needs to traverse it and read the examples (see Test 4).
+          # needs to traverse it and read the examples (see Test 4). Open only
+          # what the runner owns: Test 4's outputs belong to uid 1654, and chmod
+          # on another user's file fails even when the mode would not change.
           chmod a+rX .
-          chmod -R a+rX examples
+          find examples -user "$(id -u)" -exec chmod a+rX {} +
+          # These examples use the default payload store, .elspeth/payloads
+          # under the checkout root, so the image user must be able to create it.
+          mkdir -p .elspeth
+          chmod a+rwx .elspeth
           for example in boolean_routing batch_aggregation json_explode schema_contracts_demo; do
             echo "Running example: ${example}"
             rm -rf "examples/${example}/output" "examples/${example}/runs"
@@ -892,10 +901,6 @@ jobs:
               "$IMAGE" run \
               --settings "examples/${example}/settings.yaml" \
               --execute
-            docker run --rm \
-              -v "$PWD:/app:rw" \
-              --entrypoint /bin/sh "$IMAGE" -c \
-              "chmod -R a+rwX /app/examples/${example}/output /app/examples/${example}/runs"
           done
 
       - name: Test summary
@@ -915,6 +920,36 @@ jobs:
               echo "| Reference Gateway | signed digest identity and read-only health | ✅ |"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove image-owned smoke outputs
+        # Runs after failures too, so no per-run checkout directory is left
+        # holding files the runner user cannot delete. The image user removes
+        # what it wrote (inside the runner-owned output/, runs/ and .elspeth/
+        # directories it was given); the runner then owns everything left.
+        if: always() && env.SMOKE_IMAGE != ''
+        run: |
+          # The image user can only have written inside the directories the
+          # steps opened to it, and those are exactly the world-writable ones.
+          paths=()
+          while IFS= read -r p; do
+            paths+=("/app/${p#./}")
+          done < <(find ./examples ./.elspeth -maxdepth 2 -type d -perm -0002 -user "$(id -u)" 2>/dev/null)
+          if [[ ${#paths[@]} -gt 0 ]]; then
+            # An earlier failure may have skipped the steps that let the image
+            # user traverse the checkout; grant search (not read) on the
+            # runner-owned directories above the targets.
+            chmod a+X . examples examples/*/
+            docker run --rm \
+              -v "$PWD:/app:rw" \
+              --entrypoint find "$SMOKE_IMAGE" \
+              "${paths[@]}" -user 1654 -delete
+          fi
+          left="$(find . -user 1654 | wc -l)"
+          if [[ "$left" -ne 0 ]]; then
+            echo "ERROR: ${left} image-owned paths remain in the checkout"
+            find . -user 1654
+            exit 1
+          fi
 
   # ===========================================================================
   # Create GitHub Release (on version tags)
