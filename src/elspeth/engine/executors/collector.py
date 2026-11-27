@@ -74,11 +74,17 @@ class CollectorOutcome:
 
     Mutual exclusivity mirrors CoalesceOutcome: held excludes release/failure;
     a release and a failure never coexist.
+
+    A successful flush (not held, no failure, not a plugin-free close)
+    partitions every consumed member exactly once into ``surviving_tokens``
+    or ``quarantined_tokens``; every other outcome carries both empty.
     """
 
     held: bool
     released_tokens: tuple[TokenInfo, ...] = ()
     consumed_tokens: tuple[TokenInfo, ...] = ()
+    surviving_tokens: tuple[TokenInfo, ...] = ()
+    quarantined_tokens: tuple[TokenInfo, ...] = ()
     collector_name: str | None = None
     group_id: str | None = None
     failure_reason: CollectorGroupFailureReason | None = None
@@ -90,6 +96,25 @@ class CollectorOutcome:
             raise OrchestrationInvariantError("CollectorOutcome: held=True excludes release/failure")
         if self.released_tokens and self.failure_reason is not None:
             raise OrchestrationInvariantError("CollectorOutcome: release and failure are mutually exclusive")
+        survivor_ids = [token.token_id for token in self.surviving_tokens]
+        quarantine_ids = [token.token_id for token in self.quarantined_tokens]
+        if self.held or self.failure_reason is not None or self.closed_without_plugin is not None:
+            if survivor_ids or quarantine_ids:
+                raise OrchestrationInvariantError("CollectorOutcome: only a successful flush carries a survivor/quarantine partition")
+            return
+        consumed_ids = [token.token_id for token in self.consumed_tokens]
+        if len(survivor_ids) != len(set(survivor_ids)):
+            raise OrchestrationInvariantError("CollectorOutcome: duplicate surviving token")
+        if len(quarantine_ids) != len(set(quarantine_ids)):
+            raise OrchestrationInvariantError("CollectorOutcome: duplicate quarantined token")
+        if not set(survivor_ids) <= set(consumed_ids):
+            raise OrchestrationInvariantError("CollectorOutcome: surviving token outside consumed members")
+        if not set(quarantine_ids) <= set(consumed_ids):
+            raise OrchestrationInvariantError("CollectorOutcome: quarantined token outside consumed members")
+        if set(quarantine_ids) & set(survivor_ids):
+            raise OrchestrationInvariantError("CollectorOutcome: quarantined token overlaps survivor")
+        if sorted(survivor_ids + quarantine_ids) != sorted(consumed_ids):
+            raise OrchestrationInvariantError("CollectorOutcome: survivors and quarantined do not partition the consumed members")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1337,6 +1362,8 @@ class CollectorExecutor:
             held=False,
             released_tokens=released,
             consumed_tokens=members,
+            surviving_tokens=tuple(entry.token for entry in surviving),
+            quarantined_tokens=tuple(entry.token for index, entry in enumerate(entries) if index in quarantined),
             collector_name=collector_name,
             group_id=group_id,
         )
