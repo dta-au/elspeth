@@ -739,6 +739,7 @@ class NodeStateRepository:
         failures: Sequence[tuple[str, float, ExecutionError]],
         *,
         conn: Connection,
+        metadata_by_state: Mapping[str, SerializedCompletionMetadata] | None = None,
     ) -> None:
         """Complete many node states as FAILED in one audit transaction.
 
@@ -747,15 +748,26 @@ class NodeStateRepository:
         several states at once (``ExecutionRepository.complete_collector_failure``)
         writes them all or none, with the same immutability and read-back
         contract as ``complete_node_state``.
+
+        ``metadata_by_state`` names the states that carry a plugin's
+        post-execution context, already serialised by
+        :func:`serialize_completion_metadata`; every other state writes none.
+        A FAILED state never carries a success reason, so serialised metadata
+        holding one is refused, as is metadata for a state not being failed.
         """
+        if metadata_by_state is not None:
+            failing = {state_id for state_id, _duration_ms, _error in failures}
+            if not set(metadata_by_state) <= failing:
+                raise ValueError("complete_node_states_failed_many: metadata names a state that is not being failed")
         rows: list[_BulkStateCompletion] = []
         for state_id, duration_ms, error in failures:
+            metadata = metadata_by_state[state_id] if metadata_by_state is not None and state_id in metadata_by_state else None
             validate_node_state_completion_fields(
                 NodeStateStatus.FAILED,
                 output_data_present=False,
                 duration_ms=duration_ms,
                 error_present=True,
-                success_reason_present=False,
+                success_reason_present=metadata is not None and metadata.success_reason_json is not None,
             )
             rows.append(
                 _BulkStateCompletion(
@@ -763,7 +775,7 @@ class NodeStateRepository:
                     output_hash=None,
                     duration_ms=duration_ms,
                     error_json=canonical_json(error.to_dict()),
-                    context_after_json=None,
+                    context_after_json=metadata.context_after_json if metadata is not None else None,
                 )
             )
         self._complete_node_states_many(rows, status=NodeStateStatus.FAILED, conn=conn)

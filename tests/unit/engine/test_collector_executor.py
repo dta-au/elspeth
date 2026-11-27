@@ -167,7 +167,7 @@ class _FakeCollectorTransform:
             # I-2 (fix round 2): a real "transform returned status=error"
             # failure — distinct from raise_on_process, which propagates
             # past NodeStateGuard entirely and never reaches _fail_group.
-            return TransformResult.error(reason={"reason": "collector_plugin_declared_failure"})
+            return TransformResult.error(reason={"reason": "collector_plugin_declared_failure"}, context_after=self.context_after)
 
         success_reason: dict[str, Any] = {"action": "collected"}
         metadata: dict[str, Any] = {}
@@ -1326,6 +1326,126 @@ class TestFlushAudit:
         else:
             assert second_flush["context_after_json"] is not None
             assert json.loads(second_flush["context_after_json"]) == second.to_dict()
+
+
+class TestFailedFlushContext:
+    """The plugin's returned error may carry post-execution context; the FAILED flush
+    state persists it, member holds never do, and no other failure arm has one."""
+
+    def test_failed_flush_persists_plugin_error_context(self, collector_env: _CollectorEnv) -> None:
+        import json
+
+        from elspeth.contracts.node_state_context import GateEvaluationContext
+
+        env = collector_env
+        context = GateEvaluationContext(condition="partial run", result="False", route_label="false")
+        env.transform.return_error = True
+        env.transform.context_after = context
+        members, group_id = env.seed_group(count=2)
+        for member in members:
+            outcome = env.executor.accept(member, "stitch")
+
+        assert outcome.failure_reason == "collector_transform_error"
+        flush = _flush_audit_state(env, group_id, members)
+        assert flush["status"] == NodeStateStatus.FAILED.value
+        assert flush["success_reason_json"] is None
+        assert flush["context_after_json"] is not None
+        assert json.loads(flush["context_after_json"]) == context.to_dict()
+        holds = _member_hold_states(env, members)
+        assert [hold["status"] for hold in holds] == [NodeStateStatus.FAILED.value] * 2
+        assert [(hold["success_reason_json"], hold["context_after_json"]) for hold in holds] == [(None, None)] * 2
+
+    def test_failed_flush_context_is_serialised_once(self, collector_env: _CollectorEnv) -> None:
+        import json
+
+        env = collector_env
+        context = _ScriptedContext({"attempted": 2})
+        env.transform.return_error = True
+        env.transform.context_after = context
+        members, group_id = env.seed_group(count=2)
+        for member in members:
+            env.executor.accept(member, "stitch")
+
+        assert context.to_dict_calls == 1
+        flush = _flush_audit_state(env, group_id, members)
+        assert flush["context_after_json"] is not None
+        assert json.loads(flush["context_after_json"]) == {"attempted": 2}
+
+    def test_unserialisable_error_context_raises_before_any_verdict_write(self, collector_env: _CollectorEnv) -> None:
+        """A returned error whose context the audit write refuses is a plugin bug: it raises
+        before the group verdict, so no group failure row exists and every hold stays OPEN."""
+        env = collector_env
+        env.transform.return_error = True
+        env.transform.context_after = _ScriptedContext({"ratio": float("nan")})
+        members, _group_id = env.seed_group(count=2)
+        member_ids = {member.token_id for member in members}
+        env.executor.accept(members[0], "stitch")
+
+        with pytest.raises(ValueError, match="non-finite"):
+            env.executor.accept(members[1], "stitch")
+
+        assert env.factory.run_status_projection.count_failed_collector_groups(env.run_id) == 0
+        assert env.open_hold_token_ids(node="stitch") == sorted(member_ids)
+        assert env.executor.buffered_member_count() == 2
+        [flush_error] = env.failed_flush_state_errors(node="stitch", member_token_ids=member_ids)
+        assert flush_error["type"] == "ValueError"
+        assert flush_error["phase"] == "collector_flush"
+
+    def test_contract_violation_after_a_contextual_success_writes_no_context(self, collector_env: _CollectorEnv) -> None:
+        """A success result's context does not leak onto the FAILED flush state when the
+        engine's own output check fails the group."""
+        from elspeth.contracts.node_state_context import GateEvaluationContext
+
+        env = collector_env
+        env.transform.context_after = GateEvaluationContext(condition="ran", result="True", route_label="true")
+        env.transform.emit_assembled = _NON_CANONICAL_INT
+        members, group_id = env.seed_group(count=2)
+        for member in members:
+            outcome = env.executor.accept(member, "stitch")
+
+        assert outcome.failure_reason == "collector_contract_violation"
+        flush = _flush_audit_state(env, group_id, members)
+        assert flush["status"] == NodeStateStatus.FAILED.value
+        assert flush["context_after_json"] is None
+        assert [hold["context_after_json"] for hold in _member_hold_states(env, members)] == [None, None]
+
+    def test_input_preflight_violation_writes_no_context(self, collector_env: _CollectorEnv) -> None:
+        from elspeth.contracts.node_state_context import GateEvaluationContext
+
+        env = collector_env
+        env.transform.context_after = GateEvaluationContext(condition="ran", result="True", route_label="true")
+        env.transform.input_schema = _StrictAssembledSchema
+        members, group_id = env.seed_group(count=1)
+        outcome = env.executor.accept(members[0], "stitch")
+
+        assert outcome.failure_reason == "collector_contract_violation"
+        assert env.transform.call_count == 0
+        flush = _flush_audit_state(env, group_id, members)
+        assert flush["context_after_json"] is None
+        assert [hold["context_after_json"] for hold in _member_hold_states(env, members)] == [None]
+
+    def test_plugin_free_failures_write_no_context(self, collector_env: _CollectorEnv) -> None:
+        """require_all with a lost member and require_all with an empty roster never run the
+        plugin: the lost-member verdict writes its held member's hold with NULL context, and
+        neither writes a flush state."""
+        from elspeth.contracts.node_state_context import GateEvaluationContext
+
+        env = collector_env
+        env.transform.context_after = GateEvaluationContext(condition="ran", result="True", route_label="true")
+        members, group_id = env.seed_group(count=2)
+        env.executor.accept(members[0], "stitch")
+        outcome = env.executor.notify_member_lost("stitch", group_id, members[1].token_id, "quarantined")
+        assert outcome is not None and outcome.failure_reason == "collector_missing_members"
+        empty_group = env.seed_empty_group()
+        empty = env.executor.notify_empty_group("stitch", empty_group)
+        assert empty.failure_reason == "empty_expansion"
+
+        assert env.transform.call_count == 0
+        holds = _member_hold_states(env, members)
+        assert [(hold["token_id"], hold["status"], hold["context_after_json"]) for hold in holds] == [
+            (members[0].token_id, NodeStateStatus.FAILED.value, None)
+        ]
+        assert env.failed_flush_state_errors(node="stitch", member_token_ids={member.token_id for member in members}) == []
 
 
 class TestFlushContractPreflight:

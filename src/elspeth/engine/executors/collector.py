@@ -37,6 +37,7 @@ from elspeth.contracts.errors import (
     PluginContractViolation,
 )
 from elspeth.contracts.identity import innermost_own_frame
+from elspeth.contracts.node_state_context import SerializedCompletionMetadata
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.secret_scrub import scrub_text_for_audit, scrub_transform_error_reason
@@ -978,6 +979,7 @@ class CollectorExecutor:
         guard: NodeStateGuard,
         flush_error: ExecutionError,
         flush_duration_ms: float,
+        flush_metadata: SerializedCompletionMetadata | None,
     ) -> CollectorOutcome:
         """Fail the group as a whole after its flush: the two plugin arms.
 
@@ -994,6 +996,11 @@ class CollectorExecutor:
         commits leaves every hold OPEN, and the group is re-flushed on resume.
         After it commits, resume completes this verdict without the plugin
         (``CollectorJournalRestorer``).
+
+        ``flush_metadata`` is the returned error's post-execution context,
+        already serialised by the caller before any write; it lands on the
+        flush state only. The contract-violation arm has no plugin context and
+        passes None.
         """
         member_holds, hold_error = self._group_failure_verdict(collector_name, key, pending, failure_reason=failure_reason)
         guard.complete_collector_failure(
@@ -1005,6 +1012,7 @@ class CollectorExecutor:
             duration_ms=flush_duration_ms,
             member_holds=member_holds,
             hold_error=hold_error,
+            flush_metadata=flush_metadata,
         )
         return self._close_failed_group(collector_name, key, pending, failure_reason=failure_reason)
 
@@ -1253,6 +1261,7 @@ class CollectorExecutor:
                         context=violation.to_audit_dict(),
                     ),
                     flush_duration_ms=(self._clock.monotonic() - now) * 1000,
+                    flush_metadata=None,
                 )
             if result.status != "success":
                 if result.reason is None:
@@ -1260,6 +1269,12 @@ class CollectorExecutor:
                         f"Collector transform '{transform.name}' returned error but reason is None. "
                         'Use TransformResult.error({"reason": "...", ...}) to create error results.'
                     )
+                # The returned error's post-execution context goes through the
+                # same single serialiser as the success path, BEFORE the verdict
+                # writes: a context the audit write refuses raises with no
+                # side effect (a plugin bug, as on the success path). A FAILED
+                # state never carries a success reason.
+                error_metadata = serialize_completion_metadata(success_reason=None, context_after=result.context_after)
                 return self._fail_group_after_flush(
                     collector_name,
                     key,
@@ -1277,6 +1292,7 @@ class CollectorExecutor:
                         context=scrub_transform_error_reason(result.reason),
                     ),
                     flush_duration_ms=(self._clock.monotonic() - now) * 1000,
+                    flush_metadata=error_metadata,
                 )
 
             # The plugin's success reason and context go through the

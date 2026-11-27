@@ -548,8 +548,14 @@ class NodeStateGuard:
         duration_ms: float,
         member_holds: Sequence[tuple[TokenRef, str, float]],
         hold_error: ExecutionError,
+        flush_metadata: SerializedCompletionMetadata | None = None,
     ) -> None:
-        """Record the collector group's FAILED verdict — this flush state and every member hold — atomically."""
+        """Record the collector group's FAILED verdict — this flush state and every member hold — atomically.
+
+        ``flush_metadata`` is the plugin's post-execution context from its
+        returned error, serialised before this call; it lands on this flush
+        state only.
+        """
         self._execution.complete_collector_failure(
             coordination_token=coordination_token,
             group_id=group_id,
@@ -560,6 +566,7 @@ class NodeStateGuard:
             flush_duration_ms=duration_ms,
             member_holds=member_holds,
             hold_error=hold_error,
+            flush_metadata=flush_metadata,
         )
         self._terminal_persisted = True
         self._completed = True
