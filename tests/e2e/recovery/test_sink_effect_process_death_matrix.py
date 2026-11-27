@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
+import threading
 import time
 from collections import Counter
 from collections.abc import Callable
@@ -11,23 +13,31 @@ from dataclasses import dataclass
 from datetime import timedelta
 from hashlib import sha256
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
+from elspeth.contracts import Determinism
 from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
+from elspeth.contracts.errors import SinkRequiredFieldsViolation
+from elspeth.contracts.events import EngineSpanCompleted, EngineSpanName, EngineSpanStatus
 from elspeth.contracts.scheduler import SchedulerEventType
+from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.core.checkpoint import CheckpointManager, RecoveryManager, check_run_status_resumable
 from elspeth.core.config import CheckpointSettings, QueueSettings, SourceSettings, TransformSettings
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.dag.wiring import WiredTransform
 from elspeth.core.landscape import LandscapeDB
+from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.engine.executors.sink_effects import SinkEffectCoordinator, SinkEffectExecutionSeam
 from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
+from elspeth.engine.orchestrator.run_status import derive_resume_terminal_status_from_audit
 from elspeth.engine.processor import RowProcessor
+from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.sinks import _local_file_effects
 from elspeth.plugins.sinks.json_sink import JSONSink
+from elspeth.telemetry import TelemetryManager
 from tests.e2e.recovery.harness import (
     _InterruptibleSource,
     _PassthroughTransform,
@@ -35,7 +45,8 @@ from tests.e2e.recovery.harness import (
     spawn_database_process_with_pause,
 )
 from tests.fixtures.base_classes import as_sink, as_source, as_transform
-from tests.fixtures.landscape import expire_leader_seat
+from tests.fixtures.landscape import expire_leader_seat, expire_lease
+from tests.fixtures.telemetry import MockTelemetryConfig, TelemetryTestExporter
 from tests.helpers.state_engine import StateEngineImage, capture_state_engine_image
 
 if TYPE_CHECKING:
@@ -47,6 +58,7 @@ _ROWS = [{"id": 1, "value": 10}]
 _VISIBLE_PUBLICATION_SEAM = "after_visible_publication"
 _SCHEDULER_CALLBACK_SEAM = "scheduler_callback"
 _EXPECTED_BYTES = b'{"id": 1, "value": 10}\n'
+_SINK_BATCHES_SUFFIX = ".sink-batches.json"
 _PROCESS_DEATH_SEAMS = (
     SinkEffectExecutionSeam.BEFORE_RESERVATION.value,
     SinkEffectExecutionSeam.AFTER_RESERVATION.value,
@@ -210,15 +222,42 @@ def _capture_target_image(path: Path) -> _TargetImage:
     )
 
 
-def _build_pipeline(output_path: Path) -> tuple[PipelineConfig, ExecutionGraph]:
-    source = _InterruptibleSource(_ROWS, on_success="inbound")
-    transform = _PassthroughTransform()
+class _StopAfterFirstTransform(_PassthroughTransform):
+    """Request shutdown after A completes while the sealed snapshot still holds B."""
+
+    determinism = Determinism.DETERMINISTIC
+
+    def __init__(self, shutdown_event: threading.Event | None) -> None:
+        super().__init__()
+        self._shutdown_event = shutdown_event
+
+    def process(self, row: PipelineRow, ctx: Any) -> TransformResult:
+        result = super().process(row, ctx)
+        if self._shutdown_event is not None:
+            self._shutdown_event.set()
+        return result
+
+
+def _build_pipeline(
+    output_path: Path,
+    *,
+    rows: list[dict[str, Any]] | None = None,
+    snapshot_for_resume: bool = False,
+    shutdown_event: threading.Event | None = None,
+) -> tuple[PipelineConfig, ExecutionGraph]:
+    source = _InterruptibleSource(_ROWS if rows is None else rows, on_success="inbound")
+    if snapshot_for_resume:
+        source.config["snapshot_for_resume"] = True
+    transform = _StopAfterFirstTransform(shutdown_event) if snapshot_for_resume else _PassthroughTransform()
+    schema: dict[str, Any] = {"mode": "observed"}
+    if snapshot_for_resume:
+        schema["required_fields"] = ["must_exist"]
     sink = JSONSink(
         {
             "path": str(output_path),
             "format": "jsonl",
             "mode": "write",
-            "schema": {"mode": "observed"},
+            "schema": schema,
         }
     )
     sources = {"primary": as_source(source)}
@@ -271,6 +310,8 @@ def _run_to_sink_seam(
     output_path: str,
     payload_path: str,
     seam_value: str,
+    rows: list[dict[str, Any]] | None = None,
+    snapshot_for_resume: bool = False,
 ) -> None:
     assert callable(pause)
     _install_short_sink_lease()
@@ -294,7 +335,8 @@ def _run_to_sink_seam(
             original_fault(self, seam)
 
         SinkEffectCoordinator._fault = pause_at_target  # type: ignore[method-assign]
-    config, graph = _build_pipeline(Path(output_path))
+    shutdown_event = threading.Event() if snapshot_for_resume else None
+    config, graph = _build_pipeline(Path(output_path), rows=rows, snapshot_for_resume=snapshot_for_resume, shutdown_event=shutdown_event)
     checkpoint_config = RuntimeCheckpointConfig.from_settings(CheckpointSettings(enabled=True, frequency="every_row"))
     Orchestrator(
         db,
@@ -307,6 +349,7 @@ def _run_to_sink_seam(
         run_id=run_id,
         openrouter_catalog_sha256="0" * 64,
         openrouter_catalog_source="bundled",
+        shutdown_event=shutdown_event,
     )
 
 
@@ -315,22 +358,62 @@ def _resume_run(
     run_id: str,
     output_path: str,
     payload_path: str,
+    rows: list[dict[str, Any]] | None = None,
+    snapshot_for_resume: bool = False,
+    expect_boundary_failure: bool = False,
+    witness_sink_batches: bool = False,
 ) -> None:
     _install_short_sink_lease()
-    config, graph = _build_pipeline(Path(output_path))
+    config, graph = _build_pipeline(Path(output_path), rows=rows, snapshot_for_resume=snapshot_for_resume)
     checkpoint_manager = CheckpointManager(db)
     resume_point = RecoveryManager(db, checkpoint_manager).get_resume_point(run_id, graph)
     assert resume_point is not None
-    Orchestrator(
-        db,
-        checkpoint_manager=checkpoint_manager,
-        checkpoint_config=RuntimeCheckpointConfig.from_settings(CheckpointSettings(enabled=True, frequency="every_row")),
-    ).resume(
-        resume_point,
-        config,
-        graph,
-        payload_store=FilesystemPayloadStore(Path(payload_path)),
-    )
+    # The witness observes the production sink spans through the public
+    # telemetry constructor argument. It is opt-in so the seam matrix keeps
+    # resuming with telemetry disabled.
+    exporter = TelemetryTestExporter()
+    telemetry = TelemetryManager(MockTelemetryConfig(), exporters=[exporter]) if witness_sink_batches else None
+    try:
+        orchestrator = Orchestrator(
+            db,
+            checkpoint_manager=checkpoint_manager,
+            checkpoint_config=RuntimeCheckpointConfig.from_settings(CheckpointSettings(enabled=True, frequency="every_row")),
+            telemetry_manager=telemetry,
+        )
+        if expect_boundary_failure:
+            with pytest.raises(SinkRequiredFieldsViolation, match="must_exist"):
+                orchestrator.resume(resume_point, config, graph, payload_store=FilesystemPayloadStore(Path(payload_path)))
+        else:
+            result = orchestrator.resume(resume_point, config, graph, payload_store=FilesystemPayloadStore(Path(payload_path)))
+            if snapshot_for_resume:
+                Path(output_path).with_suffix(".result.json").write_text(
+                    json.dumps(
+                        {
+                            "status": result.status.value,
+                            "processed": result.rows_processed,
+                            "succeeded": result.rows_succeeded,
+                            "failed": result.rows_failed,
+                        }
+                    )
+                )
+        if telemetry is not None:
+            telemetry.flush()
+            _write_sink_batches(Path(output_path), exporter)
+    finally:
+        if telemetry is not None:
+            telemetry.close()
+
+
+def _write_sink_batches(output_path: Path, exporter: TelemetryTestExporter) -> None:
+    """Record each sink invocation's token membership and span status."""
+    batches: list[dict[str, object]] = []
+    for event in exporter.events:
+        if type(event) is not EngineSpanCompleted or event.name is not EngineSpanName.SINK:
+            continue
+        token_ids = event.attributes["token.ids"]
+        assert type(token_ids) is tuple
+        batches.append({"token_ids": list(token_ids), "status": event.status.value})
+    output_path.with_suffix(_SINK_BATCHES_SUFFIX).write_text(json.dumps(batches))
 
 
 def _wait_until_run_is_resumable(database_url: str, run_id: str) -> None:
@@ -354,9 +437,8 @@ def _assert_attempt_evidence(
     effect_id: object,
     expected: tuple[tuple[str, str, int], ...],
 ) -> None:
-    effect = image.tables["sink_effects"][0]
-    attempts = image.tables["sink_effect_attempts"]
-    assert all(attempt["effect_id"] == effect_id for attempt in attempts)
+    effect = next(row for row in image.tables["sink_effects"] if row["effect_id"] == effect_id)
+    attempts = tuple(row for row in image.tables["sink_effect_attempts"] if row["effect_id"] == effect_id)
     assert all(0 <= int(attempt["generation"]) <= int(effect["generation"]) for attempt in attempts)
     for attempt in attempts:
         if attempt["state"] == "returned":
@@ -566,6 +648,202 @@ def _exercise_process_death_seam(
         row for row in resumed_image.tables["scheduler_events"] if row["event_type"] == SchedulerEventType.MARK_PENDING_SINK_TERMINAL.value
     )
     assert len(terminal_events) == 1
+
+
+@pytest.mark.skipif(os.name != "posix", reason="SIGKILL exit-code oracle is POSIX-specific")
+@pytest.mark.parametrize(
+    ("second_row_valid", "witness_sink_batches"),
+    [(False, True), (False, False), (True, True)],
+    ids=["boundary-rejected", "boundary-rejected-telemetry-off", "valid-control"],
+)
+@pytest.mark.timing_sensitive
+def test_snapshot_tail_joins_published_member_on_real_kill_resume(
+    tmp_path: Path, second_row_valid: bool, witness_sink_batches: bool
+) -> None:
+    rows = [
+        {"id": 1, "value": 10, "must_exist": True},
+        {"id": 2, "value": 20, **({"must_exist": True} if second_row_valid else {})},
+    ]
+    expected_a = b'{"id": 1, "must_exist": true, "value": 10}\n'
+    expected_b = b'{"id": 2, "must_exist": true, "value": 20}\n'
+    database_url = f"sqlite:///{tmp_path / 'audit.db'}"
+    output_path = tmp_path / "output.jsonl"
+    payload_path = tmp_path / "payloads"
+    run_id = "run-snapshot-tail"
+    with LandscapeDB(database_url):
+        pass
+
+    with spawn_database_process_with_pause(
+        database_url=database_url,
+        seam=_VISIBLE_PUBLICATION_SEAM,
+        action=_run_to_sink_seam,
+        action_args=(run_id, str(output_path), str(payload_path), _VISIBLE_PUBLICATION_SEAM, rows, True),
+    ) as child:
+        ready = child.wait_until_ready(timeout=_PROCESS_TIMEOUT_SECONDS)
+        assert ready.pid != os.getpid()
+        child.kill()
+        assert child.wait_for_exit(timeout=_PROCESS_TIMEOUT_SECONDS).was_killed
+
+    assert output_path.read_bytes() == expected_a
+    killed_target = _capture_target_image(output_path)
+    with LandscapeDB.from_url(database_url, create_tables=False) as db:
+        killed_image = capture_state_engine_image(db, run_id=run_id)
+        expire_leader_seat(db, run_id)
+    assert len(killed_image.tables["rows"]) == 1
+    assert killed_image.tables["rows"][0]["source_row_index"] == 0
+    assert len(killed_image.tables["sink_effects"]) == 1
+    killed_effect = killed_image.tables["sink_effects"][0]
+    effect_id = killed_effect["effect_id"]
+    assert killed_effect["state"] == "in_flight"
+    assert len(killed_image.tables["sink_effect_members"]) == 1
+    a_token_id = killed_image.tables["sink_effect_members"][0]["token_id"]
+    assert type(a_token_id) is str
+    assert killed_image.tables["sink_effect_members"][0]["effect_id"] == effect_id
+    _assert_attempt_evidence(killed_image, effect_id=effect_id, expected=_KILLED_ATTEMPTS[_VISIBLE_PUBLICATION_SEAM])
+
+    _wait_until_run_is_resumable(database_url, run_id)
+    with spawn_database_process_at_seam(
+        database_url=database_url,
+        seam="resume-completed",
+        action=_resume_run,
+        action_args=(run_id, str(output_path), str(payload_path), rows, True, not second_row_valid, witness_sink_batches),
+    ) as child:
+        child.wait_until_ready(timeout=_PROCESS_TIMEOUT_SECONDS)
+        child.release()
+        assert child.wait_for_exit(timeout=_PROCESS_TIMEOUT_SECONDS).exitcode == 0
+
+    with LandscapeDB.from_url(database_url, create_tables=False) as db:
+        first_resume_image = capture_state_engine_image(db, run_id=run_id)
+    assert len(first_resume_image.tables["rows"]) == 2
+    assert sorted(row["source_row_index"] for row in first_resume_image.tables["rows"]) == [0, 1]
+    b_row_id = next(row["row_id"] for row in first_resume_image.tables["rows"] if row["source_row_index"] == 1)
+    b_token_id = next(token["token_id"] for token in first_resume_image.tables["tokens"] if token["row_id"] == b_row_id)
+    assert type(b_token_id) is str
+    if witness_sink_batches:
+        # The first resume must hand the re-driven member A and the fresh row B to
+        # ONE sink invocation; that invocation is the one the boundary rejects.
+        sink_batches = json.loads(output_path.with_suffix(_SINK_BATCHES_SUFFIX).read_text())
+        assert [sorted(batch["token_ids"]) for batch in sink_batches] == [sorted([a_token_id, b_token_id])], (
+            f"first resume did not write A and B in one sink invocation: A={a_token_id!r}, B={b_token_id!r}, sink batches={sink_batches!r}"
+        )
+        expected_span_status = EngineSpanStatus.OK if second_row_valid else EngineSpanStatus.ERROR
+        assert sink_batches[0]["status"] == expected_span_status.value, (
+            f"the A+B sink invocation ended {sink_batches[0]['status']!r}, expected {expected_span_status.value!r}"
+        )
+    else:
+        # The telemetry-off run is the operator default; it keeps every durable
+        # assertion below and must leave no witness sidecar behind. It does not
+        # witness that A and B shared one sink invocation: only the
+        # boundary-rejected sibling proves that.
+        assert not output_path.with_suffix(_SINK_BATCHES_SUFFIX).exists()
+
+    if not second_row_valid:
+        rejected_image = first_resume_image
+        sink_node_id = killed_effect["sink_node_id"]
+        assert [
+            state["status"]
+            for state in rejected_image.tables["node_states"]
+            if state["token_id"] == b_token_id and state["node_id"] == sink_node_id
+        ] == ["failed"]
+        assert [
+            outcome["outcome"]
+            for outcome in rejected_image.tables["token_outcomes"]
+            if outcome["token_id"] == b_token_id and outcome["completed"] == 1
+        ] == ["failure"]
+        # Ordered so the pre-fix regression (A failed with B's batch) is named
+        # before the generic "A has no outcome yet" check can trip on it.
+        a_failure_outcomes = [
+            (outcome["outcome"], outcome["path"], outcome["completed"])
+            for outcome in rejected_image.tables["token_outcomes"]
+            if outcome["token_id"] == a_token_id and (outcome["outcome"] == "failure" or outcome["path"] == "unrouted")
+        ]
+        assert a_failure_outcomes == [], (
+            f"B's boundary rejection marked the published member A FAILURE/UNROUTED: (outcome, path, completed)={a_failure_outcomes!r}"
+        )
+        failure_token_ids = {outcome["token_id"] for outcome in rejected_image.tables["token_outcomes"] if outcome["outcome"] == "failure"}
+        assert failure_token_ids == {b_token_id}, (
+            f"only B may carry a FAILURE outcome after the boundary rejection: B={b_token_id!r}, failed tokens={failure_token_ids!r}"
+        )
+        a_completed_outcomes = [
+            (outcome["outcome"], outcome["path"])
+            for outcome in rejected_image.tables["token_outcomes"]
+            if outcome["token_id"] == a_token_id and outcome["completed"] == 1
+        ]
+        assert a_completed_outcomes == [], f"A must stay undecided until its effect reconciles: (outcome, path)={a_completed_outcomes!r}"
+        a_sink_states = [
+            state["status"]
+            for state in rejected_image.tables["node_states"]
+            if state["token_id"] == a_token_id and state["node_id"] == sink_node_id
+        ]
+        assert a_sink_states == ["open"], f"B's boundary rejection closed the published member A's sink state: {a_sink_states!r}"
+        rejected_effect = next(effect for effect in rejected_image.tables["sink_effects"] if effect["effect_id"] == effect_id)
+        assert rejected_effect["state"] == "in_flight", (
+            f"A's in-flight effect changed state across B's rejection: {rejected_effect['state']!r}"
+        )
+        failed_operations = [
+            operation
+            for operation in rejected_image.tables["operations"]
+            if operation["operation_type"] == "sink_write" and operation["status"] == "failed"
+        ]
+        assert len(failed_operations) == 1
+        assert failed_operations[0]["sink_effect_id"] is None
+        assert "missing ['must_exist']" in str(failed_operations[0]["error_message"])
+        assert output_path.read_bytes() == expected_a
+        with LandscapeDB.from_url(database_url, create_tables=False) as db:
+            for item in rejected_image.tables["token_work_items"]:
+                if item["status"] == "leased":
+                    expire_lease(db.engine, item["work_item_id"])
+        _wait_until_run_is_resumable(database_url, run_id)
+        with spawn_database_process_at_seam(
+            database_url=database_url,
+            seam="resume-completed",
+            action=_resume_run,
+            action_args=(run_id, str(output_path), str(payload_path), rows, True),
+        ) as child:
+            child.wait_until_ready(timeout=_PROCESS_TIMEOUT_SECONDS)
+            child.release()
+            assert child.wait_for_exit(timeout=_PROCESS_TIMEOUT_SECONDS).exitcode == 0
+
+    assert output_path.read_bytes() == expected_a + (expected_b if second_row_valid else b"")
+    if not second_row_valid:
+        assert _capture_target_image(output_path) == killed_target
+    with LandscapeDB.from_url(database_url, create_tables=False) as db:
+        resumed_image = capture_state_engine_image(db, run_id=run_id)
+        audit_status, audit_counters = derive_resume_terminal_status_from_audit(
+            RecorderFactory(db, payload_store=FilesystemPayloadStore(payload_path)), run_id
+        )
+    resumed_effect = next(effect for effect in resumed_image.tables["sink_effects"] if effect["effect_id"] == effect_id)
+    assert resumed_effect["state"] == "finalized"
+    assert len(resumed_image.tables["sink_effects"]) == (2 if second_row_valid else 1)
+    assert len([operation for operation in _effect_operations(resumed_image) if operation["sink_effect_id"] == effect_id]) == 1
+    _assert_attempt_evidence(resumed_image, effect_id=effect_id, expected=_FINAL_ATTEMPTS[_VISIBLE_PUBLICATION_SEAM])
+    outcomes = {outcome["token_id"]: outcome for outcome in resumed_image.tables["token_outcomes"] if outcome["completed"] == 1}
+    assert outcomes[a_token_id]["outcome"] == "success"
+    assert outcomes[a_token_id]["path"] != "unrouted"
+    assert len(outcomes) == 2
+    sink_node_id = resumed_effect["sink_node_id"]
+    assert [
+        state["status"]
+        for state in resumed_image.tables["node_states"]
+        if state["token_id"] == a_token_id and state["node_id"] == sink_node_id
+    ] == ["completed"]
+    assert [
+        state["status"]
+        for state in resumed_image.tables["node_states"]
+        if state["token_id"] == b_token_id and state["node_id"] == sink_node_id
+    ] == ["completed" if second_row_valid else "failed"]
+    assert outcomes[b_token_id]["outcome"] == ("success" if second_row_valid else "failure")
+    result = json.loads(output_path.with_suffix(".result.json").read_text())
+    assert result == {
+        "status": audit_status.value,
+        "processed": audit_counters.rows_processed,
+        "succeeded": audit_counters.rows_succeeded,
+        "failed": audit_counters.rows_failed,
+    }
+    assert result["processed"] == 2
+    assert result["succeeded"] == (2 if second_row_valid else 1)
+    assert result["failed"] == (0 if second_row_valid else 1)
+    assert resumed_image.tables["runs"][0]["status"] == result["status"]
 
 
 @pytest.mark.skipif(os.name != "posix", reason="SIGKILL exit-code oracle is POSIX-specific")
