@@ -92,6 +92,8 @@ from elspeth.plugins.infrastructure.runtime_factory import (
 from elspeth.plugins.sources.blob_rows import BlobRowsEntry
 from elspeth.web.application_finalizers import ApplicationFinalizerCapability, ApplicationFinalizerKind
 from elspeth.web.async_workers import (
+    WORKER_ADMISSION_REFUSED,
+    AsyncWorkerAdmissionTimeoutError,
     _raise_lifecycle_originals,
     _retain_cancellation,
     run_application_finalizer_in_worker,
@@ -212,6 +214,7 @@ from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, WebPlug
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 from elspeth.web.plugin_policy.validation import validate_plugin_policy
 from elspeth.web.provider_config_policy import web_llm_retry_budget_policy_error
+from elspeth.web.required_executor import RequiredGenerationUnavailable
 from elspeth.web.secrets.wiring_policy import runtime_secret_wiring_policy
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.prompt_file_review import (
@@ -291,7 +294,9 @@ _LOSS_WATCHER_TRANSIENT_DB_ERRORS: tuple[type[SQLAlchemyError], ...] = (
 )
 
 
-def _log_loss_watcher_poll_retry(exc: SQLAlchemyError, *, run_id: UUID, consecutive_failures: int) -> None:
+def _log_loss_watcher_poll_retry(
+    exc: SQLAlchemyError | AsyncWorkerAdmissionTimeoutError, *, run_id: UUID, consecutive_failures: int
+) -> None:
     """Log one transient loss-watcher poll failure; error level from the threshold on.
 
     Class names only, no ``exc_info``: SQLAlchemy cause chains carry the URL.
@@ -310,6 +315,24 @@ def _log_loss_watcher_poll_retry(exc: SQLAlchemyError, *, run_id: UUID, consecut
             exc_class=type(exc).__name__,
             consecutive_failures=consecutive_failures,
         )
+
+
+def _execution_pipeline_started(lease: SessionOperationLease) -> bool:
+    """Whether the run executor has begun this lease's pipeline Future.
+
+    Read from the Future bound to the lease's own acquisition obligation: a
+    Future the worker took (``running``) or finished after taking (``done``
+    and not cancelled) has started. No bound Future, or one still queued,
+    has not. A lease without that exact obligation counts as started, which
+    keeps the immediate record.
+    """
+    obligation = lease.execution_obligation
+    if type(obligation) is not ExecutionAcquisitionObligation:
+        return True
+    pipeline = obligation.pipeline
+    if pipeline is None:
+        return False
+    return pipeline.running() or (pipeline.done() and not pipeline.cancelled())
 
 
 def _log_loss_watcher_poll_failed(exc: SQLAlchemyError, *, run_id: UUID) -> None:
@@ -2339,11 +2362,35 @@ class ExecutionServiceImpl:
         owner.task = task
         try:
             await self._signal_shutdown_on_operation_loss(owner.lease, shutdown_event, run_id=run_id, close_requested=owner.close_requested)
+        except RequiredGenerationUnavailable as original:
+            if self.execution_lease_release_registry.recovery.instance_draining.is_set():
+                owner.outcome = (task, None)
+                return
+            self._stop_run_on_loss_watcher_death(owner.lease, shutdown_event, original)
+            owner.outcome = (task, original)
+            raise
         except BaseException as original:
+            if not owner.close_requested.is_set():
+                self._stop_run_on_loss_watcher_death(owner.lease, shutdown_event, original)
             owner.outcome = (task, original)
             raise
         else:
             owner.outcome = (task, None)
+
+    def _stop_run_on_loss_watcher_death(
+        self, lease: SessionOperationLease, shutdown_event: threading.Event, original: BaseException
+    ) -> None:
+        """Stop the watched run at once; record the failure at once only if its pipeline has started.
+
+        The shutdown event is set first, so a pipeline that starts after the
+        check below finds it already set. A run whose pipeline is still queued
+        behind another run's has its failure recorded when its own completion
+        joins this watcher. Recording it now would begin process recovery and
+        stop the run that is executing.
+        """
+        shutdown_event.set()
+        if _execution_pipeline_started(lease):
+            self.execution_lease_release_registry.record_failure(original)
 
     async def _join_loss_watcher(
         self,
@@ -3466,6 +3513,10 @@ class ExecutionServiceImpl:
                     return
                 try:
                     run = await self._session_service.get_run(run_id)
+                except WORKER_ADMISSION_REFUSED as exc:
+                    consecutive_poll_failures += 1
+                    _log_loss_watcher_poll_retry(exc, run_id=run_id, consecutive_failures=consecutive_poll_failures)
+                    continue
                 except _LOSS_WATCHER_TRANSIENT_DB_ERRORS as exc:
                     # Transient session-DB failure (lock contention, pool
                     # checkout timeout, dropped connection, failover). This task

@@ -3189,10 +3189,9 @@ class TestPeriodicOrphanCleanup:
     async def test_continues_after_exception(self) -> None:
         """Periodic cleanup logs recoverable audit/DB failures and keeps running.
 
-        The catch in _periodic_orphan_cleanup is narrowed to
-        OperationalError — transient connection drop, lock timeout, or
-        SQLite-busy — the one failure class the loop must survive (and only
-        up to the consecutive-failure bound; see the escalation test below).
+        The catch in _periodic_orphan_cleanup retries OperationalError and
+        refused shared-pool admission, up to the consecutive-failure bound.
+        Other failure classes still end the task.
         A prior iteration used RuntimeError here, which is now the wrong
         signal: RuntimeError is a programmer-bug class and must propagate
         past the catch (see the companion programmer-bug test below).

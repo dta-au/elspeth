@@ -60,6 +60,7 @@ from elspeth.plugins.transforms.llm.model_catalog import (
 )
 from elspeth.web.application_finalizers import ApplicationFinalizerOwner
 from elspeth.web.async_workers import (
+    WORKER_ADMISSION_REFUSED,
     AsyncWorkerAdmissionTimeoutError,
     configure_required_executor_recovery,
     required_generation_unavailable,
@@ -468,12 +469,14 @@ async def _periodic_orphan_cleanup(
         await asyncio.sleep(interval_seconds)
         cancelled = 0
         live_run_ids: frozenset[str] = frozenset()
+        archive_cap_original: OSError | None = None
         try:
             try:
                 await session_service.reconcile_consumed_archives()
             except OSError as cleanup_exc:
                 archive_cleanup_failures += 1
                 if archive_cleanup_failures >= _ORPHAN_CLEANUP_MAX_CONSECUTIVE_FAILURES:
+                    archive_cap_original = cleanup_exc
                     raise
                 slog.error(
                     "periodic_archive_cleanup_pending",
@@ -505,13 +508,16 @@ async def _periodic_orphan_cleanup(
                     create_tables=create_tables,
                 )
             consecutive_failures = 0
-        except OperationalError as cleanup_exc:
-            # Only OperationalError is retried — the one DB failure class
-            # that models transient contention (lock timeout, dropped
-            # connection, sqlite-busy) rather than standing operator or
-            # programmer state. Every other SQLAlchemyError subclass
-            # (ProgrammingError, IntegrityError, ...), OSError, and
-            # SchemaCompatibilityError propagates, terminating the task
+        except (OperationalError, WORKER_ADMISSION_REFUSED, ExceptionGroup) as cleanup_exc:
+            if cleanup_exc is archive_cap_original:
+                raise
+            if isinstance(cleanup_exc, ExceptionGroup):
+                _refusals, other = cleanup_exc.split(WORKER_ADMISSION_REFUSED)
+                if other is not None:
+                    raise
+            # OperationalError and refused shared-pool admissions are retried
+            # up to the same consecutive-failure bound. Other failures
+            # propagate, terminating the task
             # so the fault surfaces at lifespan shutdown (the outer
             # contextlib.suppress narrows to CancelledError only) —
             # retrying those every interval can never fix them.
