@@ -7,7 +7,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from functools import lru_cache
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, NamedTuple
 
 import httpx
 from openai import RateLimitError as OpenAIRateLimitError
@@ -20,6 +20,12 @@ from elspeth.contracts.provider_rejection import RequestRejectionReason, SafeReq
 from elspeth.contracts.trust_boundary import observation_boundary
 
 if TYPE_CHECKING:
+    from litellm.exceptions import BadRequestError as LiteLLMBadRequestError
+    from litellm.exceptions import RateLimitError as LiteLLMRateLimitError
+    from litellm.llms.anthropic.common_utils import AnthropicError
+    from litellm.llms.custom_httpx.http_handler import MaskedHTTPStatusError
+    from litellm.llms.openai.common_utils import OpenAIError as LiteLLMOpenAIError
+    from openai import APIStatusError
     from openai import BadRequestError as OpenAIBadRequestError
 
 
@@ -339,8 +345,23 @@ _REQUEST_TOO_LARGE = SafeRequestRejection(reason_code="request_too_large", reaso
 _REQUEST_TOO_LARGE_FAILURE = ProviderFailure(ComposerLLMCallStatus.BAD_REQUEST_ERROR, "bad_request", False, _REQUEST_TOO_LARGE)
 
 
-def _chained_provider_status_413(exc: BaseException) -> bool:
-    """Recognise a provider 413 that LiteLLM exposed under a different status."""
+class _ChainedStatusTypes(NamedTuple):
+    """The LiteLLM and SDK exception types a relabelled provider status is read through."""
+
+    litellm_bad_request: type[LiteLLMBadRequestError]
+    litellm_rate_limit: type[LiteLLMRateLimitError]
+    anthropic_wrapper: type[AnthropicError]
+    masked_http_status: type[MaskedHTTPStatusError]
+    openai_wrapper: type[LiteLLMOpenAIError]
+    sdk_status: type[APIStatusError]
+
+
+def _chained_status_types() -> _ChainedStatusTypes:
+    """Import the chain types on first use; LiteLLM stays out of startup (see classify_provider_failure).
+
+    Three of these live in LiteLLM-internal modules. The dependency contract
+    test calls this loader, so a LiteLLM release that moves one fails by name.
+    """
     from litellm.exceptions import BadRequestError as LiteLLMBadRequestError
     from litellm.exceptions import RateLimitError as LiteLLMRateLimitError
     from litellm.llms.anthropic.common_utils import AnthropicError
@@ -348,34 +369,51 @@ def _chained_provider_status_413(exc: BaseException) -> bool:
     from litellm.llms.openai.common_utils import OpenAIError as LiteLLMOpenAIError
     from openai import APIStatusError
 
+    return _ChainedStatusTypes(
+        litellm_bad_request=LiteLLMBadRequestError,
+        litellm_rate_limit=LiteLLMRateLimitError,
+        anthropic_wrapper=AnthropicError,
+        masked_http_status=MaskedHTTPStatusError,
+        openai_wrapper=LiteLLMOpenAIError,
+        sdk_status=APIStatusError,
+    )
+
+
+def chained_provider_status(exc: BaseException) -> int | None:
+    """The provider's own status when LiteLLM relabelled it and the typed chain agrees; otherwise ``None``.
+
+    Only a relabelled 413 is recognised, so the result is 413 or ``None``.
+    """
+    chain_types = _chained_status_types()
+
     # LiteLLM's provider wrapper is authoritative: it holds the HTTP status
     # LiteLLM read before relabelling. The lower SDK/HTTP error must agree.
     # LiteLLM does not promise this implicit __context__ chain; the
     # MockTransport route tests pin it so an upstream change is detected.
     wrapper = exc.__context__
-    if isinstance(exc, LiteLLMRateLimitError):
-        if not isinstance(wrapper, LiteLLMOpenAIError):
-            return False
+    if isinstance(exc, chain_types.litellm_rate_limit):
+        if not isinstance(wrapper, chain_types.openai_wrapper):
+            return None
         wrapper_status: object = wrapper.status_code
         if type(wrapper_status) is not int or wrapper_status != 413:
-            return False
+            return None
         lower = wrapper.__context__
-        if not isinstance(lower, APIStatusError):
-            return False
+        if not isinstance(lower, chain_types.sdk_status):
+            return None
         lower_status: object = lower.status_code
-        return type(lower_status) is int and lower_status == 413
-    if isinstance(exc, LiteLLMBadRequestError):
-        if not isinstance(wrapper, AnthropicError):
-            return False
+        return 413 if type(lower_status) is int and lower_status == 413 else None
+    if isinstance(exc, chain_types.litellm_bad_request):
+        if not isinstance(wrapper, chain_types.anthropic_wrapper):
+            return None
         wrapper_status = wrapper.status_code
         if type(wrapper_status) is not int or wrapper_status != 413:
-            return False
+            return None
         lower = wrapper.__context__
-        if not isinstance(lower, MaskedHTTPStatusError):
-            return False
+        if not isinstance(lower, chain_types.masked_http_status):
+            return None
         lower_status = lower.status_code
-        return type(lower_status) is int and lower_status == 413
-    return False
+        return 413 if type(lower_status) is int and lower_status == 413 else None
+    return None
 
 
 def request_size_rejection(exc: BaseException | None) -> SafeRequestRejection | None:
@@ -443,7 +481,7 @@ def classify_provider_failure(exc: BaseException) -> ProviderFailure | None:
         if (
             not specific_code_seen
             and rejection.reason_code != "context_length_exceeded"
-            and (status == 413 or _chained_provider_status_413(exc))
+            and (status == 413 or chained_provider_status(exc) == 413)
         ):
             rejection = _REQUEST_TOO_LARGE
         return ProviderFailure(ComposerLLMCallStatus.BAD_REQUEST_ERROR, "bad_request", False, rejection)
@@ -464,7 +502,7 @@ def classify_provider_failure(exc: BaseException) -> ProviderFailure | None:
         return ProviderFailure(ComposerLLMCallStatus.API_ERROR, "unavailable", True)
     if disposition == "rate_limit":
         assert isinstance(exc, OpenAIRateLimitError)
-        if _chained_provider_status_413(exc):
+        if chained_provider_status(exc) == 413:
             return _REQUEST_TOO_LARGE_FAILURE
         observed = observe_rate_limit(exc)
         return ProviderFailure(

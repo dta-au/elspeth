@@ -395,6 +395,39 @@ describe("ProgressView", () => {
     expect(screen.getByText("Running — counts so far")).toBeInTheDocument();
   });
 
+  // The polite live region speaks when its text changes, so its text must
+  // follow the phase alone: queued, then running, and nothing new while the
+  // counters move within a phase.
+  it("announces queued then running, and not on counter updates within a phase", () => {
+    const mockedHook = useWebSocket as ReturnType<typeof vi.fn>;
+    mockedHook.mockReturnValue({
+      activeRunId: "run-1",
+      wsDisconnected: false,
+      progress: progressFixture({ status: "pending" }),
+    });
+    const { rerender } = render(<ProgressView />);
+    const region = screen.getByRole("status");
+    expect(region).toHaveTextContent("Pipeline queued.");
+
+    mockedHook.mockReturnValue({
+      activeRunId: "run-1",
+      wsDisconnected: false,
+      progress: progressFixture({ status: "running", source_rows_processed: 3, tokens_succeeded: 2 }),
+    });
+    rerender(<ProgressView />);
+    expect(screen.getByRole("status")).toBe(region);
+    expect(region).toHaveTextContent(/^Pipeline running\.$/);
+
+    mockedHook.mockReturnValue({
+      activeRunId: "run-1",
+      wsDisconnected: false,
+      progress: progressFixture({ status: "running", source_rows_processed: 7, tokens_succeeded: 6 }),
+    });
+    rerender(<ProgressView />);
+    expect(screen.getByRole("status")).toBe(region);
+    expect(region).toHaveTextContent(/^Pipeline running\.$/);
+  });
+
   it("labels pending counters as queued rather than running", () => {
     (useWebSocket as ReturnType<typeof vi.fn>).mockReturnValue({
       activeRunId: "run-1",
@@ -406,6 +439,8 @@ describe("ProgressView", () => {
 
     expect(screen.getByText("Queued — waiting to start")).toBeInTheDocument();
     expect(screen.queryByText("Running — counts so far")).not.toBeInTheDocument();
+    expect(screen.getByRole("progressbar", { name: "Pipeline execution queued" })).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("Pipeline queued.");
   });
 
   it("describes cancellation of a pending run as queued", () => {
