@@ -1130,8 +1130,10 @@ class CollectorExecutor:
         #
         # Fix round 3 (I-1): this invocation CONSUMES its attempt before the
         # guard opens. On success or a failure RESULT the group leaves
-        # self._pending and the bump is moot; on a plugin EXCEPTION the
-        # guard auto-fails this attempt durably and the group stays
+        # self._pending and the bump is moot; on a plugin EXCEPTION, or a
+        # result whose success reason or context the audit write refuses
+        # (serialised below before any release or verdict), the guard
+        # auto-fails this attempt durably and the group stays
         # installed, so the post-restore sweep's retry must open the NEXT
         # attempt — the in-process twin of _open_group's max_attempt + 1
         # derivation across a takeover (UniqueConstraint(token_id,

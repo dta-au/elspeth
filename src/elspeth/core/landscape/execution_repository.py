@@ -1422,8 +1422,11 @@ class ExecutionRepository:
             AuditIntegrityError: The group or reason is missing, or the hold
                 error does not record this group and reason; members are
                 repeated or cross the run; a flush state is named without its
-                error or vice versa; a state is missing, foreign, at another
-                node, not OPEN, or a hold does not belong to its member.
+                error or vice versa; flush metadata is named without its flush
+                state; a state is missing, foreign, at another node, not OPEN,
+                or a hold does not belong to its member.
+            ValueError: The flush metadata carries a success reason (a FAILED
+                state never records one).
         """
         subject = "collector failure verdict"
         run_id = coordination_token.run_id

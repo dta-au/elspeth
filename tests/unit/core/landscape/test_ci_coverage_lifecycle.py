@@ -794,3 +794,22 @@ def test_collector_verdict_refuses_a_flush_success_reason_with_no_write(setup: R
         assert state is not None and state.status == NodeStateStatus.OPEN
     with setup.db.read_only_connection() as conn:
         assert conn.execute(select(collector_group_failures_table)).all() == []
+
+
+def test_bulk_failed_write_refuses_metadata_for_a_state_not_being_failed(setup: RecorderSetup) -> None:
+    """Metadata keyed to a state outside the failing set is refused, never silently dropped."""
+    from elspeth.contracts.errors import ExecutionError
+    from elspeth.core.landscape.execution.node_states import serialize_completion_metadata
+
+    _values, flush_state_id, hold_state_id = _collector_verdict_with_flush(setup)
+    metadata = serialize_completion_metadata(success_reason=None, context_after=None)
+    error = ExecutionError(exception="returned an error", exception_type="TransformError", phase="collector_flush")
+
+    with pytest.raises(ValueError, match="metadata names a state that is not being failed"), setup.db.write_connection() as conn:
+        setup.execution.node_states.complete_node_states_failed_many(
+            [(flush_state_id, 1.0, error)], conn=conn, metadata_by_state={hold_state_id: metadata}
+        )
+
+    for state_id in (flush_state_id, hold_state_id):
+        state = setup.execution.get_node_state(state_id)
+        assert state is not None and state.status == NodeStateStatus.OPEN
