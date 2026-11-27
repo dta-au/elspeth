@@ -541,8 +541,8 @@ async def inspect_prompt_guard_request(client: PromptGuardClient, request: Promp
     if integrity_error is not None:
         raise integrity_error
     if decision is None:
-        # The request context suppressed an exception raised by the calls.
-        return PromptGuardDecision("allow", "clean")
+        # A check without a decision from its calls fails closed.
+        return PromptGuardDecision("unavailable", "service_error")
     return decision
 
 
