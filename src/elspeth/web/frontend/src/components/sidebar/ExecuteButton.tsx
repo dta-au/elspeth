@@ -18,6 +18,7 @@ import type {
   PluginSummary,
   SourceSpec,
 } from "@/types/index";
+import { isLiveRunStatus } from "@/types/index";
 import type { ReadinessRowId } from "@/types/api";
 import {
   REQUEST_RUN_EVENT,
@@ -457,7 +458,7 @@ export function primaryRunBlockReason(input: {
  *  — one string, two channels (the existing title/aria-describedby pair for
  *  mouse/some-AT users, this visible line for everyone else). */
 const RUN_BLOCK_REASON_TEXT: Record<RunBlockReason, string> = {
-  running: "The pipeline is already running.",
+  running: "A pipeline run is already active.",
   composing: "Wait for the composer to finish thinking.",
   settling: "Wait for your last change to finish saving and checking.",
   interpretation: INTERPRETATION_PENDING_RUN_BLOCK_TITLE,
@@ -593,7 +594,7 @@ export function ExecuteButton(): JSX.Element | null {
     !composerBusy &&
     !sessionOperationInFlight &&
     !isExecuting &&
-    progress?.status !== "running" &&
+    !(progress !== null && isLiveRunStatus(progress.status)) &&
     !isRunBlocked;
 
   // Gate legibility (elspeth-088bf83922 T-2) — derived, non-gating. These
@@ -601,7 +602,7 @@ export function ExecuteButton(): JSX.Element | null {
   // feed back into `canExecute`.
   const blockReason = primaryRunBlockReason({
     isExecuting,
-    progressRunning: progress?.status === "running",
+    progressRunning: progress !== null && isLiveRunStatus(progress.status),
     composerBusy,
     sessionOperationInFlight,
     isRunBlocked,
