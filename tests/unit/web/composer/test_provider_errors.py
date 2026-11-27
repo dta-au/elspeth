@@ -42,6 +42,16 @@ _PROVIDER = "test-provider"
 _MODEL = "test/model"
 
 
+def test_chained_status_types_import_on_the_resolved_dependencies() -> None:
+    # Dependency contract: the classifier's own lazy loader, called as the classifier calls it, so a
+    # LiteLLM release that moves one of these internal exception types fails CI with the import that
+    # broke. Imported here, not at module scope, so the rest of this module collects without the loader.
+    from elspeth.web.composer.provider_errors import _chained_status_types
+
+    for exception_type in _chained_status_types():
+        assert issubclass(exception_type, BaseException)
+
+
 @pytest.mark.parametrize(
     ("status", "content", "content_type", "mapped_type", "kind", "retryable", "rate_limited", "reason"),
     [
@@ -209,6 +219,22 @@ def test_direct_claude_chain_with_non_413_wrapper_keeps_bad_request_policy() -> 
     response = httpx.Response(413, request=request)
     lower = MaskedHTTPStatusError(httpx.HTTPStatusError(_SECRET, request=request, response=response))
     wrapper = AnthropicError(status_code=400, message=_SECRET)
+    wrapper.__context__ = lower
+    mapped = BadRequestError(_SECRET, model=_MODEL, llm_provider="anthropic")
+    mapped.__context__ = wrapper
+
+    result = classify_provider_failure(mapped)
+    assert result is not None
+    assert result.kind == "bad_request"
+    assert result.request_rejection is not None
+    assert result.request_rejection.reason_code is None
+
+
+def test_direct_claude_chain_with_lower_400_keeps_bad_request_policy() -> None:
+    request = httpx.Request("POST", "https://example.invalid")
+    response = httpx.Response(400, request=request)
+    lower = MaskedHTTPStatusError(httpx.HTTPStatusError(_SECRET, request=request, response=response))
+    wrapper = AnthropicError(status_code=413, message=_SECRET)
     wrapper.__context__ = lower
     mapped = BadRequestError(_SECRET, model=_MODEL, llm_provider="anthropic")
     mapped.__context__ = wrapper

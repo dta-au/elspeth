@@ -29,11 +29,13 @@ import httpx
 import litellm
 import pytest
 from litellm.exceptions import APIError as LiteLLMAPIError
+from litellm.exceptions import BadRequestError as LiteLLMBadRequestError
 from litellm.exceptions import RateLimitError as LiteLLMRateLimitError
 from litellm.litellm_core_utils.exception_mapping_utils import exception_type
 from litellm.llms.anthropic.common_utils import AnthropicError
 from litellm.llms.base_llm.chat.transformation import BaseLLMException
 from litellm.llms.bedrock.common_utils import BedrockError
+from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
 from litellm.llms.openai.common_utils import OpenAIError
 from openai import AsyncOpenAI
 
@@ -348,6 +350,64 @@ async def _genuine_429() -> LiteLLMRateLimitError:
     return await _openai_route_failure(429, b"Rate limit reached on tokens per min (TPM)")
 
 
+async def _direct_claude_route_failure(status: int, content: bytes) -> LiteLLMBadRequestError:
+    """What real ``litellm.acompletion`` raises for a direct-Claude ``status`` over a mock transport (no network)."""
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(status, content=content, headers={"content-type": "application/json"})
+        )
+    ) as http_client:
+        handler = AsyncHTTPHandler()
+        handler.client = http_client
+        with pytest.raises(LiteLLMBadRequestError) as caught:
+            await litellm.acompletion(
+                model="anthropic/claude-3-5-sonnet-20240620",
+                messages=[{"role": "user", "content": "hello"}],
+                api_base="https://example.invalid",
+                api_key="test-key",
+                client=handler,
+                num_retries=0,
+                max_retries=0,
+            )
+    return caught.value
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("call_path", ("tool", "text"))
+@pytest.mark.parametrize("route", ("openai", "claude", "plain-400"))
+async def test_gateway_carrier_keeps_the_providers_typed_status(
+    route: str, call_path: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # LiteLLM relabels the provider's 413 as 429 (OpenAI route) or 400 (direct Claude); the carrier
+    # records the 413 the typed chain proves. A plain 400 keeps its own status.
+    rejection: LiteLLMRateLimitError | LiteLLMBadRequestError
+    if route == "openai":
+        rejection = await _relabelled_413()
+        assert rejection.status_code == 429
+    elif route == "claude":
+        rejection = await _direct_claude_route_failure(413, b'{"error":{"message":"Request too large"}}')
+        assert rejection.status_code == 400
+    else:
+        rejection = await _direct_claude_route_failure(
+            400, b'{"type":"error","error":{"type":"invalid_request_error","message":"Invalid input"}}'
+        )
+        assert rejection.status_code == 400
+
+    async def refuse(**_kwargs: object) -> object:
+        raise rejection
+
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", refuse)
+    gateway = _text_service(tmp_path)._provider_gateway
+    with pytest.raises(_BadRequestLLMError) as caught:
+        if call_path == "tool":
+            await gateway._call_llm([{"role": "user", "content": "hi"}], [])
+        else:
+            await gateway._call_text_llm([{"role": "user", "content": "hi"}])
+
+    assert caught.value.__cause__ is rejection
+    assert caught.value.provider_status_code == (400 if route == "plain-400" else 413)
+
+
 @pytest.mark.asyncio
 async def test_a_413_reported_as_a_rate_limit_with_history_present_is_resent_once_with_every_earlier_turn_left_out() -> None:
     service, session_id = _service(_GENEROUS_SETTING)
@@ -398,12 +458,14 @@ async def test_a_413_reported_as_a_rate_limit_on_the_gateway_text_path_is_the_re
         await _text_service(tmp_path)._provider_gateway._call_text_llm([{"role": "user", "content": "hi"}])
 
     assert caught.value.__cause__ is rejection
+    assert caught.value.provider_status_code == 413
     assert request_size_rejection(caught.value.__cause__) == _TOO_LARGE
 
 
 @pytest.mark.asyncio
-async def test_control_a_genuine_rate_limit_on_the_gateway_text_path_is_not_the_rejected_request_carrier(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize("call_path", ("tool", "text"))
+async def test_control_a_genuine_rate_limit_on_the_gateway_is_not_the_rejected_request_carrier(
+    call_path: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     failure = await _genuine_429()
 
@@ -411,8 +473,13 @@ async def test_control_a_genuine_rate_limit_on_the_gateway_text_path_is_not_the_
         raise failure
 
     monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fail)
+    gateway = _text_service(tmp_path)._provider_gateway
 
     with pytest.raises(LiteLLMRateLimitError) as caught:
-        await _text_service(tmp_path)._provider_gateway._call_text_llm([{"role": "user", "content": "hi"}])
+        if call_path == "tool":
+            await gateway._call_llm([{"role": "user", "content": "hi"}], [])
+        else:
+            await gateway._call_text_llm([{"role": "user", "content": "hi"}])
 
     assert caught.value is failure
+    assert caught.value.status_code == 429
