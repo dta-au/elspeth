@@ -24,6 +24,7 @@ from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.hashing import is_lower_sha256_hex
 from elspeth.contracts.prompt_guard import (
     PROMPT_GUARD_MAX_TEXT_CHARACTERS,
+    PromptGuardCall,
     PromptGuardCallPlan,
     PromptGuardCallResult,
     PromptGuardClient,
@@ -490,6 +491,25 @@ def _inspection_plan(
     return _InspectionPlan(send_user, _pack_documents(new_units), tuple(new_keys), reused)
 
 
+async def _inspect_prompt_guard_calls(
+    client: PromptGuardClient, calls: tuple[PromptGuardCall, ...]
+) -> tuple[PromptGuardDecision, None] | tuple[None, AuditIntegrityError]:
+    """Return the calls' decision, or their integrity error and no decision, for the caller to act on after context exit.
+
+    The decision is the first non-allow call decision, or allow when every call allows.
+    """
+    try:
+        for call in calls:
+            result = await client.inspect_call(call)
+            if type(result) is not PromptGuardCallResult:
+                raise AuditIntegrityError("Prompt guard adapter returned a foreign call result")
+            if result.decision.disposition != "allow":
+                return result.decision, None
+    except AuditIntegrityError as failure:
+        return None, failure
+    return PromptGuardDecision("allow", "clean"), None
+
+
 async def inspect_prompt_guard_request(client: PromptGuardClient, request: PromptGuardRequest) -> PromptGuardDecision:
     """Send one planned request only when its calls cover every input."""
     call_plan = client.plan_calls(request)
@@ -503,17 +523,27 @@ async def inspect_prompt_guard_request(client: PromptGuardClient, request: Promp
     covered = {index for call in calls for index in call.document_indexes}
     if covered != set(range(len(request.documents))) or (bool(request.user_prompt) and not any(call.carries_user_prompt for call in calls)):
         return PromptGuardDecision("unavailable", "unsupported_input")
+    # An integrity error is held while the request context closes with no exception in flight, then raised whatever
+    # the close outcome; it never travels with a decision.
+    decision: PromptGuardDecision | None = None
+    integrity_error: AuditIntegrityError | None = None
     try:
         async with client.request_context():
-            for call in calls:
-                result = await client.inspect_call(call)
-                if type(result) is not PromptGuardCallResult:
-                    raise AuditIntegrityError("Prompt guard adapter returned a foreign call result")
-                if result.decision.disposition != "allow":
-                    return result.decision
+            decision, integrity_error = await _inspect_prompt_guard_calls(client, calls)
     except PromptGuardRequestUnavailable as failure:
+        if integrity_error is not None:
+            raise integrity_error from failure
         return failure.decision
-    return PromptGuardDecision("allow", "clean")
+    except Exception as failure:
+        if integrity_error is not None:
+            raise integrity_error from failure
+        raise
+    if integrity_error is not None:
+        raise integrity_error
+    if decision is None:
+        # The request context suppressed an exception raised by the calls.
+        return PromptGuardDecision("allow", "clean")
+    return decision
 
 
 async def _inspect_plan(
