@@ -115,7 +115,7 @@ from elspeth.core.landscape.schema import (
 
 if TYPE_CHECKING:
     from elspeth.contracts.errors import TransformSuccessReason
-    from elspeth.contracts.node_state_context import NodeStateContext
+    from elspeth.contracts.node_state_context import NodeStateContext, SerializedCompletionMetadata
     from elspeth.contracts.payload_store import PayloadStore
 
 __all__ = ["ExecutionRepository", "GroupRecord"]
@@ -340,6 +340,7 @@ class ExecutionRepository:
         error: ExecutionError | TransformErrorReason | CoalesceFailureReason | RowUnionFailureReason | None = None,
         success_reason: TransformSuccessReason | None = None,
         context_after: NodeStateContext | None = None,
+        serialized_metadata: SerializedCompletionMetadata | None = None,
     ) -> NodeStateCompleted: ...
 
     @overload
@@ -366,6 +367,7 @@ class ExecutionRepository:
         error: ExecutionError | TransformErrorReason | CoalesceFailureReason | RowUnionFailureReason | None = None,
         success_reason: TransformSuccessReason | None = None,
         context_after: NodeStateContext | None = None,
+        serialized_metadata: SerializedCompletionMetadata | None = None,
     ) -> NodeStatePending | NodeStateCompleted | NodeStateFailed:
         """Complete a node state (PENDING, COMPLETED, or FAILED)."""
         return self.node_states.complete_node_state(
@@ -377,6 +379,7 @@ class ExecutionRepository:
             error=error,
             success_reason=success_reason,
             context_after=context_after,
+            serialized_metadata=serialized_metadata,
         )
 
     def get_node_state(self, state_id: str) -> NodeState | None:

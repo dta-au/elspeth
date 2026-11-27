@@ -138,6 +138,10 @@ class _FakeCollectorTransform:
         self.return_zero_rows = False
         self.return_error = False
         self.echo_rows = False
+        self.context_after: Any = None
+        # Merged into the success reason's ``metadata``; a test puts a value
+        # canonical JSON refuses here to arm the flush's reason serialisation.
+        self.extra_reason_metadata: dict[str, Any] = {}
         # The value emitted under ``assembled``; a test swaps in a value canonical
         # JSON refuses (an int beyond 2**53) to arm the flush's output hash.
         self.emit_assembled: Any = True
@@ -166,8 +170,12 @@ class _FakeCollectorTransform:
             return TransformResult.error(reason={"reason": "collector_plugin_declared_failure"})
 
         success_reason: dict[str, Any] = {"action": "collected"}
+        metadata: dict[str, Any] = {}
         if self.quarantine_indices:
-            success_reason["metadata"] = {"quarantined_indices": list(self.quarantine_indices)}
+            metadata["quarantined_indices"] = list(self.quarantine_indices)
+        metadata.update(self.extra_reason_metadata)
+        if metadata:
+            success_reason["metadata"] = metadata
         if self.return_zero_rows:
             # B-4: the auditable "intentionally emitted nothing" shape
             # (results.py:438-457) — NOT success_multi([]), which raises
@@ -182,7 +190,7 @@ class _FakeCollectorTransform:
         else:
             contract = rows[0].contract
             out_rows = (PipelineRow({"assembled": self.emit_assembled, "count": len(rows)}, contract),)
-        return TransformResult.success_multi(out_rows, success_reason=success_reason)
+        return TransformResult.success_multi(out_rows, success_reason=success_reason, context_after=self.context_after)
 
 
 class _EnvExecutor:
@@ -1030,6 +1038,294 @@ class TestFlush:
         release_records = [r for r in records if r["group_id"] != group_id and r["kind"] == "expand"]
         assert len(release_records) == 1
         assert release_records[0]["member_count"] == 0
+
+
+def _flush_audit_state(env: _CollectorEnv, group_id: str, members: list[TokenInfo]) -> Any:
+    from sqlalchemy import select
+
+    record = env.factory.barrier_restore.get_group_record(run_id=env.run_id, group_id=group_id)
+    assert record is not None
+    member_ids = {member.token_id for member in members}
+    with env.db.connection() as conn:
+        rows = (
+            conn.execute(
+                select(node_states_table)
+                .where(node_states_table.c.run_id == env.run_id)
+                .where(node_states_table.c.node_id == str(env.node_id))
+                .where(node_states_table.c.token_id == record.opener_token_id)
+            )
+            .mappings()
+            .all()
+        )
+    flushes = [row for row in rows if row["token_id"] not in member_ids]
+    assert len(flushes) == 1
+    return flushes[0]
+
+
+def _member_hold_states(env: _CollectorEnv, members: list[TokenInfo]) -> list[Any]:
+    from sqlalchemy import select
+
+    with env.db.connection() as conn:
+        return list(
+            conn.execute(
+                select(node_states_table)
+                .where(node_states_table.c.run_id == env.run_id)
+                .where(node_states_table.c.node_id == str(env.node_id))
+                .where(node_states_table.c.token_id.in_([member.token_id for member in members]))
+            )
+            .mappings()
+            .all()
+        )
+
+
+class _ScriptedContext:
+    """A plugin's post-execution context: returns a fixed payload and counts serialisations."""
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self._payload = payload
+        self.to_dict_calls = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        self.to_dict_calls += 1
+        return dict(self._payload)
+
+
+class TestFlushAudit:
+    def test_flush_persists_success_reason(self, collector_env: _CollectorEnv) -> None:
+        import json
+
+        from sqlalchemy import select
+
+        env = collector_env
+        env.transform.quarantine_indices = [0]
+        members, group_id = env.seed_group(count=2)
+        for member in members:
+            env.executor.accept(member, "stitch")
+        flush = _flush_audit_state(env, group_id, members)
+        assert flush["status"] == NodeStateStatus.COMPLETED.value
+        assert flush["success_reason_json"] is not None
+        assert json.loads(flush["success_reason_json"]) == {"action": "collected", "metadata": {"quarantined_indices": [0]}}
+        with env.db.connection() as conn:
+            member_reasons = (
+                conn.execute(
+                    select(node_states_table.c.success_reason_json)
+                    .where(node_states_table.c.run_id == env.run_id)
+                    .where(node_states_table.c.node_id == str(env.node_id))
+                    .where(node_states_table.c.token_id.in_([member.token_id for member in members]))
+                )
+                .scalars()
+                .all()
+            )
+        assert member_reasons == [None, None]
+
+    def test_flush_persists_ordinary_success_reason_without_context(self, collector_env: _CollectorEnv) -> None:
+        import json
+
+        env = collector_env
+        members, group_id = env.seed_group(count=2)
+        for member in members:
+            env.executor.accept(member, "stitch")
+        flush = _flush_audit_state(env, group_id, members)
+        assert flush["success_reason_json"] is not None
+        assert json.loads(flush["success_reason_json"]) == {"action": "collected"}
+        assert flush["context_after_json"] is None
+
+    def test_flush_persists_plugin_context_after(self, collector_env: _CollectorEnv) -> None:
+        import json
+
+        from elspeth.contracts.node_state_context import GateEvaluationContext
+
+        env = collector_env
+        context = GateEvaluationContext(condition="items accepted", result="True", route_label="true")
+        env.transform.context_after = context
+        members, group_id = env.seed_group(count=2)
+        for member in members:
+            env.executor.accept(member, "stitch")
+        flush = _flush_audit_state(env, group_id, members)
+        assert flush["context_after_json"] is not None
+        assert json.loads(flush["context_after_json"]) == context.to_dict()
+
+    def test_loss_triggered_flush_persists_reason(self, best_effort_env: _CollectorEnv) -> None:
+        import json
+
+        env = best_effort_env
+        members, group_id = env.seed_group(count=2)
+        env.executor.accept(members[0], "stitch")
+        outcome = env.executor.notify_member_lost("stitch", group_id, members[1].token_id, "quarantined")
+        assert outcome is not None and outcome.held is False
+        flush = _flush_audit_state(env, group_id, members)
+        assert flush["success_reason_json"] is not None
+        assert json.loads(flush["success_reason_json"]) == {"action": "collected"}
+
+    def test_failed_flush_has_error_and_no_success_reason(self, collector_env: _CollectorEnv) -> None:
+        env = collector_env
+        env.transform.return_error = True
+        members, group_id = env.seed_group(count=2)
+        for member in members:
+            outcome = env.executor.accept(member, "stitch")
+        assert outcome.failure_reason == "collector_transform_error"
+        flush = _flush_audit_state(env, group_id, members)
+        assert flush["status"] == NodeStateStatus.FAILED.value
+        assert flush["error_json"] is not None
+        assert flush["success_reason_json"] is None
+
+    def test_plugin_free_closes_create_no_success_reason(self, best_effort_env: _CollectorEnv) -> None:
+        from sqlalchemy import select
+
+        env = best_effort_env
+        empty_group = env.seed_empty_group()
+        env.executor.notify_empty_group("stitch", empty_group)
+        members, lost_group = env.seed_group(count=2)
+        for member in members:
+            env.executor.notify_member_lost("stitch", lost_group, member.token_id, "quarantined")
+        assert env.transform.call_count == 0
+        with env.db.connection() as conn:
+            reasons = (
+                conn.execute(
+                    select(node_states_table.c.success_reason_json)
+                    .where(node_states_table.c.run_id == env.run_id)
+                    .where(node_states_table.c.node_id == str(env.node_id))
+                )
+                .scalars()
+                .all()
+            )
+        assert reasons == []
+
+    def test_restored_close_persists_reason(self, collector_env: _CollectorEnv) -> None:
+        import json
+
+        env = collector_env
+        members, group_id = env.seed_group(count=2)
+        env.executor.accept(members[0], "stitch")
+        env.factory.execution.begin_node_state(
+            token_id=members[1].token_id,
+            node_id=str(env.node_id),
+            member_token=env.setup.coordination_token.membership,
+            step_index=1,
+            input_data=members[1].row_data.to_dict(),
+            attempt=0,
+            resume_checkpoint_id=None,
+        )
+        items = [env.blocked_item_for(member, collector_name="stitch") for member in members]
+        fresh = env.fresh_executor()
+        fresh.restore_from_journal(
+            items=items,
+            state_ids=env.state_ids_for(items),
+            attempt_offsets={member.token_id: 0 for member in members},
+            resume_checkpoint_id="ckpt-1",
+        )
+        outcomes = fresh.flush_restored_complete_groups(ctx=env.ctx)
+        assert len(outcomes) == 1 and outcomes[0].held is False
+        flush = _flush_audit_state(env, group_id, members)
+        assert flush["success_reason_json"] is not None
+        assert json.loads(flush["success_reason_json"]) == {"action": "collected"}
+
+    @pytest.mark.parametrize("bad_field", ["success_reason", "context_after"])
+    def test_unserialisable_plugin_metadata_raises_before_any_side_effect(self, collector_env: _CollectorEnv, bad_field: str) -> None:
+        """A plugin's reason or context that the audit write would refuse is refused
+        BEFORE the release: no child token is minted, no member hold is closed, and no
+        quarantine terminal is written. The group stays installed with every hold OPEN,
+        as after a plugin exception, and the flush state is auto-failed."""
+        env = collector_env
+        env.transform.quarantine_indices = [0]
+        if bad_field == "success_reason":
+            env.transform.extra_reason_metadata = {"ratio": float("nan")}
+        else:
+            env.transform.context_after = _ScriptedContext({"ratio": float("nan")})
+        members, group_id = env.seed_group(count=2)
+        member_ids = {member.token_id for member in members}
+        env.executor.accept(members[0], "stitch")
+
+        with pytest.raises(ValueError, match="non-finite"):
+            env.executor.accept(members[1], "stitch")
+
+        records = env.factory.data_flow.get_group_records_for_run(env.run_id)
+        assert [record for record in records if record["group_id"] != group_id] == []
+        assert env.open_hold_token_ids(node="stitch") == sorted(member_ids)
+        assert env.quarantined_token_ids() == []
+        assert env.executor.buffered_member_count() == 2
+        [flush_error] = env.failed_flush_state_errors(node="stitch", member_token_ids=member_ids)
+        assert flush_error["type"] == "ValueError"
+        assert flush_error["phase"] == "collector_flush"
+
+    def test_flush_context_is_serialised_once_and_persisted_as_serialised(self, collector_env: _CollectorEnv) -> None:
+        """The early validation and the write share one serialisation: the context is
+        rendered exactly once, and that rendering is what the flush state holds."""
+        import json
+
+        env = collector_env
+        context = _ScriptedContext({"pool": "p1", "served": 2})
+        env.transform.context_after = context
+        members, group_id = env.seed_group(count=2)
+        for member in members:
+            env.executor.accept(member, "stitch")
+
+        assert context.to_dict_calls == 1
+        flush = _flush_audit_state(env, group_id, members)
+        assert flush["context_after_json"] is not None
+        assert json.loads(flush["context_after_json"]) == {"pool": "p1", "served": 2}
+
+    def test_member_holds_carry_neither_reason_nor_context(self, collector_env: _CollectorEnv) -> None:
+        """The batch-wide reason and context belong to the flush state only: neither the
+        quarantined member's FAILED hold nor the survivor's COMPLETED hold carries them."""
+        import json
+
+        from elspeth.contracts.node_state_context import GateEvaluationContext
+
+        env = collector_env
+        context = GateEvaluationContext(condition="items accepted", result="True", route_label="true")
+        env.transform.context_after = context
+        env.transform.quarantine_indices = [0]
+        members, group_id = env.seed_group(count=2)
+        for member in members:
+            env.executor.accept(member, "stitch")
+
+        flush = _flush_audit_state(env, group_id, members)
+        assert flush["context_after_json"] is not None
+        assert json.loads(flush["context_after_json"]) == context.to_dict()
+        holds = {row["token_id"]: row for row in _member_hold_states(env, members)}
+        assert holds[members[0].token_id]["status"] == NodeStateStatus.FAILED.value
+        assert holds[members[1].token_id]["status"] == NodeStateStatus.COMPLETED.value
+        for hold in holds.values():
+            assert hold["success_reason_json"] is None
+            assert hold["context_after_json"] is None
+
+    @pytest.mark.parametrize("second_context", ["different", "none"])
+    def test_successive_groups_persist_only_their_own_reason_and_context(self, collector_env: _CollectorEnv, second_context: str) -> None:
+        import json
+
+        from elspeth.contracts.node_state_context import GateEvaluationContext
+
+        env = collector_env
+        first = GateEvaluationContext(condition="first group", result="True", route_label="true")
+        env.transform.context_after = first
+        env.transform.quarantine_indices = [0]
+        first_members, first_group = env.seed_group(count=2)
+        for member in first_members:
+            env.executor.accept(member, "stitch")
+
+        second = (
+            GateEvaluationContext(condition="second group", result="False", route_label="false") if second_context == "different" else None
+        )
+        env.transform.context_after = second
+        env.transform.quarantine_indices = []
+        second_members, second_group = env.seed_group(count=2)
+        for member in second_members:
+            env.executor.accept(member, "stitch")
+
+        first_flush = _flush_audit_state(env, first_group, first_members)
+        second_flush = _flush_audit_state(env, second_group, second_members)
+        assert first_flush["success_reason_json"] is not None
+        assert json.loads(first_flush["success_reason_json"]) == {"action": "collected", "metadata": {"quarantined_indices": [0]}}
+        assert first_flush["context_after_json"] is not None
+        assert json.loads(first_flush["context_after_json"]) == first.to_dict()
+        assert second_flush["success_reason_json"] is not None
+        assert json.loads(second_flush["success_reason_json"]) == {"action": "collected"}
+        if second is None:
+            assert second_flush["context_after_json"] is None
+        else:
+            assert second_flush["context_after_json"] is not None
+            assert json.loads(second_flush["context_after_json"]) == second.to_dict()
 
 
 class TestFlushContractPreflight:

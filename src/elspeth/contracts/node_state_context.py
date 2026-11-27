@@ -33,6 +33,23 @@ class NodeStateContext(Protocol):
     def to_dict(self) -> dict[str, Any]: ...
 
 
+@dataclass(frozen=True, slots=True)
+class SerializedCompletionMetadata:
+    """A completion's success reason and context in the exact form the node-state write persists.
+
+    Built by ``serialize_completion_metadata`` in
+    ``elspeth.core.landscape.execution.node_states``, the one validator and
+    serialiser the node-state completion write itself uses. A caller that must
+    refuse a plugin's metadata BEFORE side effects of its own (the collector
+    flush releases tokens and closes member holds before its flush state
+    completes) serialises first and hands this value to the write, so the bytes
+    checked are the bytes stored, with no second serialisation.
+    """
+
+    success_reason_json: str | None
+    context_after_json: str | None
+
+
 class QueryOrderEntryInput(Protocol):
     """Structural view of reorder-buffer entries needed for audit ordering.
 

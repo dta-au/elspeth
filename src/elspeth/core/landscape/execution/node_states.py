@@ -37,6 +37,7 @@ from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, 
 from elspeth.contracts.engine import CoalesceParentCompletion
 from elspeth.contracts.errors import AuditIntegrityError, ExecutionError, TransformErrorReason
 from elspeth.contracts.hashing import repr_hash
+from elspeth.contracts.node_state_context import SerializedCompletionMetadata
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.core.ids import generate_id
@@ -80,6 +81,20 @@ def _validate_transform_success_reason(success_reason: object) -> None:
     action = success_reason.get("action")
     if not isinstance(action, str):
         raise ValueError("success_reason['action'] must be a str")
+
+
+def serialize_completion_metadata(
+    *, success_reason: TransformSuccessReason | None, context_after: NodeStateContext | None
+) -> SerializedCompletionMetadata:
+    """Validate and canonicalise a completion's success reason and context; raises on refusal.
+
+    The single serialiser behind :meth:`NodeStateRepository.complete_node_state_on`;
+    its result is the owned :class:`SerializedCompletionMetadata` that write persists as given.
+    """
+    context_after_json = canonical_json(context_after.to_dict()) if context_after is not None else None
+    _validate_transform_success_reason(success_reason)
+    success_reason_json = canonical_json(success_reason) if success_reason is not None else None
+    return SerializedCompletionMetadata(success_reason_json=success_reason_json, context_after_json=context_after_json)
 
 
 @dataclass(frozen=True, slots=True)
@@ -549,6 +564,7 @@ class NodeStateRepository:
         error: ExecutionError | TransformErrorReason | CoalesceFailureReason | RowUnionFailureReason | None = None,
         success_reason: TransformSuccessReason | None = None,
         context_after: NodeStateContext | None = None,
+        serialized_metadata: SerializedCompletionMetadata | None = None,
     ) -> NodeStatePending | NodeStateCompleted | NodeStateFailed:
         """Complete one state under the writer's current membership."""
         with fenced_member_transaction(self._db.engine, member_token=member_token, verb="complete_node_state") as conn:
@@ -562,6 +578,7 @@ class NodeStateRepository:
                 error=error,
                 success_reason=success_reason,
                 context_after=context_after,
+                serialized_metadata=serialized_metadata,
             )
 
     def complete_node_state_on(
@@ -575,6 +592,7 @@ class NodeStateRepository:
         error: ExecutionError | TransformErrorReason | CoalesceFailureReason | RowUnionFailureReason | None = None,
         success_reason: TransformSuccessReason | None = None,
         context_after: NodeStateContext | None = None,
+        serialized_metadata: SerializedCompletionMetadata | None = None,
         conn: Connection,
     ) -> NodeStatePending | NodeStateCompleted | NodeStateFailed:
         """Complete a node state.
@@ -590,6 +608,9 @@ class NodeStateRepository:
             duration_ms: Processing duration (required)
             error: Error details (if failed)
             context_after: Optional context snapshot after processing
+            serialized_metadata: ``success_reason`` and ``context_after`` already
+                validated and serialised by :func:`serialize_completion_metadata`;
+                persisted as given. Exclusive with the two raw arguments.
 
         Returns:
             NodeStatePending if status is pending, NodeStateCompleted if completed, NodeStateFailed if failed
@@ -597,13 +618,18 @@ class NodeStateRepository:
         Raises:
             ValueError: If status is OPEN (not a valid terminal status)
             ValueError: If duration_ms is not provided
+            ValueError: If serialized_metadata is passed with a raw success_reason or context_after
         """
+        if serialized_metadata is not None and (success_reason is not None or context_after is not None):
+            raise ValueError("complete_node_state takes success_reason/context_after or serialized_metadata, not both")
         validate_node_state_completion_fields(
             status,
             output_data_present=output_data is not None,
             duration_ms=duration_ms,
             error_present=error is not None,
-            success_reason_present=success_reason is not None,
+            success_reason_present=(
+                success_reason is not None if serialized_metadata is None else serialized_metadata.success_reason_json is not None
+            ),
         )
 
         timestamp = now()
@@ -615,10 +641,10 @@ class NodeStateRepository:
             error_json = canonical_json(error_data)
         else:
             error_json = None
-        context_json = canonical_json(context_after.to_dict()) if context_after is not None else None
-        # Serialize success reason if provided (use canonical_json for audit consistency)
-        _validate_transform_success_reason(success_reason)
-        success_reason_json = canonical_json(success_reason) if success_reason is not None else None
+        if serialized_metadata is None:
+            serialized_metadata = serialize_completion_metadata(success_reason=success_reason, context_after=context_after)
+        context_json = serialized_metadata.context_after_json
+        success_reason_json = serialized_metadata.success_reason_json
 
         # Single transaction: UPDATE + SELECT-back for atomicity.
         # Prevents a concurrent reader from seeing the row between states.

@@ -45,6 +45,7 @@ from elspeth.core.canonical import stable_hash
 from elspeth.core.config import CollectorSettings, ScopeSettings
 from elspeth.core.landscape.collector_group_failure_holds import collector_group_failure_hold_error
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
+from elspeth.core.landscape.execution.node_states import serialize_completion_metadata
 from elspeth.core.landscape.execution_repository import ExecutionRepository
 from elspeth.engine._error_hash import compute_error_hash
 from elspeth.engine.aggregation_result import validated_quarantined_indices
@@ -1278,6 +1279,14 @@ class CollectorExecutor:
                     flush_duration_ms=(self._clock.monotonic() - now) * 1000,
                 )
 
+            # The plugin's success reason and context go through the
+            # persistence layer's own validator and serialiser HERE, before the
+            # release and the member-hold completions below: a value the audit
+            # write refuses then raises with no side effect (the guard
+            # auto-fails this attempt and the group stays installed, as after a
+            # plugin exception), and the flush state persists exactly these
+            # serialised bytes rather than serialising a second time.
+            flush_metadata = serialize_completion_metadata(success_reason=result.success_reason, context_after=result.context_after)
             output_rows: tuple[PipelineRow, ...] = (result.row,) if result.row is not None else tuple(result.rows or ())
             quarantined = validated_quarantined_indices(result, buffered_token_count=len(members), aggregation_name=collector_name)
             surviving = tuple(entry for index, entry in enumerate(entries) if index not in quarantined)
@@ -1354,6 +1363,7 @@ class CollectorExecutor:
                 NodeStateStatus.COMPLETED,
                 output_data={"released_count": len(released), "member_count": len(members)},
                 duration_ms=duration_ms,
+                serialized_metadata=flush_metadata,
             )
 
         del self._pending[key]

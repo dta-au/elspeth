@@ -45,7 +45,7 @@ if TYPE_CHECKING:
     from elspeth.contracts.audit import TokenRef
     from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
     from elspeth.contracts.errors import CoalesceFailureReason, TransformErrorReason, TransformSuccessReason
-    from elspeth.contracts.node_state_context import NodeStateContext
+    from elspeth.contracts.node_state_context import NodeStateContext, SerializedCompletionMetadata
 
 logger = logging.getLogger(__name__)
 
@@ -400,6 +400,7 @@ class NodeStateGuard:
         error: ExecutionError | TransformErrorReason | CoalesceFailureReason | None = None,
         success_reason: TransformSuccessReason | None = None,
         context_after: NodeStateContext | None = None,
+        serialized_metadata: SerializedCompletionMetadata | None = None,
     ) -> None:
         """Complete the node state.  Guard will not intervene after this.
 
@@ -407,6 +408,11 @@ class NodeStateGuard:
         Pre-persistence failures must still flow through the auto-fail path,
         but post-commit materialization failures must not trigger a second
         terminal write on top of an already-persisted state.
+
+        ``serialized_metadata`` (COMPLETED only) is the success reason and
+        context a caller already validated and serialised before side effects
+        of its own; the repository persists it as given, exclusive with the raw
+        ``success_reason`` / ``context_after``.
         """
         if status not in _GUARD_TERMINAL_NODE_STATE_STATUSES:
             valid = ", ".join(member.name for member in sorted(_GUARD_TERMINAL_NODE_STATE_STATUSES, key=lambda item: item.value))
@@ -436,12 +442,15 @@ class NodeStateGuard:
                     error=error,
                     success_reason=success_reason,
                     context_after=context_after,
+                    serialized_metadata=serialized_metadata,
                 )
             else:
                 # The FAILED completion contract has no success_reason;
                 # reject rather than silently drop a caller's value.
                 if success_reason is not None:
                     raise OrchestrationInvariantError("NodeStateGuard.complete(FAILED) does not accept success_reason.")
+                if serialized_metadata is not None:
+                    raise OrchestrationInvariantError("NodeStateGuard.complete(FAILED) does not accept serialized_metadata.")
                 self._execution.complete_node_state(
                     member_token=self._member_token,
                     state_id=self.state_id,

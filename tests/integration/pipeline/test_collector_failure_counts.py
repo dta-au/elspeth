@@ -291,6 +291,39 @@ payload_store:
     ]
 
 
+def test_batch_replicate_flush_retains_invalid_copies_explanation(tmp_path: Path) -> None:
+    """The shipped plugin's explanation belongs to the group's flush state."""
+    pipeline = _COLLECTOR_PIPELINE.replace("plugin: batch_stats", "plugin: batch_replicate").replace(
+        "value_field: item", "copies_field: item"
+    )
+    env = build_pipeline(tmp_path, pipeline, [{"id": 1, "items": [0, 1]}])
+    result = run_pipeline(env)
+    assert result.status is RunStatus.COMPLETED_WITH_FAILURES
+    db = env["db"]
+    node_id = _collector_node(db)
+    with db.connection() as conn:
+        reasons = (
+            conn.execute(
+                select(node_states_table.c.success_reason_json)
+                .where(node_states_table.c.run_id == result.run_id)
+                .where(node_states_table.c.node_id == node_id)
+                .where(node_states_table.c.success_reason_json.is_not(None))
+            )
+            .scalars()
+            .all()
+        )
+    assert len(reasons) == 1
+    assert json.loads(reasons[0]) == {
+        "action": "processed",
+        "fields_added": ["copy_index"],
+        "metadata": {
+            "quarantined_count": 1,
+            "quarantined": [{"reason": "invalid_copies", "field": "item", "row_index": 0}],
+            "quarantined_indices": [0],
+        },
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class _Surfaces:
     """Every counting reader's view of one run."""
