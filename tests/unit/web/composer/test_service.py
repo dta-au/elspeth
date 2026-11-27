@@ -33,7 +33,8 @@ from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.freeze import deep_freeze, deep_thaw
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.prompt_guard import (
-    PromptGuardClient,
+    PromptGuardCall,
+    PromptGuardCallResult,
     PromptGuardContentPart,
     PromptGuardDecision,
     PromptGuardRequest,
@@ -128,6 +129,7 @@ from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_
 from tests.fixtures.required_executor import assert_owned_executor_fixture_settled
 from tests.helpers.advisor_review import parse_advisor_publication_review
 from tests.helpers.litellm_dispatch import Failure, Route, provider_failure
+from tests.helpers.prompt_guard_clients import SingleCallPromptGuardClient, request_from_call
 from tests.helpers.session_fences import fenced_operation_context
 from tests.unit.web.composer._helpers import (
     FakeChoice,
@@ -751,7 +753,7 @@ async def test_guard_refusal_retains_committed_effect_integrity(
 
     from elspeth.web.dependencies import create_catalog_service
 
-    class CheckpointGuard(PromptGuardClient):
+    class CheckpointGuard(SingleCallPromptGuardClient):
         def __init__(self, decision: PromptGuardDecision) -> None:
             self.decision = decision
             self.requests: list[PromptGuardRequest] = []
@@ -768,9 +770,9 @@ async def test_guard_refusal_retains_committed_effect_integrity(
         def timeout_seconds(self) -> float:
             return 5.0
 
-        async def inspect(self, request: PromptGuardRequest) -> PromptGuardDecision:
-            self.requests.append(request)
-            return self.decision
+        async def inspect_call(self, call: PromptGuardCall) -> PromptGuardCallResult:
+            self.requests.append(request_from_call(call))
+            return PromptGuardCallResult(self.decision)
 
     primary_guard = CheckpointGuard(PromptGuardDecision("allow", "clean"))
     advisor_guard = CheckpointGuard(PromptGuardDecision("blocked", "policy_blocked"))

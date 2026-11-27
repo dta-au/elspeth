@@ -12,7 +12,7 @@ from elspeth.core.url_validation import validate_credential_safe_https_url
 AZURE_PROMPT_SHIELDS_API_VERSION = "2024-09-01"
 
 
-class PromptGuardSettings(BaseModel):
+class AzurePromptGuardSettings(BaseModel):
     """A dedicated Content Safety endpoint, credential and total check timeout."""
 
     model_config = ConfigDict(frozen=True, extra="forbid", hide_input_in_errors=True)
@@ -50,3 +50,6 @@ class PromptGuardSettings(BaseModel):
         ):
             raise ValueError("Prompt guard subscription key must be bounded nonempty ASCII without whitespace")
         return value
+
+
+PromptGuardSettings = AzurePromptGuardSettings

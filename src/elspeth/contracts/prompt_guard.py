@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
+from contextlib import AbstractAsyncContextManager
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
@@ -267,6 +268,63 @@ class PromptGuardDecision:
             raise AuditIntegrityError("Prompt guard decision is outside its closed coherent vocabulary")
 
 
+@dataclass(frozen=True, slots=True)
+class PromptGuardCall:
+    """One complete physical request and the input positions it carries."""
+
+    payload: bytes = field(repr=False)
+    document_indexes: tuple[int, ...]
+    carries_user_prompt: bool
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.payload) is not bytes
+            or type(self.document_indexes) is not tuple
+            or any(type(index) is not int or index < 0 for index in self.document_indexes)
+            or type(self.carries_user_prompt) is not bool
+        ):
+            raise AuditIntegrityError("Prompt guard call lacks exact owned payload coverage")
+
+
+@dataclass(frozen=True, slots=True)
+class PromptGuardUnsupportedInput:
+    """The adapter cannot cover this complete request."""
+
+
+@dataclass(frozen=True, slots=True)
+class PromptGuardCallPlan:
+    """Ordered physical calls or an explicit unsupported-input outcome."""
+
+    calls: tuple[PromptGuardCall, ...] | PromptGuardUnsupportedInput
+
+    def __post_init__(self) -> None:
+        if type(self.calls) is PromptGuardUnsupportedInput:
+            return
+        if type(self.calls) is not tuple or not self.calls or any(type(call) is not PromptGuardCall for call in self.calls):
+            raise AuditIntegrityError("Prompt guard call plan requires owned physical calls")
+
+
+@dataclass(frozen=True, slots=True)
+class PromptGuardCallResult:
+    """The admitted decision from one physical request."""
+
+    decision: PromptGuardDecision
+
+    def __post_init__(self) -> None:
+        if type(self.decision) is not PromptGuardDecision:
+            raise AuditIntegrityError("Prompt guard call result requires an owned decision")
+
+
+class PromptGuardRequestUnavailable(Exception):
+    """An adapter could not complete one planned request; carries its owned unavailable decision."""
+
+    def __init__(self, decision: PromptGuardDecision) -> None:
+        if type(decision) is not PromptGuardDecision or decision.disposition != "unavailable":
+            raise AuditIntegrityError("Prompt guard request failure requires an owned unavailable decision")
+        super().__init__(decision.reason)
+        self.decision = decision
+
+
 class PromptGuardClient(ABC):
     """Nominal extension point for dedicated detector transports."""
 
@@ -286,5 +344,18 @@ class PromptGuardClient(ABC):
         """Bound for a complete invocation, not each individual segment."""
 
     @abstractmethod
-    async def inspect(self, request: PromptGuardRequest) -> PromptGuardDecision:
-        """Check every supported input surface or return unavailable."""
+    def plan_calls(self, request: PromptGuardRequest) -> PromptGuardCallPlan:
+        """Deterministically describe every physical request without I/O."""
+
+    @abstractmethod
+    async def inspect_call(self, call: PromptGuardCall) -> PromptGuardCallResult:
+        """Send one physical request and admit its decision."""
+
+    @abstractmethod
+    def request_context(self) -> AbstractAsyncContextManager[None]:
+        """Keep transport resources scoped to one planned request.
+
+        Every physical call of the request runs inside it. An adapter that
+        cannot open or close its transport raises
+        ``PromptGuardRequestUnavailable`` with the decision for the request.
+        """
