@@ -44,6 +44,11 @@ function compositionWithSource(version: number) {
   };
 }
 
+/** The expectedVersion of every validate() call, in call order. */
+function validatedVersions(validate: ReturnType<typeof vi.fn>): number[] {
+  return validate.mock.calls.map((call) => (call[1] as { expectedVersion: number }).expectedVersion);
+}
+
 function compositionAtNewVersion(version: number) {
   return {
     version,
@@ -1181,12 +1186,12 @@ describe("auto-validate on composition-state version change", () => {
   });
 });
 
-// ── Fix A: auto-validate guard checks progress?.status === "running" ─────────
+// ── Fix A: auto-validate guard checks for a live run (running or pending) ────
 //
 // Discrimination: the old guard only checks isExecuting. If isExecuting is
-// false but progress.status === "running" (the post-200 live-run window),
-// the bug fires validate; the fix suppresses it.
-describe("auto-validate guard respects progress.status === 'running' (Fix A)", () => {
+// false but a run is live (progress.status "running", or "pending" while it
+// is queued), the bug fires validate; the fix suppresses it.
+describe("auto-validate guard respects a live run, running or pending (Fix A)", () => {
   beforeEach(() => {
     _resetSubscriptionsForTesting();
     useAuthStore.setState({ token: "tok", user: { user_id: "user-a" } as never });
@@ -1204,22 +1209,22 @@ describe("auto-validate guard respects progress.status === 'running' (Fix A)", (
     initStoreSubscriptions();
   });
 
-  it("does NOT fire validate when progress.status is 'running' even though isExecuting is false", async () => {
+  it.each(["running", "pending"])("does NOT auto-validate when progress.status is '%s'", async (status) => {
     const validate = vi.fn().mockResolvedValue(undefined);
     useExecutionStore.setState({ validate } as never);
 
     // Simulate: HTTP /execute returned 200 (isExecuting=false) but WS progress
-    // is live (status="running").
+    // is live, including the queued period.
     useExecutionStore.setState({
       isExecuting: false,
-      progress: { status: "running", source_rows_processed: 0, tokens_succeeded: 0,
+      progress: { status, source_rows_processed: 0, tokens_succeeded: 0,
         tokens_failed: 0, tokens_quarantined: 0, tokens_routed_success: 0,
         tokens_routed_failure: 0, accounting: null, recent_errors: [] } as never,
     } as never);
 
     // Bump the composition version — this fires the auto-validate subscription.
     // Bug: only checks isExecuting (false) → validate fires.
-    // Fix: also checks progress?.status === "running" → validate suppressed.
+    // Live progress suppresses validation.
     useSessionStore.setState({
       compositionState: compositionWithSource(2) as never,
     } as never);
@@ -1230,18 +1235,46 @@ describe("auto-validate guard respects progress.status === 'running' (Fix A)", (
     });
     expect(validate).not.toHaveBeenCalled();
 
-    // Now clear the running progress — validate should fire.
+    // Now clear the live progress — validate should fire.
     useExecutionStore.setState({ progress: null } as never);
     // Re-fire the same compositionState (new object ref) so the subscriber
     // callback runs again. The version is unchanged; what changed is the guard
     // condition (progress=null), which is checked from executionStore at fire
-    // time. pendingValidateTarget was set to version 2 by the blocked
-    // subscription fire above, so fireValidateLoop will run with target 2.
+    // time. The blocked fire above returned at the guard without queuing
+    // anything, so this fire queues version 2 itself and starts the loop.
     useSessionStore.setState({
       compositionState: compositionWithSource(2) as never,
     } as never);
 
     await waitFor(() => expect(validate).toHaveBeenCalledWith("sess-1", { expectedVersion: 2 }));
+  });
+
+  // The validate loop re-checks the live run before it consumes a queued
+  // request, so a request queued during a live run is dropped there anyway
+  // unless the run has ended by the time the loop reaches it. Ending the run
+  // while the earlier validation is still in flight isolates the subscriber's
+  // own guard: refused, version 2 never reaches the loop; queued, it is
+  // validated once the run ends. The idle case shows that the loop does
+  // consume a queued version inside this wait.
+  it.each([
+    ["idle", null, [1, 2]],
+    ["running", "running", [1]],
+    ["pending", "pending", [1]],
+  ] as const)("queues a version published during an in-flight validation only when no run is live (%s)", async (_label, status, versions) => {
+    let releaseFirst!: () => void;
+    const first = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const validate = vi.fn().mockReturnValueOnce(first).mockResolvedValue(undefined);
+    useExecutionStore.setState({ validate } as never);
+
+    useSessionStore.setState({ compositionState: compositionWithSource(1) as never } as never);
+    expect(validate).toHaveBeenCalledTimes(1);
+    useExecutionStore.setState({ progress: status === null ? null : ({ status } as never) } as never);
+    useSessionStore.setState({ compositionState: compositionWithSource(2) as never } as never);
+    useExecutionStore.setState({ progress: null } as never);
+    releaseFirst();
+    await act(async () => { await first; await Promise.resolve(); });
+
+    expect(validatedVersions(validate)).toEqual(versions);
   });
 });
 
@@ -1455,13 +1488,13 @@ describe("requestValidate — forced manual validate entry point", () => {
     expect(validate).not.toHaveBeenCalled();
   });
 
-  it("skips validate when progress.status is 'running'", async () => {
+  it.each(["running", "pending"])("skips forced validate when progress.status is '%s'", async (status) => {
     const validate = vi.fn().mockResolvedValue(undefined);
     useExecutionStore.setState({
       validate,
       isExecuting: false,
       progress: {
-        status: "running",
+        status,
         source_rows_processed: 0,
         tokens_succeeded: 0,
         tokens_failed: 0,
@@ -1480,6 +1513,54 @@ describe("requestValidate — forced manual validate entry point", () => {
       await Promise.resolve();
     });
     expect(validate).not.toHaveBeenCalled();
+  });
+
+  // Same isolation for the forced entry's own guard: the run ends while the
+  // earlier validation is still in flight, so the loop's re-check would let a
+  // queued request through. Refused at entry, version 2 is never validated.
+  it.each([
+    ["idle", null, [1, 2]],
+    ["running", "running", [1]],
+    ["pending", "pending", [1]],
+  ] as const)("queues a forced validation requested during an in-flight validation only when no run is live (%s)", async (_label, status, versions) => {
+    let releaseFirst!: () => void;
+    const first = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const validate = vi.fn().mockReturnValueOnce(first).mockResolvedValue(undefined);
+    useExecutionStore.setState({ validate } as never);
+
+    requestValidate("sess-1", 1);
+    expect(validate).toHaveBeenCalledTimes(1);
+    useExecutionStore.setState({ progress: status === null ? null : ({ status } as never) } as never);
+    requestValidate("sess-1", 2);
+    useExecutionStore.setState({ progress: null } as never);
+    releaseFirst();
+    await act(async () => { await first; await Promise.resolve(); });
+
+    expect(validatedVersions(validate)).toEqual(versions);
+  });
+
+  // The queued version-2 request passes the entry guard (nothing is live yet);
+  // only the loop's own check can drop it. The idle case shows the loop does
+  // reach and consume the queued request inside the same wait, so the live
+  // cases' single call is the guard's doing, not an early read.
+  it.each([
+    ["idle", null, [1, 2]],
+    ["running", "running", [1]],
+    ["pending", "pending", [1]],
+  ] as const)("re-checks the live run when the loop reaches a queued forced validation (%s)", async (_label, status, versions) => {
+    let releaseFirst!: () => void;
+    const first = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const validate = vi.fn().mockReturnValueOnce(first).mockResolvedValue(undefined);
+    useExecutionStore.setState({ validate } as never);
+
+    requestValidate("sess-1", 1);
+    expect(validate).toHaveBeenCalledTimes(1);
+    requestValidate("sess-1", 2);
+    useExecutionStore.setState({ progress: status === null ? null : ({ status } as never) } as never);
+    releaseFirst();
+    await act(async () => { await first; await Promise.resolve(); });
+
+    expect(validatedVersions(validate)).toEqual(versions);
   });
 });
 

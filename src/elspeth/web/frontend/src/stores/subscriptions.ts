@@ -10,6 +10,7 @@ import { useAuditReadinessStore } from "./auditReadinessStore";
 import { useAuthStore } from "./authStore";
 import { usePreferencesStore } from "./preferencesStore";
 import type { CompositionState, ValidationResult } from "@/types/index";
+import { isLiveRunStatus } from "@/types/index";
 import { hasCompositionContent } from "@/utils/compositionState";
 import { compositionContentEqual } from "@/lib/compositionContent";
 import {
@@ -474,7 +475,7 @@ export function initStoreSubscriptions(): void {
     if (!hasCompositionContent(state.compositionState)) return;
     if (lastValidatedVersionBySession.get(sessionId) === version) return;
     const exec = useExecutionStore.getState();
-    if (exec.isExecuting || exec.progress?.status === "running") return;
+    if (exec.isExecuting || (exec.progress !== null && isLiveRunStatus(exec.progress.status))) return;
 
     // Content-equal carry-forward: a verdict that LANDED for this exact
     // content is carried to the new version instead of re-POSTing /validate.
@@ -534,7 +535,7 @@ async function fireValidateLoop(): Promise<void> {
     while (pendingValidateTarget !== null) {
       const target = pendingValidateTarget;
       const execState = useExecutionStore.getState();
-      if (execState.isExecuting || execState.progress?.status === "running") {
+      if (execState.isExecuting || (execState.progress !== null && isLiveRunStatus(execState.progress.status))) {
         pendingValidateTarget = null;
         break;
       }
@@ -600,7 +601,7 @@ function forcedValidateAllowed(): boolean {
     return false;
   }
   const exec = useExecutionStore.getState();
-  return !(exec.isExecuting || exec.progress?.status === "running");
+  return !(exec.isExecuting || (exec.progress !== null && isLiveRunStatus(exec.progress.status)));
 }
 
 function enqueueForcedValidate(sessionId: string, version: number): void {
