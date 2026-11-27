@@ -24,6 +24,8 @@ from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.hashing import is_lower_sha256_hex
 from elspeth.contracts.prompt_guard import (
     PROMPT_GUARD_MAX_TEXT_CHARACTERS,
+    PromptGuardCallPlan,
+    PromptGuardCallResult,
     PromptGuardClient,
     PromptGuardContentPart,
     PromptGuardDecision,
@@ -31,9 +33,11 @@ from elspeth.contracts.prompt_guard import (
     PromptGuardMode,
     PromptGuardReason,
     PromptGuardRequest,
+    PromptGuardRequestUnavailable,
     PromptGuardRole,
     PromptGuardThinkingParts,
     PromptGuardToolArgumentParts,
+    PromptGuardUnsupportedInput,
     validate_prompt_guard_content_parts,
     validate_prompt_guard_thinking_parts,
     validate_prompt_guard_tool_argument_parts,
@@ -486,6 +490,32 @@ def _inspection_plan(
     return _InspectionPlan(send_user, _pack_documents(new_units), tuple(new_keys), reused)
 
 
+async def inspect_prompt_guard_request(client: PromptGuardClient, request: PromptGuardRequest) -> PromptGuardDecision:
+    """Send one planned request only when its calls cover every input."""
+    call_plan = client.plan_calls(request)
+    if type(call_plan) is not PromptGuardCallPlan:
+        raise AuditIntegrityError("Prompt guard adapter returned a foreign call plan")
+    calls = call_plan.calls
+    if type(calls) is PromptGuardUnsupportedInput:
+        return PromptGuardDecision("unavailable", "unsupported_input")
+    if type(calls) is not tuple:
+        raise AuditIntegrityError("Prompt guard adapter returned foreign physical calls")
+    covered = {index for call in calls for index in call.document_indexes}
+    if covered != set(range(len(request.documents))) or (bool(request.user_prompt) and not any(call.carries_user_prompt for call in calls)):
+        return PromptGuardDecision("unavailable", "unsupported_input")
+    try:
+        async with client.request_context():
+            for call in calls:
+                result = await client.inspect_call(call)
+                if type(result) is not PromptGuardCallResult:
+                    raise AuditIntegrityError("Prompt guard adapter returned a foreign call result")
+                if result.decision.disposition != "allow":
+                    return result.decision
+    except PromptGuardRequestUnavailable as failure:
+        return failure.decision
+    return PromptGuardDecision("allow", "clean")
+
+
 async def _inspect_plan(
     client: PromptGuardClient, request: PromptGuardRequest, plan: _InspectionPlan, submitted: list[int]
 ) -> PromptGuardDecision:
@@ -503,10 +533,14 @@ async def _inspect_plan(
     if plan.user_prompt is not None:
         prompt_units = 1
         submitted.append(prompt_units)
-        decisions.append(await client.inspect(PromptGuardRequest(request.role, plan.user_prompt, (), request.request_hash)))
+        decisions.append(
+            await inspect_prompt_guard_request(client, PromptGuardRequest(request.role, plan.user_prompt, (), request.request_hash))
+        )
     if plan.documents:
         submitted.append(len(plan.new_keys) - prompt_units)
-        decisions.append(await client.inspect(PromptGuardRequest(request.role, "", plan.documents, request.request_hash)))
+        decisions.append(
+            await inspect_prompt_guard_request(client, PromptGuardRequest(request.role, "", plan.documents, request.request_hash))
+        )
     for decision in decisions:
         if type(decision) is not PromptGuardDecision or decision.disposition != "allow":
             return decision

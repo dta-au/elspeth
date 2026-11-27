@@ -286,7 +286,7 @@ async def _guarded_title_turn_app(tmp_path, monkeypatch, *, title_decision, prim
     import litellm
     from pydantic import SecretStr
 
-    from elspeth.contracts.prompt_guard import PromptGuardDecision
+    from elspeth.contracts.prompt_guard import PromptGuardCallResult, PromptGuardDecision
     from elspeth.web.dependencies import create_catalog_service
     from elspeth.web.prompt_guard_config import PromptGuardSettings
 
@@ -306,18 +306,20 @@ async def _guarded_title_turn_app(tmp_path, monkeypatch, *, title_decision, prim
     sdk_requests = []
     events = []
 
-    async def inspect(_self, request):
-        if not request.documents:
+    async def inspect_call(_self, call):
+        body = json.loads(call.payload)
+        documents = body["documents"]
+        if not documents:
             # The user prompt is inspected in its own call; title and primary
             # checks are told apart by their documents.
-            events.append(("prompt", request.user_prompt))
-            return PromptGuardDecision("allow", "clean")
-        title = any("Conversation excerpt (UNTRUSTED USER DATA" in document for document in request.documents)
+            events.append(("prompt", body["userPrompt"]))
+            return PromptGuardCallResult(PromptGuardDecision("allow", "clean"))
+        title = any("Conversation excerpt (UNTRUSTED USER DATA" in document for document in documents)
         disposition = title_decision if title else primary_decision
         reason = {"allow": "clean", "blocked": "policy_blocked", "unavailable": "service_error"}[disposition]
-        guard_requests.append((title, request))
+        guard_requests.append((title, body))
         events.append(("guard", "title" if title else "primary", disposition))
-        return PromptGuardDecision(disposition, reason)
+        return PromptGuardCallResult(PromptGuardDecision(disposition, reason))
 
     async def completion(**kwargs):
         title = kwargs.get("max_tokens") == 40 and "tools" not in kwargs
@@ -366,7 +368,7 @@ async def _guarded_title_turn_app(tmp_path, monkeypatch, *, title_decision, prim
             usage={"prompt_tokens": 4, "completion_tokens": 3, "total_tokens": 7, "cost": 0.001},
         )
 
-    monkeypatch.setattr("elspeth.web.composer.prompt_guard_clients.AzurePromptGuardClient.inspect", inspect)
+    monkeypatch.setattr("elspeth.web.composer.prompt_guard_clients.AzurePromptGuardClient.inspect_call", inspect_call)
     monkeypatch.setattr(litellm, "acompletion", completion)
     monkeypatch.setattr(
         "elspeth.web.composer.service.compute_availability",
@@ -406,7 +408,7 @@ async def test_real_worker_title_guard_is_terminal_before_primary(
     refused = title_decision if title_decision != "allow" else primary_decision
     assert payload["error_type"] == f"prompt_guard_{refused}"
     assert len(sdk) == expected_sdk
-    assert guards[0][0] is True and all(request.user_prompt == "" for _title, request in guards)
+    assert guards[0][0] is True and all(request["userPrompt"] == "" for _title, request in guards)
     # The title check scans the user prompt; after its allow the primary check
     # reuses it and sends only its own documents.
     assert [event for event in events if event[0] == "prompt"] == [("prompt", message)]
@@ -550,14 +552,14 @@ async def test_real_worker_title_guard_uses_the_admitted_operation_deadline(tmp_
     app.state.settings = app.state.settings.model_copy(update={"composer_timeout_seconds": 8.0})
     entered, joined = asyncio.Event(), asyncio.Event()
 
-    async def wait_for_operation_deadline(_self, request):
+    async def wait_for_operation_deadline(_self, call):
         entered.set()
         try:
             await asyncio.Event().wait()
         finally:
             joined.set()
 
-    monkeypatch.setattr("elspeth.web.composer.prompt_guard_clients.AzurePromptGuardClient.inspect", wait_for_operation_deadline)
+    monkeypatch.setattr("elspeth.web.composer.prompt_guard_clients.AzurePromptGuardClient.inspect_call", wait_for_operation_deadline)
     session = await service.create_session("alice", "New session", "local")
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         settled = await submit_and_settle(client, app, path=f"/api/sessions/{session.id}/messages", body=message_body("Build it."))

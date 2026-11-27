@@ -19,7 +19,14 @@ import httpx
 import pytest
 from sqlalchemy import select
 
-from elspeth.contracts.prompt_guard import PromptGuardClient, PromptGuardContentPart, PromptGuardDecision, PromptGuardRequest
+from elspeth.contracts.prompt_guard import (
+    PromptGuardCall,
+    PromptGuardCallPlan,
+    PromptGuardCallResult,
+    PromptGuardClient,
+    PromptGuardContentPart,
+    PromptGuardRequest,
+)
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.composer import prompt_guard
 from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused, enforce_prompt_guard
@@ -100,8 +107,14 @@ class _SwitchablePolicyClient(PromptGuardClient):
     def timeout_seconds(self) -> float:
         return self._inner.timeout_seconds
 
-    async def inspect(self, request: PromptGuardRequest) -> PromptGuardDecision:
-        return await self._inner.inspect(request)
+    def plan_calls(self, request: PromptGuardRequest) -> PromptGuardCallPlan:
+        return self._inner.plan_calls(request)
+
+    def request_context(self):
+        return self._inner.request_context()
+
+    async def inspect_call(self, call: PromptGuardCall) -> PromptGuardCallResult:
+        return await self._inner.inspect_call(call)
 
 
 @pytest.fixture

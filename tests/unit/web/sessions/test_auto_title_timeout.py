@@ -13,7 +13,7 @@ from litellm.exceptions import Timeout as LiteLLMTimeout
 from pydantic import SecretStr
 from sqlalchemy import select
 
-from elspeth.contracts.prompt_guard import PromptGuardDecision
+from elspeth.contracts.prompt_guard import PromptGuardCallResult, PromptGuardDecision
 from elspeth.web.composer.availability import ComposerAvailability
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.dependencies import create_catalog_service
@@ -43,20 +43,22 @@ async def _title_timeout_app(tmp_path, monkeypatch, *, quota_enabled=False, titl
     )
     guards = []
 
-    async def inspect(_self, request):
-        if not request.documents:
+    async def inspect_call(_self, call):
+        body = json.loads(call.payload)
+        documents = body["documents"]
+        if not documents:
             # The user prompt is inspected in its own call; title and primary
             # checks are told apart by their documents.
-            return PromptGuardDecision("allow", "clean")
-        title = any("Conversation excerpt (UNTRUSTED USER DATA" in document for document in request.documents)
-        guards.append((title, request))
+            return PromptGuardCallResult(PromptGuardDecision("allow", "clean"))
+        title = any("Conversation excerpt (UNTRUSTED USER DATA" in document for document in documents)
+        guards.append((title, body))
         if title:
             await asyncio.sleep(guard_delay)
         disposition = title_decision if title else "allow"
         reason = {"allow": "clean", "blocked": "policy_blocked", "unavailable": "service_error"}[disposition]
-        return PromptGuardDecision(disposition, reason)
+        return PromptGuardCallResult(PromptGuardDecision(disposition, reason))
 
-    monkeypatch.setattr("elspeth.web.composer.prompt_guard_clients.AzurePromptGuardClient.inspect", inspect)
+    monkeypatch.setattr("elspeth.web.composer.prompt_guard_clients.AzurePromptGuardClient.inspect_call", inspect_call)
     monkeypatch.setattr(
         "elspeth.web.composer.service.compute_availability",
         lambda **kwargs: ComposerAvailability(available=True, provider="test", model=kwargs["model"]),

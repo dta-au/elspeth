@@ -38,7 +38,7 @@ from structlog.typing import FilteringBoundLogger
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.hashing import stable_hash
-from elspeth.contracts.prompt_guard import PromptGuardClient, PromptGuardDecision, PromptGuardRequest
+from elspeth.contracts.prompt_guard import PromptGuardCall, PromptGuardCallResult, PromptGuardDecision
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 from elspeth.web.composer import provider_gateway
@@ -118,6 +118,7 @@ from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from elspeth_lints.core.ast_walker import iter_python_files
 from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
 from tests.helpers.litellm_dispatch import Failure, Route, provider_failure
+from tests.helpers.prompt_guard_clients import SingleCallPromptGuardClient
 
 
 @pytest.mark.asyncio
@@ -1154,7 +1155,7 @@ def physical_advisor(tmp_path, monkeypatch):
             engine.dispose()
 
 
-class _BlockingAdvisorGuard(PromptGuardClient):
+class _BlockingAdvisorGuard(SingleCallPromptGuardClient):
     @property
     def adapter(self) -> str:
         return "azure_prompt_shields"
@@ -1167,8 +1168,8 @@ class _BlockingAdvisorGuard(PromptGuardClient):
     def timeout_seconds(self) -> float:
         return 1.0
 
-    async def inspect(self, request: PromptGuardRequest) -> PromptGuardDecision:
-        return PromptGuardDecision("blocked", "policy_blocked")
+    async def inspect_call(self, call: PromptGuardCall) -> PromptGuardCallResult:
+        return PromptGuardCallResult(PromptGuardDecision("blocked", "policy_blocked"))
 
 
 @pytest.mark.asyncio
