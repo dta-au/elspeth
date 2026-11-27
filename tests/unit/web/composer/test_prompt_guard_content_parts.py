@@ -25,7 +25,14 @@ from elspeth.contracts.prompt_guard import (
     detach_prompt_guard_messages,
 )
 from elspeth.web.composer.audit import BufferingRecorder
-from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused, _request, enforce_prompt_guard, prompt_guard_user_scope
+from elspeth.web.composer.prompt_guard import (
+    PromptGuardMount,
+    PromptGuardRefused,
+    _request,
+    enforce_prompt_guard,
+    inspect_prompt_guard_request,
+    prompt_guard_user_scope,
+)
 from elspeth.web.composer.prompt_guard_clients import AzurePromptGuardClient
 from elspeth.web.composer.prompt_guard_rendering import json_content_parts
 from elspeth.web.composer.provider_gateway import ProviderGateway, _litellm_acompletion
@@ -221,7 +228,7 @@ async def test_large_structured_tool_arguments_keep_exact_wire_and_all_untrusted
         observed.append(json.loads(sent.content))
         return _allow(sent)
 
-    decision = await AzurePromptGuardClient(_settings(), http_transport=httpx.MockTransport(serve)).inspect(request)
+    decision = await inspect_prompt_guard_request(AzurePromptGuardClient(_settings(), http_transport=httpx.MockTransport(serve)), request)
     assert decision.disposition == "allow"
     assert tuple(document for body in observed for document in body["documents"]) == request.documents
     assert PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY not in json.dumps(evidence.messages)
@@ -241,7 +248,7 @@ async def test_long_history_is_packed_losslessly_and_sent_to_actual_azure_adapte
         observed.append(json.loads(sent.content))
         return _allow(sent)
 
-    decision = await AzurePromptGuardClient(_settings(), http_transport=httpx.MockTransport(serve)).inspect(request)
+    decision = await inspect_prompt_guard_request(AzurePromptGuardClient(_settings(), http_transport=httpx.MockTransport(serve)), request)
     assert decision.disposition == "allow"
     assert tuple(document for body in observed for document in body["documents"]) == request.documents
     assert all(body["userPrompt"] == "Build a graph" for body in observed)

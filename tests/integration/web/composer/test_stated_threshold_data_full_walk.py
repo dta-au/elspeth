@@ -132,11 +132,15 @@ async def test_referential_planner_threshold_retirement_preserves_first_candidat
     def mount(config):
         assert config == guard_settings
         client = AzurePromptGuardClient(config, http_transport=httpx.MockTransport(shield_response))
-        real_inspect = client.inspect
-        assert real_inspect.__func__ is AzurePromptGuardClient.inspect
-        assert real_inspect.__module__ == "elspeth.web.composer.prompt_guard_clients"
+        real_plan_calls = client.plan_calls
+        real_inspect_call = client.inspect_call
+        assert real_plan_calls.__func__ is AzurePromptGuardClient.plan_calls
+        assert real_inspect_call.__func__ is AzurePromptGuardClient.inspect_call
+        assert real_inspect_call.__module__ == "elspeth.web.composer.prompt_guard_clients"
 
-        async def inspect(request):
+        planned_hashes = []
+
+        def plan_calls(request):
             # Forward to the actual Azure adapter; this observer supplies no verdict.
             # One check sends the user prompt and its new documents in separate
             # calls under one request hash; record one guard event per check.
@@ -144,14 +148,20 @@ async def test_referential_planner_threshold_retirement_preserves_first_candidat
                 inspected_documents.extend(request.documents)
             else:
                 assert request.user_prompt == _CURRENT_REQUEST
-            decision = await real_inspect(request)
-            assert decision.disposition == "allow"
-            if not guard_bindings or guard_bindings[-1] != request.request_hash:
-                guard_bindings.append(request.request_hash)
-                events.append("guard")
-            return decision
+            planned_hashes.append(request.request_hash)
+            return real_plan_calls(request)
 
-        monkeypatch.setattr(client, "inspect", inspect)
+        async def inspect_call(call):
+            result = await real_inspect_call(call)
+            assert result.decision.disposition == "allow"
+            request_hash = planned_hashes[-1]
+            if not guard_bindings or guard_bindings[-1] != request_hash:
+                guard_bindings.append(request_hash)
+                events.append("guard")
+            return result
+
+        monkeypatch.setattr(client, "plan_calls", plan_calls)
+        monkeypatch.setattr(client, "inspect_call", inspect_call)
         return PromptGuardMount(client)
 
     monkeypatch.setattr("elspeth.web.composer.service.build_prompt_guard_mount", mount)

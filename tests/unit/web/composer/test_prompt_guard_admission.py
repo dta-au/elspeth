@@ -14,7 +14,8 @@ from sqlalchemy import select
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.prompt_guard import (
     PROMPT_GUARD_TRUST_KEY,
-    PromptGuardClient,
+    PromptGuardCall,
+    PromptGuardCallResult,
     PromptGuardDecision,
     PromptGuardRequest,
     PromptGuardTrust,
@@ -33,10 +34,11 @@ from elspeth.web.required_work import (
 )
 from elspeth.web.sessions.composer_operation_errors import project_composer_operation_error
 from elspeth.web.sessions.models import chat_messages_table, quota_provider_attempts_table
+from tests.helpers.prompt_guard_clients import SingleCallPromptGuardClient, request_from_call
 from tests.unit.web.sessions.test_token_usage_adapters import _quota_service
 
 
-class _GuardClient(PromptGuardClient):
+class _GuardClient(SingleCallPromptGuardClient):
     def __init__(self, decision: PromptGuardDecision) -> None:
         self.decision = decision
         self.requests: list[PromptGuardRequest] = []
@@ -53,9 +55,9 @@ class _GuardClient(PromptGuardClient):
     def timeout_seconds(self) -> float:
         return 1.0
 
-    async def inspect(self, request: PromptGuardRequest) -> PromptGuardDecision:
-        self.requests.append(request)
-        return self.decision
+    async def inspect_call(self, call: PromptGuardCall) -> PromptGuardCallResult:
+        self.requests.append(request_from_call(call))
+        return PromptGuardCallResult(self.decision)
 
 
 @pytest.fixture
@@ -271,7 +273,7 @@ async def test_cancellation_joins_checker_and_commits_cancelled_audit_before_ret
     joined = asyncio.Event()
 
     class WaitingClient(_GuardClient):
-        async def inspect(self, request):
+        async def inspect_call(self, call):
             entered.set()
             try:
                 await asyncio.Future()
