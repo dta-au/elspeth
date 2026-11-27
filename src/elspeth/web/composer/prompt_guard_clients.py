@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
@@ -11,13 +15,18 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.prompt_guard import (
     PROMPT_GUARD_MAX_DOCUMENTS_PER_CALL,
     PROMPT_GUARD_MAX_TEXT_CHARACTERS,
+    PromptGuardCall,
+    PromptGuardCallPlan,
+    PromptGuardCallResult,
     PromptGuardClient,
     PromptGuardDecision,
     PromptGuardRequest,
+    PromptGuardRequestUnavailable,
+    PromptGuardUnsupportedInput,
 )
 from elspeth.core.canonical import stable_hash
 from elspeth.web.composer.bounded_json import bounded_json_loads
-from elspeth.web.prompt_guard_config import AZURE_PROMPT_SHIELDS_API_VERSION, PromptGuardSettings
+from elspeth.web.prompt_guard_config import AZURE_PROMPT_SHIELDS_API_VERSION, AzurePromptGuardSettings, PromptGuardSettings
 
 _MAX_RESPONSE_BYTES = 65_536
 
@@ -95,11 +104,12 @@ def _admit_azure_response(body: bytes, *, document_count: int, has_user_prompt: 
 class AzurePromptGuardClient(PromptGuardClient):
     """One independent Azure endpoint; no runtime row/run identity or model keys."""
 
-    def __init__(self, settings: PromptGuardSettings, *, http_transport: httpx.AsyncBaseTransport | None = None) -> None:
-        if type(settings) is not PromptGuardSettings:
+    def __init__(self, settings: AzurePromptGuardSettings, *, http_transport: httpx.AsyncBaseTransport | None = None) -> None:
+        if type(settings) is not AzurePromptGuardSettings:
             raise AuditIntegrityError("Prompt guard factory requires owned Azure settings")
         self._settings = settings
         self._http_transport = http_transport
+        self._request_client: ContextVar[httpx.AsyncClient] = ContextVar("azure_prompt_guard_request_client")
         self._policy_fingerprint = stable_hash(
             {
                 "adapter": settings.adapter,
@@ -126,13 +136,32 @@ class AzurePromptGuardClient(PromptGuardClient):
     def timeout_seconds(self) -> float:
         return self._settings.timeout_seconds
 
-    async def inspect(self, request: PromptGuardRequest) -> PromptGuardDecision:
+    def plan_calls(self, request: PromptGuardRequest) -> PromptGuardCallPlan:
         if type(request) is not PromptGuardRequest:
             raise AuditIntegrityError("Prompt guard requires an owned immutable request")
         batches = _document_batches(request)
         if batches is None:
-            return PromptGuardDecision("unavailable", "unsupported_input")
-        url = f"{self._settings.endpoint}/contentsafety/text:shieldPrompt?api-version={AZURE_PROMPT_SHIELDS_API_VERSION}"
+            return PromptGuardCallPlan(PromptGuardUnsupportedInput())
+        calls: list[PromptGuardCall] = []
+        offset = 0
+        for documents in batches:
+            payload = json.dumps(
+                {"userPrompt": request.user_prompt, "documents": list(documents)},
+                ensure_ascii=False,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+            calls.append(PromptGuardCall(payload, tuple(range(offset, offset + len(documents))), bool(request.user_prompt)))
+            offset += len(documents)
+        return PromptGuardCallPlan(tuple(calls))
+
+    @asynccontextmanager
+    async def request_context(self) -> AsyncIterator[None]:
+        """Use one transport client for all physical calls of a request.
+
+        Opening, using and closing the client share one failure mapping, so a
+        transport that fails to open or close gives the request's decision.
+        """
         try:
             async with asyncio.timeout(self.timeout_seconds):
                 async with httpx.AsyncClient(
@@ -145,32 +174,46 @@ class AzurePromptGuardClient(PromptGuardClient):
                         "Accept-Encoding": "identity",
                     },
                 ) as client:
-                    for documents in batches:
-                        async with client.stream(
-                            "POST", url, json={"userPrompt": request.user_prompt, "documents": list(documents)}
-                        ) as response:
-                            if response.status_code != 200:
-                                return PromptGuardDecision("unavailable", "service_error")
-                            if response.headers.get("content-encoding", "identity").lower() != "identity":
-                                return PromptGuardDecision("unavailable", "invalid_response")
-                            body = bytearray()
-                            async for chunk in response.aiter_bytes(chunk_size=4096):
-                                if len(body) + len(chunk) > _MAX_RESPONSE_BYTES:
-                                    return PromptGuardDecision("unavailable", "invalid_response")
-                                body.extend(chunk)
-                            decision = _admit_azure_response(
-                                bytes(body), document_count=len(documents), has_user_prompt=bool(request.user_prompt)
-                            )
-                            if decision.disposition != "allow":
-                                return decision
+                    token = self._request_client.set(client)
+                    try:
+                        yield
+                    finally:
+                        self._request_client.reset(token)
         except TimeoutError:
-            return PromptGuardDecision("unavailable", "timeout")
+            raise PromptGuardRequestUnavailable(PromptGuardDecision("unavailable", "timeout")) from None
         except httpx.TimeoutException:
-            return PromptGuardDecision("unavailable", "timeout")
+            raise PromptGuardRequestUnavailable(PromptGuardDecision("unavailable", "timeout")) from None
         except httpx.HTTPError:
-            return PromptGuardDecision("unavailable", "service_error")
-        return PromptGuardDecision("allow", "clean")
+            raise PromptGuardRequestUnavailable(PromptGuardDecision("unavailable", "service_error")) from None
+
+    async def inspect_call(self, call: PromptGuardCall) -> PromptGuardCallResult:
+        if type(call) is not PromptGuardCall:
+            raise AuditIntegrityError("Prompt guard requires an owned physical call")
+        try:
+            client = self._request_client.get()
+        except LookupError:
+            raise AuditIntegrityError("Prompt guard physical call lacks a request context") from None
+        url = f"{self._settings.endpoint}/contentsafety/text:shieldPrompt?api-version={AZURE_PROMPT_SHIELDS_API_VERSION}"
+        # Transport errors are not caught here: they unwind through the request's client, as one failure mapping
+        # covers the whole client lifetime (``request_context``). The content headers are sent in the order a JSON
+        # body gives them: ``Content-Length`` then ``Content-Type``.
+        headers = {"Content-Length": str(len(call.payload)), "Content-Type": "application/json"}
+        async with client.stream("POST", url, content=call.payload, headers=headers) as response:
+            if response.status_code != 200:
+                return PromptGuardCallResult(PromptGuardDecision("unavailable", "service_error"))
+            if response.headers.get("content-encoding", "identity").lower() != "identity":
+                return PromptGuardCallResult(PromptGuardDecision("unavailable", "invalid_response"))
+            body = bytearray()
+            async for chunk in response.aiter_bytes(chunk_size=4096):
+                if len(body) + len(chunk) > _MAX_RESPONSE_BYTES:
+                    return PromptGuardCallResult(PromptGuardDecision("unavailable", "invalid_response"))
+                body.extend(chunk)
+            return PromptGuardCallResult(
+                _admit_azure_response(bytes(body), document_count=len(call.document_indexes), has_user_prompt=call.carries_user_prompt)
+            )
 
 
 def build_prompt_guard_client(settings: PromptGuardSettings) -> PromptGuardClient:
+    if type(settings) is not AzurePromptGuardSettings:
+        raise AuditIntegrityError("Prompt guard factory requires owned Azure settings")
     return AzurePromptGuardClient(settings)

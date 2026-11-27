@@ -13,6 +13,7 @@ from elspeth.contracts.prompt_guard import (
     PROMPT_GUARD_MAX_TEXT_CHARACTERS,
     PromptGuardRequest,
 )
+from elspeth.web.composer.prompt_guard import inspect_prompt_guard_request
 from elspeth.web.prompt_guard_config import PromptGuardSettings
 
 
@@ -44,7 +45,7 @@ async def test_azure_exact_user_documents_and_dedicated_credential_allow() -> No
         return httpx.Response(200, json=_response())
 
     client = AzurePromptGuardClient(_settings(), http_transport=httpx.MockTransport(serve))
-    result = await client.inspect(_request())
+    result = await inspect_prompt_guard_request(client, _request())
     assert (result.disposition, result.reason) == ("allow", "clean")
     assert len(observed) == 1
     assert str(observed[0].url) == "https://guard.example.test/contentsafety/text:shieldPrompt?api-version=2024-09-01"
@@ -75,7 +76,7 @@ async def test_azure_only_complete_strict_service_results_allow(payload: object,
     from elspeth.web.composer.prompt_guard_clients import AzurePromptGuardClient
 
     transport = httpx.MockTransport(lambda request: httpx.Response(200, json=payload))
-    result = await AzurePromptGuardClient(_settings(), http_transport=transport).inspect(_request())
+    result = await inspect_prompt_guard_request(AzurePromptGuardClient(_settings(), http_transport=transport), _request())
     assert result.disposition == expected
     if expected == "unavailable":
         assert result.reason == "invalid_response"
@@ -93,7 +94,9 @@ async def test_azure_batches_whole_documents_without_truncation() -> None:
         observed.append(body)
         return httpx.Response(200, json=_response(len(body["documents"])))
 
-    result = await AzurePromptGuardClient(_settings(), http_transport=httpx.MockTransport(serve)).inspect(_request(documents=documents))
+    result = await inspect_prompt_guard_request(
+        AzurePromptGuardClient(_settings(), http_transport=httpx.MockTransport(serve)), _request(documents=documents)
+    )
     assert result.disposition == "allow"
     returned = tuple(document for body in observed for document in body["documents"])
     assert returned == documents
@@ -123,7 +126,7 @@ async def test_azure_accepts_history_beyond_old_logical_limits_without_changing_
         return httpx.Response(200, json=_response(len(body["documents"])))
 
     client = AzurePromptGuardClient(_settings(timeout_seconds=60), http_transport=httpx.MockTransport(serve))
-    result = await client.inspect(_request(user=user, documents=documents))
+    result = await inspect_prompt_guard_request(client, _request(user=user, documents=documents))
     assert (result.disposition, result.reason) == ("allow", "clean")
     assert tuple(document for body in observed for document in body["documents"]) == documents
     assert len(observed) == 129
@@ -149,7 +152,9 @@ async def test_azure_unsupported_input_never_sends_partial_content(guard_request
         observed.append(sent)
         return httpx.Response(200, json=_response())
 
-    result = await AzurePromptGuardClient(_settings(), http_transport=httpx.MockTransport(serve)).inspect(guard_request)
+    result = await inspect_prompt_guard_request(
+        AzurePromptGuardClient(_settings(), http_transport=httpx.MockTransport(serve)), guard_request
+    )
     assert (result.disposition, result.reason) == ("unavailable", "unsupported_input")
     assert observed == []
 
@@ -165,7 +170,7 @@ async def test_azure_failure_is_safe_and_never_follows_redirects_or_retries(stat
         observed.append(request)
         return httpx.Response(status, headers={"location": "https://other.example.test"}, text="private provider body")
 
-    result = await AzurePromptGuardClient(_settings(), http_transport=httpx.MockTransport(serve)).inspect(_request())
+    result = await inspect_prompt_guard_request(AzurePromptGuardClient(_settings(), http_transport=httpx.MockTransport(serve)), _request())
     assert (result.disposition, result.reason) == ("unavailable", "service_error")
     assert len(observed) == 1
     assert "private" not in repr(result)
@@ -177,7 +182,7 @@ async def test_azure_rejects_malformed_and_oversized_response(body: bytes) -> No
     from elspeth.web.composer.prompt_guard_clients import AzurePromptGuardClient
 
     transport = httpx.MockTransport(lambda request: httpx.Response(200, content=body))
-    result = await AzurePromptGuardClient(_settings(), http_transport=transport).inspect(_request())
+    result = await inspect_prompt_guard_request(AzurePromptGuardClient(_settings(), http_transport=transport), _request())
     assert (result.disposition, result.reason) == ("unavailable", "invalid_response")
 
 
@@ -187,7 +192,7 @@ async def test_azure_duplicate_verdict_keys_cannot_hide_detected_attack() -> Non
 
     body = b'{"userPromptAnalysis":{"attackDetected":true,"attackDetected":false},"documentsAnalysis":[{"attackDetected":false}]}'
     transport = httpx.MockTransport(lambda request: httpx.Response(200, content=body))
-    result = await AzurePromptGuardClient(_settings(), http_transport=transport).inspect(_request())
+    result = await inspect_prompt_guard_request(AzurePromptGuardClient(_settings(), http_transport=transport), _request())
     assert (result.disposition, result.reason) == ("unavailable", "invalid_response")
 
 
@@ -196,10 +201,14 @@ async def test_azure_document_only_and_user_only_have_exact_coverage() -> None:
     from elspeth.web.composer.prompt_guard_clients import AzurePromptGuardClient
 
     document_transport = httpx.MockTransport(lambda request: httpx.Response(200, json={"documentsAnalysis": [{"attackDetected": False}]}))
-    document_result = await AzurePromptGuardClient(_settings(), http_transport=document_transport).inspect(_request(user=""))
+    document_result = await inspect_prompt_guard_request(
+        AzurePromptGuardClient(_settings(), http_transport=document_transport), _request(user="")
+    )
     assert document_result.disposition == "allow"
     user_transport = httpx.MockTransport(lambda request: httpx.Response(200, json={"userPromptAnalysis": {"attackDetected": False}}))
-    user_result = await AzurePromptGuardClient(_settings(), http_transport=user_transport).inspect(_request(documents=()))
+    user_result = await inspect_prompt_guard_request(
+        AzurePromptGuardClient(_settings(), http_transport=user_transport), _request(documents=())
+    )
     assert user_result.disposition == "allow"
 
 
@@ -214,8 +223,8 @@ async def test_azure_stops_remaining_batches_after_block() -> None:
         calls += 1
         return httpx.Response(200, json=_response(1, detected=True))
 
-    result = await AzurePromptGuardClient(_settings(), http_transport=httpx.MockTransport(serve)).inspect(
-        _request(documents=("a" * 6000, "b" * 6000))
+    result = await inspect_prompt_guard_request(
+        AzurePromptGuardClient(_settings(), http_transport=httpx.MockTransport(serve)), _request(documents=("a" * 6000, "b" * 6000))
     )
     assert result.disposition == "blocked"
     assert calls == 1
@@ -232,7 +241,7 @@ async def test_azure_transport_error_is_safe_without_retry() -> None:
         calls += 1
         raise httpx.ConnectError("seeded private transport details", request=request)
 
-    result = await AzurePromptGuardClient(_settings(), http_transport=httpx.MockTransport(serve)).inspect(_request())
+    result = await inspect_prompt_guard_request(AzurePromptGuardClient(_settings(), http_transport=httpx.MockTransport(serve)), _request())
     assert (result.disposition, result.reason) == ("unavailable", "service_error")
     assert calls == 1
     assert "private" not in repr(result)
@@ -251,7 +260,7 @@ async def test_azure_deadline_covers_entire_document_batch() -> None:
         return httpx.Response(200, json=_response(1))
 
     client = AzurePromptGuardClient(_settings(timeout_seconds=0.06), http_transport=httpx.MockTransport(serve))
-    result = await client.inspect(_request(documents=("a" * 6000, "b" * 6000)))
+    result = await inspect_prompt_guard_request(client, _request(documents=("a" * 6000, "b" * 6000)))
     assert (result.disposition, result.reason) == ("unavailable", "timeout")
     assert calls == 2
 
@@ -272,7 +281,7 @@ async def test_azure_cancellation_propagates_and_joins_transport() -> None:
             finished.set()
 
     client = AzurePromptGuardClient(_settings(), http_transport=httpx.MockTransport(serve))
-    task = asyncio.create_task(client.inspect(_request()))
+    task = asyncio.create_task(inspect_prompt_guard_request(client, _request()))
     await started.wait()
     task.cancel()
     with pytest.raises(asyncio.CancelledError):

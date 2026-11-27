@@ -885,8 +885,13 @@ async def test_sessionless_gateway_boot_probe_is_unqualified_without_dispatch(
         guard_calls.append((args, kwargs))
         raise AssertionError("sessionless gateway probe called the guard")
 
+    def forbid_guard_plan(*args: object, **kwargs: object) -> Any:
+        guard_calls.append((args, kwargs))
+        raise AssertionError("sessionless gateway probe planned a guard request")
+
     monkeypatch.setattr("litellm.acompletion", forbid_sdk)
-    monkeypatch.setattr("elspeth.web.composer.prompt_guard_clients.AzurePromptGuardClient.inspect", forbid_guard)
+    monkeypatch.setattr("elspeth.web.composer.prompt_guard_clients.AzurePromptGuardClient.plan_calls", forbid_guard_plan)
+    monkeypatch.setattr("elspeth.web.composer.prompt_guard_clients.AzurePromptGuardClient.inspect_call", forbid_guard)
     monkeypatch.setattr(provider_gateway, "enforce_prompt_guard", forbid_guard)
     requests = _planner_probe_requests(
         tmp_path,

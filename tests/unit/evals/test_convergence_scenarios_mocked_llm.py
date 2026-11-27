@@ -52,7 +52,7 @@ from pydantic import SecretBytes
 from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.composer_interpretation import InterpretationKind
-from elspeth.contracts.prompt_guard import PromptGuardClient, PromptGuardDecision, PromptGuardRequest
+from elspeth.contracts.prompt_guard import PromptGuardCall, PromptGuardCallResult, PromptGuardDecision
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.blobs.service import content_hash as _content_hash
 from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
@@ -69,6 +69,7 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
+from tests.helpers.prompt_guard_clients import SingleCallPromptGuardClient
 from tests.helpers.session_fences import seed_session_operation_fence
 from tests.unit.web.composer._helpers import _clean_advisor_checkpoint
 from tests.unit.web.composer._helpers import (
@@ -149,7 +150,7 @@ def _llm_response(content: str | None = None, tool_calls: list[dict[str, Any]] |
 # --------------------------------------------------------------------------
 
 
-class _AllowPromptGuard(PromptGuardClient):
+class _AllowPromptGuard(SingleCallPromptGuardClient):
     @property
     def adapter(self) -> str:
         return "controlled-convergence"
@@ -162,8 +163,8 @@ class _AllowPromptGuard(PromptGuardClient):
     def timeout_seconds(self) -> float:
         return 1.0
 
-    async def inspect(self, request: PromptGuardRequest) -> PromptGuardDecision:
-        return PromptGuardDecision("allow", "clean")
+    async def inspect_call(self, call: PromptGuardCall) -> PromptGuardCallResult:
+        return PromptGuardCallResult(PromptGuardDecision("allow", "clean"))
 
 
 @pytest.fixture(autouse=True)

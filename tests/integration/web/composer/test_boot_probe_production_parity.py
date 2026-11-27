@@ -313,8 +313,13 @@ async def test_sessionless_probe_is_not_qualified_and_calls_neither_provider(
         guard_calls.append((args, kwargs))
         raise AssertionError("sessionless probe called the guard")
 
+    def forbid_guard_plan(*args, **kwargs):
+        guard_calls.append((args, kwargs))
+        raise AssertionError("sessionless probe planned a guard request")
+
     monkeypatch.setattr("litellm.acompletion", forbid_sdk)
-    monkeypatch.setattr("elspeth.web.composer.prompt_guard_clients.AzurePromptGuardClient.inspect", forbid_guard)
+    monkeypatch.setattr("elspeth.web.composer.prompt_guard_clients.AzurePromptGuardClient.plan_calls", forbid_guard_plan)
+    monkeypatch.setattr("elspeth.web.composer.prompt_guard_clients.AzurePromptGuardClient.inspect_call", forbid_guard)
     monkeypatch.setattr(gateway_module, "enforce_prompt_guard", forbid_guard)
     requests = build_composer_probe_requests(settings)
     assert [request.surface for request in requests] == ["loop_tools", "planner_tools", "hatch_terminal", "advisor"]
