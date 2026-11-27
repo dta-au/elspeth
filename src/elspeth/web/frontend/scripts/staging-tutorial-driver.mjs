@@ -22,35 +22,55 @@ export function isAuditRequest(url, method) {
     /\/api\/sessions\/[0-9a-f-]{36}\/runs\/[^/]+\/audit-story(?:[?#]|$)/i.test(url);
 }
 
-async function isEnabled(locator) {
-  return locator.isEnabled().catch(() => false);
+// One attempt's actionability wait (visible, stable, enabled, receives events), never a response wait: 2 s lets a card's entry animation or a brief overlay clear on the loaded 4-vCPU staging box.
+const ENABLED_CLICK_TIMEOUT_MS = 2_000;
+// Attempts on a button that stays enabled while refusing: 3 gives a slow-settling button about 6 s in all, then Playwright's own error ends the walk.
+const STILL_ENABLED_CLICK_ATTEMPTS = 3;
+
+// Click the first enabled button `buttons` matches; the locator re-resolves when the click runs.
+// After the click, Playwright waits only for a page navigation the click starts (these buttons
+// start none), so the timeout never covers the request the click sends.
+// A refused click goes uncounted, and the caller rescans, only when `buttons` matches no enabled
+// button afterwards. While one is left, even on another card, the refusal counts in `refusals`
+// (reset when a click lands) and the last attempt rethrows Playwright's error.
+async function clickFirstEnabled(buttons, refusals) {
+  try {
+    await buttons.first().click({ timeout: ENABLED_CLICK_TIMEOUT_MS });
+  } catch (error) {
+    if (await buttons.count().catch(() => 0) === 0) return false;
+    refusals.count += 1;
+    if (refusals.count >= STILL_ENABLED_CLICK_ATTEMPTS) throw error;
+    return false;
+  }
+  refusals.count = 0;
+  return true;
 }
 
 export async function resolveVisibleReviews(page) {
   const promptRegions = page.getByRole("region", { name: "Prompt template review" });
+  const refusals = { count: 0 };
   let actions = 0;
-  for (let guard = 0; guard < 12; guard += 1) {
-    const regionCount = await promptRegions.count().catch(() => 0);
-    for (let i = 0; i < regionCount; i += 1) {
-      await promptRegions.nth(i).evaluate((element) => {
+  reviewPass: for (let guard = 0; guard < 12; guard += 1) {
+    // evaluateAll() acts on the regions present now and never waits; nth(i).evaluate() on a
+    // region that unmounted after the count would wait for the default timeout.
+    await promptRegions.evaluateAll((elements) => {
+      for (const element of elements) {
         element.scrollTop = element.scrollHeight;
         element.dispatchEvent(new Event("scroll"));
-      }).catch(() => {});
-    }
+      }
+    }).catch(() => {});
     let clicked = false;
     for (const name of ACKNOWLEDGEMENT_ACTIONS) {
-      const buttons = page.getByRole("button", { name });
-      const count = await buttons.count().catch(() => 0);
-      for (let i = 0; i < count; i += 1) {
-        const button = buttons.nth(i);
-        if (await isEnabled(button)) {
-          await button.click();
-          actions += 1;
-          clicked = true;
-          break;
-        }
-      }
-      if (clicked) break;
+      // count() reads the page once; a waiting check such as isEnabled() on an absent
+      // locator would block for the default timeout. The click re-resolves the first
+      // enabled button when it runs, so no index crosses from the check to the action.
+      const enabledButtons = page.getByRole("button", { name, disabled: false });
+      if (await enabledButtons.count().catch(() => 0) === 0) continue;
+      // A refused click rescans on the next pass.
+      if (!(await clickFirstEnabled(enabledButtons, refusals))) continue reviewPass;
+      actions += 1;
+      clicked = true;
+      break;
     }
     if (!clicked) break;
   }
@@ -66,17 +86,17 @@ export async function driveFreeformTutorial(page, options = {}) {
   await sendBrief.waitFor({ state: "visible", timeout: 30_000 });
   await sendBrief.click();
 
+  // A deliberate walk total, never reset on the disabled branch: a reset would let a Continue to Run that keeps toggling run to the deadline again.
+  const continueRefusals = { count: 0 };
+  const acceptRefusals = { count: 0 };
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const continueToRun = page.getByRole("button", { name: FREEFORM_BUILD_ACTION_NAMES[1] });
-    if (await isEnabled(continueToRun)) {
-      try {
-        await continueToRun.click({ timeout: 2_000 });
-      } catch (error) {
-        // A new review can disable this button between the enabled check and click.
-        if (!(await isEnabled(continueToRun))) continue;
-        throw error;
-      }
+    // count() reads the page once; isEnabled() on these usually-absent buttons would wait
+    // for the default timeout on every poll. Only enabled buttons match, and a click that
+    // is refused because a new review disabled or removed the button rescans.
+    const continueToRun = page.getByRole("button", { name: FREEFORM_BUILD_ACTION_NAMES[1], disabled: false });
+    if (await continueToRun.count().catch(() => 0) > 0) {
+      if (!(await clickFirstEnabled(continueToRun, continueRefusals))) continue;
       await page.getByRole("heading", { name: /Ready to run/i }).waitFor({ state: "visible", timeout: 60_000 });
       await page.getByRole("button", { name: FREEFORM_BUILD_ACTION_NAMES[2], exact: true }).click();
       await page.getByRole("button", { name: "Continue", exact: true })
@@ -84,9 +104,9 @@ export async function driveFreeformTutorial(page, options = {}) {
       return;
     }
     const accept = page.getByRole("region", { name: /Awaiting your decision/ })
-      .getByRole("button", { name: /Accept proposal:/ }).first();
-    if (await isEnabled(accept)) {
-      await accept.click();
+      .getByRole("button", { name: /Accept proposal:/, disabled: false });
+    if (await accept.count().catch(() => 0) > 0) {
+      await clickFirstEnabled(accept, acceptRefusals);
       continue;
     }
     if (await resolveVisibleReviews(page) > 0) continue;
