@@ -1,0 +1,785 @@
+{
+  "attack_on_second_document_call_stops_later_calls": {
+    "outcomes": [
+      {
+        "adapter": "azure_prompt_shields",
+        "disposition": "blocked",
+        "policy_fingerprint": "ccdcf97c6371014df4d62e88e38ffb4c9a1cb4dcae7a84aab1b005eacdadc32d",
+        "reason": "policy_blocked",
+        "schema_version": 2,
+        "units_reused": 0,
+        "units_scanned": 6
+      }
+    ],
+    "requests": [
+      {
+        "body_sha256": "6336c5df7e8269a82118d2416118f52ebe2d346c03a32a17cceea854bdde8246",
+        "header_order": [
+          "ocp-apim-subscription-key",
+          "accept-encoding",
+          "content-length",
+          "content-type"
+        ],
+        "headers": {
+          "accept-encoding": "identity",
+          "content-length": "6070",
+          "content-type": "application/json"
+        },
+        "method": "POST",
+        "subscription_key_present": true,
+        "url": "https://guard.example.test/contentsafety/text:shieldPrompt?api-version=2024-09-01"
+      },
+      {
+        "body_sha256": "0632e2c68ae18dc36aa5a7e08115aa78da6d0d5219ce46f3cba62d98616526c2",
+        "header_order": [
+          "ocp-apim-subscription-key",
+          "accept-encoding",
+          "content-length",
+          "content-type"
+        ],
+        "headers": {
+          "accept-encoding": "identity",
+          "content-length": "6070",
+          "content-type": "application/json"
+        },
+        "method": "POST",
+        "subscription_key_present": true,
+        "url": "https://guard.example.test/contentsafety/text:shieldPrompt?api-version=2024-09-01"
+      }
+    ]
+  },
+  "call_timeout_reaches_an_exit_sensitive_close": {
+    "outcomes": [
+      {
+        "adapter": "azure_prompt_shields",
+        "disposition": "unavailable",
+        "policy_fingerprint": "ccdcf97c6371014df4d62e88e38ffb4c9a1cb4dcae7a84aab1b005eacdadc32d",
+        "reason": "timeout",
+        "schema_version": 2,
+        "units_reused": 0,
+        "units_scanned": 1
+      }
+    ],
+    "requests": [
+      {
+        "body_sha256": "8c0779a04fa648bc0d1be77bc90adf64d7d7f0ed2c909082be5acc36e5c676d5",
+        "header_order": [
+          "ocp-apim-subscription-key",
+          "accept-encoding",
+          "content-length",
+          "content-type"
+        ],
+        "headers": {
+          "accept-encoding": "identity",
+          "content-length": "45",
+          "content-type": "application/json"
+        },
+        "method": "POST",
+        "subscription_key_present": true,
+        "url": "https://guard.example.test/contentsafety/text:shieldPrompt?api-version=2024-09-01"
+      }
+    ]
+  },
+  "client_close_error": {
+    "outcomes": [
+      {
+        "adapter": "azure_prompt_shields",
+        "disposition": "unavailable",
+        "policy_fingerprint": "ccdcf97c6371014df4d62e88e38ffb4c9a1cb4dcae7a84aab1b005eacdadc32d",
+        "reason": "service_error",
+        "schema_version": 2,
+        "units_reused": 0,
+        "units_scanned": 2
+      }
+    ],
+    "requests": [
+      {
+        "body_sha256": "8c0779a04fa648bc0d1be77bc90adf64d7d7f0ed2c909082be5acc36e5c676d5",
+        "header_order": [
+          "ocp-apim-subscription-key",
+          "accept-encoding",
+          "content-length",
+          "content-type"
+        ],
+        "headers": {
+          "accept-encoding": "identity",
+          "content-length": "45",
+          "content-type": "application/json"
+        },
+        "method": "POST",
+        "subscription_key_present": true,
+        "url": "https://guard.example.test/contentsafety/text:shieldPrompt?api-version=2024-09-01"
+      },
+      {
+        "body_sha256": "463f622b987c8875c964bf96b31c9241a24a2d16aa7dd69242638d2e71d12b7d",
+        "header_order": [
+          "ocp-apim-subscription-key",
+          "accept-encoding",
+          "content-length",
+          "content-type"
+        ],
+        "headers": {
+          "accept-encoding": "identity",
+          "content-length": "84",
+          "content-type": "application/json"
+        },
+        "method": "POST",
+        "subscription_key_present": true,
+        "url": "https://guard.example.test/contentsafety/text:shieldPrompt?api-version=2024-09-01"
+      }
+    ]
+  },
+  "client_open_error": {
+    "outcomes": [
+      {
+        "adapter": "azure_prompt_shields",
+        "disposition": "unavailable",
+        "policy_fingerprint": "ccdcf97c6371014df4d62e88e38ffb4c9a1cb4dcae7a84aab1b005eacdadc32d",
+        "reason": "service_error",
+        "schema_version": 2,
+        "units_reused": 0,
+        "units_scanned": 2
+      }
+    ],
+    "requests": []
+  },
+  "document_at_limit_is_sent": {
+    "outcomes": [
+      {
+        "adapter": "azure_prompt_shields",
+        "disposition": "allow",
+        "policy_fingerprint": "ccdcf97c6371014df4d62e88e38ffb4c9a1cb4dcae7a84aab1b005eacdadc32d",
+        "reason": "clean",
+        "schema_version": 2,
+        "units_reused": 0,
+        "units_scanned": 1
+      }
+    ],
+    "requests": [
+      {
+        "body_sha256": "f16fbbf69bc3c5ec5e2183c19ea843dabf6b4765579e3d9874b129a637c0c107",
+        "header_order": [
+          "ocp-apim-subscription-key",
+          "accept-encoding",
+          "content-length",
+          "content-type"
+        ],
+        "headers": {
+          "accept-encoding": "identity",
+          "content-length": "10042",
+          "content-type": "application/json"
+        },
+        "method": "POST",
+        "subscription_key_present": true,
+        "url": "https://guard.example.test/contentsafety/text:shieldPrompt?api-version=2024-09-01"
+      }
+    ]
+  },
+  "document_over_limit_is_refused": {
+    "outcomes": [
+      {
+        "adapter": "azure_prompt_shields",
+        "disposition": "unavailable",
+        "policy_fingerprint": "ccdcf97c6371014df4d62e88e38ffb4c9a1cb4dcae7a84aab1b005eacdadc32d",
+        "reason": "unsupported_input",
+        "schema_version": 2,
+        "units_reused": 0,
+        "units_scanned": 0
+      }
+    ],
+    "requests": []
+  },
+  "documents_only": {
+    "outcomes": [
+      {
+        "adapter": "azure_prompt_shields",
+        "disposition": "allow",
+        "policy_fingerprint": "ccdcf97c6371014df4d62e88e38ffb4c9a1cb4dcae7a84aab1b005eacdadc32d",
+        "reason": "clean",
+        "schema_version": 2,
+        "units_reused": 0,
+        "units_scanned": 1
+      }
+    ],
+    "requests": [
+      {
+        "body_sha256": "463f622b987c8875c964bf96b31c9241a24a2d16aa7dd69242638d2e71d12b7d",
+        "header_order": [
+          "ocp-apim-subscription-key",
+          "accept-encoding",
+          "content-length",
+          "content-type"
+        ],
+        "headers": {
+          "accept-encoding": "identity",
+          "content-length": "84",
+          "content-type": "application/json"
+        },
+        "method": "POST",
+        "subscription_key_present": true,
+        "url": "https://guard.example.test/contentsafety/text:shieldPrompt?api-version=2024-09-01"
+      }
+    ]
+  },
+  "five_large_documents_split_by_characters": {
+    "outcomes": [
+      {
+        "adapter": "azure_prompt_shields",
+        "disposition": "allow",
+        "policy_fingerprint": "ccdcf97c6371014df4d62e88e38ffb4c9a1cb4dcae7a84aab1b005eacdadc32d",
+        "reason": "clean",
+        "schema_version": 2,
+        "units_reused": 0,
+        "units_scanned": 5
+      }
+    ],
+    "requests": [
+      {
+        "body_sha256": "6336c5df7e8269a82118d2416118f52ebe2d346c03a32a17cceea854bdde8246",
+        "header_order": [
+          "ocp-apim-subscription-key",
+          "accept-encoding",
+          "content-length",
+          "content-type"
+        ],
+        "headers": {
+          "accept-encoding": "identity",
+          "content-length": "6070",
+          "content-type": "application/json"
+        },
+        "method": "POST",
+        "subscription_key_present": true,
+        "url": "https://guard.example.test/contentsafety/text:shieldPrompt?api-version=2024-09-01"
+      },
+      {
+        "body_sha256": "0632e2c68ae18dc36aa5a7e08115aa78da6d0d5219ce46f3cba62d98616526c2",
+        "header_order": [
+          "ocp-apim-subscription-key",
+          "accept-encoding",
+          "content-length",
+          "content-type"
+        ],
+        "headers": {
+          "accept-encoding": "identity",
+          "content-length": "6070",
+          "content-type": "application/json"
+        },
+        "method": "POST",
+        "subscription_key_present": true,
+        "url": "https://guard.example.test/contentsafety/text:shieldPrompt?api-version=2024-09-01"
+      },
+      {
+        "body_sha256": "96b7cdbab5f34586b16733921be3297c155fbc1dcb515b03da842ebd5a821f21",
+        "header_order": [
+          "ocp-apim-subscription-key",
+          "accept-encoding",
+          "content-length",
+          "content-type"
+        ],
+        "headers": {
+          "accept-encoding": "identity",
+          "content-length": "6070",
+          "content-type": "application/json"
+        },
+        "method": "POST",
+        "subscription_key_present": true,
+        "url": "https://guard.example.test/contentsafety/text:shieldPrompt?api-version=2024-09-01"
+      },
+      {
+        "body_sha256": "9fa1526c8dc6f3b7471128c3f1f5e1ac6db815f3c69099d149ab3540e42dbc98",
+        "header_order": [
+          "ocp-apim-subscription-key",
+          "accept-encoding",
+          "content-length",
+          "content-type"
+        ],
+        "headers": {
+          "accept-encoding": "identity",
+          "content-length": "6070",
+          "content-type": "application/json"
+        },
+        "method": "POST",
+        "subscription_key_present": true,
+        "url": "https://guard.example.test/contentsafety/text:shieldPrompt?api-version=2024-09-01"
+      },
+      {
+        "body_sha256": "a827182bc39c012ae5bbf718687b1192db1552c867712e33bf893425e976713a",
+        "header_order": [
+          "ocp-apim-subscription-key",
+          "accept-encoding",
+          "content-length",
+          "content-type"
+        ],
+        "headers": {
+          "accept-encoding": "identity",
+          "content-length": "6070",
+          "content-type": "application/json"
+        },
+        "method": "POST",
+        "subscription_key_present": true,
+        "url": "https://guard.example.test/contentsafety/text:shieldPrompt?api-version=2024-09-01"
+      }
+    ]
+  },
+  "invalid_body": {
+    "outcomes": [
+      {
+        "adapter": "azure_prompt_shields",
+        "disposition": "unavailable",
+        "policy_fingerprint": "ccdcf97c6371014df4d62e88e38ffb4c9a1cb4dcae7a84aab1b005eacdadc32d",
+        "reason": "invalid_response",
+        "schema_version": 2,
+        "units_reused": 0,
+        "units_scanned": 1
+      }
+    ],
+    "requests": [
+      {
+        "body_sha256": "8c0779a04fa648bc0d1be77bc90adf64d7d7f0ed2c909082be5acc36e5c676d5",
+        "header_order": [
+          "ocp-apim-subscription-key",
+          "accept-encoding",
+          "content-length",
+          "content-type"
+        ],
+        "headers": {
+          "accept-encoding": "identity",
+          "content-length": "45",
+          "content-type": "application/json"
+        },
+        "method": "POST",
+        "subscription_key_present": true,
+        "url": "https://guard.example.test/contentsafety/text:shieldPrompt?api-version=2024-09-01"
+      }
+    ]
+  },
+  "non_200_answer": {
+    "outcomes": [
+      {
+        "adapter": "azure_prompt_shields",
+        "disposition": "unavailable",
+        "policy_fingerprint": "ccdcf97c6371014df4d62e88e38ffb4c9a1cb4dcae7a84aab1b005eacdadc32d",
+        "reason": "service_error",
+        "schema_version": 2,
+        "units_reused": 0,
+        "units_scanned": 1
+      }
+    ],
+    "requests": [
+      {
+        "body_sha256": "8c0779a04fa648bc0d1be77bc90adf64d7d7f0ed2c909082be5acc36e5c676d5",
+        "header_order": [
+          "ocp-apim-subscription-key",
+          "accept-encoding",
+          "content-length",
+          "content-type"
+        ],
+        "headers": {
+          "accept-encoding": "identity",
+          "content-length": "45",
+          "content-type": "application/json"
+        },
+        "method": "POST",
+        "subscription_key_present": true,
+        "url": "https://guard.example.test/contentsafety/text:shieldPrompt?api-version=2024-09-01"
+      }
+    ]
+  },
+  "non_ascii_text": {
+    "outcomes": [
+      {
+        "adapter": "azure_prompt_shields",
+        "disposition": "allow",
+        "policy_fingerprint": "ccdcf97c6371014df4d62e88e38ffb4c9a1cb4dcae7a84aab1b005eacdadc32d",
+        "reason": "clean",
+        "schema_version": 2,
+        "units_reused": 0,
+        "units_scanned": 2
+      }
+    ],
+    "requests": [
+      {
+        "body_sha256": "b026e524ec8899a50ec381605e50a8b8f3a3d34980a0264bec567c3de82f489f",
+        "header_order": [
+          "ocp-apim-subscription-key",
+          "accept-encoding",
+          "content-length",
+          "content-type"
+        ],
+        "headers": {
+          "accept-encoding": "identity",
+          "content-length": "40",
+          "content-type": "application/json"
+        },
+        "method": "POST",
+        "subscription_key_present": true,
+        "url": "https://guard.example.test/contentsafety/text:shieldPrompt?api-version=2024-09-01"
+      },
+      {
+        "body_sha256": "fba6cee09c881c1dd2841af5723172520a1bd0647257b68850b1b488f1966cbd",
+        "header_order": [
+          "ocp-apim-subscription-key",
+          "accept-encoding",
+          "content-length",
+          "content-type"
+        ],
+        "headers": {
+          "accept-encoding": "identity",
+          "content-length": "80",
+          "content-type": "application/json"
+        },
+        "method": "POST",
+        "subscription_key_present": true,
+        "url": "https://guard.example.test/contentsafety/text:shieldPrompt?api-version=2024-09-01"
+      }
+    ]
+  },
+  "oversize_unit_enforced": {
+    "outcomes": [
+      {
+        "adapter": "azure_prompt_shields",
+        "disposition": "unavailable",
+        "policy_fingerprint": "ccdcf97c6371014df4d62e88e38ffb4c9a1cb4dcae7a84aab1b005eacdadc32d",
+        "reason": "unsupported_input",
+        "schema_version": 2,
+        "units_reused": 0,
+        "units_scanned": 0
+      }
+    ],
+    "requests": []
+  },
+  "oversize_unit_not_enforced": {
+    "outcomes": [
+      {
+        "adapter": "unconfigured",
+        "disposition": "debug_bypass",
+        "policy_fingerprint": "6a48c8da63ff35f1634dde6db6bbd183c472bedb9a78d601d6f1c78c6fc67882",
+        "reason": "guard_not_configured",
+        "schema_version": 2,
+        "units_reused": 0,
+        "units_scanned": 0
+      }
+    ],
+    "requests": []
+  },
+  "prompt_only": {
+    "outcomes": [
+      {
+        "adapter": "azure_prompt_shields",
+        "disposition": "allow",
+        "policy_fingerprint": "ccdcf97c6371014df4d62e88e38ffb4c9a1cb4dcae7a84aab1b005eacdadc32d",
+        "reason": "clean",
+        "schema_version": 2,
+        "units_reused": 0,
+        "units_scanned": 1
+      }
+    ],
+    "requests": [
+      {
+        "body_sha256": "8c0779a04fa648bc0d1be77bc90adf64d7d7f0ed2c909082be5acc36e5c676d5",
+        "header_order": [
+          "ocp-apim-subscription-key",
+          "accept-encoding",
+          "content-length",
+          "content-type"
+        ],
+        "headers": {
+          "accept-encoding": "identity",
+          "content-length": "45",
+          "content-type": "application/json"
+        },
+        "method": "POST",
+        "subscription_key_present": true,
+        "url": "https://guard.example.test/contentsafety/text:shieldPrompt?api-version=2024-09-01"
+      }
+    ]
+  },
+  "prompt_plus_documents": {
+    "outcomes": [
+      {
+        "adapter": "azure_prompt_shields",
+        "disposition": "allow",
+        "policy_fingerprint": "ccdcf97c6371014df4d62e88e38ffb4c9a1cb4dcae7a84aab1b005eacdadc32d",
+        "reason": "clean",
+        "schema_version": 2,
+        "units_reused": 0,
+        "units_scanned": 2
+      }
+    ],
+    "requests": [
+      {
+        "body_sha256": "8c0779a04fa648bc0d1be77bc90adf64d7d7f0ed2c909082be5acc36e5c676d5",
+        "header_order": [
+          "ocp-apim-subscription-key",
+          "accept-encoding",
+          "content-length",
+          "content-type"
+        ],
+        "headers": {
+          "accept-encoding": "identity",
+          "content-length": "45",
+          "content-type": "application/json"
+        },
+        "method": "POST",
+        "subscription_key_present": true,
+        "url": "https://guard.example.test/contentsafety/text:shieldPrompt?api-version=2024-09-01"
+      },
+      {
+        "body_sha256": "463f622b987c8875c964bf96b31c9241a24a2d16aa7dd69242638d2e71d12b7d",
+        "header_order": [
+          "ocp-apim-subscription-key",
+          "accept-encoding",
+          "content-length",
+          "content-type"
+        ],
+        "headers": {
+          "accept-encoding": "identity",
+          "content-length": "84",
+          "content-type": "application/json"
+        },
+        "method": "POST",
+        "subscription_key_present": true,
+        "url": "https://guard.example.test/contentsafety/text:shieldPrompt?api-version=2024-09-01"
+      }
+    ]
+  },
+  "second_check_reuses_units": {
+    "outcomes": [
+      {
+        "adapter": "azure_prompt_shields",
+        "disposition": "allow",
+        "policy_fingerprint": "ccdcf97c6371014df4d62e88e38ffb4c9a1cb4dcae7a84aab1b005eacdadc32d",
+        "reason": "clean",
+        "schema_version": 2,
+        "units_reused": 0,
+        "units_scanned": 2
+      },
+      {
+        "adapter": "azure_prompt_shields",
+        "disposition": "allow",
+        "policy_fingerprint": "ccdcf97c6371014df4d62e88e38ffb4c9a1cb4dcae7a84aab1b005eacdadc32d",
+        "reason": "clean",
+        "schema_version": 2,
+        "units_reused": 2,
+        "units_scanned": 0
+      }
+    ],
+    "requests": [
+      {
+        "body_sha256": "8c0779a04fa648bc0d1be77bc90adf64d7d7f0ed2c909082be5acc36e5c676d5",
+        "header_order": [
+          "ocp-apim-subscription-key",
+          "accept-encoding",
+          "content-length",
+          "content-type"
+        ],
+        "headers": {
+          "accept-encoding": "identity",
+          "content-length": "45",
+          "content-type": "application/json"
+        },
+        "method": "POST",
+        "subscription_key_present": true,
+        "url": "https://guard.example.test/contentsafety/text:shieldPrompt?api-version=2024-09-01"
+      },
+      {
+        "body_sha256": "463f622b987c8875c964bf96b31c9241a24a2d16aa7dd69242638d2e71d12b7d",
+        "header_order": [
+          "ocp-apim-subscription-key",
+          "accept-encoding",
+          "content-length",
+          "content-type"
+        ],
+        "headers": {
+          "accept-encoding": "identity",
+          "content-length": "84",
+          "content-type": "application/json"
+        },
+        "method": "POST",
+        "subscription_key_present": true,
+        "url": "https://guard.example.test/contentsafety/text:shieldPrompt?api-version=2024-09-01"
+      }
+    ]
+  },
+  "six_large_documents_split_by_characters": {
+    "outcomes": [
+      {
+        "adapter": "azure_prompt_shields",
+        "disposition": "allow",
+        "policy_fingerprint": "ccdcf97c6371014df4d62e88e38ffb4c9a1cb4dcae7a84aab1b005eacdadc32d",
+        "reason": "clean",
+        "schema_version": 2,
+        "units_reused": 0,
+        "units_scanned": 6
+      }
+    ],
+    "requests": [
+      {
+        "body_sha256": "6336c5df7e8269a82118d2416118f52ebe2d346c03a32a17cceea854bdde8246",
+        "header_order": [
+          "ocp-apim-subscription-key",
+          "accept-encoding",
+          "content-length",
+          "content-type"
+        ],
+        "headers": {
+          "accept-encoding": "identity",
+          "content-length": "6070",
+          "content-type": "application/json"
+        },
+        "method": "POST",
+        "subscription_key_present": true,
+        "url": "https://guard.example.test/contentsafety/text:shieldPrompt?api-version=2024-09-01"
+      },
+      {
+        "body_sha256": "0632e2c68ae18dc36aa5a7e08115aa78da6d0d5219ce46f3cba62d98616526c2",
+        "header_order": [
+          "ocp-apim-subscription-key",
+          "accept-encoding",
+          "content-length",
+          "content-type"
+        ],
+        "headers": {
+          "accept-encoding": "identity",
+          "content-length": "6070",
+          "content-type": "application/json"
+        },
+        "method": "POST",
+        "subscription_key_present": true,
+        "url": "https://guard.example.test/contentsafety/text:shieldPrompt?api-version=2024-09-01"
+      },
+      {
+        "body_sha256": "96b7cdbab5f34586b16733921be3297c155fbc1dcb515b03da842ebd5a821f21",
+        "header_order": [
+          "ocp-apim-subscription-key",
+          "accept-encoding",
+          "content-length",
+          "content-type"
+        ],
+        "headers": {
+          "accept-encoding": "identity",
+          "content-length": "6070",
+          "content-type": "application/json"
+        },
+        "method": "POST",
+        "subscription_key_present": true,
+        "url": "https://guard.example.test/contentsafety/text:shieldPrompt?api-version=2024-09-01"
+      },
+      {
+        "body_sha256": "9fa1526c8dc6f3b7471128c3f1f5e1ac6db815f3c69099d149ab3540e42dbc98",
+        "header_order": [
+          "ocp-apim-subscription-key",
+          "accept-encoding",
+          "content-length",
+          "content-type"
+        ],
+        "headers": {
+          "accept-encoding": "identity",
+          "content-length": "6070",
+          "content-type": "application/json"
+        },
+        "method": "POST",
+        "subscription_key_present": true,
+        "url": "https://guard.example.test/contentsafety/text:shieldPrompt?api-version=2024-09-01"
+      },
+      {
+        "body_sha256": "a827182bc39c012ae5bbf718687b1192db1552c867712e33bf893425e976713a",
+        "header_order": [
+          "ocp-apim-subscription-key",
+          "accept-encoding",
+          "content-length",
+          "content-type"
+        ],
+        "headers": {
+          "accept-encoding": "identity",
+          "content-length": "6070",
+          "content-type": "application/json"
+        },
+        "method": "POST",
+        "subscription_key_present": true,
+        "url": "https://guard.example.test/contentsafety/text:shieldPrompt?api-version=2024-09-01"
+      },
+      {
+        "body_sha256": "e645b03fddcada7a0870ddaaf18d1f2339b554b16f7e4aa16e962d7716e909b9",
+        "header_order": [
+          "ocp-apim-subscription-key",
+          "accept-encoding",
+          "content-length",
+          "content-type"
+        ],
+        "headers": {
+          "accept-encoding": "identity",
+          "content-length": "6070",
+          "content-type": "application/json"
+        },
+        "method": "POST",
+        "subscription_key_present": true,
+        "url": "https://guard.example.test/contentsafety/text:shieldPrompt?api-version=2024-09-01"
+      }
+    ]
+  },
+  "timeout": {
+    "outcomes": [
+      {
+        "adapter": "azure_prompt_shields",
+        "disposition": "unavailable",
+        "policy_fingerprint": "f4330e3b67ba5090dc8ca5d24bb2174f59dbb3ecb9bf76c8e1cccaac8e625d64",
+        "reason": "timeout",
+        "schema_version": 2,
+        "units_reused": 0,
+        "units_scanned": 1
+      }
+    ],
+    "requests": [
+      {
+        "body_sha256": "8c0779a04fa648bc0d1be77bc90adf64d7d7f0ed2c909082be5acc36e5c676d5",
+        "header_order": [
+          "ocp-apim-subscription-key",
+          "accept-encoding",
+          "content-length",
+          "content-type"
+        ],
+        "headers": {
+          "accept-encoding": "identity",
+          "content-length": "45",
+          "content-type": "application/json"
+        },
+        "method": "POST",
+        "subscription_key_present": true,
+        "url": "https://guard.example.test/contentsafety/text:shieldPrompt?api-version=2024-09-01"
+      }
+    ]
+  },
+  "trusted_beside_untrusted": {
+    "outcomes": [
+      {
+        "adapter": "azure_prompt_shields",
+        "disposition": "allow",
+        "policy_fingerprint": "ccdcf97c6371014df4d62e88e38ffb4c9a1cb4dcae7a84aab1b005eacdadc32d",
+        "reason": "clean",
+        "schema_version": 2,
+        "units_reused": 0,
+        "units_scanned": 1
+      }
+    ],
+    "requests": [
+      {
+        "body_sha256": "7e80aa0a1ed4480155470822279b3c92c708c736ff703e7411bdc04705854b53",
+        "header_order": [
+          "ocp-apim-subscription-key",
+          "accept-encoding",
+          "content-length",
+          "content-type"
+        ],
+        "headers": {
+          "accept-encoding": "identity",
+          "content-length": "78",
+          "content-type": "application/json"
+        },
+        "method": "POST",
+        "subscription_key_present": true,
+        "url": "https://guard.example.test/contentsafety/text:shieldPrompt?api-version=2024-09-01"
+      }
+    ]
+  }
+}

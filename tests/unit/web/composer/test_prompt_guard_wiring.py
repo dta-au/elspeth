@@ -15,7 +15,8 @@ from sqlalchemy import select
 from elspeth.contracts.composer_interpretation import InterpretationChoice, InterpretationKind
 from elspeth.contracts.prompt_guard import (
     PROMPT_GUARD_TRUST_KEY,
-    PromptGuardClient,
+    PromptGuardCall,
+    PromptGuardCallResult,
     PromptGuardDecision,
     PromptGuardRequest,
     PromptGuardTrust,
@@ -26,7 +27,7 @@ from elspeth.web.composer import provider_gateway
 from elspeth.web.composer import service as service_module
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.graph_recovery import GraphRecoveryContext
-from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused, prompt_guard_user_scope
+from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused, enforce_prompt_guard, prompt_guard_user_scope
 from elspeth.web.composer.provider_quota import ProviderInvocationFamily, ProviderInvocationOwner
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.required_work import (
@@ -46,11 +47,12 @@ from elspeth.web.sessions.models import (
 )
 from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.routes._helpers import _persist_turn_audit_cohort, _state_from_record
+from tests.helpers.prompt_guard_clients import SingleCallPromptGuardClient, request_from_call
 from tests.unit.web.composer._helpers import _empty_state, _make_settings, _mock_catalog
 from tests.unit.web.sessions.test_token_usage_adapters import _quota_service
 
 
-class _Client(PromptGuardClient):
+class _Client(SingleCallPromptGuardClient):
     def __init__(self, decision: PromptGuardDecision) -> None:
         self.decision = decision
         self.requests: list[PromptGuardRequest] = []
@@ -67,9 +69,9 @@ class _Client(PromptGuardClient):
     def timeout_seconds(self) -> float:
         return 1.0
 
-    async def inspect(self, request: PromptGuardRequest) -> PromptGuardDecision:
-        self.requests.append(request)
-        return self.decision
+    async def inspect_call(self, call: PromptGuardCall) -> PromptGuardCallResult:
+        self.requests.append(request_from_call(call))
+        return PromptGuardCallResult(self.decision)
 
 
 def _check_requests(requests: list[PromptGuardRequest]) -> list[list[PromptGuardRequest]]:
@@ -315,10 +317,13 @@ async def test_real_advisor_format_retry_gets_its_own_guard_and_preserves_prior_
     engine, _sessions, owner, coordinator = invocation
 
     class RetryClient(_Client):
-        async def inspect(self, request):
+        async def inspect_call(self, call):
+            request = request_from_call(call)
             self.requests.append(request)
             first_check = request.request_hash == self.requests[0].request_hash
-            return PromptGuardDecision("allow", "clean") if first_check else PromptGuardDecision("blocked", "policy_blocked")
+            return PromptGuardCallResult(
+                PromptGuardDecision("allow", "clean") if first_check else PromptGuardDecision("blocked", "policy_blocked")
+            )
 
     client = RetryClient(PromptGuardDecision("allow", "clean"))
     service = _guarded_service(invocation, monkeypatch, advisor_client=client)
@@ -549,13 +554,42 @@ async def test_guard_refusal_has_no_model_audit_or_provider_retry(invocation, mo
 
 
 @pytest.mark.asyncio
+async def test_adapter_timeout_ends_the_whole_check_before_the_documents_request(invocation):
+    # An adapter's own TimeoutError ends the whole check as a timeout: the documents request is never sent.
+    engine, _service, owner, coordinator = invocation
+
+    class TimingOutClient(_Client):
+        async def inspect_call(self, call):
+            self.requests.append(request_from_call(call))
+            raise TimeoutError
+
+    client = TimingOutClient(PromptGuardDecision("allow", "clean"))
+    with pytest.raises(PromptGuardRefused):
+        await enforce_prompt_guard(
+            mount=PromptGuardMount(client),
+            mode="required",
+            role="composer",
+            provider_custody=owner.mint(ProviderInvocationFamily.PRIMARY),
+            messages=[{"role": "tool", "content": "Graph evidence"}, {"role": "user", "content": "Compare columns."}],
+            user_prompt="Compare columns.",
+            trusted_message_indexes=frozenset(),
+        )
+    assert [request.documents for request in client.requests] == [()]
+    with engine.connect() as connection:
+        rows = connection.execute(select(chat_messages_table)).all()
+    check = rows[0].tool_calls[0]["check"]
+    assert (check["disposition"], check["reason"]) == ("unavailable", "timeout")
+    coordinator.assert_completed()
+
+
+@pytest.mark.asyncio
 async def test_existing_provider_deadline_includes_guard_and_joins_cancelled_check(invocation, monkeypatch):
     engine, _service, owner, coordinator = invocation
     entered = asyncio.Event()
     joined = asyncio.Event()
 
     class WaitingClient(_Client):
-        async def inspect(self, request):
+        async def inspect_call(self, call):
             entered.set()
             try:
                 await asyncio.Future()
@@ -745,11 +779,11 @@ async def test_allow_binds_detached_messages_and_tools_despite_caller_mutation(i
     tools = [{"type": "function", "function": {"name": "neutral_tool", "description": "Original description"}}]
 
     class MutatingClient(_Client):
-        async def inspect(self, request):
-            self.requests.append(request)
+        async def inspect_call(self, call):
+            self.requests.append(request_from_call(call))
             messages[0]["content"] = "Changed after inspection"
             tools[0]["function"]["description"] = "Changed after inspection"
-            return PromptGuardDecision("allow", "clean")
+            return PromptGuardCallResult(PromptGuardDecision("allow", "clean"))
 
     client = MutatingClient(PromptGuardDecision("allow", "clean"))
     sent = []

@@ -48,7 +48,8 @@ from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.prompt_guard import (
     PROMPT_GUARD_MAX_TEXT_CHARACTERS,
-    PromptGuardClient,
+    PromptGuardCall,
+    PromptGuardCallResult,
     PromptGuardDecision,
     PromptGuardMode,
     PromptGuardRequest,
@@ -160,6 +161,7 @@ from tests.helpers.prompt_guard_audit import (
     assert_prompt_guard_check_shape,
     unscanned_check_counts,
 )
+from tests.helpers.prompt_guard_clients import SingleCallPromptGuardClient
 from tests.helpers.session_fences import fenced_operation_context
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
@@ -6564,7 +6566,7 @@ async def test_guard_deadline_preserves_operation_timeout_without_provider_attem
     build_planner_authoring_aids(policy)
     policy.validate_composition_state(_empty_state())
 
-    class DeadlineGuard(PromptGuardClient):
+    class DeadlineGuard(SingleCallPromptGuardClient):
         def __init__(self, *, slow: bool) -> None:
             self.slow = slow
 
@@ -6580,10 +6582,10 @@ async def test_guard_deadline_preserves_operation_timeout_without_provider_attem
         def timeout_seconds(self) -> float:
             return 0.02 if scope == "guard-bound" else 5.0
 
-        async def inspect(self, request: PromptGuardRequest) -> PromptGuardDecision:
+        async def inspect_call(self, call: PromptGuardCall) -> PromptGuardCallResult:
             nonlocal guard_started_at, guard_cancelled
             if not self.slow:
-                return PromptGuardDecision("allow", "clean")
+                return PromptGuardCallResult(PromptGuardDecision("allow", "clean"))
             guard_started_at = real_time()
             try:
                 await asyncio.Event().wait()

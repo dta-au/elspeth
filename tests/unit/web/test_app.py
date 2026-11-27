@@ -2035,9 +2035,14 @@ class TestLifespanShutdown:
             guard_calls.append((args, kwargs))
             raise AssertionError("sessionless startup called Prompt Shields")
 
+        def forbid_guard_plan(*args, **kwargs):
+            guard_calls.append((args, kwargs))
+            raise AssertionError("sessionless startup planned a Prompt Shields request")
+
         monkeypatch.setattr(boot_probe, "probe_composer_config", record_real_probe)
         monkeypatch.setattr("litellm.acompletion", forbid_sdk)
-        monkeypatch.setattr("elspeth.web.composer.prompt_guard_clients.AzurePromptGuardClient.inspect", forbid_guard)
+        monkeypatch.setattr("elspeth.web.composer.prompt_guard_clients.AzurePromptGuardClient.plan_calls", forbid_guard_plan)
+        monkeypatch.setattr("elspeth.web.composer.prompt_guard_clients.AzurePromptGuardClient.inspect_call", forbid_guard)
         monkeypatch.setattr("elspeth.web.composer.provider_gateway.enforce_prompt_guard", forbid_guard)
         monkeypatch.setattr(app_module, "_COMPOSER_BOOT_CONFIG_COUNTER", counter)
         monkeypatch.setattr(app_module, "_COMPOSER_BOOT_CONFIG_PROBE_LATENCY", latency)

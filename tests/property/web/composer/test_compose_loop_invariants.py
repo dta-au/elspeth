@@ -48,7 +48,6 @@ from tests.property.web.composer.strategies import (
 import elspeth.web.composer.tool_batch as composer_tool_batch_module
 from elspeth.contracts.prompt_guard import (
     PromptGuardContentPart,
-    PromptGuardDecision,
     PromptGuardRequest,
     PromptGuardToolArgumentParts,
 )
@@ -310,14 +309,14 @@ def _make_harness(tmp_path: Path, *, session_state: SessionState = "empty") -> _
 
     def guard_client(settings: PromptGuardSettings) -> AzurePromptGuardClient:
         client = AzurePromptGuardClient(settings, http_transport=httpx.MockTransport(shield_response))
-        real_inspect = client.inspect
+        real_plan_calls = client.plan_calls
 
-        async def inspect(request: PromptGuardRequest) -> PromptGuardDecision:
+        def plan_calls(request: PromptGuardRequest):
             # Observe the request; only the real Azure adapter supplies its decision.
             guard_requests.append(request)
-            return await real_inspect(request)
+            return real_plan_calls(request)
 
-        guard_observers.enter_context(patch.object(client, "inspect", new=inspect))
+        guard_observers.enter_context(patch.object(client, "plan_calls", new=plan_calls))
         return client
 
     try:
