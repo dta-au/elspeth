@@ -1,0 +1,220 @@
+{
+  "attack_on_second_of_three_calls_stops_the_third": {
+    "decision": [
+      "blocked",
+      "policy_blocked"
+    ],
+    "requests": [
+      {
+        "body_sha256": "9977d377ad37e81a055c2a7ff9fe74d0e92ec0ce44226f760861701cd67cb261",
+        "header_order": [
+          "ocp-apim-subscription-key",
+          "accept-encoding",
+          "content-length",
+          "content-type"
+        ],
+        "headers": {
+          "accept-encoding": "identity",
+          "content-length": "96",
+          "content-type": "application/json"
+        },
+        "method": "POST",
+        "subscription_key_present": true,
+        "url": "https://guard.example.test/contentsafety/text:shieldPrompt?api-version=2024-09-01"
+      },
+      {
+        "body_sha256": "4f214268151a226970cc0c1b7fd673ced253ce68147a2e296eb27515cc9541a9",
+        "header_order": [
+          "ocp-apim-subscription-key",
+          "accept-encoding",
+          "content-length",
+          "content-type"
+        ],
+        "headers": {
+          "accept-encoding": "identity",
+          "content-length": "96",
+          "content-type": "application/json"
+        },
+        "method": "POST",
+        "subscription_key_present": true,
+        "url": "https://guard.example.test/contentsafety/text:shieldPrompt?api-version=2024-09-01"
+      }
+    ]
+  },
+  "documents_one_character_over_the_limit_split_into_two_calls": {
+    "decision": [
+      "allow",
+      "clean"
+    ],
+    "requests": [
+      {
+        "body_sha256": "a4c4d5a264141495f832e8efee105858f77dc85b40dcfd1fc23065ca73cd8a8c",
+        "header_order": [
+          "ocp-apim-subscription-key",
+          "accept-encoding",
+          "content-length",
+          "content-type"
+        ],
+        "headers": {
+          "accept-encoding": "identity",
+          "content-length": "4035",
+          "content-type": "application/json"
+        },
+        "method": "POST",
+        "subscription_key_present": true,
+        "url": "https://guard.example.test/contentsafety/text:shieldPrompt?api-version=2024-09-01"
+      },
+      {
+        "body_sha256": "406b031399b33080556a1512bcb706c0248f5134ab12bb1650d48135cefc7fa3",
+        "header_order": [
+          "ocp-apim-subscription-key",
+          "accept-encoding",
+          "content-length",
+          "content-type"
+        ],
+        "headers": {
+          "accept-encoding": "identity",
+          "content-length": "6034",
+          "content-type": "application/json"
+        },
+        "method": "POST",
+        "subscription_key_present": true,
+        "url": "https://guard.example.test/contentsafety/text:shieldPrompt?api-version=2024-09-01"
+      }
+    ]
+  },
+  "documents_totalling_the_character_limit_share_one_call": {
+    "decision": [
+      "allow",
+      "clean"
+    ],
+    "requests": [
+      {
+        "body_sha256": "2af8ab5cf13f986653ba1b918c6a2e624be6fd879e047c487b6f91ae69874a46",
+        "header_order": [
+          "ocp-apim-subscription-key",
+          "accept-encoding",
+          "content-length",
+          "content-type"
+        ],
+        "headers": {
+          "accept-encoding": "identity",
+          "content-length": "10037",
+          "content-type": "application/json"
+        },
+        "method": "POST",
+        "subscription_key_present": true,
+        "url": "https://guard.example.test/contentsafety/text:shieldPrompt?api-version=2024-09-01"
+      }
+    ]
+  },
+  "five_short_documents_share_one_call": {
+    "decision": [
+      "allow",
+      "clean"
+    ],
+    "requests": [
+      {
+        "body_sha256": "9977d377ad37e81a055c2a7ff9fe74d0e92ec0ce44226f760861701cd67cb261",
+        "header_order": [
+          "ocp-apim-subscription-key",
+          "accept-encoding",
+          "content-length",
+          "content-type"
+        ],
+        "headers": {
+          "accept-encoding": "identity",
+          "content-length": "96",
+          "content-type": "application/json"
+        },
+        "method": "POST",
+        "subscription_key_present": true,
+        "url": "https://guard.example.test/contentsafety/text:shieldPrompt?api-version=2024-09-01"
+      }
+    ]
+  },
+  "prompt_rides_beside_every_document_call": {
+    "decision": [
+      "allow",
+      "clean"
+    ],
+    "requests": [
+      {
+        "body_sha256": "fe75075f71a696f244034b7e0d364bcf213e9020c15eccfc2eddf4e0fcef1607",
+        "header_order": [
+          "ocp-apim-subscription-key",
+          "accept-encoding",
+          "content-length",
+          "content-type"
+        ],
+        "headers": {
+          "accept-encoding": "identity",
+          "content-length": "109",
+          "content-type": "application/json"
+        },
+        "method": "POST",
+        "subscription_key_present": true,
+        "url": "https://guard.example.test/contentsafety/text:shieldPrompt?api-version=2024-09-01"
+      },
+      {
+        "body_sha256": "d95340162bf2e4b1de544d9191ab5b77528e07acdfdca7359fade1a08579c458",
+        "header_order": [
+          "ocp-apim-subscription-key",
+          "accept-encoding",
+          "content-length",
+          "content-type"
+        ],
+        "headers": {
+          "accept-encoding": "identity",
+          "content-length": "70",
+          "content-type": "application/json"
+        },
+        "method": "POST",
+        "subscription_key_present": true,
+        "url": "https://guard.example.test/contentsafety/text:shieldPrompt?api-version=2024-09-01"
+      }
+    ]
+  },
+  "six_short_documents_split_after_five": {
+    "decision": [
+      "allow",
+      "clean"
+    ],
+    "requests": [
+      {
+        "body_sha256": "9977d377ad37e81a055c2a7ff9fe74d0e92ec0ce44226f760861701cd67cb261",
+        "header_order": [
+          "ocp-apim-subscription-key",
+          "accept-encoding",
+          "content-length",
+          "content-type"
+        ],
+        "headers": {
+          "accept-encoding": "identity",
+          "content-length": "96",
+          "content-type": "application/json"
+        },
+        "method": "POST",
+        "subscription_key_present": true,
+        "url": "https://guard.example.test/contentsafety/text:shieldPrompt?api-version=2024-09-01"
+      },
+      {
+        "body_sha256": "12a1a284543e7525e089a6f0bbfc8aad5f91cb023911b23cbb37c00ebfeab239",
+        "header_order": [
+          "ocp-apim-subscription-key",
+          "accept-encoding",
+          "content-length",
+          "content-type"
+        ],
+        "headers": {
+          "accept-encoding": "identity",
+          "content-length": "44",
+          "content-type": "application/json"
+        },
+        "method": "POST",
+        "subscription_key_present": true,
+        "url": "https://guard.example.test/contentsafety/text:shieldPrompt?api-version=2024-09-01"
+      }
+    ]
+  }
+}

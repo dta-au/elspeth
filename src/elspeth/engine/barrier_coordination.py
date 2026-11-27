@@ -980,9 +980,8 @@ class BarrierIntakeCoordinator:
                     f"Collector {collector_name!r} released a group but the fire-completion seams are not wired."
                 )
             # Item 14: the executor writes no survivor terminal (only the
-            # Ruling-36 quarantine writes), and CollectorOutcome carries no
-            # flag to consult (META-17) — the seam records whatever terminal
-            # it finds MISSING among the consumed members, unconditionally.
+            # Ruling-36 quarantine writes), so the seam records whatever
+            # terminal it finds MISSING among the consumed members.
             # A quarantined member already holds (FAILURE, QUARANTINED_AT_SOURCE)
             # and is skipped; a second write would trip
             # ix_token_outcomes_terminal_unique. Survivors carry
@@ -1010,13 +1009,28 @@ class BarrierIntakeCoordinator:
                 release=release,
                 group_losses=self._take_pending_group_losses(),
             )
+            # The executor already wrote each quarantined member's terminal;
+            # it reaches the live counters and telemetry only once the fire
+            # has committed, so a failed fire publishes nothing.
+            quarantine_results = tuple(
+                RowResult(
+                    token=token,
+                    final_data=token.row_data,
+                    outcome=TerminalOutcome.FAILURE,
+                    path=TerminalPath.QUARANTINED_AT_SOURCE,
+                )
+                for token in outcome.quarantined_tokens
+            )
+            for token in outcome.quarantined_tokens:
+                self._emit_token_completed(token, outcome=TerminalOutcome.FAILURE, path=TerminalPath.QUARANTINED_AT_SOURCE)
             if release.sink_results:
                 return BarrierIntakeDisposition(
                     kind=BarrierIntakeDispositionKind.PENDING_SINK,
-                    results=tuple(replace(result, scheduler_pending_sink=True) for result in release.sink_results),
+                    results=quarantine_results + tuple(replace(result, scheduler_pending_sink=True) for result in release.sink_results),
                 )
             return BarrierIntakeDisposition(
                 kind=BarrierIntakeDispositionKind.READY_CONTINUATION,
+                results=quarantine_results,
                 child_items=release.items,
             )
 

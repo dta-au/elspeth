@@ -481,7 +481,11 @@ export function RunsHistoryDrawer({ onClose, runsOverride }: RunsHistoryDrawerPr
       {cancelTargetRunId !== null && (
         <ConfirmDialog
           title="Cancel pipeline"
-          message="Cancel the running pipeline? This cannot be undone."
+          message={
+            runs.find((run) => run.id === cancelTargetRunId)?.status === "pending"
+              ? "Cancel the queued pipeline? This cannot be undone."
+              : "Cancel the running pipeline? This cannot be undone."
+          }
           confirmLabel="Cancel pipeline"
           variant="danger"
           onConfirm={() => {

@@ -80,7 +80,7 @@ async def _inspect(azure, messages, *, user=_USER, role="composer"):
         content_parts=evidence.content_parts,
         tool_argument_parts=evidence.tool_argument_parts,
     )
-    decision = await client.inspect(request)
+    decision = await prompt_guard.inspect_prompt_guard_request(client, request)
     return decision, request, evidence, sent
 
 

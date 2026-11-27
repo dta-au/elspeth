@@ -14,6 +14,7 @@ import {
 } from "react";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useExecutionStore } from "@/stores/executionStore";
+import { isLiveRunStatus } from "@/types/index";
 import { requestValidate } from "@/stores/subscriptions";
 import { useFocusTrap } from "@/hooks/useFocusTrap";
 import { Input } from "@/components/ui";
@@ -120,7 +121,7 @@ export function CommandPalette({
         runAdmissionAvailable &&
         validationResult?.readiness?.execution_ready === true &&
         !isExecuting &&
-        progress?.status !== "running" &&
+        !(progress !== null && isLiveRunStatus(progress.status)) &&
         !!activeSessionId,
       action: () => {
         if (activeSessionId) {

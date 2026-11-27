@@ -1316,7 +1316,7 @@ Freeform loop, one provider call:
 6. `capture_provider_context` — bounded copy + `canonical_json` of messages+tools, **retained** on the call record (`provider_gateway.py:765`, `provider_context.py:267-292`).
 7. `deepcopy(kwargs)` — messages + tools again (`provider_gateway.py:480`).
 8. `require_no_credential_material(credential_messages)` over the whole request (`provider_gateway.py:530`).
-9. `enforce_prompt_guard` → `_request(...)` over all messages/tools, then the external inspection (`prompt_guard.py:460-480`). `AzurePromptGuardClient.inspect` opens a **new `httpx.AsyncClient` per inspection** and POSTs document batches (`prompt_guard_clients.py:136-150`).
+9. `enforce_prompt_guard` → `_request(...)` over all messages/tools, then the external inspection (`prompt_guard.py:460-480`). `inspect_prompt_guard_request` takes the document batches from `AzurePromptGuardClient.plan_calls`, opens a **new `httpx.AsyncClient` per inspection** through `request_context`, and POSTs each batch through `inspect_call`.
 10. `_hash_and_measure_request` — `canonical_json` of every message and of the tool list (`llm_response_parsing.py:687-697`).
 
 Planner, one round: cache markers, `detach_prompt_guard_evidence`, `json.loads(canonical_json({messages, tools}))` (`pipeline_planner.py:3607`), `build_planner_capability_manifest` (calls `canonical_set_pipeline_schema()` twice, each a fresh decode — `tools/schema_contract.py:426-434`), `canonical_json` for the byte budget (`:3636`), `observe_messages`, `capture_provider_context` (`:3762`), `prepare_delivery`, then items 7–10 above.
