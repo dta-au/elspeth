@@ -78,6 +78,7 @@ from elspeth.config_loading import load_settings_from_yaml_string
 from elspeth.contracts import Determinism, PipelineRow, PluginSchema, RunStatus
 from elspeth.contracts.schema_contract import FieldContract, SchemaContract
 from elspeth.core.dag import ExecutionGraph
+from elspeth.engine.orchestrator import landscape_registration
 from elspeth.engine.orchestrator.preflight import (
     assemble_and_validate_pipeline_config,
     execution_sinks_for_runtime,
@@ -3196,6 +3197,23 @@ def test_harness_preserves_sparse_durable_parent_ordinals_before_semantic_set_pr
             [(1, "parent-a"), (1, "parent-b")],
             token_keys,
         )
+
+
+def test_harness_tokenizes_only_the_running_engine_plugin_version() -> None:
+    assert corpus_harness.ENGINE_VERSION is landscape_registration.ENGINE_VERSION
+    running = f"engine:{landscape_registration.ENGINE_VERSION}"
+
+    assert corpus_harness._semantic_plugin_version(running) == "engine:$ENGINE_VERSION"
+    for recorded in (
+        f"{running}.1",
+        f"{running} ",
+        running.upper(),
+        "engine:0.0.0-other",
+        "engine:",
+        "1.0.0",
+        None,
+    ):
+        assert corpus_harness._semantic_plugin_version(recorded) == recorded
 
 
 def test_semantic_runtime_token_projection_uses_an_explicit_parent_set() -> None:
