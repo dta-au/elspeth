@@ -351,9 +351,11 @@ def _log_loss_watcher_poll_failed(exc: SQLAlchemyError, *, run_id: UUID) -> None
 def _log_loss_watcher_failure_deferred(exc: BaseException, *, run_id: UUID) -> None:
     """Log a queued run's watcher failure whose record waits for that run's own end.
 
-    The failure is recorded when the queued run completes; until then no
-    durable record of it exists, only log lines. Class names only, no
-    ``exc_info``.
+    When the queued run completes, the release registry retains the failure
+    in memory, which fails that run's lifecycle and requests process
+    recovery. Until then the failure is held only as the watcher's outcome,
+    and this log line is the only trace this step leaves. Class names only,
+    no ``exc_info``.
     """
     slog.error(
         "execution_loss_watcher_failure_deferred",

@@ -222,8 +222,8 @@ class RegisteredWebInstanceMembership(WebInstanceMembership):
                 # Of database errors, only OperationalError is retried, bounded
                 # as stated above: it is the one failure class that models
                 # transient contention. WebInstanceMembershipLost and every
-                # other error propagate at once — the row is gone or the fault is
-                # standing, and renewing cannot fix either. exc_info is
+                # error not handled above propagate at once — the row is gone or
+                # the fault is standing, and renewing cannot fix either. exc_info is
                 # deliberately omitted: SQLAlchemy cause chains carry the
                 # database URL.
                 consecutive_failures += 1
