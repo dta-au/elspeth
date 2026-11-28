@@ -42,11 +42,14 @@ from elspeth.web.process_recovery import ProcessRecovery
 _HEARTBEAT_MAX_CONSECUTIVE_FAILURES = 5
 """Consecutive transient-failure bound for lease renewal.
 
-One or two ``OperationalError`` heartbeats are contention and retry
-cleanly; this many in a row means the process can no longer prove it is
-alive. The heartbeat task then re-raises and its done callback signals the
-host to shut down the process so the supervisor restarts it — the same
-escalation the periodic orphan sweeper uses.
+Applies only while no admission refusal has been seen since the last
+successful heartbeat; after a refusal, the lease deadline alone bounds the
+retries (see ``_heartbeat_loop``). One or two ``OperationalError``
+heartbeats are contention and retry cleanly; this many in a row means the
+process can no longer prove it is alive. The heartbeat task then re-raises
+and its done callback signals the host to shut down the process so the
+supervisor restarts it — the same escalation the periodic orphan sweeper
+uses.
 """
 
 
@@ -185,11 +188,12 @@ class RegisteredWebInstanceMembership(WebInstanceMembership):
         #   the regular interval, up to _HEARTBEAT_MAX_CONSECUTIVE_FAILURES.
         # - A refusal seen since the last success: refusals and
         #   OperationalErrors are both retried after the short delay, bounded
-        #   by the lease deadline alone. A failed attempt escalates if the
-        #   next attempt would not start at least one regular interval before
+        #   by the lease deadline alone. A failed attempt escalates once the
+        #   next attempt would start at or after one regular interval before
         #   the lease expires. The margin left at expiry is that interval less
         #   the next attempt's admission wait and its upkeep call, which has
         #   no timeout of its own; the margin holds only if both fit in it.
+        # A success returns the loop to the first mode.
         loop = asyncio.get_running_loop()
         consecutive_failures = 0
         last_successful_heartbeat = loop.time()
@@ -215,10 +219,10 @@ class RegisteredWebInstanceMembership(WebInstanceMembership):
                     raise
                 self._log.warning("web_instance_heartbeat_failed", exc_class=type(exc).__name__)
             except OperationalError as exc:
-                # Only OperationalError is retried, and only a bounded number
-                # of times: it is the one failure class that models transient
-                # contention. WebInstanceMembershipLost and every other error
-                # propagate at once — the row is gone or the fault is
+                # Of database errors, only OperationalError is retried, bounded
+                # as stated above: it is the one failure class that models
+                # transient contention. WebInstanceMembershipLost and every
+                # other error propagate at once — the row is gone or the fault is
                 # standing, and renewing cannot fix either. exc_info is
                 # deliberately omitted: SQLAlchemy cause chains carry the
                 # database URL.

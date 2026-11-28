@@ -467,6 +467,7 @@ async def test_heartbeat_refusal_then_database_errors_obeys_lease_deadline(monke
     # After a refusal, database errors are retried after the short delay too,
     # bounded by the lease deadline.
     assert sleeps == [1, 1, 0.25, 0.25]
+    assert clock < 1 + 5, "the loss path must begin before the lease from the success at t=1 expires"
     assert logs[0] == ("warning", "web_instance_heartbeat_failed")
     assert logs[-1] == ("error", "web_instance_heartbeat_escalating")
 
@@ -507,6 +508,55 @@ async def test_heartbeat_database_errors_after_refusal_retry_until_the_lease_dea
     # one at 19 s escalates: one more delay would leave less than one interval.
     assert (calls, clock) == (9, 19.0), "database errors after a refusal must retry until the lease deadline"
     assert clock < 30, "the loss path must begin before the membership lease lapses"
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_success_after_refusal_restores_the_count_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The default ratio: lease 30 s, interval 10 s.
+    clock = 0.0
+    calls = 0
+    sleeps: list[float] = []
+    escalations: list[dict[str, Any]] = []
+    real_sleep = asyncio.sleep
+    database_error = OperationalError("heartbeat", {}, RuntimeError("database unavailable"))
+
+    async def fake_sleep(seconds: float) -> None:
+        nonlocal clock
+        sleeps.append(seconds)
+        clock += seconds
+        await real_sleep(0)
+
+    async def heartbeat(*_args: Any, **_kwargs: Any) -> None:
+        nonlocal clock, calls
+        calls += 1
+        if calls == 1:
+            clock += 1.0  # The refusal arrives after the full admission wait.
+            raise async_workers.AsyncWorkerAdmissionTimeoutError("admission refused")
+        if calls == 2:
+            return
+        raise database_error
+
+    def error(event: str, **fields: Any) -> None:
+        if event == "web_instance_heartbeat_escalating":
+            escalations.append(fields)
+
+    _fake_heartbeat_clock(monkeypatch, sleep=fake_sleep, now=lambda: clock, heartbeat=heartbeat)
+    owner = SimpleNamespace(
+        _interval_seconds=heartbeat_interval_seconds(30),
+        _lease_seconds=30,
+        _heartbeat_authority=SimpleNamespace(heartbeat=lambda: None),
+        _identity=SimpleNamespace(instance_id="instance"),
+        _log=SimpleNamespace(warning=lambda _event, **_fields: None, error=error),
+    )
+    with pytest.raises((OperationalError, async_workers.AsyncWorkerAdmissionTimeoutError)) as raised:
+        await asyncio.wait_for(RegisteredWebInstanceMembership._heartbeat_loop(owner), timeout=5)
+    assert raised.value is database_error
+    # Refused at 11 s, renewed at 12 s, then database errors at 22, 32, 42, 52
+    # and 62 s: after the success they are retried at the regular interval and
+    # the fifth reaches the count cap.
+    assert sleeps == [10, 1, 10, 10, 10, 10, 10], "a success must return database errors to the regular interval"
+    assert (calls, clock) == (7, 62.0)
+    assert escalations == [{"exc_class": "OperationalError", "consecutive_failures": 5}]
 
 
 @pytest.mark.asyncio
