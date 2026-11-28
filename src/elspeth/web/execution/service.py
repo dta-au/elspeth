@@ -264,10 +264,10 @@ _MAX_AUTHORITATIVE_PROOF_TEXT_CHARS = 1000
 # Execution loss watcher (``_signal_shutdown_on_operation_loss``). The watcher
 # is the only carrier of a durable ``cancel_requested_at`` written by another
 # replica to the worker that owns the run, so one transient session-DB error in
-# its poll must not end it. The healthy poll interval is unchanged; after a
-# transient session-DB error the interval doubles per consecutive failure up to
-# the cap, and from the escalation threshold onward every failure is logged at
-# error level. The lease-loss wait stays armed during every backoff interval.
+# its poll must not end it. The healthy poll interval is unchanged; after a transient
+# session-DB error or a refused shared-pool admission the interval doubles per consecutive
+# failure up to the cap, and from the escalation threshold onward every failure is logged
+# at error level. The lease-loss wait stays armed during every backoff interval.
 _LOSS_WATCHER_POLL_SECONDS = 0.25
 _LOSS_WATCHER_MAX_BACKOFF_SECONDS = 5.0
 _LOSS_WATCHER_ESCALATE_AFTER_FAILURES = 5
@@ -282,7 +282,7 @@ _LOSS_WATCHER_ESCALATE_AFTER_FAILURES = 5
 # - ``DisconnectionError``: the pool detected a dead connection at checkout.
 # The watcher also retries any other ``DBAPIError`` whose
 # ``connection_invalidated`` flag SQLAlchemy's disconnect detection set. All
-# other faults (``ProgrammingError``, ``IntegrityError``, an unflagged
+# other database faults (``ProgrammingError``, ``IntegrityError``, an unflagged
 # ``DBAPIError``, ``PendingRollbackError``) are logged and re-raised. ``get_run``
 # opens a fresh ``engine.begin()`` per poll, so no failed transaction carries
 # over between polls and a ``PendingRollbackError`` there would be a code defect.
