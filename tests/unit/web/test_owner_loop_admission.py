@@ -467,7 +467,11 @@ async def test_heartbeat_refusal_then_database_errors_obeys_lease_deadline(monke
     # After a refusal, database errors are retried after the short delay too,
     # bounded by the lease deadline.
     assert sleeps == [1, 1, 0.25, 0.25]
-    assert clock < 1 + 5, "the loss path must begin before the lease from the success at t=1 expires"
+    # Deadline from the success at t=1: lease 5 less one interval. The final
+    # attempt's check reached it; the one before (its next start, clock - 0.7) did not.
+    deadline = 1 + 5 - 1
+    assert clock + 0.25 >= deadline, "the escalation must not come before the lease deadline"
+    assert clock - 0.7 < deadline, "the escalation must not come after the lease deadline"
     assert logs[0] == ("warning", "web_instance_heartbeat_failed")
     assert logs[-1] == ("error", "web_instance_heartbeat_escalating")
 
@@ -557,6 +561,53 @@ async def test_heartbeat_success_after_refusal_restores_the_count_cap(monkeypatc
     assert sleeps == [10, 1, 10, 10, 10, 10, 10], "a success must return database errors to the regular interval"
     assert (calls, clock) == (7, 62.0)
     assert escalations == [{"exc_class": "OperationalError", "consecutive_failures": 5}]
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_success_resets_the_database_error_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The default ratio, lease 30 s and interval 10 s, with no refusal anywhere:
+    # two database errors, a success, then database errors until the cap.
+    cap = membership_lifecycle._HEARTBEAT_MAX_CONSECUTIVE_FAILURES
+    clock = 0.0
+    calls = 0
+    sleeps: list[float] = []
+    escalations: list[dict[str, Any]] = []
+    real_sleep = asyncio.sleep
+    database_error = OperationalError("heartbeat", {}, RuntimeError("database unavailable"))
+
+    async def fake_sleep(seconds: float) -> None:
+        nonlocal clock
+        sleeps.append(seconds)
+        clock += seconds
+        await real_sleep(0)
+
+    async def heartbeat(*_args: Any, **_kwargs: Any) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            return
+        raise database_error
+
+    def error(event: str, **fields: Any) -> None:
+        if event == "web_instance_heartbeat_escalating":
+            escalations.append(fields)
+
+    _fake_heartbeat_clock(monkeypatch, sleep=fake_sleep, now=lambda: clock, heartbeat=heartbeat)
+    owner = SimpleNamespace(
+        _interval_seconds=heartbeat_interval_seconds(30),
+        _lease_seconds=30,
+        _heartbeat_authority=SimpleNamespace(heartbeat=lambda: None),
+        _identity=SimpleNamespace(instance_id="instance"),
+        _log=SimpleNamespace(warning=lambda _event, **_fields: None, error=error),
+    )
+    with pytest.raises(OperationalError) as raised:
+        await asyncio.wait_for(RegisteredWebInstanceMembership._heartbeat_loop(owner), timeout=5)
+    assert raised.value is database_error
+    # The success resets the count, so the two earlier errors do not count
+    # towards the cap: escalation comes on the cap-th error after the success.
+    assert calls == 3 + cap, "the database errors before a success must not count towards the cap"
+    assert sleeps == [10] * (3 + cap)
+    assert escalations == [{"exc_class": "OperationalError", "consecutive_failures": cap}]
 
 
 @pytest.mark.asyncio
