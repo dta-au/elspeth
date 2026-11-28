@@ -349,11 +349,12 @@ def _log_loss_watcher_poll_failed(exc: SQLAlchemyError, *, run_id: UUID) -> None
 
 
 def _log_loss_watcher_failure_deferred(exc: BaseException, *, run_id: UUID) -> None:
-    """Log a queued run's watcher failure whose record waits for that run's own end.
+    """Log a queued run's watcher failure whose record is deferred.
 
-    The run fails when its completion joins the watcher and raises this
-    failure. Whichever comes first, that completion or shutdown seeing the
-    dead watcher, records the failure in the release registry. The record
+    The run's completion joins the watcher and raises this failure, which
+    fails that run's completion lifecycle. Whichever comes first, that
+    completion or shutdown seeing the dead watcher, records the failure in
+    the release registry. The record
     keeps it in memory, seals the registry against new EXECUTE acquisitions
     process-wide and requests process recovery. Until then the failure is
     held only as the watcher's outcome, and this log line is the only trace

@@ -423,7 +423,22 @@ def _fake_heartbeat_clock(
 
 
 @pytest.mark.asyncio
-async def test_heartbeat_refusal_then_database_errors_obeys_lease_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("call_seconds", "expected_calls"),
+    [
+        # Every check after the slow first database error reads a clock that
+        # the call did not move: escalation comes at the check that first
+        # reaches the deadline exactly, so a threshold one short delay early,
+        # or a strict comparison, moves it.
+        pytest.param({3: 0.5}, 7, id="instant-deciding-call"),
+        # The deciding call itself takes 0.25 s: only a check that reads the
+        # clock after the call reaches the deadline on that call.
+        pytest.param({3: 0.5, 6: 0.25}, 6, id="slow-deciding-call"),
+    ],
+)
+async def test_heartbeat_refusal_then_database_errors_obeys_lease_deadline(
+    monkeypatch: pytest.MonkeyPatch, call_seconds: dict[int, float], expected_calls: int
+) -> None:
     clock = 0.0
     calls = 0
     sleeps: list[float] = []
@@ -446,8 +461,7 @@ async def test_heartbeat_refusal_then_database_errors_obeys_lease_deadline(monke
             return
         if calls == 2:
             raise refusal
-        if calls == 3:
-            clock += 0.5  # One slow call, so the deadline check reads the clock after the call.
+        clock += call_seconds.get(calls, 0.0)
         raise database_error
 
     _fake_heartbeat_clock(monkeypatch, sleep=fake_sleep, now=lambda: clock, heartbeat=heartbeat)
@@ -466,10 +480,10 @@ async def test_heartbeat_refusal_then_database_errors_obeys_lease_deadline(monke
     assert raised.value is database_error, "a refusal inside the lease must be retried"
     # After a refusal, database errors are retried after the short delay too,
     # bounded by the lease deadline: the success at t=1 plus lease 5 less one
-    # interval, so t=5. The checks (now + 0.25) read 4.0, 4.25, 4.5, 4.75 and
-    # 5.0; the one at exactly 5.0 escalates, on the fifth database error.
-    assert calls == 7
-    assert sleeps == [1, 1, 0.25, 0.25, 0.25, 0.25, 0.25]
+    # interval, so t=5. A failed attempt escalates once its check, the clock
+    # after the call plus 0.25, reaches 5.0; both cases end at clock 4.75.
+    assert calls == expected_calls
+    assert sleeps == [1, 1] + [0.25] * (expected_calls - 2)
     assert clock == 4.75
     assert logs[0] == ("warning", "web_instance_heartbeat_failed")
     assert logs[-1] == ("error", "web_instance_heartbeat_escalating")
