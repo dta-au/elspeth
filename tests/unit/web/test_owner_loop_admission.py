@@ -19,7 +19,7 @@ from elspeth.web.app import _periodic_orphan_cleanup
 from elspeth.web.application_finalizers import ApplicationFinalizerOwner
 from elspeth.web.coordination import membership_lifecycle
 from elspeth.web.coordination.membership_authority import RepositoryWebInstanceMembershipAuthority
-from elspeth.web.coordination.membership_lifecycle import RegisteredWebInstanceMembership
+from elspeth.web.coordination.membership_lifecycle import RegisteredWebInstanceMembership, heartbeat_interval_seconds
 from elspeth.web.process_recovery import ProcessRecovery
 from elspeth.web.sessions.composer_async_worker import ComposerAsyncWorker
 from elspeth.web.sessions.engine import create_session_engine
@@ -464,11 +464,49 @@ async def test_heartbeat_refusal_then_database_errors_obeys_lease_deadline(monke
         await asyncio.wait_for(RegisteredWebInstanceMembership._heartbeat_loop(owner), timeout=5)
     assert raised.value is database_error, "a refusal inside the lease must be retried"
     assert calls == 4
-    # Only the refusal is retried after the short delay; the database error that
-    # follows it is retried at the regular interval, so the count cap spans intervals.
-    assert sleeps == [1, 1, 0.25, 1]
+    # After a refusal, database errors are retried after the short delay too,
+    # bounded by the lease deadline.
+    assert sleeps == [1, 1, 0.25, 0.25]
     assert logs[0] == ("warning", "web_instance_heartbeat_failed")
     assert logs[-1] == ("error", "web_instance_heartbeat_escalating")
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_database_errors_after_refusal_retry_until_the_lease_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The default ratio: lease 30 s, interval 10 s.
+    clock = 0.0
+    calls = 0
+    real_sleep = asyncio.sleep
+    database_error = OperationalError("heartbeat", {}, RuntimeError("database unavailable"))
+
+    async def fake_sleep(seconds: float) -> None:
+        nonlocal clock
+        clock += seconds
+        await real_sleep(0)
+
+    async def heartbeat(*_args: Any, **_kwargs: Any) -> None:
+        nonlocal clock, calls
+        calls += 1
+        if calls == 1:
+            clock += 1.0  # The refusal arrives after the full admission wait.
+            raise async_workers.AsyncWorkerAdmissionTimeoutError("admission refused")
+        raise database_error
+
+    _fake_heartbeat_clock(monkeypatch, sleep=fake_sleep, now=lambda: clock, heartbeat=heartbeat)
+    owner = SimpleNamespace(
+        _interval_seconds=heartbeat_interval_seconds(30),
+        _lease_seconds=30,
+        _heartbeat_authority=SimpleNamespace(heartbeat=lambda: None),
+        _identity=SimpleNamespace(instance_id="instance"),
+        _log=structlog.get_logger("test"),
+    )
+    with pytest.raises((OperationalError, async_workers.AsyncWorkerAdmissionTimeoutError)) as raised:
+        await asyncio.wait_for(RegisteredWebInstanceMembership._heartbeat_loop(owner), timeout=5)
+    assert raised.value is database_error, "a refusal inside the lease must be retried"
+    # Refused at 11 s; database errors at 12 s to 19 s, one short delay apart. The
+    # one at 19 s escalates: one more delay would leave less than one interval.
+    assert (calls, clock) == (9, 19.0), "database errors after a refusal must retry until the lease deadline"
+    assert clock < 30, "the loss path must begin before the membership lease lapses"
 
 
 @pytest.mark.asyncio
