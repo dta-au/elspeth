@@ -661,6 +661,7 @@ def test_coalesce_restore_refuses_damaged_commit_receipt(setup: RecorderSetup, c
         ("flush-fields", "together or not at all"),
         ("closed-flush", "OPEN flush state"),
         ("recorded", "already recorded"),
+        ("flush-metadata-orphan", "flush metadata only with its flush state"),
     ],
 )
 def test_collector_verdict_refuses_partial_or_foreign_evidence(setup: RecorderSetup, case: str, message: str) -> None:
@@ -719,7 +720,96 @@ def test_collector_verdict_refuses_partial_or_foreign_evidence(setup: RecorderSe
         values["flush_state_id"] = holds[0][1]
     elif case == "recorded":
         setup.execution.complete_collector_failure(**values)
+    elif case == "flush-metadata-orphan":
+        from elspeth.contracts.node_state_context import GateEvaluationContext
+        from elspeth.core.landscape.execution.node_states import serialize_completion_metadata
+
+        values["flush_metadata"] = serialize_completion_metadata(
+            success_reason=None, context_after=GateEvaluationContext(condition="c", result="True", route_label="true")
+        )
     with pytest.raises(AuditIntegrityError, match=message):
         setup.execution.complete_collector_failure(**values)
     with setup.db.read_only_connection() as conn:
         assert len(conn.execute(select(collector_group_failures_table)).all()) == (1 if case == "recorded" else 0)
+
+
+def _collector_verdict_with_flush(setup: RecorderSetup) -> tuple[dict[str, Any], str, str]:
+    """Verdict arguments naming an OPEN flush state (tok-0's) and one OPEN member hold (tok-1's)."""
+    from elspeth.contracts.errors import ExecutionError
+
+    _batch(setup)
+    ensure_fork_group_record(setup.factory, run_id=setup.run_id, group_id="group-1", opener_token_id="tok-0")
+    register_test_node(setup.data_flow, setup.run_id, "collector-1", node_type=NodeType.COLLECTOR, plugin_name="collector")
+    flush_state_id, hold_state_id = (
+        setup.execution.begin_node_state(
+            token_id, "collector-1", 2, {"value": 1}, member_token=setup.coordination_token.membership
+        ).state_id
+        for token_id in ("tok-0", "tok-1")
+    )
+    reason = CollectorGroupFailureReason.COLLECTOR_TRANSFORM_ERROR
+    values: dict[str, Any] = {
+        "group_id": "group-1",
+        "collector_node_id": "collector-1",
+        "failure_reason": reason,
+        "flush_state_id": flush_state_id,
+        "flush_error": ExecutionError(exception="returned an error", exception_type="TransformError", phase="collector_flush"),
+        "flush_duration_ms": 1.0,
+        "member_holds": ((TokenRef("tok-1", setup.run_id), hold_state_id, 1.0),),
+        "hold_error": collector_group_failure_hold_error(group_id="group-1", failure_reason=reason, lost_members=()),
+        "coordination_token": setup.coordination_token,
+    }
+    return values, flush_state_id, hold_state_id
+
+
+def test_collector_verdict_persists_flush_context_on_the_flush_state_only(setup: RecorderSetup) -> None:
+    from elspeth.contracts.node_state_context import GateEvaluationContext
+    from elspeth.core.landscape.execution.node_states import serialize_completion_metadata
+
+    values, flush_state_id, hold_state_id = _collector_verdict_with_flush(setup)
+    metadata = serialize_completion_metadata(
+        success_reason=None, context_after=GateEvaluationContext(condition="c", result="False", route_label="false")
+    )
+
+    setup.execution.complete_collector_failure(**values, flush_metadata=metadata)
+
+    flush = setup.execution.get_node_state(flush_state_id)
+    hold = setup.execution.get_node_state(hold_state_id)
+    assert flush is not None and hold is not None
+    assert flush.status == NodeStateStatus.FAILED and hold.status == NodeStateStatus.FAILED
+    assert flush.context_after_json == metadata.context_after_json
+    assert hold.context_after_json is None
+
+
+def test_collector_verdict_refuses_a_flush_success_reason_with_no_write(setup: RecorderSetup) -> None:
+    from elspeth.core.landscape.execution.node_states import serialize_completion_metadata
+
+    values, flush_state_id, hold_state_id = _collector_verdict_with_flush(setup)
+    metadata = serialize_completion_metadata(success_reason={"action": "collected"}, context_after=None)
+
+    with pytest.raises(ValueError, match="FAILED node state must not have success_reason"):
+        setup.execution.complete_collector_failure(**values, flush_metadata=metadata)
+
+    for state_id in (flush_state_id, hold_state_id):
+        state = setup.execution.get_node_state(state_id)
+        assert state is not None and state.status == NodeStateStatus.OPEN
+    with setup.db.read_only_connection() as conn:
+        assert conn.execute(select(collector_group_failures_table)).all() == []
+
+
+def test_bulk_failed_write_refuses_metadata_for_a_state_not_being_failed(setup: RecorderSetup) -> None:
+    """Metadata keyed to a state outside the failing set is refused, never silently dropped."""
+    from elspeth.contracts.errors import ExecutionError
+    from elspeth.core.landscape.execution.node_states import serialize_completion_metadata
+
+    _values, flush_state_id, hold_state_id = _collector_verdict_with_flush(setup)
+    metadata = serialize_completion_metadata(success_reason=None, context_after=None)
+    error = ExecutionError(exception="returned an error", exception_type="TransformError", phase="collector_flush")
+
+    with pytest.raises(ValueError, match="metadata names a state that is not being failed"), setup.db.write_connection() as conn:
+        setup.execution.node_states.complete_node_states_failed_many(
+            [(flush_state_id, 1.0, error)], conn=conn, metadata_by_state={hold_state_id: metadata}
+        )
+
+    for state_id in (flush_state_id, hold_state_id):
+        state = setup.execution.get_node_state(state_id)
+        assert state is not None and state.status == NodeStateStatus.OPEN

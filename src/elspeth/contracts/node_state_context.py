@@ -10,6 +10,9 @@ Trust-tier notes
 * ``NodeStateContext`` — Protocol for structural typing (mypy only).
 * ``PoolExecutionContext`` — typed pool stats from LLM multi-query.
 * ``from_executor_stats()`` — Tier 1 factory: crash on bad data.
+* ``SerializedCompletionMetadata`` — a completion's success reason and
+  context already validated and canonicalised by the node-state
+  serialiser; persisted as given, never re-serialised.
 """
 
 from __future__ import annotations
@@ -31,6 +34,23 @@ class NodeStateContext(Protocol):
     """
 
     def to_dict(self) -> dict[str, Any]: ...
+
+
+@dataclass(frozen=True, slots=True)
+class SerializedCompletionMetadata:
+    """A completion's success reason and context in the exact form the node-state write persists.
+
+    Built by ``serialize_completion_metadata`` in
+    ``elspeth.core.landscape.execution.node_states``, the validator and
+    serialiser behind ``complete_node_state_on``. A caller that must
+    refuse a plugin's metadata BEFORE side effects of its own (the collector
+    flush releases tokens and closes member holds before its flush state
+    completes) serialises first and hands this value to the write, so the bytes
+    checked are the bytes stored, with no second serialisation.
+    """
+
+    success_reason_json: str | None
+    context_after_json: str | None
 
 
 class QueryOrderEntryInput(Protocol):

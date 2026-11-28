@@ -115,7 +115,7 @@ from elspeth.core.landscape.schema import (
 
 if TYPE_CHECKING:
     from elspeth.contracts.errors import TransformSuccessReason
-    from elspeth.contracts.node_state_context import NodeStateContext
+    from elspeth.contracts.node_state_context import NodeStateContext, SerializedCompletionMetadata
     from elspeth.contracts.payload_store import PayloadStore
 
 __all__ = ["ExecutionRepository", "GroupRecord"]
@@ -340,6 +340,7 @@ class ExecutionRepository:
         error: ExecutionError | TransformErrorReason | CoalesceFailureReason | RowUnionFailureReason | None = None,
         success_reason: TransformSuccessReason | None = None,
         context_after: NodeStateContext | None = None,
+        serialized_metadata: SerializedCompletionMetadata | None = None,
     ) -> NodeStateCompleted: ...
 
     @overload
@@ -366,6 +367,7 @@ class ExecutionRepository:
         error: ExecutionError | TransformErrorReason | CoalesceFailureReason | RowUnionFailureReason | None = None,
         success_reason: TransformSuccessReason | None = None,
         context_after: NodeStateContext | None = None,
+        serialized_metadata: SerializedCompletionMetadata | None = None,
     ) -> NodeStatePending | NodeStateCompleted | NodeStateFailed:
         """Complete a node state (PENDING, COMPLETED, or FAILED)."""
         return self.node_states.complete_node_state(
@@ -377,6 +379,7 @@ class ExecutionRepository:
             error=error,
             success_reason=success_reason,
             context_after=context_after,
+            serialized_metadata=serialized_metadata,
         )
 
     def get_node_state(self, state_id: str) -> NodeState | None:
@@ -1383,6 +1386,7 @@ class ExecutionRepository:
         flush_duration_ms: float | None,
         member_holds: Sequence[tuple[TokenRef, str, float]],
         hold_error: ExecutionError,
+        flush_metadata: SerializedCompletionMetadata | None = None,
     ) -> None:
         """Record a collector group's FAILED verdict atomically: the group's one durable failure.
 
@@ -1392,7 +1396,10 @@ class ExecutionRepository:
         is ONE leader-fenced transaction:
 
         - the flush's opener-anchored node_state FAILED with ``flush_error``
-          (absent for the lost-members arm, which never opens a flush);
+          (absent for the lost-members arm, which never opens a flush), and
+          with the plugin's post-execution context when its returned error
+          carried one (``flush_metadata``, serialised before this call; never
+          on a member hold, never a success reason);
         - every arrived member's accept-time hold FAILED with ``hold_error``,
           the group-level ``CollectorGroupFailure`` each survivor carries;
         - one immutable group failure row, even when no member arrived.
@@ -1415,8 +1422,11 @@ class ExecutionRepository:
             AuditIntegrityError: The group or reason is missing, or the hold
                 error does not record this group and reason; members are
                 repeated or cross the run; a flush state is named without its
-                error or vice versa; a state is missing, foreign, at another
-                node, not OPEN, or a hold does not belong to its member.
+                error or vice versa; flush metadata is named without its flush
+                state; a state is missing, foreign, at another node, not OPEN,
+                or a hold does not belong to its member.
+            ValueError: The flush metadata carries a success reason (a FAILED
+                state never records one).
         """
         subject = "collector failure verdict"
         run_id = coordination_token.run_id
@@ -1441,6 +1451,8 @@ class ExecutionRepository:
             raise AuditIntegrityError(f"{subject} hold error does not record group {group_id!r} and its failure reason")
         if (flush_state_id is None) != (flush_error is None) or (flush_state_id is None) != (flush_duration_ms is None):
             raise AuditIntegrityError(f"{subject} names a flush state, its error and its duration together or not at all")
+        if flush_metadata is not None and flush_state_id is None:
+            raise AuditIntegrityError(f"{subject} names flush metadata only with its flush state")
         with fenced_leader_transaction(
             self._db.engine,
             token=coordination_token,
@@ -1484,7 +1496,13 @@ class ExecutionRepository:
             if flush_state_id is not None and flush_error is not None and flush_duration_ms is not None:
                 failed_states.insert(0, (flush_state_id, flush_duration_ms, flush_error))
             if failed_states:
-                self.node_states.complete_node_states_failed_many(failed_states, conn=conn)
+                self.node_states.complete_node_states_failed_many(
+                    failed_states,
+                    conn=conn,
+                    metadata_by_state=(
+                        {flush_state_id: flush_metadata} if flush_state_id is not None and flush_metadata is not None else None
+                    ),
+                )
             conn.execute(
                 collector_group_failures_table.insert().values(
                     run_id=run_id,

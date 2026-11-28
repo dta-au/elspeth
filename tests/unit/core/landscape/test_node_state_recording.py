@@ -15,7 +15,7 @@ from elspeth.contracts import (
     RoutingMode,
     RoutingSpec,
 )
-from elspeth.contracts.errors import ConfigGateReason, SchedulerLeaseLostError
+from elspeth.contracts.errors import ConfigGateReason, SchedulerLeaseLostError, TransformSuccessReason
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
@@ -617,6 +617,104 @@ class TestCompleteNodeState:
         assert fetched.context_after_json is not None
         parsed = json.loads(fetched.context_after_json)
         assert parsed == context.to_dict()
+
+    def test_serialized_metadata_matches_raw_and_persists_as_given(self):
+        from elspeth.contracts.node_state_context import GateEvaluationContext
+        from elspeth.core.landscape.execution.node_states import serialize_completion_metadata
+
+        _db, factory, _row_id, token_id = _setup_with_token()
+        member = leader_coordination_token(factory, "run-1").membership
+        success = {"action": "classified", "metadata": {"kept": [2, 1]}}
+        context = GateEvaluationContext(condition="row['x'] > 0", result="True", route_label="true")
+        raw_state = factory.execution.begin_node_state(
+            token_id=token_id, node_id="source-0", step_index=0, input_data={"x": 1}, member_token=member
+        )
+        factory.execution.complete_node_state(
+            raw_state.state_id,
+            NodeStateStatus.COMPLETED,
+            output_data={"x": 1},
+            duration_ms=1,
+            success_reason=success,
+            context_after=context,
+            member_token=member,
+        )
+        metadata = serialize_completion_metadata(success_reason=success, context_after=context)
+        prepared_state = factory.execution.begin_node_state(
+            token_id=token_id, node_id="transform-1", step_index=1, input_data={"x": 1}, member_token=member
+        )
+        factory.execution.complete_node_state(
+            prepared_state.state_id,
+            NodeStateStatus.COMPLETED,
+            output_data={"x": 1},
+            duration_ms=1,
+            serialized_metadata=metadata,
+            member_token=member,
+        )
+
+        raw = factory.execution.get_node_state(raw_state.state_id)
+        prepared = factory.execution.get_node_state(prepared_state.state_id)
+        assert isinstance(raw, NodeStateCompleted)
+        assert isinstance(prepared, NodeStateCompleted)
+        assert prepared.success_reason_json == metadata.success_reason_json == raw.success_reason_json
+        assert prepared.context_after_json == metadata.context_after_json == raw.context_after_json
+        assert metadata.success_reason_json is not None
+        assert json.loads(metadata.success_reason_json) == success
+
+    @pytest.mark.parametrize("raw_field", ["success_reason", "context_after"])
+    def test_serialized_metadata_with_raw_metadata_is_refused_before_write(self, raw_field: str):
+        from elspeth.contracts.node_state_context import GateEvaluationContext
+        from elspeth.core.landscape.execution.node_states import serialize_completion_metadata
+
+        _db, factory, _row_id, token_id = _setup_with_token()
+        member = leader_coordination_token(factory, "run-1").membership
+        state = factory.execution.begin_node_state(
+            token_id=token_id, node_id="source-0", step_index=0, input_data={"x": 1}, member_token=member
+        )
+        metadata = serialize_completion_metadata(success_reason={"action": "classified"}, context_after=None)
+        success_reason: TransformSuccessReason | None = {"action": "classified"} if raw_field == "success_reason" else None
+        context_after = GateEvaluationContext(condition="c", result="True", route_label="true") if raw_field == "context_after" else None
+
+        with pytest.raises(ValueError, match="not both"):
+            factory.execution.complete_node_state(
+                state.state_id,
+                NodeStateStatus.COMPLETED,
+                output_data={"x": 1},
+                duration_ms=1,
+                success_reason=success_reason,
+                context_after=context_after,
+                serialized_metadata=metadata,
+                member_token=member,
+            )
+
+        fetched = factory.execution.get_node_state(state.state_id)
+        assert fetched is not None
+        assert fetched.status == NodeStateStatus.OPEN
+
+    def test_serialized_success_reason_on_failed_is_refused(self):
+        from elspeth.core.landscape.execution.node_states import serialize_completion_metadata
+
+        _db, factory, _row_id, token_id = _setup_with_token()
+        member = leader_coordination_token(factory, "run-1").membership
+        state = factory.execution.begin_node_state(
+            token_id=token_id, node_id="source-0", step_index=0, input_data={"x": 1}, member_token=member
+        )
+        metadata = serialize_completion_metadata(success_reason={"action": "classified"}, context_after=None)
+
+        # The facade types serialized_metadata on its COMPLETED overload only; the
+        # repository implementation behind it takes any status, so call it there.
+        with pytest.raises(ValueError, match="FAILED node state must not have success_reason"):
+            factory.execution.node_states.complete_node_state(
+                state.state_id,
+                NodeStateStatus.FAILED,
+                error={"reason": "something broke"},
+                duration_ms=1,
+                serialized_metadata=metadata,
+                member_token=member,
+            )
+
+        fetched = factory.execution.get_node_state(state.state_id)
+        assert fetched is not None
+        assert fetched.status == NodeStateStatus.OPEN
 
     def test_stores_duration_ms(self):
         _db, factory, _row_id, token_id = _setup_with_token()
