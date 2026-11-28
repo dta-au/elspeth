@@ -348,6 +348,19 @@ def _log_loss_watcher_poll_failed(exc: SQLAlchemyError, *, run_id: UUID) -> None
     )
 
 
+def _log_loss_watcher_failure_deferred(exc: BaseException, *, run_id: UUID) -> None:
+    """Log a queued run's watcher failure whose record waits for that run's own end.
+
+    The failure is recorded when the queued run completes; until then this
+    line is the only trace of it. Class names only, no ``exc_info``.
+    """
+    slog.error(
+        "execution_loss_watcher_failure_deferred",
+        run_id=str(run_id),
+        exc_class=type(exc).__name__,
+    )
+
+
 class InlineBlobPromptSurfaceAdmissionError(Exception):
     """An LLM-authored blob was bound as inline content into an LLM prompt surface.
 
@@ -2366,19 +2379,19 @@ class ExecutionServiceImpl:
             if self.execution_lease_release_registry.recovery.instance_draining.is_set():
                 owner.outcome = (task, None)
                 return
-            self._stop_run_on_loss_watcher_death(owner.lease, shutdown_event, original)
             owner.outcome = (task, original)
+            self._stop_run_on_loss_watcher_death(owner.lease, shutdown_event, original, run_id=run_id)
             raise
         except BaseException as original:
-            if not owner.close_requested.is_set():
-                self._stop_run_on_loss_watcher_death(owner.lease, shutdown_event, original)
             owner.outcome = (task, original)
+            if not owner.close_requested.is_set():
+                self._stop_run_on_loss_watcher_death(owner.lease, shutdown_event, original, run_id=run_id)
             raise
         else:
             owner.outcome = (task, None)
 
     def _stop_run_on_loss_watcher_death(
-        self, lease: SessionOperationLease, shutdown_event: threading.Event, original: BaseException
+        self, lease: SessionOperationLease, shutdown_event: threading.Event, original: BaseException, *, run_id: UUID
     ) -> None:
         """Stop the watched run at once; record the failure at once only if its pipeline has started.
 
@@ -2386,11 +2399,14 @@ class ExecutionServiceImpl:
         check below finds it already set. A run whose pipeline is still queued
         behind another run's has its failure recorded when its own completion
         joins this watcher. Recording it now would begin process recovery and
-        stop the run that is executing.
+        stop the run that is executing. Until then the deferred failure is
+        logged once, so it is visible while the queued run waits.
         """
         shutdown_event.set()
         if _execution_pipeline_started(lease):
             self.execution_lease_release_registry.record_failure(original)
+        else:
+            _log_loss_watcher_failure_deferred(original, run_id=run_id)
 
     async def _join_loss_watcher(
         self,

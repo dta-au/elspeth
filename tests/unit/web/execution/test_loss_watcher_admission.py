@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import threading
-import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -18,6 +17,7 @@ import pytest
 import pytest_asyncio
 import structlog
 from sqlalchemy import update
+from structlog.testing import capture_logs
 
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web import async_workers
@@ -41,6 +41,10 @@ _SOURCE = {"plugin": "csv", "on_success": "rows", "options": {"path": "input.csv
 async def _bounded(awaitable: Any, *, seconds: float, label: str) -> Any:
     task = asyncio.create_task(awaitable)
     done, _pending = await asyncio.wait({task}, timeout=seconds)
+    if task not in done:
+        # Leave no task running past its bound: cancel it and wait, bounded, for it to end.
+        task.cancel()
+        await asyncio.wait({task}, timeout=seconds)
     assert task in done, f"{label} did not complete within {seconds} seconds"
     return await task
 
@@ -232,9 +236,8 @@ async def test_refused_poll_stays_live_and_carries_peer_cancel(tmp_path: Path, e
                 .where(runs_table.c.id == str(run.run_id))
                 .values(cancel_requested_at=datetime.now(UTC), cancellation_source="user")
             )
-        started = time.monotonic()
+        # Bound: the 5 s maximum backoff, plus scheduling and one poll.
         assert await _eventually(run.shutdown_event.is_set, seconds=8)
-        assert time.monotonic() - started <= 8  # 5 s maximum backoff, plus scheduling and one poll.
 
 
 @pytest.mark.asyncio
@@ -270,12 +273,16 @@ async def test_lease_loss_is_seen_after_refusal(tmp_path: Path, execution_fixtur
 async def test_missing_run_stops_immediately_and_records_once(tmp_path: Path, execution_fixture: ExecutionTestCustody) -> None:
     async with _case(execution_fixture, tmp_path, seeded=False, started=True) as (run, _engine, expected):
         registry = run.service.execution_lease_release_registry
-        assert await _eventually(run.watcher.done, seconds=5)
+        with capture_logs() as logs:
+            assert await _eventually(run.watcher.done, seconds=5)
         original = run.watcher.exception()
         assert isinstance(original, ValueError)
         assert run.shutdown_event.is_set()
         assert registry._failures == [original]
         expected.append(original)
+        assert [entry for entry in logs if entry["event"] == "execution_loss_watcher_failure_deferred"] == [], (
+            "a started run's watcher failure is recorded at once, not deferred"
+        )
 
 
 @pytest.mark.asyncio
@@ -307,6 +314,41 @@ async def test_poll_raised_cancelled_error_is_a_watcher_failure(tmp_path: Path, 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure_class",
+    [pytest.param(RequiredGenerationUnavailable, id="generation-unavailable"), pytest.param(ValueError, id="other-error")],
+)
+async def test_watcher_original_survives_a_failing_stop_step(
+    tmp_path: Path, execution_fixture: ExecutionTestCustody, failure_class: type[Exception]
+) -> None:
+    async with _case(execution_fixture, tmp_path, started=True) as (run, _engine, expected):
+        # The watcher keeps its own original as its outcome before it stops the
+        # run, so a stop step that raises cannot leave the join without it.
+        original = failure_class("poll failed")
+        stop_failure = RuntimeError("stop step failed")
+        with patch("elspeth.web.execution.service._execution_pipeline_started", side_effect=stop_failure):
+            run.service._session_service.get_run.side_effect = original
+            assert await _eventually(run.watcher.done, seconds=5)
+        owner = run.service._loss_watcher_owner(run.watcher, run.lease)
+        try:
+            assert run.watcher.exception() is stop_failure
+            assert run.shutdown_event.is_set()
+            cancellations, watcher_error = await run.service._join_loss_watcher(run.watcher, run.lease)
+            assert watcher_error is original, f"the join must return the watcher's original, got {watcher_error!r}"
+            assert cancellations == []
+            assert owner.outcome == (run.watcher, original)
+        finally:
+            expected.append(original)
+            if owner.outcome is None:
+                # Bound for a failing run: service shutdown waits until it has
+                # observed every finished watcher's outcome, and its wait cannot
+                # be cancelled, so a watcher left without one would hang this
+                # case's cleanup. Supply the outcome so the assertion above stays
+                # the reported failure. Reached only without the fix.
+                owner.outcome = (run.watcher, original)
+
+
+@pytest.mark.asyncio
 async def test_queued_run_watcher_death_waits_for_its_own_end(tmp_path: Path, execution_fixture: ExecutionTestCustody) -> None:
     executing, engine = await _start(execution_fixture, tmp_path)
     expected: list[BaseException] = []
@@ -319,10 +361,12 @@ async def test_queued_run_watcher_death_waits_for_its_own_end(tmp_path: Path, ex
         assert executing_pipeline is not None
         assert await _eventually(executing_pipeline.running, seconds=5), "the executing run's pipeline did not start"
         lease, authority = await _canonical_execute_lease(executing.service, execution_fixture, session_id=uuid4())
-        queued = _Run(executing.service, executing.executor, lease, authority, uuid4())
-        queued_pipeline = queued.obligation.pipeline
-        assert queued_pipeline is not None and not queued_pipeline.running() and not queued_pipeline.done()
-        assert await _eventually(queued.watcher.done, seconds=5)
+        queued_run_id = uuid4()
+        with capture_logs() as logs:
+            queued = _Run(executing.service, executing.executor, lease, authority, queued_run_id)
+            queued_pipeline = queued.obligation.pipeline
+            assert queued_pipeline is not None and not queued_pipeline.running() and not queued_pipeline.done()
+            assert await _eventually(queued.watcher.done, seconds=5)
         original = queued.watcher.exception()
         assert isinstance(original, ValueError)
         registry = executing.service.execution_lease_release_registry
@@ -331,6 +375,15 @@ async def test_queued_run_watcher_death_waits_for_its_own_end(tmp_path: Path, ex
         assert not execution_fixture.recovery.instance_draining.is_set()
         assert not executing.shutdown_event.is_set()
         assert executing_pipeline.running()
+        deferred = [entry for entry in logs if entry["event"] == "execution_loss_watcher_failure_deferred"]
+        assert deferred == [
+            {
+                "event": "execution_loss_watcher_failure_deferred",
+                "log_level": "error",
+                "run_id": str(queued_run_id),
+                "exc_class": "ValueError",
+            }
+        ], "a deferred watcher failure is logged once, by class name, when it is deferred"
         await executing.end([])
         expected.append(original)
         await queued.end(expected)

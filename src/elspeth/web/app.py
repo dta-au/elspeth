@@ -473,6 +473,7 @@ async def _periodic_orphan_cleanup(
         try:
             try:
                 await session_service.reconcile_consumed_archives()
+            # A refused admission is an OSError, so this handler, not the outer one, takes it here.
             except OSError as cleanup_exc:
                 archive_cleanup_failures += 1
                 if archive_cleanup_failures >= _ORPHAN_CLEANUP_MAX_CONSECUTIVE_FAILURES:
@@ -517,8 +518,8 @@ async def _periodic_orphan_cleanup(
                     raise
             # OperationalError and refused shared-pool admissions are retried
             # up to the same consecutive-failure bound. Other failures
-            # propagate, terminating the task
-            # so the fault surfaces at lifespan shutdown (the outer
+            # propagate, terminating the task so the fault surfaces at
+            # lifespan shutdown (the outer
             # contextlib.suppress narrows to CancelledError only) —
             # retrying those every interval can never fix them.
             # The retry itself is bounded: past the consecutive-failure

@@ -144,9 +144,11 @@ async def test_sweep_escalates_at_refusal_cap(tmp_path: Path) -> None:
         assert calls == 5
     finally:
         fifth_allowed.set()
-        await hold.free()
-        if task is not None:
-            await _stop(task)
+        try:
+            await hold.free()
+        finally:
+            if task is not None:
+                await _stop(task)
 
 
 @pytest.mark.asyncio
@@ -288,11 +290,13 @@ async def test_composer_loop_survives_refusal_below_cap() -> None:
             assert await _eventually(lambda: refusals >= 1, seconds=5)
             assert not task.done(), "a refused poll must leave the composer loop active"
     finally:
-        await hold.free()
-        owner._stopping = True
-        owner._wake.set()
-        if task is not None and not task.done():
-            await asyncio.wait_for(task, timeout=5)
+        try:
+            await hold.free()
+        finally:
+            owner._stopping = True
+            owner._wake.set()
+            if task is not None and not task.done():
+                await asyncio.wait_for(task, timeout=5)
 
 
 @pytest.mark.asyncio
@@ -325,11 +329,13 @@ async def test_composer_loop_escalates_at_refusal_cap() -> None:
         assert calls == 5
     finally:
         fifth_allowed.set()
-        await hold.free()
-        if task is not None and not task.done():
-            owner._stopping = True
-            owner._wake.set()
-            await _stop(task)
+        try:
+            await hold.free()
+        finally:
+            if task is not None and not task.done():
+                owner._stopping = True
+                owner._wake.set()
+                await _stop(task)
 
 
 @pytest.mark.asyncio
@@ -378,19 +384,26 @@ async def test_membership_heartbeat_retries_then_takes_loss_path(tmp_path: Path,
         assert await _eventually(membership.draining.is_set, seconds=2)
         assert type(task.exception()) is async_workers.AsyncWorkerAdmissionTimeoutError
     finally:
-        await hold.free()
-        if started:
-            # stop() re-raises the heartbeat's own failure; expect exactly what the task holds,
-            # so this cleanup never replaces an assertion raised above.
-            heartbeat = membership._heartbeat_task
-            failure = heartbeat.exception() if heartbeat is not None and heartbeat.done() and not heartbeat.cancelled() else None
-            if failure is None:
-                await asyncio.wait_for(membership.stop(), timeout=5)
-            else:
-                with pytest.raises(type(failure)) as raised:
-                    await asyncio.wait_for(membership.stop(), timeout=5)
-                assert raised.value is failure
-        engine.dispose()
+        try:
+            await hold.free()
+        finally:
+            try:
+                if started:
+                    # The stop write runs only while the instance drains, and only the heartbeat's
+                    # loss path sets draining. Set it here so this cleanup cannot replace an
+                    # assertion raised above when the heartbeat has not failed.
+                    draining.set()
+                    # stop() re-raises the heartbeat's own failure; expect exactly what the task holds.
+                    heartbeat = membership._heartbeat_task
+                    failure = heartbeat.exception() if heartbeat is not None and heartbeat.done() and not heartbeat.cancelled() else None
+                    if failure is None:
+                        await asyncio.wait_for(membership.stop(), timeout=5)
+                    else:
+                        with pytest.raises(type(failure)) as raised:
+                            await asyncio.wait_for(membership.stop(), timeout=5)
+                        assert raised.value is failure
+            finally:
+                engine.dispose()
 
 
 def _fake_heartbeat_clock(
@@ -413,6 +426,7 @@ def _fake_heartbeat_clock(
 async def test_heartbeat_refusal_then_database_errors_obeys_lease_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
     clock = 0.0
     calls = 0
+    sleeps: list[float] = []
     logs: list[tuple[str, str]] = []
     real_sleep = asyncio.sleep
     refusal = async_workers.AsyncWorkerAdmissionTimeoutError("admission refused")
@@ -420,6 +434,7 @@ async def test_heartbeat_refusal_then_database_errors_obeys_lease_deadline(monke
 
     async def fake_sleep(seconds: float) -> None:
         nonlocal clock
+        sleeps.append(seconds)
         clock += seconds
         await real_sleep(0)
 
@@ -449,6 +464,9 @@ async def test_heartbeat_refusal_then_database_errors_obeys_lease_deadline(monke
         await asyncio.wait_for(RegisteredWebInstanceMembership._heartbeat_loop(owner), timeout=5)
     assert raised.value is database_error, "a refusal inside the lease must be retried"
     assert calls == 4
+    # Only the refusal is retried after the short delay; the database error that
+    # follows it is retried at the regular interval, so the count cap spans intervals.
+    assert sleeps == [1, 1, 0.25, 1]
     assert logs[0] == ("warning", "web_instance_heartbeat_failed")
     assert logs[-1] == ("error", "web_instance_heartbeat_escalating")
 
