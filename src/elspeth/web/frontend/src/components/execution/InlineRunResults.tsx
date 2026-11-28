@@ -18,6 +18,7 @@ import { NarrativeResults } from "@/components/composer/NarrativeResults";
 import { useNarrativeMode } from "@/hooks/useNarrativeMode";
 import {
   isTerminalRunStatus,
+  isLiveRunStatus,
   type DiscardStageSummary,
   type DiscardSummary,
   type Run,
@@ -289,7 +290,7 @@ export function InlineRunResults({
     ? runs.filter((run) => !run.session_id || run.session_id === activeSessionId)
     : runs;
   const hasActiveOrPendingRun =
-    visibleRuns.some((run) => run.status === "pending" || run.status === "running") ||
+    visibleRuns.some((run) => isLiveRunStatus(run.status)) ||
     (progress !== null && !isTerminalRunStatus(progress.status));
 
   useEffect(() => {

@@ -26,7 +26,7 @@ import {
 import { useAuditReadinessStore } from "@/stores/auditReadinessStore";
 import { useExecutionStore } from "@/stores/executionStore";
 import { useSessionStore } from "@/stores/sessionStore";
-import type { RunStatus } from "@/types/index";
+import { isLiveRunStatus, type RunStatus } from "@/types/index";
 import { AuthoringPaneToggle } from "./AuthoringPaneToggle";
 import { useWorkspacePaneController } from "./WorkspacePaneContext";
 import { ApprovalsView } from "./ApprovalsView";
@@ -275,7 +275,7 @@ export function ArtifactWorkspaceSurface({
   const runAttached = useExecutionStore(
     (s) =>
       s.activeRunId !== null &&
-      (s.progress?.status === "running" || s.progress?.status === "pending"),
+      (s.progress !== null && isLiveRunStatus(s.progress.status)),
   );
   const wsDisconnected = useExecutionStore((s) => s.wsDisconnected);
   // A dropped WebSocket means progress.status can no longer advance from this

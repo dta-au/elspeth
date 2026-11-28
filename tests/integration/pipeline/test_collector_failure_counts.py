@@ -65,6 +65,232 @@ from tests.integration.pipeline.test_collector_failure_verdict import (
 from tests.integration.pipeline.test_row_type_violation_routing import _run_cli, _summing_collector_settings
 
 
+@pytest.mark.parametrize("quarantine_ordinal", [0, 1, 2], ids=["first", "middle", "last"])
+@pytest.mark.parametrize("downstream", [False, True], ids=["terminal-sink", "downstream-release"])
+def test_collector_quarantine_counts_and_completes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, quarantine_ordinal: int, downstream: bool
+) -> None:
+    """A successful mixed collector flush must surface its quarantined member to live accounting.
+
+    The downstream-release cases also hold the collector's pending members until
+    all three are journaled, then feed them to the intake rotated out of opener
+    ordinal order, so the quarantined member never arrives at its own ordinal.
+    """
+    from elspeth.contracts.events import TokenCompleted
+    from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
+    from elspeth.engine.executors.collector import CollectorExecutor
+    from elspeth.engine.orchestrator import run_lifecycle
+    from elspeth.engine.orchestrator.run_status import derive_terminal_status_from_audit
+    from elspeth.telemetry.manager import TelemetryManager
+
+    completed: list[TokenCompleted] = []
+    real_handle = TelemetryManager.handle_event
+
+    def capture(self: TelemetryManager, event: Any) -> None:
+        if isinstance(event, TokenCompleted):
+            completed.append(event)
+        real_handle(self, event)
+
+    monkeypatch.setattr(TelemetryManager, "handle_event", capture)
+    parity_pairs: list[tuple[tuple[int, int], tuple[int, int]]] = []
+    real_parity = run_lifecycle.assert_terminal_counter_parity
+
+    def capture_parity(*, live: Any, audit: Any, run_id: str) -> None:
+        parity_pairs.append(((live.rows_failed, live.rows_quarantined), (audit.rows_failed, audit.rows_quarantined)))
+        real_parity(live=live, audit=audit, run_id=run_id)
+
+    monkeypatch.setattr(run_lifecycle, "assert_terminal_counter_parity", capture_parity)
+    arrivals: list[int] = []
+    reordered_batches: list[tuple[str, ...]] = []
+    if downstream:
+        real_pending = TokenSchedulerRepository.list_pending_blocked_barrier_items
+        real_accept = CollectorExecutor.accept
+
+        def rotate_collector_pending(self: TokenSchedulerRepository, *, run_id: str) -> Any:
+            pending = real_pending(self, run_id=run_id)
+            collector_pending = [row for row in pending if row.collector_name == "page_rep"]
+            if 0 < len(collector_pending) < len(pages):
+                return [row for row in pending if row.collector_name != "page_rep"]
+            # The journal lists pending rows by work_item_id, not by opener
+            # ordinal: order them by the ordinal the explode stamped on each
+            # row, then rotate by one so every member leaves its ordinal slot.
+            by_ordinal = sorted(collector_pending, key=lambda row: int(self.deserialize_row_payload(row.row_payload_json)["item_index"]))
+            if len(by_ordinal) > 1:
+                reordered_batches.append(tuple(row.token_id for row in by_ordinal))
+            collector_rows = iter(by_ordinal[1:] + by_ordinal[:1])
+            return [next(collector_rows) if row.collector_name == "page_rep" else row for row in pending]
+
+        def record_arrival(self: CollectorExecutor, token: Any, collector_name: str, ctx: Any, *, arrival_time: float | None = None) -> Any:
+            arrivals.append(token.row_data["copies"])
+            return real_accept(self, token, collector_name, ctx, arrival_time=arrival_time)
+
+        monkeypatch.setattr(TokenSchedulerRepository, "list_pending_blocked_barrier_items", rotate_collector_pending)
+        monkeypatch.setattr(CollectorExecutor, "accept", record_arrival)
+    pages = [1, 2, 3]
+    pages[quarantine_ordinal] = 0
+    (tmp_path / "docs.jsonl").write_text(json.dumps({"doc_id": "DOC-1", "pages": pages}) + "\n")
+    next_stage = "after_rep" if downstream else "out"
+    extra_transform = (
+        "  - name: after_rep\n"
+        "    plugin: passthrough\n"
+        "    input: after_rep\n"
+        "    on_success: out\n"
+        "    on_error: discard\n"
+        "    options:\n"
+        "      schema: {mode: observed}\n"
+        if downstream
+        else ""
+    )
+    settings = f"""sources:
+  docs:
+    plugin: json
+    on_success: rows
+    options:
+      path: {tmp_path / "docs.jsonl"}
+      format: jsonl
+      on_validation_failure: discard
+      schema: {{mode: observed}}
+concurrency:
+  max_workers: 1
+transforms:
+  - name: explode_pages
+    plugin: json_explode
+    input: rows
+    on_success: pages
+    on_error: discard
+    options:
+      array_field: pages
+      output_field: copies
+      schema: {{mode: observed}}
+{extra_transform}collectors:
+  - name: page_rep
+    plugin: batch_replicate
+    input: pages
+    on_success: {next_stage}
+    options:
+      copies_field: copies
+      default_copies: 1
+      include_copy_index: true
+      schema: {{mode: observed}}
+scopes:
+  - name: document_pages
+    opener: explode_pages
+    closer: page_rep
+    policy: require_all
+sinks:
+  out:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: {tmp_path / "out.jsonl"}
+      format: jsonl
+      schema: {{mode: observed}}
+telemetry:
+  enabled: true
+landscape:
+  url: sqlite:///{tmp_path / "audit.db"}
+payload_store:
+  backend: filesystem
+  base_path: {tmp_path / "payloads"}
+"""
+    cli = _run_cli(tmp_path, settings)
+    assert "Live-vs-audit terminal counter mismatch" not in cli.output
+    assert cli.exit_code == 1, cli.output
+    rows = [json.loads(line) for line in (tmp_path / "out.jsonl").read_text().splitlines()]
+    expected = [
+        {"doc_id": "DOC-1", "item_index": ordinal, "copies": count, "copy_index": index}
+        for ordinal, count in enumerate(pages)
+        if count > 0
+        for index in range(count)
+    ]
+    assert rows == expected
+    if downstream:
+        assert reordered_batches, "the intake must reorder one multi-member pending batch"
+        assert arrivals == pages[1:] + pages[:1], "the collector must receive its members rotated out of opener ordinal order"
+        assert arrivals.index(0) != quarantine_ordinal, "the quarantined member must arrive away from its ordinal"
+    db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
+    run_id = _only_run_id(db)
+    status, audit = derive_terminal_status_from_audit(RecorderFactory(db), run_id)
+    assert status is RunStatus.COMPLETED_WITH_FAILURES
+    assert (audit.rows_failed, audit.rows_quarantined) == (1, 1)
+    assert parity_pairs == [((1, 1), (1, 1))]
+    with db.connection() as conn:
+        audited_quarantined = sorted(
+            str(token_id)
+            for token_id in conn.execute(
+                select(token_outcomes_table.c.token_id)
+                .where(token_outcomes_table.c.run_id == run_id)
+                .where(token_outcomes_table.c.completed == 1)
+                .where(token_outcomes_table.c.outcome == TerminalOutcome.FAILURE.value)
+                .where(token_outcomes_table.c.path == TerminalPath.QUARANTINED_AT_SOURCE.value)
+            ).scalars()
+        )
+    quarantine_pair = (TerminalOutcome.FAILURE, TerminalPath.QUARANTINED_AT_SOURCE)
+    quarantine_events = sorted(event.token_id for event in completed if (event.outcome, event.path) == quarantine_pair)
+    assert len(audited_quarantined) == 1
+    # Identity, with multiplicity: the event names the member the audit quarantined, once.
+    assert quarantine_events == audited_quarantined
+
+
+def test_collector_quarantine_all_valid_control(tmp_path: Path) -> None:
+    (tmp_path / "docs.jsonl").write_text(json.dumps({"doc_id": "DOC-1", "pages": [1, 2]}) + "\n")
+    settings = f"""sources:
+  docs:
+    plugin: json
+    on_success: rows
+    options:
+      path: {tmp_path / "docs.jsonl"}
+      format: jsonl
+      on_validation_failure: discard
+      schema: {{mode: observed}}
+transforms:
+  - name: explode_pages
+    plugin: json_explode
+    input: rows
+    on_success: pages
+    on_error: discard
+    options:
+      array_field: pages
+      output_field: copies
+      schema: {{mode: observed}}
+collectors:
+  - name: page_rep
+    plugin: batch_replicate
+    input: pages
+    on_success: out
+    options:
+      copies_field: copies
+      include_copy_index: true
+      schema: {{mode: observed}}
+scopes:
+  - name: document_pages
+    opener: explode_pages
+    closer: page_rep
+    policy: require_all
+sinks:
+  out:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: {tmp_path / "out.jsonl"}
+      format: jsonl
+      schema: {{mode: observed}}
+landscape:
+  url: sqlite:///{tmp_path / "audit.db"}
+payload_store:
+  backend: filesystem
+  base_path: {tmp_path / "payloads"}
+"""
+    cli = _run_cli(tmp_path, settings)
+    assert cli.exit_code == 0, cli.output
+    rows = [json.loads(line) for line in (tmp_path / "out.jsonl").read_text().splitlines()]
+    assert rows == [
+        {"doc_id": "DOC-1", "item_index": 0, "copies": 1, "copy_index": 0},
+        {"doc_id": "DOC-1", "item_index": 1, "copies": 2, "copy_index": 0},
+        {"doc_id": "DOC-1", "item_index": 1, "copies": 2, "copy_index": 1},
+    ]
+
+
 @dataclass(frozen=True, slots=True)
 class _Surfaces:
     """Every counting reader's view of one run."""
