@@ -19,7 +19,12 @@ from starlette.applications import Starlette
 
 from elspeth.contracts.errors import AuditIntegrityError, ComposerOwnedSettlementFailure
 from elspeth.contracts.session_operation import SessionOperationKind
-from elspeth.web.async_workers import AsyncWorkerAdmissionTimeoutError, run_required_sql_finish_once, run_sync_in_worker
+from elspeth.web.async_workers import (
+    WORKER_ADMISSION_REFUSED,
+    AsyncWorkerAdmissionTimeoutError,
+    run_required_sql_finish_once,
+    run_sync_in_worker,
+)
 from elspeth.web.composer.audit_storage import ComposerOperationFailureFacts
 from elspeth.web.composer.private_diagnostic_facts import capture_failure_facts, safe_failure_text
 from elspeth.web.composer_watch_reads import ComposerOperationWatchReader
@@ -374,7 +379,7 @@ class ComposerAsyncWorker:
                 try:
                     await self.reap_once()
                     await self._claim_once()
-                except OperationalError as exc:
+                except (OperationalError, WORKER_ADMISSION_REFUSED) as exc:
                     # Only custody-free statements reach here: each is its own
                     # transaction and holds no lease or fence when it raises
                     # (a reap's session lease and its own-lapsed settlement
@@ -382,7 +387,10 @@ class ComposerAsyncWorker:
                     # commits each candidate separately: a claim whose commit
                     # is unknown, and any committed before the failing one, are
                     # never run here, stay queued, and are taken again with a
-                    # new token once their claim lease lapses. exc_info is
+                    # new token once their claim lease lapses. A refused
+                    # admission submits nothing; when it refuses a reap
+                    # lease's own release, that lease has already stopped
+                    # renewing, so its fence lapses with its lease. exc_info is
                     # deliberately omitted: SQLAlchemy cause chains carry the
                     # database URL.
                     consecutive_failures += 1

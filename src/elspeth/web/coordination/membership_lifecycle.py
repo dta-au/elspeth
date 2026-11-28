@@ -25,7 +25,12 @@ import structlog
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
 from elspeth.web.application_finalizers import ApplicationFinalizerKind, ApplicationFinalizerOwner
-from elspeth.web.async_workers import run_application_finalizer_in_worker, run_lease_upkeep_in_worker, run_sync_in_worker
+from elspeth.web.async_workers import (
+    WORKER_ADMISSION_REFUSED,
+    run_application_finalizer_in_worker,
+    run_lease_upkeep_in_worker,
+    run_sync_in_worker,
+)
 from elspeth.web.coordination.membership_authority import (
     RepositoryWebInstanceMembershipAuthority,
     WebInstanceIdentity,
@@ -37,11 +42,14 @@ from elspeth.web.process_recovery import ProcessRecovery
 _HEARTBEAT_MAX_CONSECUTIVE_FAILURES = 5
 """Consecutive transient-failure bound for lease renewal.
 
-One or two ``OperationalError`` heartbeats are contention and retry
-cleanly; this many in a row means the process can no longer prove it is
-alive. The heartbeat task then re-raises and its done callback signals the
-host to shut down the process so the supervisor restarts it — the same
-escalation the periodic orphan sweeper uses.
+Applies only while no admission refusal has been seen since the last
+successful heartbeat; after a refusal, the lease deadline alone bounds the
+retries (see ``_heartbeat_loop``). One or two ``OperationalError``
+heartbeats are contention and retry cleanly; this many in a row means the
+process can no longer prove it is alive. The heartbeat task then re-raises
+and its done callback signals the host to shut down the process so the
+supervisor restarts it — the same escalation the periodic orphan sweeper
+uses.
 """
 
 
@@ -172,24 +180,60 @@ class RegisteredWebInstanceMembership(WebInstanceMembership):
         self._heartbeat_task = task
 
     async def _heartbeat_loop(self) -> None:
+        # The lease deadline is read from the event-loop clock that also paces
+        # these sleeps and the worker-admission wait.
+        #
+        # One bound per mode:
+        # - No refusal since the last success: OperationalError is retried at
+        #   the regular interval, up to _HEARTBEAT_MAX_CONSECUTIVE_FAILURES.
+        # - A refusal seen since the last success: refusals and
+        #   OperationalErrors are both retried after the short delay, bounded
+        #   by the lease deadline alone. A failed attempt escalates once the
+        #   next attempt would start at or after one regular interval before
+        #   the lease expires. The margin left at expiry is that interval less
+        #   the next attempt's admission wait and its upkeep call, which has
+        #   no timeout of its own; the margin holds only if both fit in it.
+        # A success returns the loop to the first mode.
+        loop = asyncio.get_running_loop()
         consecutive_failures = 0
+        last_successful_heartbeat = loop.time()
+        refused_since_success = False
+        short_delay = min(self._interval_seconds / 4, 1.0)
+        next_delay: float = self._interval_seconds
         while True:
-            await asyncio.sleep(self._interval_seconds)
+            await asyncio.sleep(next_delay)
             try:
+                heartbeat_submitted_at = loop.time()
                 await run_lease_upkeep_in_worker(
                     self._heartbeat_authority.heartbeat, self._identity.instance_id, lease_seconds=self._lease_seconds
                 )
                 consecutive_failures = 0
+                last_successful_heartbeat = heartbeat_submitted_at
+                refused_since_success = False
+                next_delay = self._interval_seconds
+            except WORKER_ADMISSION_REFUSED as exc:
+                refused_since_success = True
+                next_delay = short_delay
+                if loop.time() + next_delay >= last_successful_heartbeat + self._lease_seconds - self._interval_seconds:
+                    self._log.error("web_instance_heartbeat_escalating", exc_class=type(exc).__name__)
+                    raise
+                self._log.warning("web_instance_heartbeat_failed", exc_class=type(exc).__name__)
             except OperationalError as exc:
-                # Only OperationalError is retried, and only a bounded number
-                # of times: it is the one failure class that models transient
-                # contention. WebInstanceMembershipLost and every other error
-                # propagate at once — the row is gone or the fault is
-                # standing, and renewing cannot fix either. exc_info is
+                # Of database errors, only OperationalError is retried, bounded
+                # as stated above: it is the one failure class that models
+                # transient contention. WebInstanceMembershipLost and every
+                # error not handled above propagate at once — the row is gone or
+                # the fault is standing, and renewing cannot fix either. exc_info is
                 # deliberately omitted: SQLAlchemy cause chains carry the
                 # database URL.
                 consecutive_failures += 1
-                if consecutive_failures >= _HEARTBEAT_MAX_CONSECUTIVE_FAILURES:
+                if refused_since_success:
+                    next_delay = short_delay
+                    bound_reached = loop.time() + next_delay >= last_successful_heartbeat + self._lease_seconds - self._interval_seconds
+                else:
+                    next_delay = self._interval_seconds
+                    bound_reached = consecutive_failures >= _HEARTBEAT_MAX_CONSECUTIVE_FAILURES
+                if bound_reached:
                     self._log.error(
                         "web_instance_heartbeat_escalating",
                         exc_class=type(exc).__name__,
