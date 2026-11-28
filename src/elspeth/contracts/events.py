@@ -25,7 +25,7 @@ from elspeth.contracts.enums import (
     TerminalOutcome,
     TerminalPath,
 )
-from elspeth.contracts.freeze import freeze_fields, require_int
+from elspeth.contracts.freeze import freeze_fields, require_bool, require_int
 from elspeth.contracts.secret_scrub import scrub_text_for_audit
 from elspeth.contracts.token_usage import TokenUsage
 
@@ -200,6 +200,15 @@ class RunSummary:
     - routed_failure: Rows routed via transform/config-gate/aggregation on_error (DIVERT — failure-side routing)
     - routed_destinations: Count per destination sink {sink_name: count}; the per-sink
       breakdown is not split by routing intent — see ADR-004 for rationale.
+
+    ``outcome_counts_known`` is False when the durable outcome counts could not
+    be read (a FAILED run whose audit summary derive failed). The outcome and
+    routing fields are then placeholders that must be zero, and formatters
+    report the counts as unknown instead of printing them.
+
+    ``total_rows_known`` is False when the rows processed figure is unknown as
+    well (no live result and no audit summary). ``total_rows`` is then a
+    placeholder that must be zero, and the outcome counts must be unknown too.
     """
 
     run_id: str
@@ -214,6 +223,8 @@ class RunSummary:
     routed_failure: int = 0  # Rows routed via transform/config-gate/aggregation on_error (DIVERT)
     routed_destinations: tuple[tuple[str, int], ...] = ()  # (sink_name, count) pairs
     collector_groups_failed: int = 0  # Structural group failures, separate from failed rows
+    outcome_counts_known: bool = True  # False: outcome counts unavailable, not zero
+    total_rows_known: bool = True  # False: rows processed unavailable, not zero
 
     def __post_init__(self) -> None:
         require_int(self.total_rows, "total_rows", min_value=0)
@@ -224,6 +235,20 @@ class RunSummary:
         require_int(self.routed_success, "routed_success", min_value=0)
         require_int(self.routed_failure, "routed_failure", min_value=0)
         require_int(self.collector_groups_failed, "collector_groups_failed", min_value=0)
+        require_bool(self.outcome_counts_known, "outcome_counts_known")
+        if not self.outcome_counts_known and (
+            self.succeeded
+            or self.failed
+            or self.quarantined
+            or self.routed_success
+            or self.routed_failure
+            or self.routed_destinations
+            or self.collector_groups_failed
+        ):
+            raise ValueError("RunSummary with unknown outcome counts must carry no outcome or routing counts")
+        require_bool(self.total_rows_known, "total_rows_known")
+        if not self.total_rows_known and (self.total_rows or self.outcome_counts_known):
+            raise ValueError("RunSummary with unknown total_rows must carry total_rows=0 and unknown outcome counts")
 
 
 # =============================================================================
