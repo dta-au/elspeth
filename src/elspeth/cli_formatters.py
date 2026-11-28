@@ -54,6 +54,15 @@ def create_console_formatters(prefix: str = "Run") -> dict[type, Callable[..., N
             RunCompletionStatus.INTERRUPTED: "⏸",
         }
         symbol = status_symbols[event.status]
+        if not event.outcome_counts_known:
+            rows_part = f"{event.total_rows:,} rows processed" if event.total_rows_known else "rows processed unknown"
+            typer.echo(
+                f"\n{symbol} {prefix} {event.status.value.upper()}: "
+                f"{rows_part} | "
+                "outcome counts unknown (audit summary unavailable) | "
+                f"{event.duration_seconds:.2f}s total"
+            )
+            return
         routed_summary = ""
         if (event.routed_success + event.routed_failure) > 0:
             dest_parts = [f"{name}:{count}" for name, count in event.routed_destinations]
@@ -137,20 +146,23 @@ def create_json_formatters() -> dict[type, Callable[..., None]]:
         )
 
     def _format_run_summary_json(event: RunSummary) -> None:
+        known = event.outcome_counts_known
+        # Unknown counts serialize as null, never as a confirmed zero.
         typer.echo(
             json.dumps(
                 {
                     "event": "run_completed",
                     "run_id": event.run_id,
                     "status": event.status.value,
-                    "total_rows": event.total_rows,
-                    "succeeded": event.succeeded,
-                    "failed": event.failed,
-                    "quarantined": event.quarantined,
-                    "collector_groups_failed": event.collector_groups_failed,
-                    "routed_success": event.routed_success,
-                    "routed_failure": event.routed_failure,
-                    "routed_destinations": dict(event.routed_destinations),
+                    "total_rows": event.total_rows if event.total_rows_known else None,
+                    "outcome_counts_known": known,
+                    "succeeded": event.succeeded if known else None,
+                    "failed": event.failed if known else None,
+                    "quarantined": event.quarantined if known else None,
+                    "collector_groups_failed": event.collector_groups_failed if known else None,
+                    "routed_success": event.routed_success if known else None,
+                    "routed_failure": event.routed_failure if known else None,
+                    "routed_destinations": dict(event.routed_destinations) if known else None,
                     "duration_seconds": event.duration_seconds,
                     "exit_code": event.exit_code,
                 }

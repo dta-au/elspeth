@@ -18,6 +18,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from pydantic import BaseModel
+from sqlalchemy.exc import OperationalError
 
 from elspeth.contracts import Checkpoint, NodeID, ResumePoint, RoutingMode, RunStatus
 from elspeth.contracts.audit import DISCARD_SINK_NAME, TokenOutcome
@@ -620,6 +621,33 @@ class TestResumeFinalizesAsFailed:
         )
         baseline_counters.routed_destinations.update({"default": 2, "failsink": 1})
         failure = RuntimeError("resume sweep failed")
+        # The post-stamp summary derive runs for real over these audit records.
+        # Its counts differ from the resume-start baseline (routed default 2)
+        # and from the merged live result (succeeded 3), so the assertions
+        # below show which source the summary read. The ABANDONED record is
+        # what the FAILED stamp's sweep writes; the summary derive must skip it.
+        mock_factory.query.get_all_token_outcomes_for_run.return_value = [
+            _make_token_outcome(
+                run_id=run_id, token_id="tok-routed", outcome=TerminalOutcome.SUCCESS, path=TerminalPath.GATE_ROUTED, sink_name="default"
+            ),
+            _make_token_outcome(
+                run_id=run_id, token_id="tok-default", outcome=TerminalOutcome.SUCCESS, path=TerminalPath.DEFAULT_FLOW, sink_name="default"
+            ),
+            _make_token_outcome(
+                run_id=run_id,
+                token_id="tok-diverted",
+                outcome=TerminalOutcome.FAILURE,
+                path=TerminalPath.ON_ERROR_ROUTED,
+                sink_name="failsink",
+                error_hash=fake_error_hash("resume-row"),
+            ),
+            _make_token_outcome(run_id=run_id, token_id="tok-in-flight", outcome=None, path=TerminalPath.ABANDONED, completed=False),
+        ]
+        # Audit rows processed (3) differs from the merged live figure (3 + 1):
+        # with a live result present, the summary reports the live figure.
+        mock_factory.run_status_projection.count_distinct_source_rows_with_terminal_outcome.return_value = 3
+        mock_factory.run_status_projection.count_failed_coalesce_barrier_rows.return_value = 0
+        mock_factory.run_status_projection.count_failed_collector_groups.return_value = 0
 
         admit_guard = _admit_resume_point(orch, resume_point)
         with (
@@ -647,12 +675,123 @@ class TestResumeFinalizesAsFailed:
         assert len(summaries) == 1
         summary = summaries[0]
         assert summary.status.value == "failed"
+        assert summary.outcome_counts_known is True
         assert summary.total_rows == 4
-        assert summary.succeeded == 3
+        assert summary.succeeded == 2
         assert summary.failed == 1
-        assert summary.routed_success == 3
+        assert summary.routed_success == 1
         assert summary.routed_failure == 1
-        assert dict(summary.routed_destinations) == {"default": 3, "failsink": 1}
+        assert dict(summary.routed_destinations) == {"default": 1, "failsink": 1}
+
+    @pytest.mark.parametrize("audit_after_stamp", ["readable", "unreadable"])
+    @pytest.mark.parametrize("work_source", ["restored-barrier", "scheduler-only"])
+    def test_degraded_resume_baseline_summary_never_reports_fewer_processed_than_succeeded(
+        self, work_source: str, audit_after_stamp: str
+    ) -> None:
+        """A transient OperationalError on the resume-start baseline read leaves
+        only a resume-local partial, which is not a cumulative count. The FAILED
+        summary must take the audit figures after the stamp, or label them
+        unknown; it must never pair resume-local rows processed with cumulative
+        audit outcomes."""
+        db = make_landscape_db()
+        event_bus = MagicMock(spec_set=["emit"])
+        emitted_events: list[object] = []
+        event_bus.emit.side_effect = emitted_events.append
+        orch = Orchestrator(db, event_bus=event_bus)
+        run_id = "run-resume-degraded-baseline"
+        _insert_failed_run(db, run_id)
+
+        mock_factory = MagicMock(spec=RecorderFactory)
+        coordination_token = _make_heartbeat_safe_token(run_id, mock_factory)
+        checkpoint = Checkpoint(
+            checkpoint_id="cp-resume-degraded-baseline",
+            run_id=run_id,
+            sequence_number=1,
+            created_at=datetime.now(UTC),
+            upstream_topology_hash="a" * 64,
+            format_version=Checkpoint.CURRENT_FORMAT_VERSION,
+        )
+        resume_point = ResumePoint(checkpoint=checkpoint, sequence_number=checkpoint.sequence_number)
+        resume_state = ResumeState(
+            factory=mock_factory,
+            run_id=run_id,
+            source_names_by_source={NodeID("source"): "source"},
+            source_lifecycle_by_source={NodeID("source"): "exhausted"},
+            has_restored_barrier_work=work_source == "restored-barrier",
+            coordination_token=coordination_token,
+        )
+        mock_factory.scheduler.count_active_work.return_value = int(work_source == "scheduler-only")
+        resume_only_result = RunResult(
+            run_id=run_id,
+            status=RunStatus.FAILED,
+            rows_processed=1,
+            rows_succeeded=1,
+            rows_failed=0,
+            rows_routed_success=0,
+            rows_routed_failure=0,
+            rows_quarantined=0,
+            routed_destinations={},
+        )
+        # Cumulative audit: three source rows succeeded across run 1 and this
+        # resume, more than the resume-local partial's one processed row.
+        mock_factory.query.get_all_token_outcomes_for_run.return_value = [
+            _make_token_outcome(
+                run_id=run_id, token_id=f"tok-{index}", outcome=TerminalOutcome.SUCCESS, path=TerminalPath.DEFAULT_FLOW, sink_name="default"
+            )
+            for index in range(3)
+        ] + [_make_token_outcome(run_id=run_id, token_id="tok-in-flight", outcome=None, path=TerminalPath.ABANDONED, completed=False)]
+        stamped_at_read: list[bool] = []
+
+        def count_source_rows(_run_id: str) -> int:
+            # The real derive's first projection read. Before the FAILED stamp
+            # (the resume-start baseline) it hits transient contention; after
+            # the stamp it is readable or still contended, per the parameter.
+            stamped = mock_factory.run_lifecycle.finalize_run.called
+            stamped_at_read.append(stamped)
+            if not stamped or audit_after_stamp == "unreadable":
+                raise OperationalError("SELECT count(DISTINCT row_id)", None, Exception("database is locked"))
+            return 3
+
+        mock_factory.run_status_projection.count_distinct_source_rows_with_terminal_outcome.side_effect = count_source_rows
+        mock_factory.run_status_projection.count_failed_coalesce_barrier_rows.return_value = 0
+        mock_factory.run_status_projection.count_failed_collector_groups.return_value = 0
+
+        admit_guard = _admit_resume_point(orch, resume_point)
+        with (
+            admit_guard,
+            patch.object(orch._resume_coordinator, "reconstruct_resume_state", return_value=resume_state),
+            patch.object(
+                orch._resume_coordinator,
+                "process_resumed_rows",
+                side_effect=_RunFailedWithPartialResultError(RuntimeError("resume sweep failed"), resume_only_result),
+            ),
+            pytest.raises(RuntimeError, match="resume sweep failed"),
+        ):
+            orch.resume(
+                resume_point,
+                MagicMock(spec=PipelineConfig),
+                MagicMock(spec=ExecutionGraph),
+                payload_store=MockPayloadStore(),
+            )
+
+        # Instrument control: the baseline read really degraded before the stamp,
+        # and the summary derive read after it.
+        assert stamped_at_read[0] is False
+        assert stamped_at_read[-1] is True
+        summaries = [event for event in emitted_events if isinstance(event, RunSummary)]
+        assert len(summaries) == 1
+        summary = summaries[0]
+        assert summary.status.value == "failed"
+        if summary.total_rows_known and summary.outcome_counts_known:
+            assert summary.total_rows >= summary.succeeded
+        if audit_after_stamp == "readable":
+            assert summary.total_rows_known is True
+            assert summary.outcome_counts_known is True
+            assert summary.total_rows == 3
+            assert summary.succeeded == 3
+        else:
+            assert summary.total_rows_known is False
+            assert summary.outcome_counts_known is False
 
     def test_resume_loop_drains_scheduler_work(self) -> None:
         """Resume re-drives the run's durable scheduler work and accumulates its results."""
@@ -2461,7 +2600,7 @@ class TestResumeFailureCounterBaselineDegradation:
             result = resume_mod._derive_resume_failure_counter_baseline(MagicMock(spec=RecorderFactory), "run-baseline")
 
         assert result is None
-        assert any("degrade to resume-local partials" in record.getMessage() for record in caplog.records)
+        assert any("FAILED ceremony gets no live result" in record.getMessage() for record in caplog.records)
 
     def test_audit_integrity_error_propagates(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from elspeth.engine.orchestrator import resume as resume_mod

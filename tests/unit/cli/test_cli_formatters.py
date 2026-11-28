@@ -128,6 +128,49 @@ class TestConsoleFormatters:
             with patch("elspeth.cli_formatters.typer.echo"):
                 summary_handler(event)  # Should not raise
 
+    def test_unknown_outcome_counts_render_as_unknown_not_zero(self) -> None:
+        summary_handler = create_console_formatters(prefix="Run")[RunSummary]
+        event = RunSummary(
+            run_id="run-unknown",
+            status=RunCompletionStatus.FAILED,
+            total_rows=3,
+            succeeded=0,
+            failed=0,
+            quarantined=0,
+            duration_seconds=0.1,
+            exit_code=2,
+            outcome_counts_known=False,
+        )
+
+        with patch("elspeth.cli_formatters.typer.echo") as mock_echo:
+            summary_handler(event)
+
+        assert mock_echo.call_args.args[0] == (
+            "\n✗ Run FAILED: 3 rows processed | outcome counts unknown (audit summary unavailable) | 0.10s total"
+        )
+
+    def test_unknown_total_rows_render_as_unknown_not_zero(self) -> None:
+        summary_handler = create_console_formatters(prefix="Run")[RunSummary]
+        event = RunSummary(
+            run_id="run-unknown-rows",
+            status=RunCompletionStatus.FAILED,
+            total_rows=0,
+            succeeded=0,
+            failed=0,
+            quarantined=0,
+            duration_seconds=0.1,
+            exit_code=2,
+            outcome_counts_known=False,
+            total_rows_known=False,
+        )
+
+        with patch("elspeth.cli_formatters.typer.echo") as mock_echo:
+            summary_handler(event)
+
+        assert mock_echo.call_args.args[0] == (
+            "\n✗ Run FAILED: rows processed unknown | outcome counts unknown (audit summary unavailable) | 0.10s total"
+        )
+
     def test_progress_elapsed_zero_formats_rate_as_zero(self) -> None:
         """Progress formatter must avoid divide-by-zero when elapsed_seconds == 0."""
         progress_handler = create_console_formatters()[ProgressEvent]
@@ -207,6 +250,7 @@ class TestJsonFormatters:
             "run_id": "run-3",
             "status": "failed",
             "total_rows": 1,
+            "outcome_counts_known": True,
             "succeeded": 0,
             "failed": 1,
             "quarantined": 0,
@@ -238,3 +282,61 @@ class TestJsonFormatters:
         payload = json.loads(mock_echo.call_args.args[0])
         assert payload["failed"] == 0
         assert payload["collector_groups_failed"] == 1
+
+    def test_unknown_outcome_counts_json_are_null_not_zero(self) -> None:
+        summary_handler = create_json_formatters()[RunSummary]
+        event = RunSummary(
+            run_id="run-unknown",
+            status=RunCompletionStatus.FAILED,
+            total_rows=3,
+            succeeded=0,
+            failed=0,
+            quarantined=0,
+            duration_seconds=0.1,
+            exit_code=2,
+            outcome_counts_known=False,
+        )
+
+        with patch("elspeth.cli_formatters.typer.echo") as mock_echo:
+            summary_handler(event)
+
+        payload = json.loads(mock_echo.call_args.args[0])
+        assert payload == {
+            "event": "run_completed",
+            "run_id": "run-unknown",
+            "status": "failed",
+            "total_rows": 3,
+            "outcome_counts_known": False,
+            "succeeded": None,
+            "failed": None,
+            "quarantined": None,
+            "collector_groups_failed": None,
+            "routed_success": None,
+            "routed_failure": None,
+            "routed_destinations": None,
+            "duration_seconds": 0.1,
+            "exit_code": 2,
+        }
+
+    def test_unknown_total_rows_json_is_null_not_zero(self) -> None:
+        summary_handler = create_json_formatters()[RunSummary]
+        event = RunSummary(
+            run_id="run-unknown-rows",
+            status=RunCompletionStatus.FAILED,
+            total_rows=0,
+            succeeded=0,
+            failed=0,
+            quarantined=0,
+            duration_seconds=0.1,
+            exit_code=2,
+            outcome_counts_known=False,
+            total_rows_known=False,
+        )
+
+        with patch("elspeth.cli_formatters.typer.echo") as mock_echo:
+            summary_handler(event)
+
+        payload = json.loads(mock_echo.call_args.args[0])
+        assert payload["total_rows"] is None
+        assert payload["outcome_counts_known"] is False
+        assert payload["succeeded"] is None

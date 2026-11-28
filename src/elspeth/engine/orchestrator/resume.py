@@ -356,10 +356,20 @@ def _resume_failure_result_from_baseline(
     *,
     baseline: ExecutionCounters | None,
     partial_result: RunResult,
-) -> RunResult:
-    """Build FAILED ceremony counters from pre-resume audit + resume-local partials."""
+) -> RunResult | None:
+    """Build the FAILED resume's live result from pre-resume audit + resume-local partials.
+
+    The FAILED ceremony reads only ``rows_processed`` from this result; its
+    outcome counts come from the audit after the FAILED stamp. The sum can
+    over-count rows processed when the resume re-drives work for a row the
+    baseline already counted (e.g. a fork parent's children).
+
+    ``None`` when the baseline read degraded: the resume-local partial alone is
+    not a cumulative count, so the ceremony gets no live result and its summary
+    reads the audit after the FAILED stamp, or reports the counts as unknown.
+    """
     if baseline is None:
-        return partial_result
+        return None
 
     counters = ExecutionCounters(
         rows_processed=baseline.rows_processed + partial_result.rows_processed,
@@ -387,15 +397,16 @@ def _derive_resume_failure_counter_baseline(factory: RecorderFactory, run_id: st
         _terminal_status, counters = derive_resume_terminal_status_from_audit(factory, run_id)
     except OperationalError:
         # Transient DB contention while reading the audit-cumulative baseline:
-        # record the degradation, then degrade to resume-local partial counters
-        # (the caller treats None as partial-only). Corruption/invariant
+        # record the degradation and return None; the FAILED ceremony then gets
+        # no live result and its summary reads the audit after the stamp, or
+        # reports the counts as unknown. Corruption/invariant
         # signals from the derive (AuditIntegrityError,
         # OrchestrationInvariantError) must propagate — substituting partial
         # counters for them would report a wrong-but-plausible FAILED result
         # over an untrustworthy audit trail.
         logger.warning(
             "Resume failure-counter baseline read hit transient DB contention for run %r; "
-            "FAILED ceremony counters degrade to resume-local partials",
+            "FAILED ceremony gets no live result and its summary reads the audit after the stamp",
             run_id,
             exc_info=True,
         )

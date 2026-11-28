@@ -130,7 +130,9 @@ def is_counted_coalesced_output(outcome_record: TokenOutcome) -> bool:
     return outcome_record.sink_name is not None
 
 
-def derive_terminal_status_from_audit(factory: RecorderFactory, run_id: str) -> tuple[RunStatus, ExecutionCounters]:
+def derive_terminal_status_from_audit(
+    factory: RecorderFactory, run_id: str, *, allow_finalization_abandonment: bool = False
+) -> tuple[RunStatus, ExecutionCounters]:
     """Recover the truthful cumulative terminal status + counters of a
     run from the Landscape audit DB.
 
@@ -169,6 +171,11 @@ def derive_terminal_status_from_audit(factory: RecorderFactory, run_id: str) -> 
     token; see the inline comment and
     ``AuditRunStatusProjection.count_distinct_source_rows_with_terminal_outcome``.
 
+    ``allow_finalization_abandonment`` is only for a FAILED summary after
+    ``finalize_run``: that terminal transaction may append ABANDONED markers
+    for undecided tokens. They are not completed outcomes. Normal completion
+    and resume derives retain the strict contradiction check.
+
     Returns:
         ``(terminal_status, counters)``.  ``counters`` feeds the local
         RunResult so its row counts match the chosen status (otherwise
@@ -205,6 +212,11 @@ def derive_terminal_status_from_audit(factory: RecorderFactory, run_id: str) -> 
     for outcome_record in outcomes:
         if not outcome_record.completed:
             if outcome_record.path is TerminalPath.ABANDONED:
+                if allow_finalization_abandonment:
+                    # FAILED finalization may sweep undecided tokens in the
+                    # same transaction as the terminal stamp. They are not
+                    # completed outcomes and contribute no summary counts.
+                    continue
                 # ADR-038 fail-closed belt. This derive runs on BOTH the
                 # normal completion arm and the resume arms (ADR-030 §D —
                 # see the module docstring), but neither should ever see an
@@ -212,7 +224,11 @@ def derive_terminal_status_from_audit(factory: RecorderFactory, run_id: str) -> 
                 # terminal stamp (normal arm derives before finalize), and a
                 # swept run trips the resume gates before either resume arm
                 # derives. Reading one here means a state those gates should
-                # already have refused — crash rather than count.
+                # already have refused — crash rather than count. The third
+                # reader, the FAILED summary in ``RunCeremony.emit_failed_ceremony``,
+                # derives AFTER its own FAILED stamp and is the only caller
+                # that passes ``allow_finalization_abandonment`` (pinned by an
+                # AST test in test_terminal_event_ownership.py).
                 raise AuditIntegrityError(
                     f"Status derive for run {run_id!r} read an ABANDONED record "
                     f"for token {outcome_record.token_id!r}: the audit trail declares "
