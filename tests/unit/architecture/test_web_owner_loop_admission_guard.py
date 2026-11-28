@@ -1,4 +1,17 @@
-"""Long-lived web owner loops review worker admission alongside database retries."""
+"""Long-lived web owner loops review worker admission alongside database retries.
+
+Limits: a green gate does not mean every owner loop is covered.
+
+- It finds a retry handler only by the bare names in ``_DB_RETRY_NAMES``. A
+  dotted name, an import alias, a new tuple constant or a broader class
+  (``SQLAlchemyError``, ``Exception``) is not seen.
+- It scans only ``try`` statements inside a ``while`` loop of an async
+  function. A ``for`` loop, or a ``while`` loop that delegates its ``try`` to a
+  helper coroutine, is not seen.
+- "Guarded" means the admission name appears in a handler of the same ``try``.
+  It checks presence, not behaviour: a handler that names the constant and
+  re-raises at once passes.
+"""
 
 from __future__ import annotations
 
@@ -19,8 +32,10 @@ _REVIEWED: dict[tuple[str, str], str] = {
     ): "Per-request renewal cancels only its own operation; this is not a process owner loop.",
 }
 
-# Reviewed per-operation paths that hold no async while retry handler. Each entry
-# must name a function that exists and scans with no hit (see the test below).
+# Documentation, not an exemption list: these reviewed per-operation paths hold
+# no async while retry handler, so they have no hits and exempt nothing. The test
+# below checks only that each function exists and still scans with no hit.
+# ``_REVIEWED`` is the one exemption: each entry must have a hit and be unguarded.
 _OUT_OF_SCOPE: dict[tuple[str, str], str] = {
     ("src/elspeth/web/sessions/composer_async_worker.py", "ComposerAsyncWorker._job"): "One operation with separate custody handling.",
     ("src/elspeth/web/execution/recovery.py", "RunRecoveryCoordinator._recover_candidate"): "One recovery candidate.",
@@ -139,8 +154,10 @@ def _gate_errors(hits: list[tuple[str, str, int, bool]]) -> list[str]:
         errors.append(f"missing required owner loops: {sorted(_REQUIRED - keys)}")
     if not keys >= set(_REVIEWED):
         errors.append(f"reviewed handlers without hits: {sorted(set(_REVIEWED) - keys)}")
-    if unguarded != set(_REVIEWED):
+    if unguarded - set(_REVIEWED):
         errors.append(f"unguarded handlers: {sorted(unguarded - set(_REVIEWED))}")
+    if (set(_REVIEWED) & keys) - unguarded:
+        errors.append(f"reviewed entries now guarded: {sorted((set(_REVIEWED) & keys) - unguarded)}")
     if not all(reason.strip() for reason in _REVIEWED.values()):
         errors.append("reviewed handler lacks reason")
     return errors
@@ -157,6 +174,14 @@ def test_out_of_scope_paths_exist_and_hold_no_loop_retry_handler() -> None:
         source = (_ROOT / path).read_text(encoding="utf-8")
         assert function in _function_names(path, source), f"{path}:{function} no longer exists"
         assert (path, function) not in keys, f"{path}:{function} now holds an async while retry handler"
+
+
+def test_reviewed_entry_that_gains_the_guard_is_reported() -> None:
+    live = _current_hits()
+    assert not _gate_errors(live), "the live tree must pass the gate before a change is scored"
+    flipped = [(path, function, line, guarded or (path, function) in _REVIEWED) for path, function, line, guarded in live]
+    errors = _gate_errors(flipped)
+    assert errors == [f"reviewed entries now guarded: {sorted(_REVIEWED)}"], errors
 
 
 def test_scanner_detects_missing_same_try_admission_handler() -> None:
