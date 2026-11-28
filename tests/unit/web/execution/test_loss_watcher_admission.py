@@ -299,6 +299,29 @@ async def test_generation_unavailable_while_live_stops_run(tmp_path: Path, execu
 
 
 @pytest.mark.asyncio
+async def test_generation_unavailable_while_draining_closes_watcher_cleanly(
+    tmp_path: Path, execution_fixture: ExecutionTestCustody
+) -> None:
+    async with _case(execution_fixture, tmp_path) as (run, _engine, _expected):
+        # Once the instance drains, the shared pool refuses the watcher's poll
+        # with RequiredGenerationUnavailable. That refusal is the drain, not a
+        # fault: the watcher ends cleanly and neither stops the run nor records
+        # or defers a failure. The run's pipeline has not started, so a
+        # watcher that took the refusal as a fault would log a deferred failure.
+        execution_fixture.recovery.begin_shutdown()
+        assert execution_fixture.recovery.instance_draining.is_set()
+        with capture_logs() as logs:
+            run.service._session_service.get_run.side_effect = RequiredGenerationUnavailable("generation unavailable")
+            assert await _eventually(run.watcher.done, seconds=5)
+        owner = run.service._loss_watcher_owner(run.watcher, run.lease)
+        assert owner.outcome == (run.watcher, None), "a refusal while draining must end the watcher without a failure"
+        assert run.watcher.exception() is None
+        assert not run.shutdown_event.is_set(), "a refusal while draining must not stop the run"
+        assert run.service.execution_lease_release_registry._failures == []
+        assert [entry for entry in logs if entry["event"] == "execution_loss_watcher_failure_deferred"] == []
+
+
+@pytest.mark.asyncio
 async def test_poll_raised_cancelled_error_is_a_watcher_failure(tmp_path: Path, execution_fixture: ExecutionTestCustody) -> None:
     async with _case(execution_fixture, tmp_path, started=True) as (run, _engine, expected):
         # A CancelledError ends the watcher like any other error: on a started

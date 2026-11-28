@@ -424,20 +424,23 @@ def _fake_heartbeat_clock(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("call_seconds", "expected_calls"),
+    ("call_seconds", "expected_calls", "expected_clock"),
     [
         # Every check after the slow first database error reads a clock that
         # the call did not move: escalation comes at the check that first
         # reaches the deadline exactly, so a threshold one short delay early,
         # or a strict comparison, moves it.
-        pytest.param({3: 0.5}, 7, id="instant-deciding-call"),
+        pytest.param({3: 0.5}, 7, 4.75, id="instant-deciding-call"),
         # The deciding call itself takes 0.25 s: only a check that reads the
         # clock after the call reaches the deadline on that call.
-        pytest.param({3: 0.5, 6: 0.25}, 6, id="slow-deciding-call"),
+        pytest.param({3: 0.5, 6: 0.25}, 6, 4.75, id="slow-deciding-call"),
+        # The deciding call takes 0.5 s, so its check lands past the deadline
+        # rather than on it: escalation must still come on that call.
+        pytest.param({3: 0.5, 6: 0.5}, 6, 5.0, id="deciding-call-overruns-deadline"),
     ],
 )
 async def test_heartbeat_refusal_then_database_errors_obeys_lease_deadline(
-    monkeypatch: pytest.MonkeyPatch, call_seconds: dict[int, float], expected_calls: int
+    monkeypatch: pytest.MonkeyPatch, call_seconds: dict[int, float], expected_calls: int, expected_clock: float
 ) -> None:
     clock = 0.0
     calls = 0
@@ -481,12 +484,59 @@ async def test_heartbeat_refusal_then_database_errors_obeys_lease_deadline(
     # After a refusal, database errors are retried after the short delay too,
     # bounded by the lease deadline: the success at t=1 plus lease 5 less one
     # interval, so t=5. A failed attempt escalates once its check, the clock
-    # after the call plus 0.25, reaches 5.0; both cases end at clock 4.75.
+    # after the call plus 0.25, reaches or passes 5.0.
     assert calls == expected_calls
     assert sleeps == [1, 1] + [0.25] * (expected_calls - 2)
-    assert clock == 4.75
+    assert clock == expected_clock
     assert logs[0] == ("warning", "web_instance_heartbeat_failed")
     assert logs[-1] == ("error", "web_instance_heartbeat_escalating")
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_instant_refusals_escalate_at_the_lease_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = 0.0
+    calls = 0
+    sleeps: list[float] = []
+    logs: list[tuple[str, str]] = []
+    real_sleep = asyncio.sleep
+    refusal = async_workers.AsyncWorkerAdmissionTimeoutError("admission refused")
+
+    async def fake_sleep(seconds: float) -> None:
+        nonlocal clock
+        sleeps.append(seconds)
+        clock += seconds
+        await real_sleep(0)
+
+    async def heartbeat(*_args: Any, **_kwargs: Any) -> None:
+        nonlocal clock, calls
+        calls += 1
+        if calls == 1:
+            clock += 1.0  # The successful submission takes time before returning.
+            return
+        raise refusal  # Every later admission is refused at once.
+
+    _fake_heartbeat_clock(monkeypatch, sleep=fake_sleep, now=lambda: clock, heartbeat=heartbeat)
+    owner = SimpleNamespace(
+        _interval_seconds=1,
+        _lease_seconds=5,
+        _heartbeat_authority=SimpleNamespace(heartbeat=lambda: None),
+        _identity=SimpleNamespace(instance_id="instance"),
+        _log=SimpleNamespace(
+            warning=lambda event, **_fields: logs.append(("warning", event)),
+            error=lambda event, **_fields: logs.append(("error", event)),
+        ),
+    )
+    with pytest.raises(async_workers.AsyncWorkerAdmissionTimeoutError) as raised:
+        await asyncio.wait_for(RegisteredWebInstanceMembership._heartbeat_loop(owner), timeout=5)
+    assert raised.value is refusal
+    # The success submitted at t=1 sets the deadline at t=1 + 5 - 1 = 5.
+    # Refusals arrive at 3.0, 3.25, ... 4.75 and move no clock. The eighth,
+    # at 4.75, is the first whose check, 4.75 plus the 0.25 delay, reaches
+    # 5.0: it escalates, and the seven before it are retried.
+    assert calls == 9
+    assert sleeps == [1, 1] + [0.25] * 7
+    assert clock == 4.75
+    assert logs == [("warning", "web_instance_heartbeat_failed")] * 7 + [("error", "web_instance_heartbeat_escalating")]
 
 
 @pytest.mark.asyncio
