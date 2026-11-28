@@ -92,12 +92,12 @@ _OWNER_UNSETTLED_LOGGED_LEAVES = 8
 # Unsettled owners remembered for the reaper; the oldest is forgotten first.
 # One that is forgotten is settled as a lost worker, as before.
 _UNSETTLED_OWNERS_RETAINED = 1_024
-# A poll whose custody-free reap or claim statement raises OperationalError
-# (transient database contention) is retried after a full scan interval, at
-# most this many times in a row: the same bound as session-lease renewal, the
-# membership heartbeat and the orphan sweeper. Past it, on any other error, or
-# on an OperationalError inside a reap's session lease or its own-lapsed
-# settlement, the loop ends and the process is restarted.
+# A poll whose custody-free reap or claim statement raises OperationalError (transient
+# database contention), or whose shared-pool admission is refused, is retried after a
+# full scan interval, at most this many times in a row across both: the same bound as
+# session-lease renewal, the membership heartbeat and the orphan sweeper. Past it, on
+# any other error, or on an OperationalError inside a reap's session lease or its
+# own-lapsed settlement, the loop ends and the process is restarted.
 _POLL_MAX_CONSECUTIVE_TRANSIENT_FAILURES = 5
 # A probe Task sleeps this long, repeatedly; waking this much later than asked
 # means some callback held the event loop, and is logged.
