@@ -2589,29 +2589,58 @@ class TestLifespanShutdown:
         assert not fits(app_module._BOOT_PROVIDER_PROBE_BUDGET_SECONDS)
 
     @pytest.mark.asyncio
-    async def test_lifespan_records_transient_failure_when_composer_probe_times_out(self, monkeypatch, tmp_path) -> None:
+    @pytest.mark.parametrize(
+        ("deadline", "expected_timeouts", "expected_failure_classes"),
+        [
+            # The advisor's remainder (0.25) is above the planner cap (0.125),
+            # so capping the advisor too changes the vector.
+            pytest.param(0.5, [0.125, 0.125, 0.25], ["TimeoutError"] * 3, id="advisor_gets_the_remainder"),
+            # The second planner request enters with less than the cap left and
+            # is granted only that; the advisor then finds the deadline spent.
+            pytest.param(
+                0.1875,
+                [0.125, 0.0625],
+                ["TimeoutError", "TimeoutError", "SharedDeadlineExhausted"],
+                id="planner_gets_less_than_the_cap",
+            ),
+        ],
+    )
+    async def test_lifespan_records_transient_failure_when_composer_probe_times_out(
+        self,
+        monkeypatch,
+        tmp_path,
+        deadline: float,
+        expected_timeouts: list[float],
+        expected_failure_classes: list[str],
+    ) -> None:
         """Hanging probes time out as nonfatal transient failures, inside one shared deadline.
 
         Worst-case probe time is the shared deadline, not a sum of per-request
-        timeouts.
+        timeouts. The budget clock advances only by the timeout each hanging
+        probe was granted, so host load cannot spend the deadline. The values
+        are dyadic, so the deadline arithmetic is exact.
         """
         app = create_app(_settings(tmp_path, composer_boot_probe_enabled=True))
         counter = _RecordingCounter()
         latency = _RecordingHistogram()
         cancelled: list[str] = []
+        probe_clock = [100.0]
 
         async def _hanging_probe(request: ComposerProbeRequest) -> bool:
             try:
                 await asyncio.Event().wait()
             finally:
                 cancelled.append(request.surface)
+                # The most recent wait_for call is this probe's own.
+                probe_clock[0] += wait_for.call_args.kwargs["timeout"]
             return True
 
         monkeypatch.setattr("elspeth.web.composer.boot_probe.probe_composer_config", _hanging_probe)
         monkeypatch.setattr("elspeth.web.app._COMPOSER_BOOT_CONFIG_COUNTER", counter)
         monkeypatch.setattr("elspeth.web.app._COMPOSER_BOOT_CONFIG_PROBE_LATENCY", latency)
-        monkeypatch.setattr("elspeth.web.app._COMPOSER_BOOT_PROBE_DEADLINE_SECONDS", 0.3)
-        monkeypatch.setattr("elspeth.web.app._COMPOSER_PLANNER_BOOT_PROBE_TIMEOUT_SECONDS", 0.1)
+        monkeypatch.setattr("elspeth.web.app._COMPOSER_BOOT_PROBE_DEADLINE_SECONDS", deadline)
+        monkeypatch.setattr("elspeth.web.app._COMPOSER_PLANNER_BOOT_PROBE_TIMEOUT_SECONDS", 0.125)
+        monkeypatch.setattr(app_module, "_composer_boot_probe_time", lambda _loop: probe_clock[0])
 
         async def _enter_and_exit_lifespan() -> None:
             async with lifespan(app):
@@ -2625,17 +2654,16 @@ class TestLifespanShutdown:
             await asyncio.wait_for(_enter_and_exit_lifespan(), timeout=5.0)
 
         timeouts = [call.kwargs["timeout"] for call in wait_for.call_args_list if call.kwargs["timeout"] != 5.0]
-        assert timeouts[:2] == [0.1, 0.1]
-        assert len(timeouts) == 3
-        # Every probe request fits inside the one deadline.
-        assert sum(timeouts) <= 0.3 + 0.01
-        assert 0.05 < timeouts[2] <= 0.1 + 0.01
-        assert cancelled == ["loop_tools", "planner_tools", "advisor"]
+        # Planner requests get min(remaining, cap); the advisor gets what remains.
+        assert timeouts == expected_timeouts
+        # Every request sent fits inside the one deadline.
+        assert sum(timeouts) == deadline
+        assert cancelled == ["loop_tools", "planner_tools", "advisor"][: len(expected_timeouts)]
         assert [attributes["probe_status"] for _amount, attributes in counter.calls] == ["transient_failure"] * 3
         assert len(latency.calls) == 3
         warnings = [entry for entry in logs if entry["event"] == "composer_boot_probe_transient_failure"]
         assert [warning["probed_surface"] for warning in warnings] == ["loop_tools", "planner_tools", "advisor"]
-        assert [warning["failure_class"] for warning in warnings] == ["TimeoutError"] * 3
+        assert [warning["failure_class"] for warning in warnings] == expected_failure_classes
         for warning in warnings[:2]:
             assert "structured_output_conformance_verified" not in warning
             assert "tool schemas unverified at boot" in warning["action"]

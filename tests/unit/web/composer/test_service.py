@@ -7597,24 +7597,14 @@ class TestToolExecutionThreadOffloading:
 
     @pytest.mark.asyncio
     async def test_event_loop_not_blocked_during_tool_execution(self) -> None:
-        """Heartbeat regression: compose() must not block the event loop.
-
-        Runs compose() alongside an async heartbeat coroutine. If the
-        heartbeat fires on schedule (not delayed by blocking tool work),
-        the event loop was free during tool execution.
-        """
-        import time
-
+        """The loop must release a tool that is waiting in a worker thread."""
         catalog = _mock_catalog()
         settings = _make_settings()
         service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
-
-        # Blocking duration must be much larger than the gap threshold
-        # to avoid false positives on slow/shared CI runners where OS
-        # scheduler jitter can delay asyncio.sleep wakeups by 50-100ms.
-        tool_block_seconds = 1.0
-        heartbeat_interval = 0.05
+        tool_started = threading.Event()
+        tool_released = threading.Event()
+        release_observed: list[bool] = []
 
         def _blocking_tool(
             _tool_name: str,
@@ -7623,7 +7613,8 @@ class TestToolExecutionThreadOffloading:
             _catalog: Any,
             **kwargs: Any,
         ) -> ToolResult:
-            time.sleep(tool_block_seconds)
+            tool_started.set()
+            release_observed.append(tool_released.wait(timeout=10.0))
             return ToolResult(
                 success=True,
                 updated_state=current_state,
@@ -7632,12 +7623,10 @@ class TestToolExecutionThreadOffloading:
                 data=None,
             )
 
-        heartbeat_times: list[float] = []
-
-        async def heartbeat() -> None:
-            while True:
-                heartbeat_times.append(time.monotonic())
-                await asyncio.sleep(heartbeat_interval)
+        async def release_tool() -> None:
+            while not tool_started.is_set():
+                await asyncio.sleep(0)
+            tool_released.set()
 
         # Use a mutation tool — the original bug was specifically about
         # mutation tools running synchronously on the event loop.
@@ -7665,31 +7654,15 @@ class TestToolExecutionThreadOffloading:
             ),
         ):
             mock_llm.side_effect = [tool_call, text]
-            hb_task = asyncio.create_task(heartbeat())
+            release_task = asyncio.create_task(release_tool())
             try:
                 await service.compose("List sources", [], state, session_id=session_id)
             finally:
-                hb_task.cancel()
+                release_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
-                    await hb_task
+                    await release_task
 
-        # With 1.0s block and 50ms interval we expect ~20 heartbeats.
-        # Require at least 4 to catch partial stalls, not just total seizure.
-        min_expected = int(tool_block_seconds / heartbeat_interval) - 2
-        assert len(heartbeat_times) >= min(min_expected, 4), (
-            f"Only {len(heartbeat_times)} heartbeat(s) fired during {tool_block_seconds}s tool execution — event loop was likely blocked"
-        )
-
-        # Check that no heartbeat interval exceeds a generous threshold.
-        # If the event loop were blocked, one interval would be ≈ tool_block_seconds.
-        # The 5x multiplier (250ms) gives wide margin for OS scheduler jitter
-        # on shared CI runners while still catching a 1.0s event loop block.
-        max_allowed_gap = heartbeat_interval * 5  # 250ms threshold vs 1.0s block (4x safety)
-        for i in range(1, len(heartbeat_times)):
-            gap = heartbeat_times[i] - heartbeat_times[i - 1]
-            assert gap < max_allowed_gap, (
-                f"Heartbeat gap {gap:.3f}s exceeds {max_allowed_gap:.3f}s — event loop was blocked (tool takes {tool_block_seconds}s)"
-            )
+        assert release_observed and all(release_observed), "The event loop did not release the in-flight mutation tool"
 
 
 class TestToolArgumentError:
