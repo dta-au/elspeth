@@ -18,6 +18,7 @@ from unittest.mock import patch
 import yaml
 from sqlalchemy import select
 
+from elspeth import __version__ as ENGINE_VERSION
 from elspeth.config_loading import load_settings_from_yaml_string
 from elspeth.contracts import RunStatus
 from elspeth.contracts.audit_export import (
@@ -448,6 +449,20 @@ def _semantic_node_config(record: Mapping[str, Any]) -> dict[str, object]:
     return semantic
 
 
+def _semantic_plugin_version(value: object) -> object:
+    """Normalize only the running engine's own version, read from the source registration uses.
+
+    Engine-owned nodes record ``engine:<installed elspeth version>``. The corpus
+    states that value as a token so the manifest does not move on a version
+    change. Any other value, including an ``engine:`` value naming a different
+    version, stays as recorded and still fails the comparison.
+    """
+
+    if value == f"engine:{ENGINE_VERSION}":
+        return "engine:$ENGINE_VERSION"
+    return value
+
+
 def _semantic_run_settings(raw_settings: object) -> dict[str, object]:
     if not isinstance(raw_settings, Mapping):
         raise AssertionError("DAG corpus run lacks material settings")
@@ -575,7 +590,7 @@ def _stable_audit_records(
                 "determinism": record["determinism"],
                 "node_type": record["node_type"],
                 "plugin_name": record["plugin_name"],
-                "plugin_version": record["plugin_version"],
+                "plugin_version": _semantic_plugin_version(record["plugin_version"]),
                 "schema_fields": record.get("schema_fields"),
                 "schema_mode": record.get("schema_mode"),
                 "sequence_in_pipeline": record.get("sequence_in_pipeline"),
