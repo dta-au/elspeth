@@ -37,6 +37,7 @@ from elspeth.contracts.errors import (
     PluginContractViolation,
 )
 from elspeth.contracts.identity import innermost_own_frame
+from elspeth.contracts.node_state_context import SerializedCompletionMetadata
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.secret_scrub import scrub_text_for_audit, scrub_transform_error_reason
@@ -45,6 +46,7 @@ from elspeth.core.canonical import stable_hash
 from elspeth.core.config import CollectorSettings, ScopeSettings
 from elspeth.core.landscape.collector_group_failure_holds import collector_group_failure_hold_error
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
+from elspeth.core.landscape.execution.node_states import serialize_completion_metadata
 from elspeth.core.landscape.execution_repository import ExecutionRepository
 from elspeth.engine._error_hash import compute_error_hash
 from elspeth.engine.aggregation_result import validated_quarantined_indices
@@ -977,6 +979,7 @@ class CollectorExecutor:
         guard: NodeStateGuard,
         flush_error: ExecutionError,
         flush_duration_ms: float,
+        flush_metadata: SerializedCompletionMetadata | None,
     ) -> CollectorOutcome:
         """Fail the group as a whole after its flush: the two plugin arms.
 
@@ -993,6 +996,11 @@ class CollectorExecutor:
         commits leaves every hold OPEN, and the group is re-flushed on resume.
         After it commits, resume completes this verdict without the plugin
         (``CollectorJournalRestorer``).
+
+        ``flush_metadata`` is the returned error's post-execution context,
+        already serialised by the caller before any write; it lands on the
+        flush state only. The contract-violation arm has no plugin context and
+        passes None.
         """
         member_holds, hold_error = self._group_failure_verdict(collector_name, key, pending, failure_reason=failure_reason)
         guard.complete_collector_failure(
@@ -1004,6 +1012,7 @@ class CollectorExecutor:
             duration_ms=flush_duration_ms,
             member_holds=member_holds,
             hold_error=hold_error,
+            flush_metadata=flush_metadata,
         )
         return self._close_failed_group(collector_name, key, pending, failure_reason=failure_reason)
 
@@ -1121,8 +1130,10 @@ class CollectorExecutor:
         #
         # Fix round 3 (I-1): this invocation CONSUMES its attempt before the
         # guard opens. On success or a failure RESULT the group leaves
-        # self._pending and the bump is moot; on a plugin EXCEPTION the
-        # guard auto-fails this attempt durably and the group stays
+        # self._pending and the bump is moot; on a plugin EXCEPTION, or a
+        # result whose success reason or context the audit write refuses
+        # (serialised below before any release or verdict), the guard
+        # auto-fails this attempt durably and the group stays
         # installed, so the post-restore sweep's retry must open the NEXT
         # attempt — the in-process twin of _open_group's max_attempt + 1
         # derivation across a takeover (UniqueConstraint(token_id,
@@ -1252,6 +1263,7 @@ class CollectorExecutor:
                         context=violation.to_audit_dict(),
                     ),
                     flush_duration_ms=(self._clock.monotonic() - now) * 1000,
+                    flush_metadata=None,
                 )
             if result.status != "success":
                 if result.reason is None:
@@ -1259,6 +1271,14 @@ class CollectorExecutor:
                         f"Collector transform '{transform.name}' returned error but reason is None. "
                         'Use TransformResult.error({"reason": "...", ...}) to create error results.'
                     )
+                # The returned error's post-execution context goes through the
+                # same serialiser as the success path, BEFORE the verdict
+                # writes: a context the audit write refuses raises before any
+                # verdict write (a plugin bug, as on the success path); the
+                # guard auto-fails this attempt and the group stays installed
+                # with every hold OPEN. A FAILED state never carries a success
+                # reason.
+                error_metadata = serialize_completion_metadata(success_reason=None, context_after=result.context_after)
                 return self._fail_group_after_flush(
                     collector_name,
                     key,
@@ -1276,8 +1296,17 @@ class CollectorExecutor:
                         context=scrub_transform_error_reason(result.reason),
                     ),
                     flush_duration_ms=(self._clock.monotonic() - now) * 1000,
+                    flush_metadata=error_metadata,
                 )
 
+            # The plugin's success reason and context go through the
+            # persistence layer's own validator and serialiser HERE, before the
+            # release and the member-hold completions below: a value the audit
+            # write refuses then raises with no side effect (the guard
+            # auto-fails this attempt and the group stays installed, as after a
+            # plugin exception), and the flush state persists exactly these
+            # serialised bytes rather than serialising a second time.
+            flush_metadata = serialize_completion_metadata(success_reason=result.success_reason, context_after=result.context_after)
             output_rows: tuple[PipelineRow, ...] = (result.row,) if result.row is not None else tuple(result.rows or ())
             quarantined = validated_quarantined_indices(result, buffered_token_count=len(members), aggregation_name=collector_name)
             surviving = tuple(entry for index, entry in enumerate(entries) if index not in quarantined)
@@ -1354,6 +1383,7 @@ class CollectorExecutor:
                 NodeStateStatus.COMPLETED,
                 output_data={"released_count": len(released), "member_count": len(members)},
                 duration_ms=duration_ms,
+                serialized_metadata=flush_metadata,
             )
 
         del self._pending[key]

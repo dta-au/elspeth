@@ -63,3 +63,35 @@ def test_resume_completes_a_recorded_collector_verdict_on_postgres(tmp_path: Pat
         finally:
             db.close()
             control_db.close()
+
+
+def test_successful_collector_flush_reason_round_trips_on_postgres(tmp_path: Path) -> None:
+    import json
+
+    from sqlalchemy import select
+
+    from elspeth.core.landscape.schema import node_states_table, nodes_table
+
+    with postgres_test_target(driver="psycopg") as url:
+        db = LandscapeDB.from_url(url)
+        assert db.engine.dialect.name == "postgresql"
+        try:
+            env = build_pipeline(tmp_path / "successful", _COLLECTOR_PIPELINE, _DOCS, db=db)
+            result = run_pipeline(env)
+            assert result.status is RunStatus.COMPLETED
+            with db.connection() as conn:
+                collector_id = conn.execute(select(nodes_table.c.node_id).where(nodes_table.c.node_type == "collector")).scalar_one()
+                reasons = (
+                    conn.execute(
+                        select(node_states_table.c.success_reason_json)
+                        .where(node_states_table.c.run_id == result.run_id)
+                        .where(node_states_table.c.node_id == collector_id)
+                        .where(node_states_table.c.success_reason_json.is_not(None))
+                    )
+                    .scalars()
+                    .all()
+                )
+            assert len(reasons) == 1
+            assert json.loads(reasons[0]) == {"action": "processed", "fields_added": ["count", "sum", "batch_size", "mean"]}
+        finally:
+            db.close()

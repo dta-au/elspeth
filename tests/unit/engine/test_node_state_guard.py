@@ -388,6 +388,65 @@ class TestNodeStateGuard:
         assert "PENDING" in kwargs["error"].exception
         assert guard.completed is False
 
+    @staticmethod
+    def _real_guard() -> Any:
+        from elspeth.engine.executors.state_guard import NodeStateGuard
+
+        setup = make_recorder_with_run(source_node_id="source-0")
+        register_test_node(setup.data_flow, setup.run_id, "transform-1")
+        _, token = setup.data_flow.create_row_with_token(
+            setup.source_node_id,
+            0,
+            {"name": "test"},
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=setup.coordination_token,
+        )
+        guard = NodeStateGuard(
+            setup.execution,
+            token_id=token.token_id,
+            node_id="transform-1",
+            member_token=setup.coordination_token.membership,
+            step_index=1,
+            input_data={"name": "test"},
+            auto_fail_phase="transform_execution",
+        )
+        return setup, guard
+
+    def test_complete_persists_serialized_metadata_as_given(self) -> None:
+        from elspeth.contracts.node_state_context import GateEvaluationContext
+        from elspeth.core.landscape.execution.node_states import serialize_completion_metadata
+
+        setup, guard = self._real_guard()
+        metadata = serialize_completion_metadata(
+            success_reason={"action": "collected", "metadata": {"kept": [1, 2]}},
+            context_after=GateEvaluationContext(condition="x", result="True", route_label="true"),
+        )
+        with guard:
+            guard.complete(NodeStateStatus.COMPLETED, output_data={"name": "test"}, duration_ms=1.0, serialized_metadata=metadata)
+
+        state = setup.execution.get_node_state(guard.state_id)
+        assert state is not None
+        assert state.status == NodeStateStatus.COMPLETED
+        assert state.success_reason_json == metadata.success_reason_json
+        assert state.context_after_json == metadata.context_after_json
+
+    def test_complete_failed_refuses_serialized_metadata_and_records_failed(self) -> None:
+        from elspeth.contracts import ExecutionError
+        from elspeth.core.landscape.execution.node_states import serialize_completion_metadata
+
+        setup, guard = self._real_guard()
+        metadata = serialize_completion_metadata(success_reason=None, context_after=None)
+        error = ExecutionError(exception="boom", exception_type="RuntimeError", phase="transform_execution")
+        with pytest.raises(OrchestrationInvariantError, match="does not accept serialized_metadata"), guard:
+            guard.complete(NodeStateStatus.FAILED, duration_ms=1.0, error=error, serialized_metadata=metadata)
+
+        state = setup.execution.get_node_state(guard.state_id)
+        assert state is not None
+        assert state.status == NodeStateStatus.FAILED
+        assert state.error_json is not None
+        assert "OrchestrationInvariantError" in state.error_json
+
     def test_state_id_accessible_inside_block(self) -> None:
         """guard.state_id is available after __enter__."""
         from elspeth.engine.executors.state_guard import NodeStateGuard
