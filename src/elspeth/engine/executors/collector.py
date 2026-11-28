@@ -1272,10 +1272,12 @@ class CollectorExecutor:
                         'Use TransformResult.error({"reason": "...", ...}) to create error results.'
                     )
                 # The returned error's post-execution context goes through the
-                # same single serialiser as the success path, BEFORE the verdict
-                # writes: a context the audit write refuses raises with no
-                # side effect (a plugin bug, as on the success path). A FAILED
-                # state never carries a success reason.
+                # same serialiser as the success path, BEFORE the verdict
+                # writes: a context the audit write refuses raises before any
+                # verdict write (a plugin bug, as on the success path); the
+                # guard auto-fails this attempt and the group stays installed
+                # with every hold OPEN. A FAILED state never carries a success
+                # reason.
                 error_metadata = serialize_completion_metadata(success_reason=None, context_after=result.context_after)
                 return self._fail_group_after_flush(
                     collector_name,

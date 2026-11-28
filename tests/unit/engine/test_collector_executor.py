@@ -1998,6 +1998,74 @@ class TestRestore:
         assert env.open_hold_token_ids(node="stitch") == []
         assert fresh.flush_restored_complete_groups(ctx=env.ctx) == ()
 
+    @pytest.mark.parametrize("bad_field", ["success_reason", "context_after", "error_context"])
+    def test_sweep_retry_after_refused_plugin_metadata_opens_the_next_attempt(self, collector_env: _CollectorEnv, bad_field: str) -> None:
+        """A reason or context the audit write refuses leaves the group parked and
+        installed, as a plugin exception does, and its attempt consumed: the retry
+        sweep opens the NEXT flush attempt (the refused one stays FAILED) and closes
+        the group with the plugin's now-recordable reason and context."""
+        import json
+
+        from sqlalchemy import select
+
+        env = collector_env
+        fresh = env.fresh_executor()
+        members, group_id = self._park_complete_group(env, fresh)
+        items = [env.blocked_item_for(m, collector_name="stitch") for m in members]
+        hold_state_ids = env.state_ids_for(items)
+        fresh.restore_from_journal(
+            items=items,
+            state_ids=hold_state_ids,
+            attempt_offsets={m.token_id: 0 for m in members},
+            resume_checkpoint_id="ckpt-1",
+        )
+        transform = fresh.transform
+        if bad_field == "success_reason":
+            transform.extra_reason_metadata = {"ratio": float("nan")}
+        else:
+            transform.return_error = bad_field == "error_context"
+            transform.context_after = _ScriptedContext({"ratio": float("nan")})
+
+        with pytest.raises(ValueError, match="non-finite"):
+            fresh.flush_restored_complete_groups(ctx=env.ctx)
+        assert fresh._executor._restored_complete_keys == [("stitch", group_id)]
+        assert env.open_hold_token_ids(node="stitch") == sorted(m.token_id for m in members)
+
+        transform.extra_reason_metadata = {}
+        transform.return_error = False
+        transform.context_after = _ScriptedContext({"attempted": 2})
+        outcomes = fresh.flush_restored_complete_groups(ctx=env.ctx)
+        assert [(o.group_id, o.held) for o in outcomes] == [(group_id, False)]
+        assert env.open_hold_token_ids(node="stitch") == []
+
+        record = env.factory.barrier_restore.get_group_record(run_id=env.run_id, group_id=group_id)
+        assert record is not None
+        with env.db.connection() as conn:
+            flush_states = sorted(
+                (row.attempt, row.status, row.success_reason_json, row.context_after_json)
+                for row in conn.execute(
+                    select(
+                        node_states_table.c.state_id,
+                        node_states_table.c.attempt,
+                        node_states_table.c.status,
+                        node_states_table.c.success_reason_json,
+                        node_states_table.c.context_after_json,
+                    )
+                    .where(node_states_table.c.run_id == env.run_id)
+                    .where(node_states_table.c.node_id == str(env.node_id))
+                    .where(node_states_table.c.token_id == record.opener_token_id)
+                )
+                if row.state_id not in set(hold_state_ids.values())
+            )
+        [(refused_attempt, refused_status, refused_reason, refused_context), (retry_attempt, retry_status, retry_reason, retry_context)] = (
+            flush_states
+        )
+        assert (refused_status, refused_reason, refused_context) == ("failed", None, None)
+        assert retry_attempt == refused_attempt + 1
+        assert retry_status == "completed"
+        assert retry_reason is not None and json.loads(retry_reason) == {"action": "collected"}
+        assert retry_context is not None and json.loads(retry_context) == {"attempted": 2}
+
     def test_flush_sweep_refuses_a_parked_group_that_is_no_longer_roster_complete(self, collector_env: _CollectorEnv) -> None:
         # The sweep's guard is for genuinely inconsistent rosters only:
         # nothing between restore and the sweep may legitimately close or
