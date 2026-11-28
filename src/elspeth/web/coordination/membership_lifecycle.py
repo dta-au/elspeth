@@ -180,20 +180,21 @@ class RegisteredWebInstanceMembership(WebInstanceMembership):
         # The lease deadline is read from the event-loop clock that also paces
         # these sleeps and the worker-admission wait.
         #
-        # Two bounds end the loop:
-        # - Lease deadline: once a refused admission has been seen since the
-        #   last success, every failed attempt (refusal or OperationalError)
-        #   escalates if the next attempt would not start at least one regular
-        #   interval before the lease expires. That attempt can still wait for
-        #   admission, so the margin left at expiry is one interval less that
-        #   admission wait.
-        # - Count cap: OperationalError is retried at the regular interval up
-        #   to _HEARTBEAT_MAX_CONSECUTIVE_FAILURES, as when no refusal is seen.
-        # Only a refusal is retried after the short delay.
+        # One bound per mode:
+        # - No refusal since the last success: OperationalError is retried at
+        #   the regular interval, up to _HEARTBEAT_MAX_CONSECUTIVE_FAILURES.
+        # - A refusal seen since the last success: refusals and
+        #   OperationalErrors are both retried after the short delay, bounded
+        #   by the lease deadline alone. A failed attempt escalates if the
+        #   next attempt would not start at least one regular interval before
+        #   the lease expires. The margin left at expiry is that interval less
+        #   the next attempt's admission wait and its upkeep call, which has
+        #   no timeout of its own; the margin holds only if both fit in it.
         loop = asyncio.get_running_loop()
         consecutive_failures = 0
         last_successful_heartbeat = loop.time()
         refused_since_success = False
+        short_delay = min(self._interval_seconds / 4, 1.0)
         next_delay: float = self._interval_seconds
         while True:
             await asyncio.sleep(next_delay)
@@ -207,11 +208,11 @@ class RegisteredWebInstanceMembership(WebInstanceMembership):
                 refused_since_success = False
                 next_delay = self._interval_seconds
             except WORKER_ADMISSION_REFUSED as exc:
-                next_delay = min(self._interval_seconds / 4, 1.0)
+                refused_since_success = True
+                next_delay = short_delay
                 if loop.time() + next_delay >= last_successful_heartbeat + self._lease_seconds - self._interval_seconds:
                     self._log.error("web_instance_heartbeat_escalating", exc_class=type(exc).__name__)
                     raise
-                refused_since_success = True
                 self._log.warning("web_instance_heartbeat_failed", exc_class=type(exc).__name__)
             except OperationalError as exc:
                 # Only OperationalError is retried, and only a bounded number
@@ -222,11 +223,13 @@ class RegisteredWebInstanceMembership(WebInstanceMembership):
                 # deliberately omitted: SQLAlchemy cause chains carry the
                 # database URL.
                 consecutive_failures += 1
-                next_delay = self._interval_seconds
-                lease_deadline_reached = refused_since_success and (
-                    loop.time() + next_delay >= last_successful_heartbeat + self._lease_seconds - self._interval_seconds
-                )
-                if consecutive_failures >= _HEARTBEAT_MAX_CONSECUTIVE_FAILURES or lease_deadline_reached:
+                if refused_since_success:
+                    next_delay = short_delay
+                    bound_reached = loop.time() + next_delay >= last_successful_heartbeat + self._lease_seconds - self._interval_seconds
+                else:
+                    next_delay = self._interval_seconds
+                    bound_reached = consecutive_failures >= _HEARTBEAT_MAX_CONSECUTIVE_FAILURES
+                if bound_reached:
                     self._log.error(
                         "web_instance_heartbeat_escalating",
                         exc_class=type(exc).__name__,

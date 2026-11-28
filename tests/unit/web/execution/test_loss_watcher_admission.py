@@ -42,7 +42,8 @@ async def _bounded(awaitable: Any, *, seconds: float, label: str) -> Any:
     task = asyncio.create_task(awaitable)
     done, _pending = await asyncio.wait({task}, timeout=seconds)
     if task not in done:
-        # Leave no task running past its bound: cancel it and wait, bounded, for it to end.
+        # Cancel it and wait, bounded, for it to end; a task that does not
+        # honour cancellation is left running.
         task.cancel()
         await asyncio.wait({task}, timeout=seconds)
     assert task in done, f"{label} did not complete within {seconds} seconds"
@@ -344,7 +345,8 @@ async def test_watcher_original_survives_a_failing_stop_step(
                 # observed every finished watcher's outcome, and its wait cannot
                 # be cancelled, so a watcher left without one would hang this
                 # case's cleanup. Supply the outcome so the assertion above stays
-                # the reported failure. Reached only without the fix.
+                # the reported failure. Reached only if the watcher records its
+                # outcome after its stop step.
                 owner.outcome = (run.watcher, original)
 
 
