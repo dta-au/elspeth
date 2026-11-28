@@ -248,6 +248,13 @@ _COMPOSER_BOOT_PROBE_DEADLINE_SECONDS = 45.0
 # loop calls with at most 200 completion tokens (11 archived calls, prompts of
 # 56k-104k tokens): p50 1.6 s, max 2.75 s.
 _COMPOSER_PLANNER_BOOT_PROBE_TIMEOUT_SECONDS = 5.0
+
+
+def _composer_boot_probe_time(loop: asyncio.AbstractEventLoop) -> float:
+    """Read the boot-probe budget clock without changing asyncio's timer clock."""
+    return loop.time()
+
+
 # httpx's connect and read timeouts are per operation: the read timeout
 # bounds each wait for a chunk, so a response that trickles in never trips it.
 # The prime is therefore also held to a total deadline, which is what the boot
@@ -1033,7 +1040,7 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
             # surface probes its own endpoint and capability even when model IDs
             # match. Every request shares one deadline (see
             # _COMPOSER_BOOT_PROBE_DEADLINE_SECONDS).
-            probe_deadline = loop.time() + _COMPOSER_BOOT_PROBE_DEADLINE_SECONDS
+            probe_deadline = _composer_boot_probe_time(loop) + _COMPOSER_BOOT_PROBE_DEADLINE_SECONDS
             for probe_request in build_composer_probe_requests(settings, env=os.environ):
                 composer_probe_start = time.monotonic()
                 probe_status = "started"
@@ -1056,7 +1063,7 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
                     "structured_output": is_advisor,
                     "probe_status": probe_status,
                 }
-                remaining = probe_deadline - loop.time()
+                remaining = probe_deadline - _composer_boot_probe_time(loop)
                 probe_timeout = min(remaining, _COMPOSER_PLANNER_BOOT_PROBE_TIMEOUT_SECONDS) if role == "planner" else remaining
                 try:
                     if remaining <= 0:
