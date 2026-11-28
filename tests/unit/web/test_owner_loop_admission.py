@@ -446,7 +446,8 @@ async def test_heartbeat_refusal_then_database_errors_obeys_lease_deadline(monke
             return
         if calls == 2:
             raise refusal
-        clock += 0.7
+        if calls == 3:
+            clock += 0.5  # One slow call, so the deadline check reads the clock after the call.
         raise database_error
 
     _fake_heartbeat_clock(monkeypatch, sleep=fake_sleep, now=lambda: clock, heartbeat=heartbeat)
@@ -463,15 +464,13 @@ async def test_heartbeat_refusal_then_database_errors_obeys_lease_deadline(monke
     with pytest.raises((OperationalError, async_workers.AsyncWorkerAdmissionTimeoutError)) as raised:
         await asyncio.wait_for(RegisteredWebInstanceMembership._heartbeat_loop(owner), timeout=5)
     assert raised.value is database_error, "a refusal inside the lease must be retried"
-    assert calls == 4
     # After a refusal, database errors are retried after the short delay too,
-    # bounded by the lease deadline.
-    assert sleeps == [1, 1, 0.25, 0.25]
-    # Deadline from the success at t=1: lease 5 less one interval. The final
-    # attempt's check reached it; the one before (its next start, clock - 0.7) did not.
-    deadline = 1 + 5 - 1
-    assert clock + 0.25 >= deadline, "the escalation must not come before the lease deadline"
-    assert clock - 0.7 < deadline, "the escalation must not come after the lease deadline"
+    # bounded by the lease deadline: the success at t=1 plus lease 5 less one
+    # interval, so t=5. The checks (now + 0.25) read 4.0, 4.25, 4.5, 4.75 and
+    # 5.0; the one at exactly 5.0 escalates, on the fifth database error.
+    assert calls == 7
+    assert sleeps == [1, 1, 0.25, 0.25, 0.25, 0.25, 0.25]
+    assert clock == 4.75
     assert logs[0] == ("warning", "web_instance_heartbeat_failed")
     assert logs[-1] == ("error", "web_instance_heartbeat_escalating")
 
