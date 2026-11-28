@@ -80,19 +80,55 @@ async function clickGesture(
   locator: Locator,
   label: string,
   ledger: TransitionLedgerRecorder | null,
+  timeout?: number,
 ): Promise<boolean> {
   const gesture = ledger?.gesture(label) ?? null;
-  const clicked = await locator.click().then(() => true, () => false);
+  const clicked = await locator.click({ timeout }).then(() => true, () => false);
   if (!clicked && gesture !== null) ledger?.retract(gesture);
   return clicked;
+}
+
+// One attempt's actionability wait (visible, stable, enabled, receives events), never a response wait: 2 s lets a card's entry animation or a brief overlay clear on the loaded 4-vCPU staging box.
+const ENABLED_CLICK_TIMEOUT_MS = 2_000;
+// Attempts on a button that stays enabled while refusing: 3 gives a slow-settling button about 6 s in all, then Playwright's own error ends the walk.
+const STILL_ENABLED_CLICK_ATTEMPTS = 3;
+// Not an actionability wait: the label read waits only when the button just counted has unmounted, and the click after it then rescans.
+const LABEL_READ_TIMEOUT_MS = 2_000;
+
+// A gesture on the first enabled button `buttons` matches, logged and retracted as clickGesture
+// does. After the click, Playwright waits only for a page navigation the click starts (these
+// buttons start none), so the timeout never covers the request the click sends. A refused click
+// goes uncounted, and the caller rescans, only when `buttons` matches no enabled button afterwards.
+// While one is left, even on another card, the refusal counts in `refusals` (reset when a click
+// lands) and the last attempt rethrows Playwright's error.
+async function clickFirstEnabled(
+  buttons: Locator,
+  label: string,
+  ledger: TransitionLedgerRecorder,
+  refusals: { count: number },
+): Promise<boolean> {
+  const gesture = ledger.gesture(label);
+  try {
+    await buttons.first().click({ timeout: ENABLED_CLICK_TIMEOUT_MS });
+  } catch (error) {
+    ledger.retract(gesture);
+    if ((await buttons.count().catch(() => 0)) === 0) return false;
+    refusals.count += 1;
+    if (refusals.count >= STILL_ENABLED_CLICK_ATTEMPTS) throw error;
+    return false;
+  }
+  refusals.count = 0;
+  return true;
 }
 
 async function resolveVisibleReviews(
   page: Page,
   ledger: TransitionLedgerRecorder | null = null,
 ): Promise<number> {
-  const primaryButtons = ACKNOWLEDGEMENT_PRIMARY_ACTION_NAMES.map((name) =>
-    page.getByRole("button", { name }),
+  // Only enabled buttons match, and each locator re-resolves when it acts: no positional
+  // index is carried from a check to the click while the card list re-renders.
+  const enabledPrimaryButtons = ACKNOWLEDGEMENT_PRIMARY_ACTION_NAMES.map((name) =>
+    page.getByRole("button", { name, disabled: false }),
   );
   const promptRegions = page.getByRole("region", {
     name: "Prompt template review",
@@ -100,31 +136,29 @@ async function resolveVisibleReviews(
   let actions = 0;
   // Bounded inner loop: each acknowledged card unmounts, shrinking the list.
   // Prompt-template cards take two iterations (View prompt -> Approve).
-  for (let guard = 0; guard < 12; guard++) {
-    const regionCount = await promptRegions.count().catch(() => 0);
-    for (let i = 0; i < regionCount; i++) {
-      await promptRegions
-        .nth(i)
-        .evaluate((el) => {
+  reviewPass: for (let guard = 0; guard < 12; guard++) {
+    // evaluateAll() acts on the regions present now and never waits; nth(i).evaluate() on a
+    // region that unmounted after the count would wait for the action timeout.
+    await promptRegions
+      .evaluateAll((elements) => {
+        for (const el of elements) {
           el.scrollTop = el.scrollHeight;
           el.dispatchEvent(new Event("scroll"));
-        })
-        .catch(() => {});
-    }
-    let clicked = false;
-    for (const buttons of primaryButtons) {
-      const total = await buttons.count().catch(() => 0);
-      for (let i = 0; i < total; i++) {
-        const btn = buttons.nth(i);
-        if (await btn.isEnabled().catch(() => false)) {
-          const label = ((await btn.textContent().catch(() => null)) ?? "").trim() || "Acknowledge";
-          await clickGesture(btn, label, ledger);
-          actions += 1;
-          clicked = true;
-          break;
         }
-      }
-      if (clicked) break;
+      })
+      .catch(() => {});
+    let clicked = false;
+    for (const buttons of enabledPrimaryButtons) {
+      // count() reads the page once; a waiting check such as isEnabled() on an absent
+      // locator would block for the action timeout.
+      if ((await buttons.count().catch(() => 0)) === 0) continue;
+      const btn = buttons.first();
+      const label = ((await btn.textContent({ timeout: LABEL_READ_TIMEOUT_MS }).catch(() => null)) ?? "").trim() || "Acknowledge";
+      // The card list changed under the click: rescan on the next pass.
+      if (!(await clickGesture(btn, label, ledger, ENABLED_CLICK_TIMEOUT_MS))) continue reviewPass;
+      actions += 1;
+      clicked = true;
+      break;
     }
     if (!clicked) {
       await page.waitForTimeout(300);
@@ -141,18 +175,22 @@ async function driveFreeformWalk(page: Page, ledger: TransitionLedgerRecorder): 
   await expect(sendBrief).toBeEnabled({ timeout: 30_000 });
   await clickGesture(sendBrief, "Send tutorial brief", ledger);
 
+  // A deliberate walk total, never reset on the disabled branch: a reset would let a Continue to Run that keeps toggling run to the deadline again.
+  const continueRefusals = { count: 0 };
   const deadline = Date.now() + 900_000;
   while (Date.now() < deadline) {
-    const ready = page.getByRole("button", { name: "Continue to Run" });
-    if (await ready.isEnabled().catch(() => false)) {
-      await clickGesture(ready, "Continue to Run", ledger);
+    // count() reads the page once; isEnabled() on these usually-absent buttons would wait
+    // for the action timeout on every poll. A refused click rescans.
+    const ready = page.getByRole("button", { name: "Continue to Run", disabled: false });
+    if ((await ready.count().catch(() => 0)) > 0) {
+      if (!(await clickFirstEnabled(ready, "Continue to Run", ledger, continueRefusals))) continue;
       await expect(page.getByRole("heading", { name: /Ready to run/i })).toBeVisible({ timeout: 60_000 });
       return;
     }
     const accept = page.getByRole("region", { name: /Awaiting your decision/ })
-      .getByRole("button", { name: /Accept proposal:/ }).first();
-    if (await accept.isEnabled().catch(() => false)) {
-      await clickGesture(accept, "Accept proposal", ledger);
+      .getByRole("button", { name: /Accept proposal:/, disabled: false });
+    if ((await accept.count().catch(() => 0)) > 0) {
+      await clickGesture(accept.first(), "Accept proposal", ledger, ENABLED_CLICK_TIMEOUT_MS);
       continue;
     }
     if (await resolveVisibleReviews(page, ledger) > 0) continue;

@@ -171,7 +171,7 @@ _REVIEWED_FORWARDERS: frozenset[tuple[str, str, str]] = frozenset(
         ("execution/service.py", "_authoritative_state_preflight_sync", "exc.error_code"),
         # Route projections and persistence of codes produced (and censused)
         # elsewhere; none of them authors a code.
-        # The execute route and the tutorial run share this one projection.
+        # The execute route, the tutorial run and approval requests share this one projection.
         ("execution/http_errors.py", "pipeline_validation_http_exception", "err.error_code"),
         # RuntimeYamlImportError's only code is the literal censused at yaml_importer.py.
         ("sessions/routes/composer/state.py", "seed_state_from_runtime_yaml", "exc.error_code"),
@@ -184,7 +184,6 @@ _REVIEWED_FORWARDERS: frozenset[tuple[str, str, str]] = frozenset(
         ("sessions/routes/_helpers.py", "_composer_persisted_validation", "error.error_code"),
         ("sessions/routes/_helpers.py", "_message_response", "rejection_record.error_code"),
         ("sessions/routes/_helpers.py", "_validation_entry_responses", "e.error_code"),
-        ("sessions/routes/workflow/approvals.py", "request_approval", "error.error_code"),
         ("sessions/service.py", "_sync", "error.error_code"),
         ("sessions/service.py", "_validate_patched_composition_state", "error.error_code"),
         ("sessions/service.py", "list_composition_rejection_events", "row.error_code"),

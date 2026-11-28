@@ -20,7 +20,9 @@ from elspeth.web.coordination.approval_authority import (
     supersede_open_approvals,
 )
 from elspeth.web.coordination.database_clock import database_now
-from elspeth.web.execution.errors import BlobSourcePathMismatchError, ExecutionReadinessError
+from elspeth.web.execution.errors import BlobSourcePathMismatchError, ExecutionReadinessError, PipelineValidationError
+from elspeth.web.execution.http_errors import pipeline_validation_http_exception
+from elspeth.web.execution.schemas import ValidationError
 from elspeth.web.sessions.models import (
     approvals_table,
     composition_states_table,
@@ -219,6 +221,36 @@ def test_invalid_execution_readiness_refuses_approval_request_without_a_row(clos
 
     assert response.status_code == 422
     assert response.json()["detail"]["error_type"] == "execution_not_ready"
+    assert audit.requested == []
+    with client.app.state.phase3_engine.connect() as conn:
+        assert conn.execute(select(approvals_table.c.approval_id)).all() == []
+
+
+def test_pipeline_validation_refusal_uses_the_shared_execution_422_shape(closed_local_app: TestClient) -> None:
+    """An approval request refused by pre-run validation answers with the same 422 as /execute and /validate."""
+    client = closed_local_app
+    session_id, state_id, audit, compiled = _seed(client)
+    compiled.error = PipelineValidationError(
+        errors=(
+            ValidationError(
+                component_id="rate",
+                component_type="transform",
+                message="'rate' requires field 'content' not emitted upstream",
+                suggestion="Wire an upstream node that emits 'content'.",
+                error_code=None,
+            ),
+        )
+    )
+
+    response = client.post(
+        f"/api/sessions/{session_id}/approvals",
+        json={"state_id": state_id, "approver_identity_id": "addressed"},
+    )
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail["kind"] == "pipeline_validation_failure"
+    assert detail == pipeline_validation_http_exception(compiled.error).detail
     assert audit.requested == []
     with client.app.state.phase3_engine.connect() as conn:
         assert conn.execute(select(approvals_table.c.approval_id)).all() == []

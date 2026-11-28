@@ -389,6 +389,7 @@ describe("CommandPalette commands", () => {
   it.each([
     ["execution request is starting", true, null],
     ["a run is active", false, { status: "running" }],
+    ["a run is queued", false, { status: "pending" }],
   ])("withholds Execute while %s", (_label, isExecuting, progress) => {
     useSessionStore.setState({ activeSessionId: "session-1" });
     executionStoreState.validationResult = makeValidationResult({

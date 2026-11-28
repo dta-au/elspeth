@@ -1,4 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { createElement } from "react";
+import { render, screen } from "@testing-library/react";
+import { ProgressView } from "@/components/execution/ProgressView";
 import { useExecutionStore } from "./executionStore";
 import { useInterpretationEventsStore } from "./interpretationEventsStore";
 import { useSessionStore } from "./sessionStore";
@@ -361,6 +364,119 @@ describe("executionStore.execute", () => {
       activeSessionId: "session-1",
       compositionState: { id: "state-1", version: 1, sources: {}, nodes: [], edges: [], outputs: [] },
     } as never);
+  });
+
+  it("shows queued progress after execute resolves while the run row is pending", async () => {
+    const { executePipeline, fetchRuns } = await import("@/api/client");
+    vi.mocked(executePipeline).mockResolvedValue({ run_id: "run-1" });
+    vi.mocked(fetchRuns).mockResolvedValue([makeRun({ status: "pending" })]);
+    vi.mocked(connectToRun).mockReturnValue({ close: vi.fn() } as never);
+
+    expect(await useExecutionStore.getState().execute("session-1")).toBe("run-1");
+    await useExecutionStore.getState().loadRuns("session-1");
+    render(createElement(ProgressView));
+
+    expect(screen.getByText("Queued — waiting to start")).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("Pipeline queued.");
+  });
+
+  // execute() starts its own run-list read and does not await it. The three
+  // cases below hold that read open, so what it does on arrival is observed
+  // against whatever happened in between. Each first waits for the read to
+  // land in `runs`, so a "still pending" or "still running" assertion cannot
+  // pass merely because the read had not applied yet.
+  it("keeps running progress when the execute-started pending read resolves after a progress event", async () => {
+    const { executePipeline, fetchRuns } = await import("@/api/client");
+    const startRead = deferred<Run[]>();
+    vi.mocked(executePipeline).mockResolvedValue({ run_id: "run-1" });
+    vi.mocked(fetchRuns).mockReturnValueOnce(startRead.promise);
+    vi.mocked(connectToRun).mockReturnValue({ close: vi.fn() } as never);
+
+    expect(await useExecutionStore.getState().execute("session-1")).toBe("run-1");
+    expect(fetchRuns).toHaveBeenCalledTimes(1);
+    expect(useExecutionStore.getState().progress?.status).toBe("pending");
+    const handlers = vi.mocked(connectToRun).mock.calls[0][2];
+    const event = {
+      run_id: "run-1",
+      timestamp: "2026-04-26T05:32:00.000Z",
+      event_type: "progress",
+      data: { source_rows_processed: 3, tokens_succeeded: 2, tokens_failed: 0,
+        tokens_quarantined: 0, tokens_routed_success: 0, tokens_routed_failure: 0 },
+    } satisfies RunEvent;
+    handlers.onProgress(event, event.data);
+    expect(useExecutionStore.getState().progress?.status).toBe("running");
+
+    startRead.resolve([makeRun({ status: "pending" })]);
+    await vi.waitFor(() =>
+      expect(useExecutionStore.getState().runs.map((run) => run.status)).toEqual(["pending"]),
+    );
+
+    expect(useExecutionStore.getState().progress?.status).toBe("running");
+    expect(useExecutionStore.getState().progress?.source_rows_processed).toBe(3);
+  });
+
+  it("records a terminal first poll directly from the pending execute seed", async () => {
+    const { executePipeline, fetchRuns } = await import("@/api/client");
+    const startRead = deferred<Run[]>();
+    vi.mocked(executePipeline).mockResolvedValue({ run_id: "run-1" });
+    vi.mocked(fetchRuns).mockReturnValueOnce(startRead.promise);
+    vi.mocked(connectToRun).mockReturnValue({ close: vi.fn() } as never);
+
+    expect(await useExecutionStore.getState().execute("session-1")).toBe("run-1");
+    expect(useExecutionStore.getState().progress?.status).toBe("pending");
+
+    startRead.resolve([
+      makeRun({ status: "completed", finished_at: "2026-04-26T05:32:08.000Z" }),
+    ]);
+    await vi.waitFor(() =>
+      expect(useExecutionStore.getState().runs.map((run) => run.status)).toEqual(["completed"]),
+    );
+
+    const state = useExecutionStore.getState();
+    expect(state.progress?.status).toBe("completed");
+    expect(state.lastRunOutcome).toEqual({
+      runId: "run-1",
+      status: "completed",
+      sessionId: "session-1",
+    });
+  });
+
+  it("does not promote a replacement active run from the previous run's outstanding read", async () => {
+    const { executePipeline, fetchRuns } = await import("@/api/client");
+    const firstRunRead = deferred<Run[]>();
+    const secondRunRead = deferred<Run[]>();
+    vi.mocked(executePipeline)
+      .mockResolvedValueOnce({ run_id: "run-1" })
+      .mockResolvedValueOnce({ run_id: "run-2" });
+    vi.mocked(fetchRuns)
+      .mockReturnValueOnce(firstRunRead.promise)
+      .mockReturnValueOnce(secondRunRead.promise);
+    vi.mocked(connectToRun).mockReturnValue({ close: vi.fn() } as never);
+
+    expect(await useExecutionStore.getState().execute("session-1")).toBe("run-1");
+    expect(await useExecutionStore.getState().execute("session-1")).toBe("run-2");
+    expect(fetchRuns).toHaveBeenCalledTimes(2);
+    expect(useExecutionStore.getState().activeRunId).toBe("run-2");
+    expect(useExecutionStore.getState().progress?.status).toBe("pending");
+
+    // The first run's read was issued before the replacement and still reports
+    // that run as running. It is the newest read so far, so it applies.
+    firstRunRead.resolve([makeRun({ id: "run-1", status: "running" })]);
+    await vi.waitFor(() =>
+      expect(useExecutionStore.getState().runs.map((run) => run.id)).toEqual(["run-1"]),
+    );
+
+    expect(useExecutionStore.getState().activeRunId).toBe("run-2");
+    expect(useExecutionStore.getState().progress?.status).toBe("pending");
+
+    secondRunRead.resolve([
+      makeRun({ id: "run-2", status: "pending" }),
+      makeRun({ id: "run-1", status: "cancelled", finished_at: "2026-04-26T05:32:08.000Z" }),
+    ]);
+    await vi.waitFor(() =>
+      expect(useExecutionStore.getState().runs.map((run) => run.id)).toEqual(["run-2", "run-1"]),
+    );
+    expect(useExecutionStore.getState().progress?.status).toBe("pending");
   });
 
   it("drops a late start success after the active session changes", async () => {
@@ -1653,6 +1769,19 @@ describe("executionStore.rehydrateActiveRun", () => {
     );
   });
 
+  it("moves an attached queued run to running on a poll without a progress event", async () => {
+    const { fetchRuns } = await import("@/api/client");
+    vi.mocked(fetchRuns).mockResolvedValueOnce([makeRun({ id: "run-queued", status: "pending" })])
+      .mockResolvedValueOnce([makeRun({ id: "run-queued", status: "running" })]);
+    vi.mocked(connectToRun).mockReturnValue({ close: vi.fn() } as never);
+
+    await useExecutionStore.getState().rehydrateActiveRun("session-1");
+    expect(useExecutionStore.getState().progress?.status).toBe("pending");
+    await useExecutionStore.getState().loadRuns("session-1");
+    expect(useExecutionStore.getState().progress?.status).toBe("running");
+    expect(connectToRun).toHaveBeenCalledTimes(1);
+  });
+
   it("does not connect when every run is terminal", async () => {
     const { fetchRuns } = await import("@/api/client");
     (fetchRuns as ReturnType<typeof vi.fn>).mockResolvedValue([
@@ -2096,6 +2225,88 @@ describe("executionStore loadRuns degraded-path reconciliation", () => {
       status: "running",
     };
   }
+
+  it("moves queued progress forward when the active run row is running", async () => {
+    const { fetchRuns } = await import("@/api/client");
+    vi.mocked(fetchRuns).mockResolvedValue([makeRun({ status: "running" })]);
+    useExecutionStore.setState({
+      activeRunId: "run-1",
+      activeRunSessionId: "session-1",
+      progress: { ...inFlightProgress(), status: "pending" },
+    });
+
+    await useExecutionStore.getState().loadRuns("session-1");
+
+    const state = useExecutionStore.getState();
+    expect(state.progress?.status).toBe("running");
+    expect(state.lastRunOutcome).toBeNull();
+    expect(state.progress?.source_rows_processed).toBe(2);
+  });
+
+  it("does not promote pending active progress from another run's running row", async () => {
+    const { fetchRuns } = await import("@/api/client");
+    // The other run's row comes first, so a selection that matched on status
+    // rather than on the active run id would find it before the active row.
+    vi.mocked(fetchRuns).mockResolvedValueOnce([
+      makeRun({ id: "run-other", status: "running" }),
+      makeRun({ status: "pending" }),
+    ]);
+    useExecutionStore.setState({
+      activeRunId: "run-1",
+      activeRunSessionId: "session-1",
+      progress: { ...inFlightProgress(), status: "pending" },
+    });
+
+    expect(await useExecutionStore.getState().loadRuns("session-1")).toBe("loaded");
+
+    const state = useExecutionStore.getState();
+    expect(state.runs.map((run) => run.id)).toEqual(["run-other", "run-1"]);
+    expect(state.activeRunId).toBe("run-1");
+    expect(state.progress?.status).toBe("pending");
+  });
+
+  it("keeps event-driven running progress through a stale pending poll", async () => {
+    const { fetchRuns } = await import("@/api/client");
+    vi.mocked(fetchRuns).mockResolvedValue([makeRun({ status: "pending" })]);
+    vi.mocked(connectToRun).mockReturnValue({ close: vi.fn() } as never);
+    useExecutionStore.setState({
+      activeRunId: "run-1",
+      activeRunSessionId: "session-1",
+      progress: { ...inFlightProgress(), status: "pending" },
+    });
+    useExecutionStore.getState().connectWebSocket("run-1");
+    const handlers = vi.mocked(connectToRun).mock.calls[0][2];
+    const event = {
+      run_id: "run-1",
+      timestamp: "2026-04-26T05:32:00.000Z",
+      event_type: "progress",
+      data: { source_rows_processed: 3, tokens_succeeded: 2, tokens_failed: 0,
+        tokens_quarantined: 0, tokens_routed_success: 0, tokens_routed_failure: 0 },
+    } satisfies RunEvent;
+    handlers.onProgress(event, event.data);
+    expect(useExecutionStore.getState().progress?.status).toBe("running");
+
+    await useExecutionStore.getState().loadRuns("session-1");
+
+    expect(useExecutionStore.getState().progress?.status).toBe("running");
+    expect(useExecutionStore.getState().progress?.source_rows_processed).toBe(3);
+  });
+
+  it("does not replace terminal progress with a non-terminal poll", async () => {
+    const { fetchRuns } = await import("@/api/client");
+    vi.mocked(fetchRuns).mockResolvedValue([makeRun({ status: "running" })]);
+    useExecutionStore.setState({
+      activeRunId: "run-1",
+      activeRunSessionId: "session-1",
+      progress: { ...inFlightProgress(), status: "completed" },
+      lastRunOutcome: { runId: "run-1", status: "completed", sessionId: "session-1" },
+    });
+
+    await useExecutionStore.getState().loadRuns("session-1");
+
+    expect(useExecutionStore.getState().progress?.status).toBe("completed");
+    expect(useExecutionStore.getState().lastRunOutcome?.status).toBe("completed");
+  });
 
   it("records the outcome and reconciles progress when the poll finds the active run terminal", async () => {
     const { fetchRuns } = await import("@/api/client");
