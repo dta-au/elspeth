@@ -361,3 +361,80 @@ async def test_core_refuses_a_foreign_call_result() -> None:
     with pytest.raises(AuditIntegrityError):
         await inspect_prompt_guard_request(client, _request("Prompt", ("Document",)))
     assert client.calls == 1
+
+
+class _ClosingClient(_CountingClient):
+    def __init__(self, *, result: str, close_failure: BaseException | None) -> None:
+        super().__init__()
+        self.result = result
+        self.close_failure = close_failure
+
+    @asynccontextmanager
+    async def request_context(self) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            if self.close_failure is not None:
+                raise self.close_failure
+
+    async def inspect_call(self, call: PromptGuardCall) -> PromptGuardCallResult:
+        self.calls += 1
+        if self.result == "foreign":
+            return _ForeignResult()
+        if self.result == "integrity":
+            raise AuditIntegrityError("Physical call integrity")
+        if self.result == "cancelled":
+            raise asyncio.CancelledError()
+        return PromptGuardCallResult(PromptGuardDecision("allow", "clean"))
+
+
+class _ForeignResult:
+    decision = PromptGuardDecision("allow", "clean")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("result", "close_failure"),
+    [
+        pytest.param(
+            "foreign",
+            PromptGuardRequestUnavailable(PromptGuardDecision("unavailable", "service_error")),
+            id="foreign_result_unavailable_close",
+        ),
+        pytest.param("foreign", RuntimeError("close failed"), id="foreign_result_exception_close"),
+        pytest.param(
+            "integrity",
+            PromptGuardRequestUnavailable(PromptGuardDecision("unavailable", "service_error")),
+            id="adapter_integrity_unavailable_close",
+        ),
+    ],
+)
+async def test_integrity_error_survives_a_failing_close(result: str, close_failure: Exception) -> None:
+    client = _ClosingClient(result=result, close_failure=close_failure)
+    with pytest.raises(AuditIntegrityError) as caught:
+        await inspect_prompt_guard_request(client, _request("Prompt", ("Document",)))
+    assert caught.value.__context__ is close_failure
+    assert client.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_unavailable_close_returns_its_decision_after_clean_calls() -> None:
+    failure = PromptGuardRequestUnavailable(PromptGuardDecision("unavailable", "service_error"))
+    client = _ClosingClient(result="allow", close_failure=failure)
+    decision = await inspect_prompt_guard_request(client, _request("Prompt", ("Document",)))
+    assert decision == failure.decision
+
+
+@pytest.mark.asyncio
+async def test_cancellation_from_a_call_propagates() -> None:
+    client = _ClosingClient(result="cancelled", close_failure=None)
+    with pytest.raises(asyncio.CancelledError):
+        await inspect_prompt_guard_request(client, _request("Prompt", ("Document",)))
+
+
+@pytest.mark.asyncio
+async def test_cancellation_while_closing_propagates_over_an_integrity_error() -> None:
+    client = _ClosingClient(result="foreign", close_failure=asyncio.CancelledError())
+    with pytest.raises(asyncio.CancelledError):
+        await inspect_prompt_guard_request(client, _request("Prompt", ("Document",)))
+    assert client.calls == 1
