@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, fields
 from datetime import UTC, datetime
+from typing import cast
 
 import pytest
 from structlog.testing import capture_logs
@@ -30,7 +31,7 @@ from structlog.testing import capture_logs
 from elspeth.contracts.audit import TokenOutcome
 from elspeth.contracts.checkpoint import ResumeRefusalCause
 from elspeth.contracts.enums import FrameKind, RunStatus, TerminalOutcome, TerminalPath
-from elspeth.contracts.errors import OrchestrationInvariantError
+from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError
 from elspeth.contracts.events import RunCompletionStatus
 from elspeth.contracts.run_result import RunResult
 from elspeth.core.checkpoint.recovery import (
@@ -39,12 +40,14 @@ from elspeth.core.checkpoint.recovery import (
     UnsatisfiableGroupMember,
 )
 from elspeth.core.checkpoint.recovery import ResumeCheck as _ResumeCheck
+from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.engine.orchestrator import run_status
 from elspeth.engine.orchestrator.run_status import (
     assert_bound_groups_settled_from_audit,
     assert_terminal_counter_parity,
     cli_completion_for,
     derive_resume_terminal_status_from_audit,
+    derive_terminal_status_from_audit,
     is_counted_coalesced_output,
 )
 from elspeth.engine.orchestrator.types import ExecutionCounters
@@ -145,6 +148,30 @@ def test_routed_outcome_tallies_destination(path: TerminalPath, outcome: Termina
     factory = _fake_factory([_routed_outcome(path, outcome, sink_name=destination)])
     _status, counters = derive_resume_terminal_status_from_audit(factory, "run-1")  # type: ignore[arg-type]
     assert counters.routed_destinations[destination] == 1
+
+
+def test_failed_summary_derivation_skips_only_finalization_abandonment() -> None:
+    abandoned = TokenOutcome(
+        outcome_id="oc-abandoned",
+        run_id="run-1",
+        token_id="tok-2",
+        outcome=None,
+        path=TerminalPath.ABANDONED,
+        completed=False,
+        recorded_at=_RECORDED_AT,
+    )
+    factory = cast(
+        RecorderFactory, _fake_factory([_routed_outcome(TerminalPath.GATE_ROUTED, TerminalOutcome.SUCCESS, sink_name="out"), abandoned])
+    )
+
+    with pytest.raises(AuditIntegrityError, match="ABANDONED"):
+        derive_terminal_status_from_audit(factory, "run-1")
+
+    status, counters = derive_terminal_status_from_audit(factory, "run-1", allow_finalization_abandonment=True)
+    assert status is RunStatus.COMPLETED
+    assert counters.rows_succeeded == counters.rows_routed_success == 1
+    assert counters.rows_processed == 1
+    assert counters.routed_destinations == {"out": 1}
 
 
 def _coalesced_outcome(token_id: str, *, sink_name: str | None) -> TokenOutcome:

@@ -304,9 +304,9 @@ class TestRunResultStatusInvariant:
     def test_failed_with_zero_rows_processed(self) -> None:
         """Engine took the failed path before any row was counted (e.g. an
         exception during source iteration).  rows_processed=0 with status=FAILED
-        is legitimate for the "exception bounded the run" case — see the
-        ``_emit_failed_ceremony`` default-result path in
-        engine/orchestrator/core.py.
+        is legitimate for the "exception bounded the run" case, where the
+        FAILED ceremony derives its counts from an audit trail that holds no
+        rows yet (``RunCeremony`` in engine/orchestrator/ceremony.py).
         """
         result = self._build(status=RunStatus.FAILED, rows_processed=0, rows_succeeded=0)
         assert result.status == RunStatus.FAILED

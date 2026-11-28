@@ -26,7 +26,7 @@ from elspeth.contracts.events import (
 from elspeth.contracts.run_result import RunResult
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.engine._best_effort import best_effort
-from elspeth.engine.orchestrator.run_status import cli_completion_for
+from elspeth.engine.orchestrator.run_status import cli_completion_for, derive_terminal_status_from_audit
 
 if TYPE_CHECKING:
     from elspeth.contracts.coordination import CoordinationToken
@@ -35,6 +35,21 @@ if TYPE_CHECKING:
     from elspeth.engine.orchestrator.ports import TelemetryManagerProtocol
 
 slog = structlog.get_logger(__name__)
+
+
+def _failed_result_from_audit(factory: RecorderFactory, run_id: str) -> RunResult | None:
+    """Derive a FAILED run's outcome counts from the durable audit, or None.
+
+    Sink-bound outcomes enter the audit only at sink finalization, so the live
+    result can include rows that never reached their sink. ``None`` means the
+    derive failed and the counts are unknown. ``best_effort`` re-raises Tier-1
+    errors, exactly as a ``finalize_run`` failure propagates.
+    """
+    derived: RunResult | None = None
+    with best_effort("Failed run audit summary derive", run_id=run_id):
+        _, audit_counters = derive_terminal_status_from_audit(factory, run_id, allow_finalization_abandonment=True)
+        derived = audit_counters.to_run_result(run_id, RunStatus.FAILED)
+    return derived
 
 
 class RunCeremony:
@@ -101,6 +116,8 @@ class RunCeremony:
         rows_routed_failure: int = 0,
         routed_destinations: Mapping[str, int] | tuple[tuple[str, int], ...] = (),
         collector_groups_failed: int = 0,
+        outcome_counts_known: bool = True,
+        rows_processed_known: bool = True,
     ) -> None:
         """Emit the terminal operator-facing RunSummary event."""
         if isinstance(routed_destinations, Mapping):
@@ -121,6 +138,8 @@ class RunCeremony:
                 routed_failure=rows_routed_failure,
                 routed_destinations=destination_items,
                 collector_groups_failed=collector_groups_failed,
+                outcome_counts_known=outcome_counts_known,
+                total_rows_known=rows_processed_known,
             )
         )
 
@@ -289,37 +308,53 @@ class RunCeremony:
         before the raise propagates into ``best_effort``) is the audit trace.
         """
 
-        failed_result = result or RunResult(
-            run_id=run_id,
-            status=RunStatus.FAILED,
-            rows_processed=0,
-            rows_succeeded=0,
-            rows_failed=0,
-            rows_routed_success=0,
-            rows_routed_failure=0,
-            rows_quarantined=0,
-            rows_forked=0,
-            rows_coalesced=0,
-            rows_coalesce_failed=0,
-            rows_expanded=0,
-            rows_buffered=0,
-            rows_diverted=0,
-            routed_destinations={},
-        )
+        # Rows processed: the live counter is the canonical per-source-row
+        # figure (one per row pulled from the source). The audit's figure counts
+        # only rows with a completed outcome, which a failed run's in-flight
+        # rows lack, so it is used only when there is no live result.
+        live_rows_processed = None if result is None else result.rows_processed
         total_duration = time.perf_counter() - start_time
         factory.run_lifecycle.finalize_run(RunStatus.FAILED, coordination_token=coordination_token)
+        # A Tier-1 error from this derive ends the ceremony here, before
+        # RunFinished, as a Tier-1 ``finalize_run`` error does.
+        failed_result = _failed_result_from_audit(factory, run_id)
         summary_status, exit_code = cli_completion_for(RunStatus.FAILED)
 
+        if failed_result is None:
+            # The FAILED stamp is durable but the outcome counts are unknown;
+            # the summary says so rather than reporting zero as confirmed.
+            # Without a live result the rows processed are unknown too.
+            # RunFinished.row_count has no unknown form, so it keeps 0 then.
+            self.emit_run_finished(
+                run_id=run_id,
+                status=RunStatus.FAILED,
+                row_count=0 if live_rows_processed is None else live_rows_processed,
+                duration_seconds=total_duration,
+            )
+            self.emit_run_summary(
+                run_id=run_id,
+                status=summary_status,
+                rows_processed=0 if live_rows_processed is None else live_rows_processed,
+                rows_succeeded=0,
+                rows_failed=0,
+                rows_quarantined=0,
+                duration_seconds=total_duration,
+                exit_code=exit_code,
+                outcome_counts_known=False,
+                rows_processed_known=live_rows_processed is not None,
+            )
+            return
+        rows_processed = failed_result.rows_processed if live_rows_processed is None else live_rows_processed
         self.emit_run_finished(
             run_id=run_id,
             status=RunStatus.FAILED,
-            row_count=failed_result.rows_processed,
+            row_count=rows_processed,
             duration_seconds=total_duration,
         )
         self.emit_run_summary(
             run_id=run_id,
             status=summary_status,
-            rows_processed=failed_result.rows_processed,
+            rows_processed=rows_processed,
             rows_succeeded=failed_result.rows_succeeded,
             rows_failed=failed_result.rows_failed,
             rows_quarantined=failed_result.rows_quarantined,

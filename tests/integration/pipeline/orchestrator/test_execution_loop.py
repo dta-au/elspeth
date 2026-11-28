@@ -681,8 +681,8 @@ class TestRunSummaryEmission:
         assert len(summaries) == 1
         assert summaries[0].duration_seconds > 0
 
-    def test_failed_run_summary_and_runfinished_preserve_partial_counts(self) -> None:
-        """Mid-run failure must report real partial counters, not zeros."""
+    def test_failed_run_summary_counts_no_unaudited_outcomes_and_keeps_rows_processed(self) -> None:
+        """Mid-run failure counts only terminal outcomes, while retaining processed rows."""
         db = LandscapeDB.in_memory()
         payload_store = MockPayloadStore()
         event_bus = CapturingEventBus()
@@ -711,7 +711,7 @@ class TestRunSummaryEmission:
         summary = summaries[0]
         assert summary.status == RunCompletionStatus.FAILED
         assert summary.total_rows == 2
-        assert summary.succeeded == 1
+        assert summary.succeeded == 0
         assert summary.failed == 0
         assert summary.quarantined == 0
         assert summary.routed_success == 0

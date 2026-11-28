@@ -1,6 +1,7 @@
 """Tests for contracts/events.py exports."""
 
 from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 
@@ -429,6 +430,106 @@ class TestRunSummaryIntValidation:
                 duration_seconds=1.0,
                 exit_code=1,
                 collector_groups_failed=value,
+            )
+
+    @pytest.mark.parametrize(
+        "counts",
+        [
+            {"succeeded": 1},
+            {"failed": 1},
+            {"quarantined": 1},
+            {"routed_success": 1},
+            {"routed_failure": 1},
+            {"routed_destinations": (("out", 1),)},
+            {"collector_groups_failed": 1},
+        ],
+    )
+    def test_unknown_outcome_counts_reject_any_count(self, counts: dict[str, Any]) -> None:
+        from elspeth.contracts.events import RunCompletionStatus, RunSummary
+
+        base: dict[str, Any] = {"succeeded": 0, "failed": 0, "quarantined": 0}
+        with pytest.raises(ValueError, match="unknown outcome counts"):
+            RunSummary(
+                run_id="r",
+                status=RunCompletionStatus.FAILED,
+                total_rows=3,
+                duration_seconds=1.0,
+                exit_code=2,
+                outcome_counts_known=False,
+                **{**base, **counts},
+            )
+
+    def test_rejects_non_bool_outcome_counts_known(self) -> None:
+        from elspeth.contracts.events import RunCompletionStatus, RunSummary
+
+        not_a_bool: Any = 0
+        with pytest.raises(TypeError, match="outcome_counts_known"):
+            RunSummary(
+                run_id="r",
+                status=RunCompletionStatus.FAILED,
+                total_rows=3,
+                succeeded=0,
+                failed=0,
+                quarantined=0,
+                duration_seconds=1.0,
+                exit_code=2,
+                outcome_counts_known=not_a_bool,
+            )
+
+    @pytest.mark.parametrize(
+        ("total_rows", "outcome_counts_known"),
+        [(3, False), (0, True), (3, True)],
+    )
+    def test_unknown_total_rows_reject_contradictions(self, total_rows: int, outcome_counts_known: bool) -> None:
+        from elspeth.contracts.events import RunCompletionStatus, RunSummary
+
+        with pytest.raises(ValueError, match="unknown total_rows"):
+            RunSummary(
+                run_id="r",
+                status=RunCompletionStatus.FAILED,
+                total_rows=total_rows,
+                succeeded=0,
+                failed=0,
+                quarantined=0,
+                duration_seconds=1.0,
+                exit_code=2,
+                outcome_counts_known=outcome_counts_known,
+                total_rows_known=False,
+            )
+
+    def test_unknown_total_rows_with_unknown_outcomes_accepted(self) -> None:
+        from elspeth.contracts.events import RunCompletionStatus, RunSummary
+
+        summary = RunSummary(
+            run_id="r",
+            status=RunCompletionStatus.FAILED,
+            total_rows=0,
+            succeeded=0,
+            failed=0,
+            quarantined=0,
+            duration_seconds=1.0,
+            exit_code=2,
+            outcome_counts_known=False,
+            total_rows_known=False,
+        )
+        assert summary.total_rows_known is False
+
+    def test_rejects_non_bool_total_rows_known(self) -> None:
+        from elspeth.contracts.events import RunCompletionStatus, RunSummary
+
+        not_a_bool: Any = 0
+        with pytest.raises(TypeError, match="total_rows_known"):
+            RunSummary(
+                run_id="r",
+                status=RunCompletionStatus.FAILED,
+                total_rows=0,
+                succeeded=0,
+                failed=0,
+                quarantined=0,
+                duration_seconds=1.0,
+                exit_code=2,
+                outcome_counts_known=False,
+                total_rows_known=not_a_bool,
             )
 
 
