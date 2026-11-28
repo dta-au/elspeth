@@ -1080,7 +1080,13 @@ _EXPECTED_SUBORDINATE_EDGE_COUNT = 154
 # record_operation_call's f52090af30050563 -> 9a5bac204144c859. Measured by the
 # gate's scanner against git archives of 9ef3350d9 and the change: two moved,
 # no arrivals/departures.
-_EXPECTED_SUBORDINATE_EDGE_SHA256 = "f804c04dbc2ba798bf2d0439d9b8a5c83b78e5f1fbe9d55f05eccff0634d6400"
+# Collector flush metadata: complete_node_state -> complete_node_state_on now
+# passes serialized_metadata (b16d7b09f86c99fd -> 6c6e07a58eca3e68) and
+# complete_collector_failure -> complete_node_states_failed_many passes
+# metadata_by_state (9e5ea854d66cd366 -> 1ba889449a0b3026). 154 edges remain.
+# Measured by scripts/fencing_inventory.py --baseline against a git archive of
+# 47ce88025: two moved, no arrivals/departures.
+_EXPECTED_SUBORDINATE_EDGE_SHA256 = "014d2579afb509b993713522977c473c3ee66599de8772371f57279e7f77556c"
 # X1 join admission records departure after a post-admission refusal:
 # JoinAdmissionService.join_run -> depart_worker joins the existing admit_follower call.
 # Measured against a02f25747: 43/0ff714e7… -> 44/a980dd0f…; one arrival.
@@ -9894,7 +9900,7 @@ def _reserve_sink_effect_disjoint_receipts(units):
         (
             "src/elspeth/core/landscape/execution_repository.py",
             "ExecutionRepository",
-            "3f7b7a2963e058d5fa2af9a9b400a180ff21028aab537af5b0e7dbb512d0ed34",
+            "80eae07fc9156300619ddec2e0fd9301cccb58ffd37283e374ba5b2d41ab8986",
         ),
         (
             "src/elspeth/core/landscape/execution/sink_effects.py",
