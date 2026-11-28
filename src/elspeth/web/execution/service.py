@@ -352,7 +352,8 @@ def _log_loss_watcher_failure_deferred(exc: BaseException, *, run_id: UUID) -> N
     """Log a queued run's watcher failure whose record waits for that run's own end.
 
     The failure is recorded when the queued run completes; until then no
-    record of it exists. Class names only, no ``exc_info``.
+    durable record of it exists, only log lines. Class names only, no
+    ``exc_info``.
     """
     slog.error(
         "execution_loss_watcher_failure_deferred",
