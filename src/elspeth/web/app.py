@@ -60,6 +60,7 @@ from elspeth.plugins.transforms.llm.model_catalog import (
 )
 from elspeth.web.application_finalizers import ApplicationFinalizerOwner
 from elspeth.web.async_workers import (
+    WORKER_ADMISSION_REFUSED,
     AsyncWorkerAdmissionTimeoutError,
     configure_required_executor_recovery,
     required_generation_unavailable,
@@ -247,6 +248,13 @@ _COMPOSER_BOOT_PROBE_DEADLINE_SECONDS = 45.0
 # loop calls with at most 200 completion tokens (11 archived calls, prompts of
 # 56k-104k tokens): p50 1.6 s, max 2.75 s.
 _COMPOSER_PLANNER_BOOT_PROBE_TIMEOUT_SECONDS = 5.0
+
+
+def _composer_boot_probe_time(loop: asyncio.AbstractEventLoop) -> float:
+    """Read the boot-probe budget clock without changing asyncio's timer clock."""
+    return loop.time()
+
+
 # httpx's connect and read timeouts are per operation: the read timeout
 # bounds each wait for a chunk, so a response that trickles in never trips it.
 # The prime is therefore also held to a total deadline, which is what the boot
@@ -468,12 +476,15 @@ async def _periodic_orphan_cleanup(
         await asyncio.sleep(interval_seconds)
         cancelled = 0
         live_run_ids: frozenset[str] = frozenset()
+        archive_cap_original: OSError | None = None
         try:
             try:
                 await session_service.reconcile_consumed_archives()
+            # A refused admission is an OSError, so this handler, not the outer one, takes it here.
             except OSError as cleanup_exc:
                 archive_cleanup_failures += 1
                 if archive_cleanup_failures >= _ORPHAN_CLEANUP_MAX_CONSECUTIVE_FAILURES:
+                    archive_cap_original = cleanup_exc
                     raise
                 slog.error(
                     "periodic_archive_cleanup_pending",
@@ -505,14 +516,17 @@ async def _periodic_orphan_cleanup(
                     create_tables=create_tables,
                 )
             consecutive_failures = 0
-        except OperationalError as cleanup_exc:
-            # Only OperationalError is retried — the one DB failure class
-            # that models transient contention (lock timeout, dropped
-            # connection, sqlite-busy) rather than standing operator or
-            # programmer state. Every other SQLAlchemyError subclass
-            # (ProgrammingError, IntegrityError, ...), OSError, and
-            # SchemaCompatibilityError propagates, terminating the task
-            # so the fault surfaces at lifespan shutdown (the outer
+        except (OperationalError, WORKER_ADMISSION_REFUSED, ExceptionGroup) as cleanup_exc:
+            if cleanup_exc is archive_cap_original:
+                raise
+            if isinstance(cleanup_exc, ExceptionGroup):
+                _refusals, other = cleanup_exc.split(WORKER_ADMISSION_REFUSED)
+                if other is not None:
+                    raise
+            # OperationalError and refused shared-pool admissions are retried
+            # up to the same consecutive-failure bound. Other failures
+            # propagate, terminating the task so the fault surfaces at
+            # lifespan shutdown (the outer
             # contextlib.suppress narrows to CancelledError only) —
             # retrying those every interval can never fix them.
             # The retry itself is bounded: past the consecutive-failure
@@ -1026,7 +1040,7 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
             # surface probes its own endpoint and capability even when model IDs
             # match. Every request shares one deadline (see
             # _COMPOSER_BOOT_PROBE_DEADLINE_SECONDS).
-            probe_deadline = loop.time() + _COMPOSER_BOOT_PROBE_DEADLINE_SECONDS
+            probe_deadline = _composer_boot_probe_time(loop) + _COMPOSER_BOOT_PROBE_DEADLINE_SECONDS
             for probe_request in build_composer_probe_requests(settings, env=os.environ):
                 composer_probe_start = time.monotonic()
                 probe_status = "started"
@@ -1049,7 +1063,7 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
                     "structured_output": is_advisor,
                     "probe_status": probe_status,
                 }
-                remaining = probe_deadline - loop.time()
+                remaining = probe_deadline - _composer_boot_probe_time(loop)
                 probe_timeout = min(remaining, _COMPOSER_PLANNER_BOOT_PROBE_TIMEOUT_SECONDS) if role == "planner" else remaining
                 try:
                     if remaining <= 0:

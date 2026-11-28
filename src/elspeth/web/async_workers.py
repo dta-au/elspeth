@@ -569,6 +569,9 @@ class AsyncWorkerAdmissionTimeoutError(TimeoutError):
     """
 
 
+WORKER_ADMISSION_REFUSED: Final[type[AsyncWorkerAdmissionTimeoutError]] = AsyncWorkerAdmissionTimeoutError
+
+
 def _get_shared_executor() -> ThreadPoolExecutor:
     """Return the process-wide bounded worker pool, constructing it once.
 

@@ -92,6 +92,8 @@ from elspeth.plugins.infrastructure.runtime_factory import (
 from elspeth.plugins.sources.blob_rows import BlobRowsEntry
 from elspeth.web.application_finalizers import ApplicationFinalizerCapability, ApplicationFinalizerKind
 from elspeth.web.async_workers import (
+    WORKER_ADMISSION_REFUSED,
+    AsyncWorkerAdmissionTimeoutError,
     _raise_lifecycle_originals,
     _retain_cancellation,
     run_application_finalizer_in_worker,
@@ -212,6 +214,7 @@ from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, WebPlug
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 from elspeth.web.plugin_policy.validation import validate_plugin_policy
 from elspeth.web.provider_config_policy import web_llm_retry_budget_policy_error
+from elspeth.web.required_executor import RequiredGenerationUnavailable
 from elspeth.web.secrets.wiring_policy import runtime_secret_wiring_policy
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.prompt_file_review import (
@@ -261,10 +264,10 @@ _MAX_AUTHORITATIVE_PROOF_TEXT_CHARS = 1000
 # Execution loss watcher (``_signal_shutdown_on_operation_loss``). The watcher
 # is the only carrier of a durable ``cancel_requested_at`` written by another
 # replica to the worker that owns the run, so one transient session-DB error in
-# its poll must not end it. The healthy poll interval is unchanged; after a
-# transient session-DB error the interval doubles per consecutive failure up to
-# the cap, and from the escalation threshold onward every failure is logged at
-# error level. The lease-loss wait stays armed during every backoff interval.
+# its poll must not end it. The healthy poll interval is unchanged; after a transient
+# session-DB error or a refused shared-pool admission the interval doubles per consecutive
+# failure up to the cap, and from the escalation threshold onward every failure is logged
+# at error level. The lease-loss wait stays armed during every backoff interval.
 _LOSS_WATCHER_POLL_SECONDS = 0.25
 _LOSS_WATCHER_MAX_BACKOFF_SECONDS = 5.0
 _LOSS_WATCHER_ESCALATE_AFTER_FAILURES = 5
@@ -279,7 +282,7 @@ _LOSS_WATCHER_ESCALATE_AFTER_FAILURES = 5
 # - ``DisconnectionError``: the pool detected a dead connection at checkout.
 # The watcher also retries any other ``DBAPIError`` whose
 # ``connection_invalidated`` flag SQLAlchemy's disconnect detection set. All
-# other faults (``ProgrammingError``, ``IntegrityError``, an unflagged
+# other database faults (``ProgrammingError``, ``IntegrityError``, an unflagged
 # ``DBAPIError``, ``PendingRollbackError``) are logged and re-raised. ``get_run``
 # opens a fresh ``engine.begin()`` per poll, so no failed transaction carries
 # over between polls and a ``PendingRollbackError`` there would be a code defect.
@@ -291,7 +294,9 @@ _LOSS_WATCHER_TRANSIENT_DB_ERRORS: tuple[type[SQLAlchemyError], ...] = (
 )
 
 
-def _log_loss_watcher_poll_retry(exc: SQLAlchemyError, *, run_id: UUID, consecutive_failures: int) -> None:
+def _log_loss_watcher_poll_retry(
+    exc: SQLAlchemyError | AsyncWorkerAdmissionTimeoutError, *, run_id: UUID, consecutive_failures: int
+) -> None:
     """Log one transient loss-watcher poll failure; error level from the threshold on.
 
     Class names only, no ``exc_info``: SQLAlchemy cause chains carry the URL.
@@ -312,6 +317,24 @@ def _log_loss_watcher_poll_retry(exc: SQLAlchemyError, *, run_id: UUID, consecut
         )
 
 
+def _execution_pipeline_started(lease: SessionOperationLease) -> bool:
+    """Whether the run executor has begun this lease's pipeline Future.
+
+    Read from the Future bound to the lease's own acquisition obligation: a
+    Future the worker took (``running``) or finished after taking (``done``
+    and not cancelled) has started. No bound Future, or one still queued,
+    has not. A lease without that exact obligation counts as started, which
+    keeps the immediate record.
+    """
+    obligation = lease.execution_obligation
+    if type(obligation) is not ExecutionAcquisitionObligation:
+        return True
+    pipeline = obligation.pipeline
+    if pipeline is None:
+        return False
+    return pipeline.running() or (pipeline.done() and not pipeline.cancelled())
+
+
 def _log_loss_watcher_poll_failed(exc: SQLAlchemyError, *, run_id: UUID) -> None:
     """Log a non-transient loss-watcher poll failure before it propagates.
 
@@ -320,6 +343,25 @@ def _log_loss_watcher_poll_failed(exc: SQLAlchemyError, *, run_id: UUID) -> None
     """
     slog.error(
         "execution_loss_watcher_poll_failed",
+        run_id=str(run_id),
+        exc_class=type(exc).__name__,
+    )
+
+
+def _log_loss_watcher_failure_deferred(exc: BaseException, *, run_id: UUID) -> None:
+    """Log a queued run's watcher failure whose record is deferred.
+
+    The run's completion joins the watcher and raises this failure, which
+    fails that run's completion lifecycle. Whichever comes first, that
+    completion or shutdown seeing the dead watcher, records the failure in
+    the release registry. The record
+    keeps it in memory, seals the registry against new EXECUTE acquisitions
+    process-wide and requests process recovery. Until then the failure is
+    held only as the watcher's outcome, and this log line is the only trace
+    this step leaves. Class names only, no ``exc_info``.
+    """
+    slog.error(
+        "execution_loss_watcher_failure_deferred",
         run_id=str(run_id),
         exc_class=type(exc).__name__,
     )
@@ -2339,11 +2381,39 @@ class ExecutionServiceImpl:
         owner.task = task
         try:
             await self._signal_shutdown_on_operation_loss(owner.lease, shutdown_event, run_id=run_id, close_requested=owner.close_requested)
+        except RequiredGenerationUnavailable as original:
+            if self.execution_lease_release_registry.recovery.instance_draining.is_set():
+                owner.outcome = (task, None)
+                return
+            owner.outcome = (task, original)
+            self._stop_run_on_loss_watcher_death(owner.lease, shutdown_event, original, run_id=run_id)
+            raise
         except BaseException as original:
             owner.outcome = (task, original)
+            if not owner.close_requested.is_set():
+                self._stop_run_on_loss_watcher_death(owner.lease, shutdown_event, original, run_id=run_id)
             raise
         else:
             owner.outcome = (task, None)
+
+    def _stop_run_on_loss_watcher_death(
+        self, lease: SessionOperationLease, shutdown_event: threading.Event, original: BaseException, *, run_id: UUID
+    ) -> None:
+        """Stop the watched run at once; record the failure at once only if its pipeline has started.
+
+        The shutdown event is set first, so a pipeline that starts after the
+        check below finds it already set. For a run whose pipeline is still
+        queued behind another run's, the failure is recorded later, by that
+        run's completion joining this watcher or by shutdown seeing the dead
+        watcher, whichever comes first. Recording it now would seal the
+        registry and begin process recovery, stopping the run that is
+        executing. Until then the deferred failure is logged once.
+        """
+        shutdown_event.set()
+        if _execution_pipeline_started(lease):
+            self.execution_lease_release_registry.record_failure(original)
+        else:
+            _log_loss_watcher_failure_deferred(original, run_id=run_id)
 
     async def _join_loss_watcher(
         self,
@@ -3466,6 +3536,10 @@ class ExecutionServiceImpl:
                     return
                 try:
                     run = await self._session_service.get_run(run_id)
+                except WORKER_ADMISSION_REFUSED as exc:
+                    consecutive_poll_failures += 1
+                    _log_loss_watcher_poll_retry(exc, run_id=run_id, consecutive_failures=consecutive_poll_failures)
+                    continue
                 except _LOSS_WATCHER_TRANSIENT_DB_ERRORS as exc:
                     # Transient session-DB failure (lock contention, pool
                     # checkout timeout, dropped connection, failover). This task
