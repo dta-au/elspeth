@@ -351,11 +351,13 @@ def _log_loss_watcher_poll_failed(exc: SQLAlchemyError, *, run_id: UUID) -> None
 def _log_loss_watcher_failure_deferred(exc: BaseException, *, run_id: UUID) -> None:
     """Log a queued run's watcher failure whose record waits for that run's own end.
 
-    When the queued run completes, the release registry retains the failure
-    in memory, which fails that run's lifecycle and requests process
-    recovery. Until then the failure is held only as the watcher's outcome,
-    and this log line is the only trace this step leaves. Class names only,
-    no ``exc_info``.
+    The run fails when its completion joins the watcher and raises this
+    failure. Whichever comes first, that completion or shutdown seeing the
+    dead watcher, records the failure in the release registry. The record
+    keeps it in memory, seals the registry against new EXECUTE acquisitions
+    process-wide and requests process recovery. Until then the failure is
+    held only as the watcher's outcome, and this log line is the only trace
+    this step leaves. Class names only, no ``exc_info``.
     """
     slog.error(
         "execution_loss_watcher_failure_deferred",
@@ -2399,11 +2401,12 @@ class ExecutionServiceImpl:
         """Stop the watched run at once; record the failure at once only if its pipeline has started.
 
         The shutdown event is set first, so a pipeline that starts after the
-        check below finds it already set. A run whose pipeline is still queued
-        behind another run's has its failure recorded when its own completion
-        joins this watcher. Recording it now would begin process recovery and
-        stop the run that is executing. Until then the deferred failure is
-        logged once, so it is visible while the queued run waits.
+        check below finds it already set. For a run whose pipeline is still
+        queued behind another run's, the failure is recorded later, by that
+        run's completion joining this watcher or by shutdown seeing the dead
+        watcher, whichever comes first. Recording it now would seal the
+        registry and begin process recovery, stopping the run that is
+        executing. Until then the deferred failure is logged once.
         """
         shutdown_event.set()
         if _execution_pipeline_started(lease):
