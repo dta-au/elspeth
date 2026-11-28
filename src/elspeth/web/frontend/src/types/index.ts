@@ -717,6 +717,13 @@ export const TERMINAL_RUN_STATUS_VALUES = [
 ] as const;
 export type TerminalRunStatus = (typeof TERMINAL_RUN_STATUS_VALUES)[number];
 
+export const LIVE_RUN_STATUS_VALUES = ["pending", "running"] as const;
+export type LiveRunStatus = (typeof LIVE_RUN_STATUS_VALUES)[number];
+
+export function isLiveRunStatus(status: RunStatus): status is LiveRunStatus {
+  return (LIVE_RUN_STATUS_VALUES as readonly RunStatus[]).includes(status);
+}
+
 export function isTerminalRunStatus(
   status: RunStatus,
 ): status is TerminalRunStatus {
@@ -728,7 +735,23 @@ export function isTerminalRunStatus(
 // without adding it to RUN_STATUS_VALUES, this fails to compile.
 type _AssertTerminalSubset = TerminalRunStatus extends RunStatus ? true : never;
 const _terminalSubsetCheck: _AssertTerminalSubset = true;
+type _AssertLiveSubset = LiveRunStatus extends RunStatus ? true : never;
+const _liveSubsetCheck: _AssertLiveSubset = true;
 void _terminalSubsetCheck;
+void _liveSubsetCheck;
+
+// Compile-time assertion: every RunStatus is exactly one of live or terminal.
+// Some sites ask "is this run still in flight?" as !isTerminalRunStatus(...)
+// (the run-list poll, the history drawer's Cancel, the WebSocket's live
+// check); for every typed status that is the answer isLiveRunStatus gives.
+// A status added to RUN_STATUS_VALUES without a class, or with both, fails
+// to compile here.
+type _AssertLiveOrTerminal = [Exclude<RunStatus, LiveRunStatus | TerminalRunStatus>] extends [never] ? true : never;
+type _AssertNotBothLiveAndTerminal = [Extract<LiveRunStatus, TerminalRunStatus>] extends [never] ? true : never;
+const _liveOrTerminalCheck: _AssertLiveOrTerminal = true;
+const _notBothLiveAndTerminalCheck: _AssertNotBothLiveAndTerminal = true;
+void _liveOrTerminalCheck;
+void _notBothLiveAndTerminalCheck;
 
 /**
  * Source-ingestion counts. Every field counts ROWS, not tokens

@@ -327,6 +327,22 @@ describe("RunsHistoryDrawer", () => {
     expect(cancel).toHaveBeenCalledWith("r2");
   });
 
+  it.each([
+    ["pending", "Cancel the queued pipeline? This cannot be undone.", "Cancel the running pipeline? This cannot be undone."],
+    ["running", "Cancel the running pipeline? This cannot be undone.", "Cancel the queued pipeline? This cannot be undone."],
+  ])("words the cancel confirmation for a %s run", async (status, shown, absent) => {
+    useExecutionStore.setState({
+      runs: [{ id: "r2", status } as never],
+      cancel: vi.fn().mockResolvedValue(undefined),
+    } as never);
+
+    render(<RunsHistoryDrawer onClose={vi.fn()} />);
+    await userEvent.click(screen.getByRole("button", { name: /^Cancel Run 1 · /i }));
+
+    expect(screen.getByText(shown)).toBeInTheDocument();
+    expect(screen.queryByText(absent)).not.toBeInTheDocument();
+  });
+
   it("does not cancel when the confirm dialog is dismissed", async () => {
     const cancel = vi.fn().mockResolvedValue(undefined);
     useExecutionStore.setState({

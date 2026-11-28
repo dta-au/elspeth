@@ -31,7 +31,7 @@ import type {
   ExecutionSecretGuard,
 } from "@/types/index";
 import type { InterpretationEvent } from "@/types/interpretation";
-import { isTerminalRunStatus } from "@/types/index";
+import { isLiveRunStatus, isTerminalRunStatus } from "@/types/index";
 import * as api from "@/api/client";
 import { connectToRun, type WebSocketConnection } from "@/api/websocket";
 import { useAuthStore } from "./authStore";
@@ -565,6 +565,9 @@ function projectRunList(
   const activeRow = state.activeRunId !== null
     ? runs.find((run) => run.id === state.activeRunId)
     : undefined;
+  if (activeRow?.status === "running" && state.progress?.status === "pending") {
+    return { runs, progress: { ...state.progress, status: "running" } };
+  }
   if (!activeRow || !isTerminalRunStatus(activeRow.status) || state.progress === null) {
     return { runs };
   }
@@ -839,7 +842,7 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
           cancel_requested: false,
           accounting: null,
           recent_errors: [],
-          status: "running",
+          status: "pending",
         },
       });
 
@@ -1324,7 +1327,7 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
    */
   attachLiveRunIfUnattached(sessionId: string, runs: Run[]) {
     const liveRun = runs.find(
-      (run) => run.status === "running" || run.status === "pending",
+      (run) => isLiveRunStatus(run.status),
     );
     if (!liveRun) return;
     const { activeRunId, progress } = get();

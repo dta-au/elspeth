@@ -465,7 +465,7 @@ def _bwrap_unusable_reason() -> str | None:
     if bwrap is None:
         return "bubblewrap is unavailable"
     probe = subprocess.run(
-        [bwrap, "--dev-bind", "/", "/", "--unshare-net", "--unshare-pid", "--proc", "/proc", "--die-with-parent", "--", "true"],
+        [bwrap, "--ro-bind", "/", "/", "--unshare-net", "--unshare-pid", "--proc", "/proc", "--die-with-parent", "--", "true"],
         capture_output=True,
         text=True,
         check=False,
@@ -599,16 +599,10 @@ def test_execute_refuses_env_in_exported_tree(tmp_path: Path) -> None:
 
 
 def test_execute_refuses_when_bwrap_namespace_cannot_start(tmp_path: Path) -> None:
-    bwrap = shutil.which("bwrap")
-    if bwrap is None:
+    reason = _bwrap_unusable_reason()
+    if shutil.which("bwrap") is None:
         pytest.skip("bubblewrap is unavailable; missing-binary refusal is environment dependent")
-    probe = subprocess.run(
-        [bwrap, "--dev-bind", "/", "/", "--unshare-net", "--unshare-pid", "--proc", "/proc", "--die-with-parent", "--", "true"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if probe.returncode == 0:
+    if reason is None:
         pytest.skip("bubblewrap works here; namespace failure cannot be exercised")
     _fixture(tmp_path)
     log_dir = tmp_path / "logs"
@@ -619,17 +613,9 @@ def test_execute_refuses_when_bwrap_namespace_cannot_start(tmp_path: Path) -> No
 
 
 def test_execute_private_loopback_and_empty_home_when_bwrap_works(tmp_path: Path) -> None:
-    bwrap = shutil.which("bwrap")
-    if bwrap is None:
-        pytest.skip("bubblewrap is unavailable")
-    probe = subprocess.run(
-        [bwrap, "--dev-bind", "/", "/", "--unshare-net", "--unshare-pid", "--proc", "/proc", "--die-with-parent", "--", "true"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if probe.returncode != 0:
-        pytest.skip(f"bubblewrap namespace self-test unavailable: {probe.stderr.strip()}")
+    reason = _bwrap_unusable_reason()
+    if reason is not None:
+        pytest.skip(reason)
     _, cases = _fixture(tmp_path)
     data = yaml.safe_load(cases.read_text())
     case = data["cases"][0]
@@ -651,17 +637,9 @@ def test_execute_private_loopback_and_empty_home_when_bwrap_works(tmp_path: Path
 
 
 def test_execute_refuses_nearer_env_when_bwrap_works(tmp_path: Path) -> None:
-    bwrap = shutil.which("bwrap")
-    if bwrap is None:
-        pytest.skip("bubblewrap is unavailable")
-    probe = subprocess.run(
-        [bwrap, "--dev-bind", "/", "/", "--unshare-net", "--unshare-pid", "--proc", "/proc", "--die-with-parent", "--", "true"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if probe.returncode != 0:
-        pytest.skip(f"bubblewrap namespace self-test unavailable: {probe.stderr.strip()}")
+    reason = _bwrap_unusable_reason()
+    if reason is not None:
+        pytest.skip(reason)
     _fixture(tmp_path)
     work = tmp_path / "work"
     (work / "cases").mkdir(parents=True)
@@ -674,17 +652,9 @@ def test_execute_refuses_nearer_env_when_bwrap_works(tmp_path: Path) -> None:
 
 
 def test_missing_sandbox_command_exit_is_fail_when_bwrap_works(tmp_path: Path) -> None:
-    bwrap = shutil.which("bwrap")
-    if bwrap is None:
-        pytest.skip("bubblewrap is unavailable")
-    probe = subprocess.run(
-        [bwrap, "--dev-bind", "/", "/", "--unshare-net", "--unshare-pid", "--proc", "/proc", "--die-with-parent", "--", "true"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if probe.returncode != 0:
-        pytest.skip(f"bubblewrap namespace self-test unavailable: {probe.stderr.strip()}")
+    reason = _bwrap_unusable_reason()
+    if reason is not None:
+        pytest.skip(reason)
     _, cases = _fixture(tmp_path)
     data = yaml.safe_load(cases.read_text())
     data["cases"][0]["command"] = 'kill -KILL "$PPID"'

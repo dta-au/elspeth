@@ -8,6 +8,18 @@ The full history is in the repository's releases and commit history.
 
 ---
 
+## Unreleased (0.8.19 integration branch)
+
+### Fixed
+
+- Release publishing: the image smoke test no longer fails when the image user
+  and the CI runner are different users, so a tag publish can complete.
+- Web Composer: an approval request that fails pipeline validation now returns
+  the same 422 response as the execute route, including its `kind` field.
+- Web Composer: when a provider rejects a request as too large but its client
+  library reports a rate limit or bad request, the recorded provider status is
+  now the provider's 413.
+
 ## 0.8.18 - 2026-11-26
 
 Canonical form v2 for new runs, worker coordination and recovery fixes in the

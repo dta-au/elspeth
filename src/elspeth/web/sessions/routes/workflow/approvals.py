@@ -44,6 +44,7 @@ from elspeth.web.execution.errors import (
     SemanticContractViolationError,
     UnresolvedInterpretationPlaceholderError,
 )
+from elspeth.web.execution.http_errors import pipeline_validation_http_exception
 from elspeth.web.execution.protocol import StateAccessError
 from elspeth.web.sessions.prompt_file_review import PromptFileReviewStale
 from elspeth.web.sessions.protocol import SessionServiceProtocol
@@ -258,23 +259,7 @@ def create_approvals_router() -> APIRouter:
                     },
                 ) from exc
             except PipelineValidationError as exc:
-                raise HTTPException(
-                    status_code=422,
-                    detail={
-                        "error_type": "pipeline_validation_failure",
-                        "detail": str(exc),
-                        "errors": [
-                            {
-                                "component_id": error.component_id,
-                                "component_type": error.component_type,
-                                "message": error.message,
-                                "suggestion": error.suggestion,
-                                "error_code": error.error_code,
-                            }
-                            for error in exc.errors
-                        ],
-                    },
-                ) from exc
+                raise pipeline_validation_http_exception(exc) from exc
             except PromptFileReviewStale as exc:
                 raise HTTPException(
                     status_code=422,

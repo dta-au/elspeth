@@ -49,7 +49,12 @@ from elspeth.web.composer.private_diagnostic_facts import bind_received_response
 from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused, build_prompt_guard_mount, enforce_prompt_guard
 from elspeth.web.composer.protocol import ComposerServiceError, ComposerSettings
 from elspeth.web.composer.provider_context import capture_provider_context
-from elspeth.web.composer.provider_errors import classify_provider_failure, request_size_rejection, size_rejection_code
+from elspeth.web.composer.provider_errors import (
+    chained_provider_status,
+    classify_provider_failure,
+    request_size_rejection,
+    size_rejection_code,
+)
 from elspeth.web.composer.provider_quota import (
     ProviderCallCustody,
     provider_call_scope,
@@ -656,7 +661,7 @@ class ProviderGateway:
             raise _BadRequestLLMError(
                 f"LLM request rejected ({type(exc).__name__})",
                 provider_detail=str(exc) or None,
-                provider_status_code=exc.status_code,
+                provider_status_code=chained_provider_status(exc) or exc.status_code,
             ) from exc
         except LiteLLMAPIError as exc:
             # A request too large for the provider or a proxy in front of it
@@ -677,7 +682,7 @@ class ProviderGateway:
             raise _BadRequestLLMError(
                 f"LLM request rejected ({type(exc).__name__})",
                 provider_detail=str(exc) or None,
-                provider_status_code=exc.status_code,
+                provider_status_code=chained_provider_status(exc) or exc.status_code,
             ) from exc
         completion = _admit_composer_llm_completion(
             response,
@@ -735,7 +740,7 @@ class ProviderGateway:
             raise _BadRequestLLMError(
                 f"LLM request rejected ({type(exc).__name__})",
                 provider_detail=str(exc) or None,
-                provider_status_code=exc.status_code,
+                provider_status_code=chained_provider_status(exc) or exc.status_code,
             ) from exc
         except LiteLLMAPIError as exc:
             # A request too large for the provider or a proxy in front of it
@@ -756,7 +761,7 @@ class ProviderGateway:
             raise _BadRequestLLMError(
                 f"LLM request rejected ({type(exc).__name__})",
                 provider_detail=str(exc) or None,
-                provider_status_code=exc.status_code,
+                provider_status_code=chained_provider_status(exc) or exc.status_code,
             ) from exc
         if not response.choices:
             empty_response_metadata = admit_llm_provider_metadata(

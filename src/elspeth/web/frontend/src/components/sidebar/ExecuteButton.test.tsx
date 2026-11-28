@@ -1126,7 +1126,7 @@ describe("ExecuteButton", () => {
     });
   }
 
-  it("shows 'The pipeline is already running.' when isExecuting is true", () => {
+  it("shows the active-run reason when isExecuting is true", () => {
     useExecutionStore.setState({
       validationResult: { is_valid: true, checks: [], errors: [], warnings: [], readiness: READY_READINESS } as never,
       isExecuting: true,
@@ -1138,29 +1138,29 @@ describe("ExecuteButton", () => {
 
     expect(
       screen.getByText(
-        "The pipeline is already running.",
+        "A pipeline run is already active.",
         { selector: "p" },
       ),
     ).toBeInTheDocument();
   });
 
-  it("shows 'The pipeline is already running.' when progress.status is 'running' even if isExecuting has reset to false", () => {
+  it.each(["running", "pending"])("shows the active-run reason when progress.status is '%s'", (status) => {
     // isExecuting flips back to false shortly after the POST resolves
     // (executionStore.ts); progress.status keeps updating via WebSocket.
-    // canExecute's `progress?.status !== "running"` condition covers this
-    // window — the reason text must too.
+    // The live-status gate covers this window; the reason text must too.
     useExecutionStore.setState({
       validationResult: { is_valid: true, checks: [], errors: [], warnings: [], readiness: READY_READINESS } as never,
       isExecuting: false,
-      progress: { status: "running" } as never,
+      progress: { status } as never,
     } as never);
     useSessionStore.setState({ activeSessionId: "sess-1" } as never);
 
     render(<ExecuteButton />);
 
     expect(
-      screen.getByText("The pipeline is already running.", { selector: "p" }),
+      screen.getByText("A pipeline run is already active.", { selector: "p" }),
     ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /run pipeline/i })).toBeDisabled();
   });
 
   it("shows the validation reason when structural validation is failing", () => {
